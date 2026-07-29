@@ -50,7 +50,8 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.match(html, /同意してオンライン一次面接を開始/);
   assert.match(html, /カメラ・マイクを許可/);
   assert.match(html, /この画面を共有/);
-  assert.match(html, /現在の社内確認環境では自動削除しません/);
+  assert.match(html, /当社が手動で削除するまで保管します/);
+  assert.doesNotMatch(html, /社内確認環境|テスト名/);
   assert.match(html, /笑顔の有無、顔立ち・容姿/);
   assert.match(html, /自動処理だけで合否を決定しません/);
   assert.match(html, /技術不具合は不利益に扱わず/);

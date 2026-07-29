@@ -37,6 +37,12 @@ type ReviewRecord = {
     detail: Record<string, unknown>;
     createdAt: string;
   }>;
+  driveSync: {
+    status: "pending" | "running" | "completed" | "failed";
+    folderUrl: string | null;
+    errorCode: string | null;
+    updatedAt: string;
+  } | null;
 };
 
 const technicalEventLabels: Record<string, string> = {
@@ -69,7 +75,7 @@ export default function StaffReviewPage() {
   const [recordingUrl, setRecordingUrl] = useState("");
   const [scores, setScores] = useState<VideoScore[]>(emptyScores);
   const [overallNote, setOverallNote] = useState("");
-  const [state, setState] = useState<"idle" | "loading" | "ready" | "saving">("idle");
+  const [state, setState] = useState<"idle" | "loading" | "ready" | "saving" | "syncing">("idle");
   const [message, setMessage] = useState("");
 
   useEffect(() => () => {
@@ -140,6 +146,41 @@ export default function StaffReviewPage() {
     }
   }
 
+  async function syncGoogleDrive() {
+    if (!review) return;
+    setState("syncing");
+    setMessage("");
+    try {
+      const response = await fetch("/api/staff/google-drive/sync", {
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: review.sessionId }),
+      });
+      const data = (await response.json()) as {
+        synced?: boolean;
+        result?: { status: "completed" | "pending"; folderUrl: string };
+        error?: string;
+      };
+      if (!response.ok || !data.result) throw new Error(data.error || "Google Driveへの格納を完了できませんでした。");
+      setReview((current) => current ? {
+        ...current,
+        driveSync: {
+          status: data.result?.status ?? "completed",
+          folderUrl: data.result?.folderUrl ?? null,
+          errorCode: null,
+          updatedAt: new Date().toISOString(),
+        },
+      } : current);
+      setState("ready");
+      setMessage(data.result.status === "completed"
+        ? "Google Driveへの格納とPDF作成を完了しました。"
+        : "Google Driveへの再格納を予約しました。");
+    } catch (error) {
+      setState("ready");
+      setMessage(error instanceof Error ? error.message : "Google Driveへの格納を完了できませんでした。");
+    }
+  }
+
   return (
     <main className="staff-shell">
       <header className="site-header staff-header">
@@ -164,7 +205,26 @@ export default function StaffReviewPage() {
 
       {review && (
         <section className="staff-review">
-          <div className="staff-meta"><div><span>氏名</span><strong>{review.candidateName || "旧テスト記録"}</strong></div><div><span>面接ID</span><strong>{review.sessionId}</strong></div><div><span>雇用形態</span><strong>{review.employment}</strong></div><div><span>希望店舗</span><strong>{review.location}</strong></div><div><span>状態</span><strong>{review.status}</strong></div></div>
+          <div className="staff-meta"><div><span>氏名</span><strong>{review.candidateName || "旧テスト記録"}</strong></div><div><span>面接ID</span><strong>{review.sessionId}</strong></div><div><span>雇用形態</span><strong>{review.employment}</strong></div><div><span>入職希望対象店舗</span><strong>{review.location}</strong></div><div><span>状態</span><strong>{review.status}</strong></div></div>
+
+          <section className="staff-panel drive-sync-panel">
+            <div className="panel-title"><p>GOOGLE DRIVE ARCHIVE</p><h2>面接記録の自動格納</h2></div>
+            <p>面接完了後、応募者氏名と面接IDの専用フォルダへ、録画・文字起こし・評価データ・PDFレポート・格納結果を保存します。同じ面接IDで再実行しても既存ファイルを更新します。</p>
+            <div className="drive-sync-actions">
+              <span className={`drive-sync-status drive-sync-${review.driveSync?.status ?? "not-started"}`}>
+                {review.driveSync?.status === "completed" ? "格納完了"
+                  : review.driveSync?.status === "running" ? "格納中"
+                    : review.driveSync?.status === "pending" ? "格納待ち"
+                      : review.driveSync?.status === "failed" ? "要再実行"
+                        : "未実行"}
+              </span>
+              {review.driveSync?.folderUrl && <a href={review.driveSync.folderUrl} target="_blank" rel="noreferrer">保存フォルダを開く ↗</a>}
+              <button className="secondary-action" onClick={() => void syncGoogleDrive()} disabled={state === "syncing" || review.status !== "completed"}>
+                {state === "syncing" ? "格納中…" : "Driveへ再格納"}
+              </button>
+            </div>
+            {review.driveSync?.status === "failed" && <p className="guardrail-copy">認証・保存先・通信状態を確認し、再実行してください。応募者の評価状態には影響しません。</p>}
+          </section>
 
           {review.technicalEvents.length > 0 && <div className="staff-message"><strong>技術・中断フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>これらの事象と映像・音声品質は、応募者の不利益な評価に使用しません。</p></div>}
 

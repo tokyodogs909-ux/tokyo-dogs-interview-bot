@@ -62,3 +62,30 @@ export const interviewHumanReviews = sqliteTable("interview_human_reviews", {
   index("interview_human_reviews_session_idx").on(table.sessionId),
   uniqueIndex("interview_human_reviews_session_reviewer_unique").on(table.sessionId, table.reviewerName),
 ]);
+
+export const interviewInvites = sqliteTable("interview_invites", {
+  nonceHash: text("nonce_hash").primaryKey(),
+  expiresAt: text("expires_at").notNull(),
+  usedAt: text("used_at"),
+  sessionId: text("session_id"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("interview_invites_expiry_idx").on(table.expiresAt),
+]);
+
+export const interviewExternalSyncs = sqliteTable("interview_external_syncs", {
+  sessionId: text("session_id").notNull().references(() => interviewSessions.id, { onDelete: "cascade" }),
+  provider: text("provider").notNull(),
+  status: text("status").notNull().default("pending"),
+  requestedAt: text("requested_at").notNull(),
+  startedAt: text("started_at"),
+  completedAt: text("completed_at"),
+  folderId: text("folder_id"),
+  folderUrl: text("folder_url"),
+  manifestJson: text("manifest_json"),
+  errorCode: text("error_code"),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  uniqueIndex("interview_external_syncs_session_provider_unique").on(table.sessionId, table.provider),
+  index("interview_external_syncs_status_idx").on(table.status),
+]);

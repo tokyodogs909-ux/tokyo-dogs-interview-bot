@@ -4,6 +4,7 @@ import {
   saveInterviewRecording,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
 
 const MAX_RECORDING_BYTES = 95 * 1024 * 1024;
 const ALLOWED_TYPES = new Set(["video/webm", "audio/webm", "video/mp4", "audio/mp4"]);
@@ -47,6 +48,7 @@ export async function POST(request: Request) {
       contentType,
       byteSize: contentLength,
     });
+    scheduleGoogleDriveSync(sessionId);
     return noStoreJson({ stored: true });
   } catch {
     return noStoreJson({ error: "録画を保存できませんでした。採用担当者へ連絡してください。" }, { status: 500 });

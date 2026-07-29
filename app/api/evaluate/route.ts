@@ -5,6 +5,7 @@ import {
 } from "@/lib/evaluation";
 import {
   EVALUATION_MODEL,
+  normalizePreferredLocation,
   type InterviewEvaluation,
   type TranscriptTurn,
 } from "@/lib/interview";
@@ -21,6 +22,7 @@ import {
   saveInterviewEvaluation,
   saveInterviewTranscript,
 } from "@/lib/interview-persistence";
+import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
 
 function cleanTurns(value: unknown): TranscriptTurn[] {
   if (!Array.isArray(value)) return [];
@@ -61,6 +63,7 @@ export async function POST(request: Request) {
       transcript?: unknown;
     };
     const sessionId = payload.sessionId?.trim() ?? "";
+    const location = normalizePreferredLocation(payload.location);
     const transcript = cleanTurns(payload.transcript);
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId) || transcript.length === 0) {
       return noStoreJson({ error: "評価に必要なオンライン一次面接記録がありません。" }, { status: 400 });
@@ -78,7 +81,7 @@ export async function POST(request: Request) {
     if (
       authorized.session &&
       (authorized.session.employment !== payload.employment ||
-        authorized.session.preferred_location !== payload.location)
+        authorized.session.preferred_location !== location)
     ) {
       return noStoreJson({ error: "応募条件とオンライン一次面接の接続情報が一致しません。" }, { status: 409 });
     }
@@ -120,7 +123,7 @@ ${SOURCE_GROUNDED_EVALUATION_GUIDE}`,
             text: JSON.stringify({
               role: "犬の幼稚園スタッフ・ドッグトレーナー候補",
               employment: payload.employment ?? "未確認",
-              preferredLocation: payload.location ?? "未確認",
+              preferredLocation: location || "未確認",
               transcript,
             }),
           }],
@@ -154,6 +157,7 @@ ${SOURCE_GROUNDED_EVALUATION_GUIDE}`,
     >;
     const evaluation = validateEvaluation(parsed, transcript);
     await saveInterviewEvaluation({ sessionId, transcript, evaluation });
+    scheduleGoogleDriveSync(sessionId);
     return noStoreJson({
       stored: true,
       humanReviewRequired: true,

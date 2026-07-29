@@ -375,6 +375,14 @@ select, .candidate-name-input { padding: 13px 14px; }
 .overall-note { margin: 16px 0; }
 .evaluation-panel { padding: 28px; }
 .evaluation-summary { color: var(--muted); line-height: 1.75; margin: 12px 0 22px; }
+.drive-sync-panel { margin-bottom: 20px; padding: 24px; }
+.drive-sync-panel > p { color: var(--muted); line-height: 1.7; }
+.drive-sync-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+.drive-sync-actions a { color: var(--brand-navy); font-weight: 700; text-decoration: underline; text-underline-offset: 3px; }
+.drive-sync-status { border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; font-size: 11px; font-weight: 700; }
+.drive-sync-completed { background: #e7f7ef; border-color: #9ad2b5; color: #16623a; }
+.drive-sync-running, .drive-sync-pending { background: var(--brand-blue-soft); color: var(--brand-navy); }
+.drive-sync-failed { background: #fff0ef; border-color: #e7aaa5; color: #8c2d24; }
 .human-review-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 18px; }
 .human-review-list > div { background: var(--brand-blue-soft); border-radius: 14px; padding: 16px; display: grid; gap: 7px; }
 .human-review-list strong { color: var(--brand-navy); }

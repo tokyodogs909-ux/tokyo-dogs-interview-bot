@@ -22,6 +22,20 @@
       "when": 1785321043248,
       "tag": "0002_unique_ricochet",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1785328217444,
+      "tag": "0003_omniscient_lucky_pierre",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1785329786950,
+      "tag": "0004_nostalgic_maggott",
+      "breakpoints": true
     }
   ]
 }

@@ -4,12 +4,21 @@ import {
   type InterviewEvaluation,
   type TranscriptTurn,
 } from "@/lib/interview";
+import {
+  assertSignedInviteConfigured,
+  createInterviewInviteToken,
+  sha256Hex,
+  signedInvitesRequired,
+  verifyInterviewInviteToken,
+} from "@/lib/interview-invite";
 
 type InterviewBindings = {
   DB?: D1Database;
   RECORDINGS?: R2Bucket;
   INTERVIEW_REVIEW_TOKEN_KASAMA?: string;
   INTERVIEW_REVIEW_TOKEN_YAMAMOTO?: string;
+  INTERVIEW_INVITE_SIGNING_SECRET?: string;
+  INTERVIEW_REQUIRE_SIGNED_INVITE?: string;
 };
 
 export type InterviewSessionRecord = {
@@ -145,6 +154,29 @@ async function ensureSchema(db: D1Database) {
       UNIQUE(session_id, reviewer_name)
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_human_reviews_session_idx ON interview_human_reviews (session_id)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_invites (
+      nonce_hash TEXT PRIMARY KEY NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      session_id TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_invites_expiry_idx ON interview_invites (expires_at)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_external_syncs (
+      session_id TEXT NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL,
+      status TEXT DEFAULT 'pending' NOT NULL,
+      requested_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      folder_id TEXT,
+      folder_url TEXT,
+      manifest_json TEXT,
+      error_code TEXT,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      UNIQUE(session_id, provider)
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_external_syncs_status_idx ON interview_external_syncs (status)"),
   ]);
   const sessionColumns = await db.prepare("PRAGMA table_info(interview_sessions)")
     .all<{ name: string }>();
@@ -168,6 +200,7 @@ export async function createInterviewSession(input: {
   candidateName: string;
   employment: string;
   location: string;
+  inviteNonceHash?: string | null;
 }) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
@@ -176,27 +209,95 @@ export async function createInterviewSession(input: {
   const now = new Date();
   const sessionId = publicSessionId();
   const accessToken = randomToken();
+  const accessTokenHash = await sha256(accessToken);
+  const nowIso = now.toISOString();
   const expiresAt = new Date(now.getTime() + SESSION_TTL_MS).toISOString();
-  await db.prepare(`INSERT INTO interview_sessions (
-    id, access_token_hash, candidate_name, employment, preferred_location, consent_version,
-    consented_at, status, expires_at, retention_until, created_at, updated_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?)`)
-    .bind(
-      sessionId,
-      await sha256(accessToken),
-      input.candidateName,
-      input.employment,
-      input.location,
-      CONSENT_VERSION,
-      now.toISOString(),
-      expiresAt,
-      STORAGE_POLICY,
-      now.toISOString(),
-      now.toISOString(),
-    ).run();
-  await audit(db, sessionId, "consent_recorded", { consentVersion: CONSENT_VERSION });
+  if (input.inviteNonceHash) {
+    const results = await db.batch([
+      db.prepare(`INSERT INTO interview_sessions (
+        id, access_token_hash, candidate_name, employment, preferred_location, consent_version,
+        consented_at, status, expires_at, retention_until, created_at, updated_at
+      ) SELECT ?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM interview_invites
+          WHERE nonce_hash = ? AND used_at IS NULL AND expires_at > ?
+        )`).bind(
+        sessionId,
+        accessTokenHash,
+        input.candidateName,
+        input.employment,
+        input.location,
+        CONSENT_VERSION,
+        nowIso,
+        expiresAt,
+        STORAGE_POLICY,
+        nowIso,
+        nowIso,
+        input.inviteNonceHash,
+        nowIso,
+      ),
+      db.prepare(`UPDATE interview_invites SET used_at = ?, session_id = ?
+        WHERE nonce_hash = ? AND used_at IS NULL AND expires_at > ?`)
+        .bind(nowIso, sessionId, input.inviteNonceHash, nowIso),
+      db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json
+      ) SELECT ?, ?, 'consent_recorded', 'candidate', ?
+        WHERE EXISTS (SELECT 1 FROM interview_sessions WHERE id = ?)`)
+        .bind(
+          crypto.randomUUID(),
+          sessionId,
+          JSON.stringify({ consentVersion: CONSENT_VERSION }),
+          sessionId,
+        ),
+    ]);
+    const sessionCreated = Number((results[0] as { meta?: { changes?: number } }).meta?.changes ?? 0) === 1;
+    const inviteConsumed = Number((results[1] as { meta?: { changes?: number } }).meta?.changes ?? 0) === 1;
+    if (!sessionCreated || !inviteConsumed) throw new Error("INTERVIEW_INVITE_INVALID");
+  } else {
+    await db.prepare(`INSERT INTO interview_sessions (
+      id, access_token_hash, candidate_name, employment, preferred_location, consent_version,
+      consented_at, status, expires_at, retention_until, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?)`)
+      .bind(
+        sessionId,
+        accessTokenHash,
+        input.candidateName,
+        input.employment,
+        input.location,
+        CONSENT_VERSION,
+        nowIso,
+        expiresAt,
+        STORAGE_POLICY,
+        nowIso,
+        nowIso,
+      ).run();
+    await audit(db, sessionId, "consent_recorded", { consentVersion: CONSENT_VERSION });
+  }
 
   return { sessionId, accessToken, expiresAt, storagePolicy: STORAGE_POLICY };
+}
+
+export async function issueInterviewInvite(expiresInHours: number) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const boundedHours = Math.max(1, Math.min(168, Math.floor(expiresInHours)));
+  const nonce = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + boundedHours * 60 * 60 * 1000);
+  await db.prepare("INSERT INTO interview_invites (nonce_hash, expires_at) VALUES (?, ?)")
+    .bind(await sha256Hex(nonce), expiresAt.toISOString()).run();
+  return {
+    token: await createInterviewInviteToken(nonce, expiresAt),
+    expiresAt: expiresAt.toISOString(),
+  };
+}
+
+export async function validateInterviewInvite(token: string | undefined) {
+  if (!signedInvitesRequired()) return { required: false, nonceHash: null };
+  assertSignedInviteConfigured();
+  if (!token) return null;
+  const verified = await verifyInterviewInviteToken(token);
+  return verified ? { required: true, nonceHash: verified.nonceHash } : null;
 }
 
 export async function authorizeInterviewRequest(request: Request, sessionId: string) {
@@ -321,6 +422,201 @@ function parseJson<T>(value: unknown, fallback: T): T {
   }
 }
 
+export type ExternalSyncStatus = {
+  provider: "google_drive";
+  status: "pending" | "running" | "completed" | "failed";
+  requestedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  folderId: string | null;
+  folderUrl: string | null;
+  manifest: Record<string, unknown> | null;
+  errorCode: string | null;
+  updatedAt: string;
+};
+
+type ExternalSyncRow = {
+  provider: string;
+  status: string;
+  requested_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  folder_id: string | null;
+  folder_url: string | null;
+  manifest_json: string | null;
+  error_code: string | null;
+  updated_at: string;
+};
+
+function safeExternalSyncStatus(row: ExternalSyncRow | null): ExternalSyncStatus | null {
+  if (!row || row.provider !== "google_drive") return null;
+  const status = ["pending", "running", "completed", "failed"].includes(row.status)
+    ? row.status as ExternalSyncStatus["status"]
+    : "failed";
+  return {
+    provider: "google_drive",
+    status,
+    requestedAt: row.requested_at,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    folderId: row.folder_id,
+    folderUrl: row.folder_url,
+    manifest: parseJson<Record<string, unknown> | null>(row.manifest_json, null),
+    errorCode: row.error_code,
+    updatedAt: row.updated_at,
+  };
+}
+
+export async function getExternalSyncStatus(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const row = await db.prepare(`SELECT provider, status, requested_at, started_at, completed_at,
+    folder_id, folder_url, manifest_json, error_code, updated_at
+    FROM interview_external_syncs WHERE session_id = ? AND provider = 'google_drive' LIMIT 1`)
+    .bind(sessionId).first<ExternalSyncRow>();
+  return safeExternalSyncStatus(row);
+}
+
+export async function requestExternalSync(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = new Date().toISOString();
+  await db.prepare(`INSERT INTO interview_external_syncs (
+    session_id, provider, status, requested_at, updated_at
+  ) VALUES (?, 'google_drive', 'pending', ?, ?)
+  ON CONFLICT(session_id, provider) DO UPDATE SET
+    requested_at = excluded.requested_at,
+    status = CASE WHEN interview_external_syncs.status = 'running' THEN 'running' ELSE 'pending' END,
+    updated_at = excluded.updated_at`)
+    .bind(sessionId, now, now).run();
+  return now;
+}
+
+export async function claimExternalSync(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const startedAt = new Date().toISOString();
+  const result = await db.prepare(`UPDATE interview_external_syncs SET
+    status = 'running', started_at = ?, completed_at = NULL, error_code = NULL, updated_at = ?
+    WHERE session_id = ? AND provider = 'google_drive' AND status = 'pending'`)
+    .bind(startedAt, startedAt, sessionId).run();
+  return Number(result.meta?.changes ?? 0) === 1 ? startedAt : null;
+}
+
+export async function completeExternalSync(input: {
+  sessionId: string;
+  startedAt: string;
+  folderId: string;
+  folderUrl: string;
+  manifest: Record<string, unknown>;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
+  await db.batch([
+    db.prepare(`UPDATE interview_external_syncs SET
+      status = CASE WHEN requested_at > ? THEN 'pending' ELSE 'completed' END,
+      completed_at = CASE WHEN requested_at > ? THEN NULL ELSE ? END,
+      folder_id = ?, folder_url = ?, manifest_json = ?, error_code = NULL, updated_at = ?
+      WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?`)
+      .bind(
+        input.startedAt,
+        input.startedAt,
+        now,
+        input.folderId,
+        input.folderUrl,
+        JSON.stringify(input.manifest),
+        now,
+        input.sessionId,
+        input.startedAt,
+      ),
+    db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'google_drive_sync_completed', 'system', ?)")
+      .bind(crypto.randomUUID(), input.sessionId, JSON.stringify({ folderId: input.folderId })),
+  ]);
+  return (await getExternalSyncStatus(input.sessionId))?.status === "pending";
+}
+
+export async function failExternalSync(input: {
+  sessionId: string;
+  startedAt: string;
+  errorCode: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
+  await db.batch([
+    db.prepare(`UPDATE interview_external_syncs SET
+      status = 'failed', error_code = ?, updated_at = ?
+      WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?`)
+      .bind(input.errorCode.slice(0, 120), now, input.sessionId, input.startedAt),
+    db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'google_drive_sync_failed', 'system', ?)")
+      .bind(crypto.randomUUID(), input.sessionId, JSON.stringify({ errorCode: input.errorCode.slice(0, 120) })),
+  ]);
+}
+
+export async function getInterviewArchiveSource(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const session = await db.prepare(`SELECT
+    id, candidate_name, employment, preferred_location, consent_version, consented_at,
+    status, recording_status, transcript_json, evaluation_json, summary,
+    retention_until, completed_at, created_at, updated_at
+    FROM interview_sessions WHERE id = ? LIMIT 1`)
+    .bind(sessionId).first<Record<string, unknown>>();
+  if (!session) return null;
+  const reviews = await db.prepare(`SELECT reviewer_name, video_scores_json, overall_note, updated_at
+    FROM interview_human_reviews WHERE session_id = ? ORDER BY reviewer_name`)
+    .bind(sessionId).all<Record<string, unknown>>();
+  const events = await db.prepare(`SELECT event_type, detail_json, created_at
+    FROM interview_audit_events WHERE session_id = ? ORDER BY created_at`)
+    .bind(sessionId).all<Record<string, unknown>>();
+  const artifact = await db.prepare(`SELECT object_key, content_type, byte_size
+    FROM interview_artifacts WHERE session_id = ? AND kind = 'recording'
+    ORDER BY created_at DESC LIMIT 1`)
+    .bind(sessionId).first<{ object_key: string; content_type: string; byte_size: number }>();
+  const storedRecording = artifact && bindings().RECORDINGS
+    ? await bindings().RECORDINGS?.get(artifact.object_key)
+    : null;
+  return {
+    sessionId,
+    candidateName: String(session.candidate_name ?? ""),
+    employment: String(session.employment ?? ""),
+    preferredLocation: String(session.preferred_location ?? ""),
+    consentVersion: String(session.consent_version ?? ""),
+    consentedAt: String(session.consented_at ?? ""),
+    status: String(session.status ?? ""),
+    recordingStatus: String(session.recording_status ?? ""),
+    transcript: parseJson<TranscriptTurn[]>(session.transcript_json, []),
+    evaluation: parseJson<InterviewEvaluation | null>(session.evaluation_json, null),
+    summary: String(session.summary ?? ""),
+    retentionPolicy: String(session.retention_until ?? ""),
+    completedAt: typeof session.completed_at === "string" ? session.completed_at : null,
+    createdAt: String(session.created_at ?? ""),
+    updatedAt: String(session.updated_at ?? ""),
+    humanReviews: (reviews.results ?? []).map((review) => ({
+      reviewerName: String(review.reviewer_name ?? ""),
+      videoScores: parseJson<VideoReviewScore[]>(review.video_scores_json, []),
+      overallNote: String(review.overall_note ?? ""),
+      updatedAt: String(review.updated_at ?? ""),
+    })),
+    auditEvents: (events.results ?? []).map((event) => ({
+      type: String(event.event_type ?? ""),
+      detail: parseJson<Record<string, unknown>>(event.detail_json, {}),
+      createdAt: String(event.created_at ?? ""),
+    })),
+    recording: artifact && storedRecording ? {
+      objectKey: artifact.object_key,
+      contentType: artifact.content_type,
+      byteSize: artifact.byte_size,
+      body: storedRecording.body,
+      etag: storedRecording.etag,
+    } : null,
+  };
+}
+
 export async function getInterviewReview(sessionId: string, reviewer: AuthorizedReviewer) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
@@ -344,6 +640,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     ) ORDER BY created_at`)
     .bind(sessionId)
     .all<Record<string, unknown>>();
+  const driveSync = await getExternalSyncStatus(sessionId);
   await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'review_opened', 'recruiter', ?)")
     .bind(crypto.randomUUID(), sessionId, JSON.stringify({ reviewer })).run();
   return {
@@ -370,6 +667,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
       detail: parseJson<Record<string, unknown>>(event.detail_json, {}),
       createdAt: event.created_at,
     })),
+    driveSync,
   };
 }
 

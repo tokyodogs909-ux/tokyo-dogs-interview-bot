@@ -1,8 +1,9 @@
 import {
   EMPLOYMENT_OPTIONS,
-  LOCATION_OPTIONS,
   REALTIME_MODEL,
   buildRealtimeSessionConfig,
+  isValidPreferredLocation,
+  normalizePreferredLocation,
 } from "@/lib/interview";
 import {
   noStoreJson,
@@ -21,14 +22,18 @@ export async function POST(request: Request) {
     if (!hasTrustedRequestOrigin(request)) {
       return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
     }
-    const payload = (await request.json()) as {
+    const rawBody = await request.text();
+    if (rawBody.length > 4_000) {
+      return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
+    }
+    const payload = JSON.parse(rawBody) as {
       sessionId?: string;
       employment?: string;
       location?: string;
     };
     const sessionId = payload.sessionId?.trim() ?? "";
     const employment = payload.employment?.trim() ?? "";
-    const location = payload.location?.trim() ?? "";
+    const location = normalizePreferredLocation(payload.location);
 
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreJson({ error: "オンライン一次面接の接続情報が正しくありません。" }, { status: 400 });
@@ -36,8 +41,8 @@ export async function POST(request: Request) {
     if (!(EMPLOYMENT_OPTIONS as readonly string[]).includes(employment)) {
       return noStoreJson({ error: "雇用形態を確認してください。" }, { status: 400 });
     }
-    if (!(LOCATION_OPTIONS as readonly string[]).includes(location)) {
-      return noStoreJson({ error: "希望店舗を確認してください。" }, { status: 400 });
+    if (!isValidPreferredLocation(location)) {
+      return noStoreJson({ error: "入職希望対象店舗を120文字以内で入力してください。" }, { status: 400 });
     }
     const authorized = await authorizeInterviewRequest(request, sessionId);
     if (!authorized) {

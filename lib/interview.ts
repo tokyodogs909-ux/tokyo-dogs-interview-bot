@@ -4,17 +4,19 @@ export const REALTIME_MODEL = "gpt-realtime-2.1";
 export const EVALUATION_MODEL = "gpt-5.6-sol";
 
 export const EMPLOYMENT_OPTIONS = ["正社員", "アルバイト・パート"] as const;
-export const LOCATION_OPTIONS = [
-  "越谷店",
-  "文京本駒込店",
-  "足立店",
-  "浦和店",
-  "所沢店",
-  "春日部店",
-  "目黒碑文谷店",
-  "横浜店",
-  "その他・相談",
-] as const;
+export const PREFERRED_LOCATION_MAX_LENGTH = 120;
+
+export function normalizePreferredLocation(value: unknown) {
+  return typeof value === "string"
+    ? value.normalize("NFKC").replace(/\s+/g, " ").trim()
+    : "";
+}
+
+export function isValidPreferredLocation(value: string) {
+  return Boolean(value) &&
+    value.length <= PREFERRED_LOCATION_MAX_LENGTH &&
+    !/[\u0000-\u001F\u007F]/.test(value);
+}
 
 export const INTERNAL_TEST_QUESTIONS = [
   "まず、これまでの仕事や学校で経験したことを簡単に教えてください。",
@@ -144,7 +146,7 @@ export function buildRealtimeInterviewInstructions(input: {
 # 今回の応募情報
 - 募集職種: 犬の幼稚園スタッフ・ドッグトレーナー候補
 - 雇用形態: ${input.employment}
-- 希望店舗: ${input.location}
+- 入職希望対象店舗: ${input.location}
 - 面接時間の目安: 15〜25分
 
 # 会話スタイル

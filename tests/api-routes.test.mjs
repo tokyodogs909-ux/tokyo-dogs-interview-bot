@@ -30,9 +30,17 @@ class FakeD1Statement {
   }
 
   async run() {
+    let changes = 0;
     if (this.sql.startsWith("INSERT INTO interview_sessions")) {
       const [id, accessTokenHash, candidateName, employment, preferredLocation, consentVersion,
         consentedAt, expiresAt, retentionUntil, createdAt, updatedAt] = this.values;
+      if (this.sql.includes("WHERE EXISTS")) {
+        const [nonceHash, comparedAt] = this.values.slice(11);
+        const invite = this.database.invites.get(nonceHash);
+        if (!invite || invite.used_at !== null || invite.expires_at <= comparedAt) {
+          return { success: true, meta: { changes: 0 } };
+        }
+      }
       this.database.sessions.set(id, {
         id,
         access_token_hash: accessTokenHash,
@@ -48,8 +56,87 @@ class FakeD1Statement {
         created_at: createdAt,
         updated_at: updatedAt,
       });
+      changes = 1;
+    } else if (this.sql.startsWith("INSERT INTO interview_invites")) {
+      const [nonceHash, expiresAt] = this.values;
+      this.database.invites.set(nonceHash, {
+        nonce_hash: nonceHash,
+        expires_at: expiresAt,
+        used_at: null,
+        session_id: null,
+      });
+      changes = 1;
+    } else if (this.sql.startsWith("UPDATE interview_invites SET used_at")) {
+      const [usedAt, sessionId, nonceHash, comparedAt] = this.values;
+      const invite = this.database.invites.get(nonceHash);
+      if (invite && invite.used_at === null && invite.expires_at > comparedAt) {
+        invite.used_at = usedAt;
+        invite.session_id = sessionId;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_invites SET session_id")) {
+      const [sessionId, nonceHash] = this.values;
+      const invite = this.database.invites.get(nonceHash);
+      if (invite?.used_at) {
+        invite.session_id = sessionId;
+        changes = 1;
+      }
     } else if (this.sql.startsWith("INSERT INTO interview_artifacts")) {
       this.database.artifacts.push(this.values);
+      changes = 1;
+    } else if (this.sql.startsWith("INSERT INTO interview_external_syncs")) {
+      const [sessionId, requestedAt, updatedAt] = this.values;
+      const current = this.database.externalSyncs.get(sessionId);
+      this.database.externalSyncs.set(sessionId, {
+        provider: "google_drive",
+        status: current?.status === "running" ? "running" : "pending",
+        requested_at: requestedAt,
+        started_at: current?.started_at ?? null,
+        completed_at: current?.completed_at ?? null,
+        folder_id: current?.folder_id ?? null,
+        folder_url: current?.folder_url ?? null,
+        manifest_json: current?.manifest_json ?? null,
+        error_code: current?.error_code ?? null,
+        updated_at: updatedAt,
+      });
+      changes = 1;
+    } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = 'running'")) {
+      const [startedAt, updatedAt, sessionId] = this.values;
+      const sync = this.database.externalSyncs.get(sessionId);
+      if (sync?.status === "pending") {
+        Object.assign(sync, {
+          status: "running",
+          started_at: startedAt,
+          completed_at: null,
+          error_code: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = CASE")) {
+      const [startedAtForStatus, , completedAt, folderId, folderUrl, manifestJson,
+        updatedAt, sessionId, expectedStartedAt] = this.values;
+      const sync = this.database.externalSyncs.get(sessionId);
+      if (sync?.started_at === expectedStartedAt) {
+        const retry = sync.requested_at > startedAtForStatus;
+        Object.assign(sync, {
+          status: retry ? "pending" : "completed",
+          completed_at: retry ? null : completedAt,
+          folder_id: folderId,
+          folder_url: folderUrl,
+          manifest_json: manifestJson,
+          error_code: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = 'failed'")) {
+      const [errorCode, updatedAt, sessionId, expectedStartedAt] = this.values;
+      const sync = this.database.externalSyncs.get(sessionId);
+      if (sync?.started_at === expectedStartedAt) {
+        Object.assign(sync, { status: "failed", error_code: errorCode, updated_at: updatedAt });
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status")) {
       const [, id] = this.values;
       const session = this.database.sessions.get(id);
@@ -89,7 +176,7 @@ class FakeD1Statement {
         session_id: sessionId,
       });
     }
-    return { success: true };
+    return { success: true, meta: { changes } };
   }
 
   async first() {
@@ -107,6 +194,9 @@ class FakeD1Statement {
       const sessionId = this.values[0];
       const values = this.database.artifacts.find((item) => item[1] === sessionId);
       return values ? { object_key: values[2], content_type: values[3], byte_size: values[4] } : null;
+    }
+    if (this.sql.startsWith("SELECT provider, status, requested_at")) {
+      return this.database.externalSyncs.get(this.values[0]) ?? null;
     }
     return null;
   }
@@ -144,6 +234,8 @@ class FakeD1 {
     this.artifacts = [];
     this.humanReviews = new Map();
     this.auditEvents = [];
+    this.invites = new Map();
+    this.externalSyncs = new Map();
   }
 
   prepare(sql) {
@@ -191,6 +283,378 @@ test("health endpoint reports server credential presence without returning the k
   assert.equal(response.headers.get("permissions-policy"), "camera=(self), microphone=(self), display-capture=(self)");
   assert.equal(response.headers.get("x-frame-options"), "DENY");
   assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+});
+
+test("Google Drive admin health check fails closed without secrets or authorization", async () => {
+  const unauthorized = await request("/api/admin/google-drive/health", {}, {
+    ...workerEnv,
+    INTERVIEW_ADMIN_TOKEN: "drive-admin-secret",
+  });
+  assert.equal(unauthorized.status, 401);
+
+  const unconfigured = await request("/api/admin/google-drive/health", {
+    headers: { Authorization: "Bearer drive-admin-secret" },
+  }, {
+    ...workerEnv,
+    INTERVIEW_ADMIN_TOKEN: "drive-admin-secret",
+  });
+  const payload = await unconfigured.json();
+  assert.equal(unconfigured.status, 503);
+  assert.equal(payload.configured, false);
+  assert.equal(payload.authenticated, false);
+  assert.ok(payload.missing.includes("GOOGLE_DRIVE_REFRESH_TOKEN"));
+  assert.equal(JSON.stringify(payload).includes("drive-admin-secret"), false);
+});
+
+test("Google Drive admin health check refreshes OAuth and verifies only the approved writable folder", async () => {
+  const originalFetch = globalThis.fetch;
+  const rootFolderId = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
+  let tokenRequestBody = "";
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      if (url === "https://oauth2.googleapis.com/token") {
+        tokenRequestBody = String(init.body);
+        assert.equal(init.method, "POST");
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      assert.match(String(url), new RegExp(`/drive/v3/files/${rootFolderId}`));
+      assert.equal(init.headers.Authorization, "Bearer temporary-google-access-token");
+      return Response.json({
+        id: rootFolderId,
+        name: "オンライン一次面接_自動格納",
+        mimeType: "application/vnd.google-apps.folder",
+        trashed: false,
+        capabilities: { canAddChildren: true },
+        webViewLink: `https://drive.google.com/drive/folders/${rootFolderId}`,
+      });
+    };
+    const response = await request("/api/admin/google-drive/health", {
+      headers: { Authorization: "Bearer drive-admin-secret" },
+    }, {
+      ...workerEnv,
+      INTERVIEW_ADMIN_TOKEN: "drive-admin-secret",
+      GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+      GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+      GOOGLE_DRIVE_REFRESH_TOKEN: "google-refresh-token",
+      GOOGLE_DRIVE_ROOT_FOLDER_ID: rootFolderId,
+      GOOGLE_DRIVE_EXPECTED_ROOT_NAME: "オンライン一次面接_自動格納",
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload.configured, true);
+    assert.equal(payload.authenticated, true);
+    assert.equal(payload.root.id, rootFolderId);
+    assert.equal(payload.root.name, "オンライン一次面接_自動格納");
+    assert.equal(payload.root.canAddChildren, true);
+    assert.equal(payload.root.locationType, "my_drive");
+    assert.match(tokenRequestBody, /grant_type=refresh_token/);
+    assert.match(tokenRequestBody, /client_id=google-client-id/);
+    const responseText = JSON.stringify(payload);
+    assert.equal(responseText.includes("google-client-secret"), false);
+    assert.equal(responseText.includes("google-refresh-token"), false);
+    assert.equal(responseText.includes("temporary-google-access-token"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("completed interview archive creates candidate folders and stores recording, transcript, evaluation, and PDF", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const rootFolderId = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    INTERVIEW_ADMIN_TOKEN: "interview-admin-secret",
+    GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+    GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+    GOOGLE_DRIVE_REFRESH_TOKEN: "google-refresh-token",
+    GOOGLE_DRIVE_ROOT_FOLDER_ID: rootFolderId,
+    GOOGLE_DRIVE_EXPECTED_ROOT_NAME: "オンライン一次面接_自動格納",
+  };
+  const session = await createTestInterviewSession(env, "正社員", "越谷店・相談可");
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "completed";
+  stored.completed_at = "2026-07-29T03:00:00.000Z";
+  stored.transcript_json = JSON.stringify([
+    { id: "turn-1", speaker: "interviewer", text: "自己紹介をお願いします。", createdAt: "2026-07-29T02:50:00.000Z" },
+    { id: "turn-2", speaker: "candidate", text: "接客経験があります。", createdAt: "2026-07-29T02:50:10.000Z" },
+  ]);
+  stored.evaluation_json = JSON.stringify({
+    recommendation: "human_review",
+    summary: "採用担当者による確認が必要です。",
+    dimensions: [],
+    strengths: ["接客経験"],
+    concerns: [],
+    contradictions: [],
+    missingTopics: ["勤務開始時期"],
+    conditions: ["他店舗配属は相談"],
+    evidenceValidationWarnings: [],
+    humanReviewRequired: true,
+  });
+  stored.summary = "採用担当者による確認が必要です。";
+  const recordingKey = `interviews/${session.sessionId}/recording.webm`;
+  const recordingBytes = new TextEncoder().encode("test-recording-with-both-audio-tracks");
+  recordings.objects.set(recordingKey, {
+    body: new Blob([recordingBytes], { type: "video/webm" }).stream(),
+    options: { httpMetadata: { contentType: "video/webm" } },
+  });
+  database.artifacts.push([
+    "artifact-id",
+    session.sessionId,
+    recordingKey,
+    "video/webm",
+    recordingBytes.byteLength,
+    "test-etag",
+    "manual-deletion-only-policy-pending",
+  ]);
+
+  let nextFile = 0;
+  const uploadedNames = [];
+  const createdFolders = [];
+  const uploadedDriveFiles = [];
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      if (href.includes(`/drive/v3/files/${rootFolderId}?`)) {
+        return Response.json({
+          id: rootFolderId,
+          name: "オンライン一次面接_自動格納",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+          webViewLink: `https://drive.google.com/drive/folders/${rootFolderId}`,
+        });
+      }
+      if (href.includes("/drive/v3/files/folder-3?")) {
+        return Response.json({
+          id: "folder-3",
+          name: `テスト 応募者_${session.sessionId}`,
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          parents: ["folder-2"],
+          appProperties: {
+            tokyoDogsKind: "tokyoDogsInterviewSession",
+            tokyoDogsInterviewSession: session.sessionId,
+          },
+          webViewLink: "https://drive.google.com/drive/folders/folder-3",
+        });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
+        return Response.json({ files: uploadedDriveFiles.length === 6 ? uploadedDriveFiles : [] });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method === "POST") {
+        const metadata = JSON.parse(String(init.body));
+        const id = `folder-${++nextFile}`;
+        createdFolders.push(metadata.name);
+        return Response.json({
+          id,
+          name: metadata.name,
+          mimeType: metadata.mimeType,
+          parents: metadata.parents,
+          appProperties: metadata.appProperties,
+          webViewLink: `https://drive.google.com/drive/folders/${id}`,
+        });
+      }
+      if (href.includes("/export?")) {
+        return new Response(new TextEncoder().encode("%PDF-1.7 test report"), {
+          status: 200,
+          headers: { "Content-Type": "application/pdf" },
+        });
+      }
+      if (href.includes("uploadType=resumable")) {
+        const metadata = JSON.parse(String(init.body));
+        uploadedNames.push(metadata.name);
+        uploadedDriveFiles.push({
+          id: `file-${nextFile + 1}`,
+          name: metadata.name,
+          size: String(recordingBytes.byteLength),
+          parents: metadata.parents,
+          appProperties: metadata.appProperties,
+        });
+        return new Response(null, {
+          status: 200,
+          headers: { Location: "https://upload.example.test/recording-session" },
+        });
+      }
+      if (href === "https://upload.example.test/recording-session") {
+        assert.equal(init.method, "PUT");
+        assert.equal(init.headers["Content-Length"], String(recordingBytes.byteLength));
+        return Response.json({
+          id: `file-${++nextFile}`,
+          name: `${session.sessionId}_面接録画.webm`,
+          size: String(recordingBytes.byteLength),
+        });
+      }
+      if (href.includes("uploadType=multipart")) {
+        const metadataBlob = init.body.get("metadata");
+        const metadata = JSON.parse(await metadataBlob.text());
+        uploadedNames.push(metadata.name);
+        const mediaBlob = init.body.get("media");
+        const uploadedFile = {
+          id: `file-${++nextFile}`,
+          name: metadata.name,
+          mimeType: metadata.mimeType || mediaBlob.type,
+          size: String(mediaBlob.size),
+          parents: metadata.parents,
+          appProperties: metadata.appProperties,
+        };
+        uploadedDriveFiles.push(uploadedFile);
+        return Response.json(uploadedFile);
+      }
+      throw new Error(`Unexpected Drive request: ${href}`);
+    };
+
+    const response = await request("/api/admin/google-drive/sync", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer interview-admin-secret",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    const payload = await response.json();
+    assert.equal(response.status, 200, JSON.stringify({ payload, sync: database.externalSyncs.get(session.sessionId), uploadedNames, createdFolders }));
+    assert.equal(payload.synced, true);
+    assert.equal(payload.result.recordingIncluded, true);
+    assert.match(payload.result.folderUrl, /^https:\/\/drive\.google\.com\/drive\/folders\/folder-/);
+    assert.deepEqual(createdFolders, ["2026", "07", `テスト 応募者_${session.sessionId}`]);
+    assert.deepEqual(new Set(uploadedNames), new Set([
+      `${session.sessionId}_文字起こし.txt`,
+      `${session.sessionId}_評価データ.json`,
+      `${session.sessionId}_オンライン一次面接レポート`,
+      `${session.sessionId}_オンライン一次面接レポート.pdf`,
+      `${session.sessionId}_面接録画.webm`,
+      `${session.sessionId}_格納結果.json`,
+    ]));
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
+    const responseText = JSON.stringify(payload);
+    assert.equal(responseText.includes("google-client-secret"), false);
+    assert.equal(responseText.includes("google-refresh-token"), false);
+    assert.equal(responseText.includes("temporary-google-access-token"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("production invite links are admin-only, expire, and can create exactly one interview session", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    INTERVIEW_ADMIN_TOKEN: "interview-admin-secret",
+    INTERVIEW_INVITE_SIGNING_SECRET: "test-signing-secret-with-sufficient-entropy",
+    INTERVIEW_REQUIRE_SIGNED_INVITE: "true",
+  };
+
+  const unauthorized = await request("/api/admin/interviews/invite", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expiresInHours: 24 }),
+  }, env);
+  assert.equal(unauthorized.status, 401);
+
+  const issue = await request("/api/admin/interviews/invite", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer interview-admin-secret",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ expiresInHours: 24 }),
+  }, env);
+  const issued = await issue.json();
+  assert.equal(issue.status, 201);
+  assert.match(issued.link, /^http:\/\/localhost\/\?invite=/);
+  assert.ok(Date.parse(issued.expiresAt) > Date.now());
+  assert.equal(JSON.stringify(issued).includes("interview-admin-secret"), false);
+  assert.equal(JSON.stringify(issued).includes("test-signing-secret"), false);
+  const inviteToken = new URL(issued.link).searchParams.get("invite");
+  assert.ok(inviteToken);
+
+  const missingInvite = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidateName: "招待なし", employment: "正社員", location: "越谷店", consent: true }),
+  }, env);
+  assert.equal(missingInvite.status, 403);
+
+  const create = () => request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "招待済み 候補者",
+      employment: "正社員",
+      location: "越谷店、または他店舗相談",
+      consent: true,
+      inviteToken,
+    }),
+  }, env);
+  const accepted = await create();
+  const acceptedPayload = await accepted.json();
+  assert.equal(accepted.status, 201);
+  assert.ok(database.sessions.has(acceptedPayload.sessionId));
+  assert.equal([...database.invites.values()][0].session_id, acceptedPayload.sessionId);
+
+  const reused = await create();
+  assert.equal(reused.status, 403);
+  assert.match((await reused.json()).error, /使用済み/);
+  assert.equal(database.sessions.size, 1);
+});
+
+test("required invite mode fails closed when the signing secret is not configured", async () => {
+  const database = new FakeD1();
+  const response = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
+  }, {
+    ...workerEnv,
+    DB: database,
+    INTERVIEW_REQUIRE_SIGNED_INVITE: "true",
+  });
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /署名設定/);
+  assert.equal(database.sessions.size, 0);
+});
+
+test("candidate can freely enter one or more preferred work locations and the server normalizes them", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const response = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "テスト 応募者",
+      employment: "正社員",
+      location: "  新宿エリア   または越谷店（配属相談希望）  ",
+      consent: true,
+    }),
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 201);
+  assert.equal(
+    database.sessions.get(payload.sessionId).preferred_location,
+    "新宿エリア または越谷店(配属相談希望)",
+  );
+
+  const missing = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "   ", consent: true }),
+  }, env);
+  assert.equal(missing.status, 400);
+
+  const tooLong = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "店".repeat(121), consent: true }),
+  }, env);
+  assert.equal(tooLong.status, 400);
 });
 
 test("interview session stores the candidate name and protects the recording with a one-time bearer token", async () => {
