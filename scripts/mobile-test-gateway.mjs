@@ -121,6 +121,52 @@ const server = http.createServer((request, response) => {
   request.pipe(upstream);
 });
 
+server.on("upgrade", (request, socket, head) => {
+  const publicUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+  const fullTestAccess = hasFullTestAccess(request);
+  if (
+    publicUrl.pathname === "/staff" ||
+    publicUrl.pathname.startsWith("/api/staff/") ||
+    (!isAllowed(publicUrl.pathname) && !fullTestAccess)
+  ) {
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const upstreamRequest = http.request({
+    host: targetHost,
+    port: targetPort,
+    path: request.url,
+    method: request.method,
+    headers: {
+      ...request.headers,
+      host: `${targetHost}:${targetPort}`,
+      "x-forwarded-host": request.headers.host ?? "localhost",
+      "x-forwarded-proto": "https",
+    },
+  });
+  upstreamRequest.on("upgrade", (upstreamResponse, upstreamSocket, upstreamHead) => {
+    const statusCode = upstreamResponse.statusCode ?? 101;
+    const statusMessage = upstreamResponse.statusMessage ?? "Switching Protocols";
+    const responseHeaders = [];
+    for (let index = 0; index < upstreamResponse.rawHeaders.length; index += 2) {
+      responseHeaders.push(`${upstreamResponse.rawHeaders[index]}: ${upstreamResponse.rawHeaders[index + 1]}`);
+    }
+    socket.write(`HTTP/1.1 ${statusCode} ${statusMessage}\r\n${responseHeaders.join("\r\n")}\r\n\r\n`);
+    if (upstreamHead.length) socket.write(upstreamHead);
+    if (head.length) upstreamSocket.write(head);
+    upstreamSocket.pipe(socket);
+    socket.pipe(upstreamSocket);
+  });
+  upstreamRequest.on("response", () => {
+    socket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+  });
+  upstreamRequest.on("error", () => socket.destroy());
+  upstreamRequest.end();
+});
+
 server.listen(listenPort, "127.0.0.1", () => {
   process.stdout.write(`Mobile test gateway: http://127.0.0.1:${listenPort}\n`);
 });

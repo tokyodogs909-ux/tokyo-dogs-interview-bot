@@ -98,6 +98,8 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(gatewaySource, /og-online-first-interview-v3\.png/);
   assert.match(gatewaySource, /オンライン一次面接ポータル/);
   assert.match(gatewaySource, /permissions-policy/);
+  assert.match(gatewaySource, /server\.on\("upgrade"/);
+  assert.match(gatewaySource, /upstreamSocket\.pipe\(socket\)/);
 });
 
 test("server-renders the protected recruiter review entry", async () => {
