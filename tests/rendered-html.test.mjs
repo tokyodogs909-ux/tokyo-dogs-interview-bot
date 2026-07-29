@@ -40,7 +40,9 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.match(html, /tokyo-dogs-logo\.jpg/);
   assert.match(html, /TOKYO DOGSの採用選考におけるオンライン一次面接/);
   assert.match(html, /オンライン採用担当者 茂木/);
-  assert.match(html, /評価は採用担当者の笠間・山本だけが確認/);
+  assert.match(html, /評価は笠間・山本だけが確認/);
+  assert.match(html, /録画・文字起こし・選考利用に同意する/);
+  assert.match(html, /上の同意欄を押してチェックしてください/);
   assert.match(html, /同意してオンライン一次面接を開始/);
   assert.match(html, /カメラ・マイクを許可/);
   assert.match(html, /この画面を共有/);
@@ -72,6 +74,8 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /resumeRemoteAudio/);
   assert.match(source, /primeRemoteAudioPlayback/);
   assert.match(source, /attachRemoteAudioToSpeaker/);
+  assert.match(source, /isRemoteAudioPlaybackActive/);
+  assert.match(source, /audio\.srcObject !== remoteStream/);
   assert.match(source, /createMediaStreamSource/);
   assert.match(source, /gain\.connect\(context\.destination\)/);
   assert.match(source, /data-testid="remote-audio-player"/);

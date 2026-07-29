@@ -312,6 +312,23 @@ export default function Home() {
     }
   }
 
+  function isRemoteAudioPlaybackActive(remoteStream: MediaStream) {
+    const graph = remotePlaybackGraphRef.current;
+    if (
+      graph?.streamId === remoteStream.id &&
+      graph.context.state === "running"
+    ) {
+      return true;
+    }
+    const audio = remoteAudioRef.current;
+    return Boolean(
+      audio &&
+      audio.srcObject === remoteStream &&
+      !audio.paused &&
+      !audio.muted,
+    );
+  }
+
   function primeRemoteAudioPlayback() {
     const audio = remoteAudioRef.current;
     if (!audio) return;
@@ -428,7 +445,7 @@ export default function Home() {
       return false;
     }
     stopAudioPrime();
-    audio.srcObject = remoteStream;
+    if (audio.srcObject !== remoteStream) audio.srcObject = remoteStream;
     audio.autoplay = true;
     audio.playsInline = true;
     audio.volume = 1;
@@ -465,6 +482,12 @@ export default function Home() {
   function queueRemoteAudioRecovery() {
     playbackRetryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     playbackRetryTimersRef.current = [0, 250, 1_000, 2_500].map((delay, index) => window.setTimeout(() => {
+      const remoteStream = remoteStreamRef.current;
+      if (remoteStream && isRemoteAudioPlaybackActive(remoteStream)) {
+        setRemoteAudioState("playing");
+        setAudioNotice("");
+        return;
+      }
       void resumeRemoteAudio(index === 3);
     }, delay));
   }
@@ -494,12 +517,17 @@ export default function Home() {
         const microphoneEnabled = streamRef.current?.getAudioTracks()[0]?.enabled ?? false;
         if (sent > previous.sent && microphoneEnabled && !candidateSpeakingRef.current) setCandidateAudioState("ready");
         if (received > previous.received) {
-          setRemoteAudioState("receiving");
-          void resumeRemoteAudio(false).then((playing) => {
-            if (!playing && !endingRef.current) {
-              setAudioNotice("質問音声は届いていますが、端末で再生が止まっています。「茂木の音声を再開」を押してください。");
-            }
-          });
+          const remoteStream = remoteStreamRef.current;
+          if (remoteStream && isRemoteAudioPlaybackActive(remoteStream)) {
+            setRemoteAudioState("playing");
+          } else {
+            setRemoteAudioState("receiving");
+            void resumeRemoteAudio(false).then((playing) => {
+              if (!playing && !endingRef.current) {
+                setAudioNotice("質問音声は届いていますが、端末で再生が止まっています。「茂木の音声を再開」を押してください。");
+              }
+            });
+          }
         }
         previousAudioStatsRef.current = { sent, received };
       } catch {
@@ -1602,17 +1630,24 @@ export default function Home() {
               {LOCATION_OPTIONS.map((item) => <option key={item}>{item}</option>)}
             </select>
             <div className="role-line"><span>募集職種</span><strong>犬の幼稚園スタッフ<br />ドッグトレーナー候補</strong></div>
-            <label className="consent-line">
+            <label className={`consent-line ${consent ? "checked" : ""}`}>
               <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} />
-              <span>録画・画面共有・文字起こしと、回答内容を採用選考に使用することに同意します。評価は採用担当者の笠間・山本だけが確認し、求職者画面には表示されません。</span>
+              <span className="consent-copy">
+                <strong>録画・文字起こし・選考利用に同意する</strong>
+                <span>面接の映像・双方の音声・回答内容を、採用選考で使用します。</span>
+                <small>評価は笠間・山本だけが確認し、求職者には表示されません。</small>
+              </span>
             </label>
             <details className="consent-details"><summary>録画とデータの詳しい取り扱い</summary><p>録画はカメラ映像と双方の音声を含み、接客ロールプレイ、文字起こしの照合、通信トラブル時の記録確認に使用します。音声と回答は外部の音声処理サービスで処理されます。記録は自動削除せず社内で保管し、必要時は採用担当者が手動で対応します。生まれつきの顔立ち・容姿、服装、背景、カメラ品質、声質、障害・健康状態の推測は評価しません。</p></details>
+            <p className={`consent-status ${consent ? "ready" : ""}`} role="status">
+              {consent ? "✓ 同意が確認されました。面接を開始できます。" : "上の同意欄を押してチェックしてください。"}
+            </p>
             <div className={`speaker-test ${speakerTestState}`}>
               <div><strong>端末の音声を確認</strong><span>{speakerTestState === "playing" ? "音声を再生しています" : speakerTestState === "passed" ? "確認音声を再生しました" : speakerTestState === "error" ? "端末の音量設定をご確認ください" : "開始前に茂木の確認音声を聞けます"}</span></div>
               <button type="button" onClick={playSpeakerTest}>{speakerTestState === "idle" ? "音声を確認" : "もう一度聞く"}</button>
             </div>
             <ol className="connection-guide">
-              <li><strong>1. 同意して開始</strong><span>下のボタンを一度押します。</span></li>
+              <li><strong>1. 同意欄をチェック</strong><span>録画・文字起こし・選考利用の内容を確認して、同意欄を押します。</span></li>
               <li><strong>2. カメラ・マイクを許可</strong><span>ブラウザの確認画面で「許可」を選びます。</span></li>
               <li><strong>3. この画面を共有</strong><span>共有の確認画面が表示された場合は、この面接画面を選びます。その後、オンライン一次面接と録画が始まります。</span></li>
             </ol>
