@@ -60,7 +60,7 @@ export default function MobileTestPage() {
       {!started && (
         <section className="mobile-test-intro">
           <div className="mobile-test-visual">
-            <img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木さん" />
+            <img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木" />
             <span>オンライン一次面接ポータル確認</span>
           </div>
           <p className="eyebrow">TOKYO DOGS / PORTAL PREVIEW</p>
@@ -91,7 +91,7 @@ export default function MobileTestPage() {
           <div className="mobile-test-conversation" aria-live="polite">
             <div className="mobile-test-guide">
               <img src="/interviewer-woman-medium-v2.png" alt="" />
-              <div><span>ONLINE RECRUITER</span><strong>オンライン採用担当者 茂木さん</strong></div>
+              <div><span>ONLINE RECRUITER</span><strong>オンライン採用担当者 茂木</strong></div>
             </div>
 
             {answers.slice(-1).map((item) => (

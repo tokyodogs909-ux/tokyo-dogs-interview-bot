@@ -21,7 +21,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const protocol = forwardedProtocol === "https" || !host.startsWith("localhost") ? "https" : "http";
   const metadataBase = new URL(`${protocol}://${host}`);
   const title = "TOKYO DOGS オンライン一次面接｜採用選考ポータル";
-  const description = "TOKYO DOGSの採用選考におけるオンライン一次面接ポータルです。オンライン採用担当者の茂木さんが、これまでの経験、仕事選びの考え方、働き方の希望をお伺いします。";
+  const description = "TOKYO DOGSの採用選考におけるオンライン一次面接ポータルです。オンライン採用担当者の茂木が、これまでの経験、仕事選びの考え方、働き方の希望をお伺いします。";
 
   return {
     metadataBase,

@@ -32,6 +32,12 @@ type RecordingAudioMix = {
   localSource: MediaStreamAudioSourceNode;
   remoteSource: MediaStreamAudioSourceNode | null;
 };
+type RemotePlaybackGraph = {
+  context: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  gain: GainNode;
+  streamId: string;
+};
 
 type RealtimeEvent = {
   type?: string;
@@ -163,6 +169,7 @@ export default function Home() {
   const recordingAudioContextRef = useRef<AudioContext | null>(null);
   const recordingAudioMixRef = useRef<RecordingAudioMix | null>(null);
   const playbackAudioContextRef = useRef<AudioContext | null>(null);
+  const remotePlaybackGraphRef = useRef<RemotePlaybackGraph | null>(null);
   const playbackPrimeRef = useRef<{
     oscillator: OscillatorNode;
     gain: GainNode;
@@ -240,6 +247,7 @@ export default function Home() {
       if (statsTimerRef.current) window.clearInterval(statsTimerRef.current);
       playbackRetryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
       cleanupRecordingAudioMix();
+      disconnectRemoteSpeaker();
       stopAudioPrime();
       void recordingAudioContextRef.current?.close();
       void playbackAudioContextRef.current?.close();
@@ -267,6 +275,41 @@ export default function Home() {
     prime.destination.disconnect();
     prime.destination.stream.getTracks().forEach((track) => track.stop());
     playbackPrimeRef.current = null;
+  }
+
+  function disconnectRemoteSpeaker() {
+    const graph = remotePlaybackGraphRef.current;
+    if (!graph) return;
+    try {
+      graph.source.disconnect();
+      graph.gain.disconnect();
+    } catch {
+      // The nodes may already be disconnected after a mobile audio-session reset.
+    }
+    remotePlaybackGraphRef.current = null;
+  }
+
+  async function attachRemoteAudioToSpeaker(remoteStream: MediaStream) {
+    const remoteTracks = remoteStream.getAudioTracks().filter((track) => track.readyState === "live");
+    if (!remoteTracks.length) return false;
+    try {
+      const context = getPlaybackAudioContext();
+      const existing = remotePlaybackGraphRef.current;
+      if (!existing || existing.streamId !== remoteStream.id) {
+        disconnectRemoteSpeaker();
+        const source = context.createMediaStreamSource(new MediaStream(remoteTracks));
+        const gain = context.createGain();
+        gain.gain.value = 1;
+        source.connect(gain);
+        gain.connect(context.destination);
+        remotePlaybackGraphRef.current = { context, source, gain, streamId: remoteStream.id };
+      }
+      if (context.state !== "running") await context.resume();
+      return context.state === "running";
+    } catch {
+      disconnectRemoteSpeaker();
+      return false;
+    }
   }
 
   function primeRemoteAudioPlayback() {
@@ -297,13 +340,14 @@ export default function Home() {
     }
   }
 
-  function speakOnDevice(text: string, updateSpeakerTest = false) {
+  function speakOnDevice(text: string, updateSpeakerTest = false, keepAudioPrimed = false) {
     if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
       if (updateSpeakerTest) setSpeakerTestState("error");
       setAudioNotice("この端末では音声確認を開始できませんでした。端末の音量と消音設定をご確認ください。");
       return;
     }
     window.speechSynthesis.cancel();
+    window.speechSynthesis.resume();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = "ja-JP";
     utterance.rate = 0.95;
@@ -316,12 +360,12 @@ export default function Home() {
     };
     utterance.onend = () => {
       if (updateSpeakerTest) setSpeakerTestState("passed");
-      if (!remoteStreamRef.current) stopAudioPrime();
+      if (!keepAudioPrimed && !remoteStreamRef.current) stopAudioPrime();
     };
     utterance.onerror = (event) => {
       if (event.error === "canceled" || event.error === "interrupted") return;
       if (updateSpeakerTest) setSpeakerTestState("error");
-      if (!remoteStreamRef.current) stopAudioPrime();
+      if (!keepAudioPrimed && !remoteStreamRef.current) stopAudioPrime();
       setAudioNotice("音声確認を再生できませんでした。端末の消音を解除し、音量を上げてもう一度お試しください。");
     };
     window.speechSynthesis.speak(utterance);
@@ -371,7 +415,7 @@ export default function Home() {
       setConnectionState("error");
       setNetworkAudioState("error");
       setAudioNotice("");
-      setErrorMessage("TD-CONN-RESPONSE: 茂木さんからの返答を受信できませんでした。通信環境を確認し、接続をやり直してください。");
+      setErrorMessage("TD-CONN-RESPONSE: 茂木からの返答を受信できませんでした。通信環境を確認し、接続をやり直してください。");
     }, allowAutomaticRetry ? 16_000 : 24_000);
   }
 
@@ -380,27 +424,40 @@ export default function Home() {
     const remoteStream = remoteStreamRef.current;
     if (!audio || !remoteStream?.getAudioTracks().length) {
       setRemoteAudioState("waiting");
-      if (showNotice) setAudioNotice("茂木さんの音声を受信しています。少しお待ちください。");
+      if (showNotice) setAudioNotice("茂木の音声を受信しています。少しお待ちください。");
       return false;
     }
     stopAudioPrime();
     audio.srcObject = remoteStream;
     audio.autoplay = true;
     audio.playsInline = true;
-    audio.muted = false;
     audio.volume = 1;
     try {
-      const playbackContext = playbackAudioContextRef.current;
-      if (playbackContext?.state === "suspended") await playbackContext.resume();
+      const speakerConnected = await attachRemoteAudioToSpeaker(remoteStream);
+      audio.muted = speakerConnected;
       const recordingContext = recordingAudioContextRef.current;
       if (recordingContext?.state === "suspended") await recordingContext.resume();
-      await audio.play();
+      try {
+        await audio.play();
+      } catch (error) {
+        if (!speakerConnected) throw error;
+      }
       setRemoteAudioState("playing");
       setAudioNotice("");
       return true;
     } catch {
+      disconnectRemoteSpeaker();
+      audio.muted = false;
+      try {
+        await audio.play();
+        setRemoteAudioState("playing");
+        setAudioNotice("");
+        return true;
+      } catch {
+        // An explicit candidate gesture is required when both playback routes are blocked.
+      }
       setRemoteAudioState("blocked");
-      if (showNotice) setAudioNotice("端末が音声の自動再生を止めています。「茂木さんの音声を再開」を押してください。");
+      if (showNotice) setAudioNotice("端末が音声の自動再生を止めています。「茂木の音声を再開」を押してください。");
       return false;
     }
   }
@@ -440,7 +497,7 @@ export default function Home() {
           setRemoteAudioState("receiving");
           void resumeRemoteAudio(false).then((playing) => {
             if (!playing && !endingRef.current) {
-              setAudioNotice("質問音声は届いていますが、端末で再生が止まっています。「茂木さんの音声を再開」を押してください。");
+              setAudioNotice("質問音声は届いていますが、端末で再生が止まっています。「茂木の音声を再開」を押してください。");
             }
           });
         }
@@ -493,7 +550,7 @@ export default function Home() {
       return true;
     } catch {
       setRecordingHasBothAudio(false);
-      setAudioNotice("録画内の茂木さんの音声を確認できません。面接は継続し、採用担当者が記録状態を確認します。");
+      setAudioNotice("録画内の茂木の音声を確認できません。面接は継続し、採用担当者が記録状態を確認します。");
       return false;
     }
   }
@@ -675,6 +732,7 @@ export default function Home() {
   async function prepareInterview() {
     if (!consent || sessionStarting) return;
     primeRemoteAudioPlayback();
+    speakOnDevice("オンライン一次面接の音声を準備しています。カメラとマイクの許可画面をご確認ください。", false, true);
     setSessionStarting(true);
     setErrorMessage("");
     setAudioNotice("");
@@ -844,6 +902,7 @@ export default function Home() {
     statsTimerRef.current = null;
     playbackRetryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     playbackRetryTimersRef.current = [];
+    disconnectRemoteSpeaker();
     stopAudioPrime();
     const activeChannel = channelRef.current;
     channelRef.current = null;
@@ -1194,7 +1253,7 @@ export default function Home() {
           if (!endingRef.current && peerRef.current === peer) {
             setRemoteAudioState("error");
             setConnectionState("error");
-            setErrorMessage("TD-CONN-AUDIO: 茂木さんの音声受信が終了しました。接続をやり直してください。");
+            setErrorMessage("TD-CONN-AUDIO: 茂木の音声受信が終了しました。接続をやり直してください。");
           }
         });
         if (remoteAudioRef.current) remoteAudioRef.current.srcObject = incomingStream;
@@ -1242,9 +1301,11 @@ export default function Home() {
         channel.send(JSON.stringify({
           type: "response.create",
           response: {
-            instructions: "「TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。この面接は音声システムで進行します」と開始してください。15〜25分の面接であることと、回答が採用選考の重要な判断資料になることを短く説明し、話しやすい自己紹介から一問だけ質問してください。実在する人間がライブで参加しているとは説明しないでください。",
+            output_modalities: ["audio"],
+            instructions: "「TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。この面接は音声システムで進行します」と音声で開始してください。自分の名前には敬称を付けず、茂木または私と表現してください。15〜25分の面接であることと、回答が採用選考の重要な判断資料になることを短く説明し、話しやすい自己紹介から一問だけ質問してください。実在する人間がライブで参加しているとは説明しないでください。",
           },
         }));
+        if (remoteStreamRef.current) queueRemoteAudioRecovery();
         armResponseWatchdog(true);
       };
       channelOpenTimerRef.current = window.setTimeout(() => {
@@ -1404,7 +1465,7 @@ export default function Home() {
     connecting: "オンライン一次面接へ接続中",
     ready: mode === "voice" ? "質問が終わったら、そのままお話しください" : "回答を入力してください",
     "candidate-speaking": "お話を聞いています",
-    "ai-speaking": "茂木さんが話しています",
+    "ai-speaking": "茂木が話しています",
     error: "接続を確認してください",
   }[connectionState];
   const connectionStepCopy = {
@@ -1439,7 +1500,7 @@ export default function Home() {
   }[networkAudioState];
   const recordingCaptureCopy = recordingCaptureState === "recording"
     ? recordingHasBothAudio === false
-      ? "カメラ・応募者音声を録画中です。茂木さんの録音状態は採用担当者が確認します。"
+      ? "カメラ・応募者音声を録画中です。茂木の録音状態は採用担当者が確認します。"
       : screenCaptureState === "ready"
       ? "面接画面・カメラ・双方の音声を録画中です。"
       : screenCaptureState === "ended"
@@ -1464,7 +1525,7 @@ export default function Home() {
         tabIndex={-1}
         playsInline
         preload="auto"
-        aria-label="オンライン採用担当者 茂木さんの音声"
+        aria-label="オンライン採用担当者 茂木の音声"
         onCanPlay={() => void resumeRemoteAudio(false)}
         onPlaying={() => {
           if (remoteStreamRef.current) {
@@ -1473,23 +1534,28 @@ export default function Home() {
           }
         }}
         onPause={() => {
-          if (remoteStreamRef.current && !endingRef.current) {
+          const speakerGraphIsRunning = remotePlaybackGraphRef.current?.context.state === "running";
+          if (remoteStreamRef.current && !endingRef.current && !speakerGraphIsRunning) {
             setRemoteAudioState("blocked");
-            setAudioNotice("担当者ガイド音声が停止しました。「茂木さんの音声を再開」を押してください。");
+            setAudioNotice("担当者ガイド音声が停止しました。「茂木の音声を再開」を押してください。");
           }
         }}
         onWaiting={() => {
-          if (remoteStreamRef.current) setRemoteAudioState("receiving");
+          if (remoteStreamRef.current && remotePlaybackGraphRef.current?.context.state !== "running") {
+            setRemoteAudioState("receiving");
+          }
         }}
         onStalled={() => {
-          if (remoteStreamRef.current) {
+          if (remoteStreamRef.current && remotePlaybackGraphRef.current?.context.state !== "running") {
             setRemoteAudioState("receiving");
             setAudioNotice("担当者ガイド音声を再受信しています。続かない場合は再生ボタンを押してください。");
           }
         }}
         onError={() => {
-          setRemoteAudioState("error");
-          setAudioNotice("茂木さんの音声を再生できません。「茂木さんの音声を再開」を押してください。");
+          if (!remotePlaybackGraphRef.current || remotePlaybackGraphRef.current.context.state !== "running") {
+            setRemoteAudioState("error");
+            setAudioNotice("茂木の音声を再生できません。「茂木の音声を再開」を押してください。");
+          }
         }}
       />
       <header className="site-header">
@@ -1509,11 +1575,11 @@ export default function Home() {
             <p className="eyebrow">共に歩む仲間達へ</p>
             <h1>あなたのことを、<br />あなたらしく話してください。</h1>
             <p className="lead">
-              TOKYO DOGSの採用選考におけるオンライン一次面接です。これまでの経験、仕事選びの考え方、働き方の希望について、オンライン採用担当者の茂木さんが順番にお伺いします。
+              TOKYO DOGSの採用選考におけるオンライン一次面接です。これまでの経験、仕事選びの考え方、働き方の希望について、オンライン採用担当者の茂木が順番にお伺いします。
             </p>
             <div className="intro-interviewer">
-              <img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木さん" />
-              <div><span>ONLINE RECRUITER</span><strong>オンライン採用担当者 茂木さん</strong></div>
+              <img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木" />
+              <div><span>ONLINE RECRUITER</span><strong>オンライン採用担当者 茂木</strong></div>
             </div>
             <div className="feature-row">
               <div><strong>15–25</strong><span>面接時間の目安</span></div>
@@ -1542,7 +1608,7 @@ export default function Home() {
             </label>
             <details className="consent-details"><summary>録画とデータの詳しい取り扱い</summary><p>録画はカメラ映像と双方の音声を含み、接客ロールプレイ、文字起こしの照合、通信トラブル時の記録確認に使用します。音声と回答は外部の音声処理サービスで処理されます。記録は自動削除せず社内で保管し、必要時は採用担当者が手動で対応します。生まれつきの顔立ち・容姿、服装、背景、カメラ品質、声質、障害・健康状態の推測は評価しません。</p></details>
             <div className={`speaker-test ${speakerTestState}`}>
-              <div><strong>端末の音声を確認</strong><span>{speakerTestState === "playing" ? "音声を再生しています" : speakerTestState === "passed" ? "確認音声を再生しました" : speakerTestState === "error" ? "端末の音量設定をご確認ください" : "開始前に茂木さんの確認音声を聞けます"}</span></div>
+              <div><strong>端末の音声を確認</strong><span>{speakerTestState === "playing" ? "音声を再生しています" : speakerTestState === "passed" ? "確認音声を再生しました" : speakerTestState === "error" ? "端末の音量設定をご確認ください" : "開始前に茂木の確認音声を聞けます"}</span></div>
               <button type="button" onClick={playSpeakerTest}>{speakerTestState === "idle" ? "音声を確認" : "もう一度聞く"}</button>
             </div>
             <ol className="connection-guide">
@@ -1589,15 +1655,15 @@ export default function Home() {
             <div className="conversation-area">
               <div className="conversation-heading">
                 <div className={`interviewer-profile ${connectionState}`}>
-                  <div className="interviewer-avatar"><img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木さん" /></div>
-                  <div><span>ONLINE RECRUITER</span><h2>オンライン採用担当者 茂木さん</h2></div>
+                  <div className="interviewer-avatar"><img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木" /></div>
+                  <div><span>ONLINE RECRUITER</span><h2>オンライン採用担当者 茂木</h2></div>
                 </div>
                 <span>{candidateTurns} 回答</span>
               </div>
               {mode === "voice" && (
                 <div className="audio-health" aria-label="双方向音声の接続状態">
                   <div className={candidateAudioState}><i /><span>あなたの音声</span><strong>{candidateAudioCopy}</strong></div>
-                  <div className={remoteAudioState}><i /><span>茂木さんの音声</span><strong>{remoteAudioCopy}</strong></div>
+                  <div className={remoteAudioState}><i /><span>茂木の音声</span><strong>{remoteAudioCopy}</strong></div>
                   <div className={networkAudioState}><i /><span>通信</span><strong>{networkAudioCopy}</strong></div>
                 </div>
               )}
@@ -1605,23 +1671,23 @@ export default function Home() {
                 <div className="audio-notice" role="status">
                   <span>{audioNotice}</span>
                   {(remoteAudioState === "blocked" || remoteAudioState === "error") && (
-                    <button onClick={() => { primeRemoteAudioPlayback(); void resumeRemoteAudio(true); }}>茂木さんの音声を再開</button>
+                    <button onClick={() => { primeRemoteAudioPlayback(); void resumeRemoteAudio(true); }}>茂木の音声を再開</button>
                   )}
                 </div>
               )}
               {mode === "voice" && (
                 <div className="audio-recovery-bar">
                   <span>聞こえない場合</span>
-                  <button onClick={() => { primeRemoteAudioPlayback(); void resumeRemoteAudio(true); }}>茂木さんの音声を再開</button>
+                  <button onClick={() => { primeRemoteAudioPlayback(); void resumeRemoteAudio(true); }}>茂木の音声を再開</button>
                   <button onClick={readLatestInterviewerTurn}>表示中の質問を読み上げ</button>
                 </div>
               )}
               <div className="conversation-log" ref={conversationRef} aria-live="polite">
                 {transcript.length === 0 ? (
-                  <div className="waiting-message"><div className={`waiting-avatar ${connectionState}`}><img src="/interviewer-woman-medium-v2.png" alt="" /></div><div className="wave"><i /><i /><i /><i /></div><strong>{connectionState === "error" ? "接続できませんでした" : "オンライン一次面接を準備しています"}</strong><p>{connectionState === "error" ? errorMessage : connectionStepCopy || "まもなく茂木さんから最初の質問が始まります。"}</p></div>
+                  <div className="waiting-message"><div className={`waiting-avatar ${connectionState}`}><img src="/interviewer-woman-medium-v2.png" alt="" /></div><div className="wave"><i /><i /><i /><i /></div><strong>{connectionState === "error" ? "接続できませんでした" : "オンライン一次面接を準備しています"}</strong><p>{connectionState === "error" ? errorMessage : connectionStepCopy || "まもなく茂木から最初の質問が始まります。"}</p></div>
                 ) : transcript.map((turn) => (
                   <article className={`message ${turn.speaker}`} key={turn.id}>
-                    <span>{turn.speaker === "interviewer" ? "茂木さん" : "あなた"}</span>
+                    <span>{turn.speaker === "interviewer" ? "茂木" : "あなた"}</span>
                     <p>{turn.text}</p>
                   </article>
                 ))}
