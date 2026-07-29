@@ -18,6 +18,7 @@ type ConnectionState =
   | "connecting"
   | "ready"
   | "candidate-speaking"
+  | "waiting-pause"
   | "ai-speaking"
   | "error";
 type ConnectionStep = "idle" | "permissions" | "session" | "voice" | "ready";
@@ -67,6 +68,8 @@ const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   autoGainControl: true,
   channelCount: 1,
 };
+
+const CANDIDATE_RESPONSE_DELAY_MS = 2_200;
 
 function formatTime(totalSeconds: number) {
   const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
@@ -183,6 +186,7 @@ export default function Home() {
   const disconnectTimerRef = useRef<number | null>(null);
   const channelOpenTimerRef = useRef<number | null>(null);
   const responseWatchdogRef = useRef<number | null>(null);
+  const candidateResponseDelayTimerRef = useRef<number | null>(null);
   const pendingCompletionTimerRef = useRef<number | null>(null);
   const pendingCompletionReasonRef = useRef<string | null>(null);
   const statsTimerRef = useRef<number | null>(null);
@@ -243,6 +247,7 @@ export default function Home() {
       if (disconnectTimerRef.current) window.clearTimeout(disconnectTimerRef.current);
       if (channelOpenTimerRef.current) window.clearTimeout(channelOpenTimerRef.current);
       if (responseWatchdogRef.current) window.clearTimeout(responseWatchdogRef.current);
+      if (candidateResponseDelayTimerRef.current) window.clearTimeout(candidateResponseDelayTimerRef.current);
       if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
       if (statsTimerRef.current) window.clearInterval(statsTimerRef.current);
       playbackRetryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
@@ -408,6 +413,35 @@ export default function Home() {
   function clearResponseWatchdog() {
     if (responseWatchdogRef.current) window.clearTimeout(responseWatchdogRef.current);
     responseWatchdogRef.current = null;
+  }
+
+  function clearCandidateResponseDelay() {
+    if (candidateResponseDelayTimerRef.current) {
+      window.clearTimeout(candidateResponseDelayTimerRef.current);
+    }
+    candidateResponseDelayTimerRef.current = null;
+  }
+
+  function scheduleResponseAfterCandidatePause() {
+    clearCandidateResponseDelay();
+    if (endingRef.current || candidateSpeakingRef.current || responseWaitingRef.current) return;
+    setConnectionState("waiting-pause");
+    candidateResponseDelayTimerRef.current = window.setTimeout(() => {
+      candidateResponseDelayTimerRef.current = null;
+      if (endingRef.current || candidateSpeakingRef.current || responseWaitingRef.current) return;
+      const channel = channelRef.current;
+      if (!channel || channel.readyState !== "open") {
+        setConnectionState("error");
+        setNetworkAudioState("error");
+        setErrorMessage("TD-CONN-DATA: 回答後の質問を開始できませんでした。接続をやり直してください。");
+        return;
+      }
+      channel.send(JSON.stringify({
+        type: "response.create",
+        response: { output_modalities: ["audio"] },
+      }));
+      armResponseWatchdog(true);
+    }, CANDIDATE_RESPONSE_DELAY_MS);
   }
 
   function armResponseWatchdog(allowAutomaticRetry: boolean) {
@@ -920,6 +954,7 @@ export default function Home() {
 
   function stopRealtime() {
     clearResponseWatchdog();
+    clearCandidateResponseDelay();
     responseWaitingRef.current = false;
     if (channelOpenTimerRef.current) window.clearTimeout(channelOpenTimerRef.current);
     channelOpenTimerRef.current = null;
@@ -1078,19 +1113,22 @@ export default function Home() {
   function handleRealtimeEvent(event: RealtimeEvent) {
     const type = event.type ?? "";
     if (type === "input_audio_buffer.speech_started") {
+      if (responseWaitingRef.current) return;
+      clearCandidateResponseDelay();
       candidateSpeakingRef.current = true;
       setConnectionState("candidate-speaking");
       setCandidateAudioState("detected");
       return;
     }
     if (type === "input_audio_buffer.speech_stopped") {
+      if (responseWaitingRef.current) return;
       candidateSpeakingRef.current = false;
-      setConnectionState("ready");
       setCandidateAudioState("ready");
-      armResponseWatchdog(true);
+      scheduleResponseAfterCandidatePause();
       return;
     }
     if (type === "response.created") {
+      clearCandidateResponseDelay();
       setConnectionState("ai-speaking");
       setNetworkAudioState("connected");
       armResponseWatchdog(false);
@@ -1180,6 +1218,7 @@ export default function Home() {
       return;
     }
     if (type === "error") {
+      clearCandidateResponseDelay();
       responseWaitingRef.current = false;
       clearResponseWatchdog();
       if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
@@ -1209,6 +1248,7 @@ export default function Home() {
     assistantPartialsRef.current.clear();
     processedCompletionCallsRef.current.clear();
     candidateSpeakingRef.current = false;
+    clearCandidateResponseDelay();
     endingRef.current = false;
 
     try {
@@ -1493,6 +1533,7 @@ export default function Home() {
     connecting: "オンライン一次面接へ接続中",
     ready: mode === "voice" ? "質問が終わったら、そのままお話しください" : "回答を入力してください",
     "candidate-speaking": "お話を聞いています",
+    "waiting-pause": "回答の続きがないか、少し待っています",
     "ai-speaking": "茂木が話しています",
     error: "接続を確認してください",
   }[connectionState];

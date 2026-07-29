@@ -182,6 +182,7 @@ select { padding: 13px 14px; }
 .live-state i { width: 8px; height: 8px; border-radius: 50%; background: var(--success); }
 .live-state.connecting i, .live-state.ai-speaking i { background: var(--brand-blue); box-shadow: 0 0 0 5px rgba(184, 218, 236, .55); animation: statePulse 1.5s infinite; }
 .live-state.candidate-speaking i { animation: statePulse 1s infinite; }
+.live-state.waiting-pause i { background: var(--brand-blue); animation: statePulse 2s infinite; }
 .live-state.error i { background: var(--danger); }
 @keyframes statePulse { 50% { opacity: .35; transform: scale(.82); } }
 .interview-time { color: var(--brand-navy); font: 700 13px var(--font-geist-mono), monospace; }
@@ -214,6 +215,7 @@ select { padding: 13px 14px; }
 .interviewer-avatar img, .waiting-avatar img { object-fit: cover; }
 .interviewer-profile.ai-speaking .interviewer-avatar { animation: interviewerTalk .72s ease-in-out infinite; box-shadow: 0 0 0 6px rgba(119,191,227,.18), 0 8px 24px rgba(7,66,105,.14); }
 .interviewer-profile.candidate-speaking .interviewer-avatar { animation: interviewerListen 1.7s ease-in-out infinite; }
+.interviewer-profile.waiting-pause .interviewer-avatar { animation: interviewerListen 2.2s ease-in-out infinite; }
 @keyframes interviewerIdle { 50% { transform: translateY(-2px) rotate(-1deg); } }
 @keyframes interviewerTalk { 50% { transform: translateY(-3px) scale(1.025); } }
 @keyframes interviewerListen { 50% { transform: rotate(2deg); } }

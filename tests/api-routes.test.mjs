@@ -274,6 +274,7 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
     assert.equal(capturedAuthorization, "Bearer test-key-never-returned");
     assert.equal(capturedBody.session.audio.input.turn_detection.type, "semantic_vad");
     assert.equal(capturedBody.session.audio.input.turn_detection.eagerness, "low");
+    assert.equal(capturedBody.session.audio.input.turn_detection.create_response, false);
     assert.equal(capturedBody.session.audio.input.turn_detection.interrupt_response, false);
     assert.equal(capturedBody.session.max_output_tokens, 1400);
     assert.match(capturedBody.session.instructions, /退職・転職を考えた理由/);

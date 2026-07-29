@@ -86,6 +86,10 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /queueRemoteAudioRecovery/);
   assert.match(source, /monitorAudioStats/);
   assert.match(source, /armResponseWatchdog/);
+  assert.match(source, /CANDIDATE_RESPONSE_DELAY_MS = 2_200/);
+  assert.match(source, /scheduleResponseAfterCandidatePause/);
+  assert.match(source, /clearCandidateResponseDelay/);
+  assert.match(source, /回答の続きがないか、少し待っています/);
   assert.match(source, /channel\.onclose/);
   assert.match(source, /channelOpenTimerRef/);
   assert.match(source, /attachRemoteAudioToRecording/);
