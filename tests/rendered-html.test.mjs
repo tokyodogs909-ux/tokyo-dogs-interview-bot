@@ -46,8 +46,10 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.match(html, /同意してオンライン一次面接を開始/);
   assert.match(html, /カメラ・マイクを許可/);
   assert.match(html, /この画面を共有/);
-  assert.match(html, /記録は自動削除せず社内で保管/);
-  assert.match(html, /生まれつきの顔立ち・容姿/);
+  assert.match(html, /現在の社内確認環境では自動削除しません/);
+  assert.match(html, /笑顔の有無、顔立ち・容姿/);
+  assert.match(html, /自動処理だけで合否を決定しません/);
+  assert.match(html, /技術不具合は不利益に扱わず/);
   assert.match(html, /接続確認（選考対象外）/);
   assert.match(html, /interviewer-woman-medium-v2\.png/);
   assert.doesNotMatch(html, /interviewer-dog\.svg/);
@@ -86,7 +88,9 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /queueRemoteAudioRecovery/);
   assert.match(source, /monitorAudioStats/);
   assert.match(source, /armResponseWatchdog/);
-  assert.match(source, /CANDIDATE_RESPONSE_DELAY_MS = 2_200/);
+  assert.match(source, /CANDIDATE_RESPONSE_DELAY_MS = 3_200/);
+  assert.match(source, /type: "response\.cancel"/);
+  assert.match(source, /reportCandidateEvent/);
   assert.match(source, /scheduleResponseAfterCandidatePause/);
   assert.match(source, /clearCandidateResponseDelay/);
   assert.match(source, /回答の続きがないか、少し待っています/);

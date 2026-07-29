@@ -12,7 +12,7 @@ export const evaluationJsonSchema = {
     recommendation: {
       type: "string",
       enum: [
-        "next_interview_recommended",
+        "job_related_evidence_complete",
         "human_review",
         "insufficient_information",
       ],
@@ -173,4 +173,3 @@ export function extractResponseText(payload: unknown) {
   }
   return "";
 }
-

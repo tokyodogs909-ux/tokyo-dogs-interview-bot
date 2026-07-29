@@ -30,9 +30,19 @@ export type VideoReviewScore = {
   note: string;
 };
 
-const CONSENT_VERSION = "2026-07-29-v1";
+export const CONSENT_VERSION = "2026-07-29-v2";
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
-const STORAGE_POLICY = "manual-deletion-only";
+const STORAGE_POLICY = "manual-deletion-only-policy-pending";
+
+export const CANDIDATE_EVENT_TYPES = [
+  "audio_playback_blocked",
+  "transcription_failed",
+  "recording_unavailable",
+  "connection_failed",
+  "candidate_requested_stop",
+] as const;
+
+export type CandidateEventType = (typeof CANDIDATE_EVENT_TYPES)[number];
 
 function bindings() {
   return (globalThis as typeof globalThis & {
@@ -228,7 +238,7 @@ export async function markInterviewStarted(sessionId: string) {
   if (!db) return;
   const now = new Date().toISOString();
   await db.batch([
-    db.prepare("UPDATE interview_sessions SET status = 'in_progress', updated_at = ? WHERE id = ?")
+    db.prepare("UPDATE interview_sessions SET status = 'in_progress', updated_at = ? WHERE id = ? AND status IN ('created', 'in_progress')")
       .bind(now, sessionId),
     db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'interview_started', 'candidate', '{}')")
       .bind(crypto.randomUUID(), sessionId),
@@ -246,7 +256,7 @@ export async function saveInterviewEvaluation(input: {
   await db.batch([
     db.prepare(`UPDATE interview_sessions SET
       status = 'completed', transcript_json = ?, evaluation_json = ?, summary = ?,
-      completed_at = ?, updated_at = ? WHERE id = ?`)
+      completed_at = ?, updated_at = ? WHERE id = ? AND status <> 'completed'`)
       .bind(
         JSON.stringify(input.transcript),
         JSON.stringify(input.evaluation),
@@ -276,6 +286,23 @@ export async function saveInterviewTranscript(input: {
   ]);
 }
 
+export async function recordCandidateEvent(input: {
+  sessionId: string;
+  eventType: CandidateEventType;
+  detail?: Record<string, string | number | boolean>;
+}) {
+  const db = database();
+  if (!db) return;
+  await db.prepare(
+    "INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, ?, 'candidate', ?)",
+  ).bind(
+    crypto.randomUUID(),
+    input.sessionId,
+    input.eventType,
+    JSON.stringify(input.detail ?? {}),
+  ).run();
+}
+
 function parseJson<T>(value: unknown, fallback: T): T {
   if (typeof value !== "string" || !value) return fallback;
   try {
@@ -300,6 +327,14 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     FROM interview_human_reviews WHERE session_id = ? ORDER BY reviewer_name`)
     .bind(sessionId)
     .all<Record<string, unknown>>();
+  const technicalEvents = await db.prepare(`SELECT event_type, detail_json, created_at
+    FROM interview_audit_events
+    WHERE session_id = ? AND event_type IN (
+      'audio_playback_blocked', 'transcription_failed', 'recording_unavailable',
+      'connection_failed', 'candidate_requested_stop'
+    ) ORDER BY created_at`)
+    .bind(sessionId)
+    .all<Record<string, unknown>>();
   await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'review_opened', 'recruiter', ?)")
     .bind(crypto.randomUUID(), sessionId, JSON.stringify({ reviewer })).run();
   return {
@@ -319,6 +354,11 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
       videoScores: parseJson<VideoReviewScore[]>(review.video_scores_json, []),
       overallNote: typeof review.overall_note === "string" ? review.overall_note : "",
       updatedAt: review.updated_at,
+    })),
+    technicalEvents: (technicalEvents.results ?? []).map((event) => ({
+      type: event.event_type,
+      detail: parseJson<Record<string, unknown>>(event.detail_json, {}),
+      createdAt: event.created_at,
     })),
   };
 }

@@ -30,6 +30,17 @@ const allowedFiles = new Set([
   "/og-online-first-interview-v3.png",
 ]);
 
+const securityHeaders = {
+  "permissions-policy": "camera=(self), microphone=(self), display-capture=(self)",
+  "referrer-policy": "no-referrer",
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "cross-origin-resource-policy": "same-origin",
+  "cross-origin-opener-policy": "same-origin",
+  "content-security-policy": "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests",
+  "strict-transport-security": "max-age=31536000; includeSubDomains",
+};
+
 function isAllowed(pathname) {
   return allowedFiles.has(pathname) || allowedPrefixes.some((prefix) => pathname.startsWith(prefix));
 }
@@ -50,10 +61,7 @@ function deny(response) {
   response.writeHead(404, {
     "content-type": "text/plain; charset=utf-8",
     "cache-control": "no-store",
-    "permissions-policy": "camera=(self), microphone=(self), display-capture=(self)",
-    "referrer-policy": "no-referrer",
-    "x-content-type-options": "nosniff",
-    "x-frame-options": "DENY",
+    ...securityHeaders,
   });
   response.end("この公開URLでは、許可されたオンライン一次面接ポータルの確認環境だけを利用できます。");
 }
@@ -106,10 +114,7 @@ const server = http.createServer((request, response) => {
   }, (upstreamResponse) => {
     response.writeHead(upstreamResponse.statusCode ?? 502, {
       ...upstreamResponse.headers,
-      "permissions-policy": "camera=(self), microphone=(self), display-capture=(self)",
-      "referrer-policy": "no-referrer",
-      "x-content-type-options": "nosniff",
-      "x-frame-options": "DENY",
+      ...securityHeaders,
     });
     upstreamResponse.pipe(response);
   });

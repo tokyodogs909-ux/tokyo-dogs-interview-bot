@@ -20,6 +20,23 @@ export async function privacySafeIdentifier(value: string) {
     .slice(0, 32);
 }
 
+export function hasTrustedRequestOrigin(request: Request) {
+  const origin = request.headers.get("Origin");
+  if (!origin) return true;
+  try {
+    const requestUrl = new URL(request.url);
+    const forwardedHost = request.headers.get("X-Forwarded-Host")?.trim();
+    const forwardedProtocol = request.headers.get("X-Forwarded-Proto") === "https" ? "https" : requestUrl.protocol.replace(":", "");
+    const allowedOrigins = new Set([requestUrl.origin]);
+    if (forwardedHost && /^[a-z0-9.:[\]-]+$/i.test(forwardedHost)) {
+      allowedOrigins.add(`${forwardedProtocol}://${forwardedHost}`);
+    }
+    return allowedOrigins.has(new URL(origin).origin);
+  } catch {
+    return false;
+  }
+}
+
 export function noStoreJson(payload: unknown, init: ResponseInit = {}) {
   const headers = new Headers(init.headers);
   headers.set("Cache-Control", "no-store");

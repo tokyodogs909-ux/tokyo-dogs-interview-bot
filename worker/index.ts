@@ -22,13 +22,21 @@ interface ExecutionContext {
   passThroughOnException(): void;
 }
 
-function withSecurityHeaders(response: Response) {
+function withSecurityHeaders(response: Response, request?: Request) {
   const headers = new Headers(response.headers);
   headers.set("Permissions-Policy", "camera=(self), microphone=(self), display-capture=(self)");
   headers.set("Referrer-Policy", "no-referrer");
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("X-Frame-Options", "DENY");
   headers.set("Cross-Origin-Resource-Policy", "same-origin");
+  headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  headers.set("Content-Security-Policy", "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests");
+  if (request && new URL(request.url).protocol === "https:") {
+    headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  if (request && ["/", "/staff"].includes(new URL(request.url).pathname)) {
+    headers.set("Cache-Control", "private, no-store");
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -67,10 +75,10 @@ const worker = {
           return result.response();
         },
       }, allowedWidths);
-      return withSecurityHeaders(response);
+      return withSecurityHeaders(response, request);
     }
 
-    return withSecurityHeaders(await handler.fetch(request, bindings, ctx));
+    return withSecurityHeaders(await handler.fetch(request, bindings, ctx), request);
   },
 };
 

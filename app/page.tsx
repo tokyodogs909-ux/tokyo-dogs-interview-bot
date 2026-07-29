@@ -69,7 +69,7 @@ const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   channelCount: 1,
 };
 
-const CANDIDATE_RESPONSE_DELAY_MS = 2_200;
+const CANDIDATE_RESPONSE_DELAY_MS = 3_200;
 
 function formatTime(totalSeconds: number) {
   const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
@@ -179,6 +179,7 @@ export default function Home() {
     destination: MediaStreamAudioDestinationNode;
   } | null>(null);
   const accessTokenRef = useRef("");
+  const sessionIdRef = useRef("TD-PENDING");
   const transcriptRef = useRef<TranscriptTurn[]>([]);
   const assistantPartialsRef = useRef(new Map<string, string>());
   const processedCompletionCallsRef = useRef(new Set<string>());
@@ -195,6 +196,7 @@ export default function Home() {
   const responseWaitingRef = useRef(false);
   const previousAudioStatsRef = useRef({ sent: 0, received: 0 });
   const candidateSpeakingRef = useRef(false);
+  const reportedCandidateEventsRef = useRef(new Set<string>());
 
   const candidateTurns = useMemo(
     () => transcript.filter((turn) => turn.speaker === "candidate").length,
@@ -415,6 +417,26 @@ export default function Home() {
     responseWatchdogRef.current = null;
   }
 
+  function reportCandidateEvent(
+    eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop",
+    code = "",
+  ) {
+    const activeSessionId = sessionIdRef.current;
+    const accessToken = accessTokenRef.current;
+    const dedupeKey = `${eventType}:${code}`;
+    if (!activeSessionId.startsWith("TD-") || activeSessionId === "TD-PENDING" || !accessToken || reportedCandidateEventsRef.current.has(dedupeKey)) return;
+    reportedCandidateEventsRef.current.add(dedupeKey);
+    void fetch("/api/interviews/event", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: activeSessionId, eventType, code }),
+      keepalive: true,
+    }).catch(() => undefined);
+  }
+
   function clearCandidateResponseDelay() {
     if (candidateResponseDelayTimerRef.current) {
       window.clearTimeout(candidateResponseDelayTimerRef.current);
@@ -612,6 +634,7 @@ export default function Home() {
       return true;
     } catch {
       setRecordingHasBothAudio(false);
+      reportCandidateEvent("recording_unavailable", "REMOTE_AUDIO_MIX_FAILED");
       setAudioNotice("録画内の茂木の音声を確認できません。面接は継続し、採用担当者が記録状態を確認します。");
       return false;
     }
@@ -742,6 +765,7 @@ export default function Home() {
         };
         recorder.onerror = () => {
           setRecordingCaptureState("error");
+          reportCandidateEvent("recording_unavailable", "RECORDER_ERROR");
           setAudioNotice("録画を継続できませんでした。面接は受け付け、採用担当者が記録状態を確認します。");
           if (recorder.state !== "inactive") {
             try {
@@ -782,6 +806,7 @@ export default function Home() {
       stopComposite?.();
       cleanupRecordingAudioMix();
       setRecordingCaptureState("error");
+      reportCandidateEvent("recording_unavailable", "FORMAT_UNAVAILABLE");
       setAudioNotice("この端末では録画を開始できませんでした。面接は継続し、採用担当者が記録状態を確認します。");
       recordingResolveRef.current?.(null);
       recordingResolveRef.current = null;
@@ -896,6 +921,7 @@ export default function Home() {
         throw new Error(data.error || "オンライン一次面接の準備を完了できませんでした。");
       }
       accessTokenRef.current = data.accessToken;
+      sessionIdRef.current = data.sessionId;
       setSessionId(data.sessionId);
       streamRef.current = nextStream;
       setStream(nextStream);
@@ -934,6 +960,7 @@ export default function Home() {
   function startInternalTest() {
     stopRealtime();
     const id = `TD-TEST-${Date.now().toString(36).toUpperCase()}`;
+    sessionIdRef.current = id;
     const firstTurn: TranscriptTurn = {
       id: "internal-test-question-1",
       speaker: "interviewer",
@@ -1113,9 +1140,13 @@ export default function Home() {
   function handleRealtimeEvent(event: RealtimeEvent) {
     const type = event.type ?? "";
     if (type === "input_audio_buffer.speech_started") {
-      if (responseWaitingRef.current) return;
       clearCandidateResponseDelay();
       candidateSpeakingRef.current = true;
+      if (responseWaitingRef.current && channelRef.current?.readyState === "open") {
+        channelRef.current.send(JSON.stringify({ type: "response.cancel" }));
+        responseWaitingRef.current = false;
+        clearResponseWatchdog();
+      }
       setConnectionState("candidate-speaking");
       setCandidateAudioState("detected");
       return;
@@ -1142,7 +1173,7 @@ export default function Home() {
         pendingCompletionTimerRef.current = window.setTimeout(runPendingCompletion, 1_200);
         return;
       }
-      setConnectionState("ready");
+      setConnectionState(candidateSpeakingRef.current ? "candidate-speaking" : "ready");
       setNetworkAudioState("connected");
       return;
     }
@@ -1160,6 +1191,7 @@ export default function Home() {
     }
     if (type === "conversation.item.input_audio_transcription.failed") {
       setCandidateAudioState("ready");
+      reportCandidateEvent("transcription_failed", "TRANSCRIPTION_FAILED");
       setAudioNotice("回答音声の文字起こしを一部確認できませんでした。内容が画面に表示されない場合は、下の入力欄から補足できます。");
       return;
     }
@@ -1274,6 +1306,7 @@ export default function Home() {
       }
       const failActiveConnection = (message: string) => {
         if (endingRef.current || peerRef.current !== peer) return;
+        reportCandidateEvent("connection_failed", message.split(":")[0]);
         stopRealtime();
         setConnectionState("error");
         setNetworkAudioState("error");
@@ -1479,6 +1512,7 @@ export default function Home() {
   function resetInterview() {
     stopRealtime();
     setSessionId("TD-PENDING");
+    sessionIdRef.current = "TD-PENDING";
     accessTokenRef.current = "";
     setStage("intro");
     setConsent(false);
@@ -1488,6 +1522,7 @@ export default function Home() {
     transcriptRef.current = [];
     setTranscript([]);
     processedCompletionCallsRef.current.clear();
+    reportedCandidateEventsRef.current.clear();
     candidateSpeakingRef.current = false;
     setProcessingWarning("");
     setErrorMessage("");
@@ -1509,6 +1544,7 @@ export default function Home() {
     stopRealtime();
     accessTokenRef.current = "";
     setSessionId("TD-PENDING");
+    sessionIdRef.current = "TD-PENDING";
     setConnectionState("idle");
     setConnectionStep("idle");
     setElapsed(0);
@@ -1605,6 +1641,7 @@ export default function Home() {
         onPause={() => {
           const speakerGraphIsRunning = remotePlaybackGraphRef.current?.context.state === "running";
           if (remoteStreamRef.current && !endingRef.current && !speakerGraphIsRunning) {
+            reportCandidateEvent("audio_playback_blocked", "HTML_AUDIO_PAUSED");
             setRemoteAudioState("blocked");
             setAudioNotice("担当者ガイド音声が停止しました。「茂木の音声を再開」を押してください。");
           }
@@ -1660,10 +1697,10 @@ export default function Home() {
           <div className="start-panel">
             <div className="panel-number">01</div>
             <div className="panel-title"><p>選考情報</p><h2>オンライン一次面接を開始</h2></div>
-            <label>雇用形態</label>
-            <div className="segmented-control">
+            <span className="field-label" id="employment-label">雇用形態</span>
+            <div className="segmented-control" role="group" aria-labelledby="employment-label">
               {EMPLOYMENT_OPTIONS.map((item) => (
-                <button key={item} className={employment === item ? "active" : ""} onClick={() => setEmployment(item)}>{item}</button>
+                <button type="button" key={item} aria-pressed={employment === item} className={employment === item ? "active" : ""} onClick={() => setEmployment(item)}>{item}</button>
               ))}
             </div>
             <label htmlFor="location">希望店舗</label>
@@ -1671,15 +1708,15 @@ export default function Home() {
               {LOCATION_OPTIONS.map((item) => <option key={item}>{item}</option>)}
             </select>
             <div className="role-line"><span>募集職種</span><strong>犬の幼稚園スタッフ<br />ドッグトレーナー候補</strong></div>
-            <label className={`consent-line ${consent ? "checked" : ""}`}>
-              <input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} />
+            <label className={`consent-line ${consent ? "checked" : ""}`} htmlFor="selection-consent">
+              <input id="selection-consent" type="checkbox" checked={consent} aria-describedby="consent-summary consent-detail-summary" onChange={(event) => setConsent(event.target.checked)} />
               <span className="consent-copy">
                 <strong>録画・文字起こし・選考利用に同意する</strong>
-                <span>面接の映像・双方の音声・回答内容を、採用選考で使用します。</span>
+                <span id="consent-summary">面接の映像・双方の音声・回答内容を、採用選考と記録の照合に使用します。</span>
                 <small>評価は笠間・山本だけが確認し、求職者には表示されません。</small>
               </span>
             </label>
-            <details className="consent-details"><summary>録画とデータの詳しい取り扱い</summary><p>録画はカメラ映像と双方の音声を含み、接客ロールプレイ、文字起こしの照合、通信トラブル時の記録確認に使用します。音声と回答は外部の音声処理サービスで処理されます。記録は自動削除せず社内で保管し、必要時は採用担当者が手動で対応します。生まれつきの顔立ち・容姿、服装、背景、カメラ品質、声質、障害・健康状態の推測は評価しません。</p></details>
+            <details className="consent-details"><summary id="consent-detail-summary">録画とデータの詳しい取り扱い</summary><div><p><strong>利用目的</strong><br />録画はカメラ映像と双方の音声を含み、接客ロールプレイなどの職務関連行動、文字起こしの照合、通信トラブル時の記録確認に使用します。</p><p><strong>処理と閲覧</strong><br />音声と回答は外部の音声・文字処理サービスで処理されます。録画、文字起こし、評価補助は認証された笠間・山本が確認します。自動処理だけで合否を決定しません。</p><p><strong>保管</strong><br />現在の社内確認環境では自動削除しません。保管期間、削除責任者、開示等の受付方法は本番利用前に社内規程で確定します。</p><p><strong>公平性とご相談</strong><br />笑顔の有無、顔立ち・容姿、服装、背景、カメラ・音声品質、声質、障害・健康状態の推測は評価しません。技術不具合は不利益に扱わず、情報不足として採用担当者が確認します。機器操作や進行方法に配慮が必要な場合は、応募時に利用した連絡経路で採用担当者へご相談ください。面接中も中止できます。</p></div></details>
             <p className={`consent-status ${consent ? "ready" : ""}`} role="status">
               {consent ? "✓ 同意が確認されました。面接を開始できます。" : "上の同意欄を押してチェックしてください。"}
             </p>
@@ -1692,7 +1729,7 @@ export default function Home() {
               <li><strong>2. カメラ・マイクを許可</strong><span>ブラウザの確認画面で「許可」を選びます。</span></li>
               <li><strong>3. この画面を共有</strong><span>共有の確認画面が表示された場合は、この面接画面を選びます。その後、オンライン一次面接と録画が始まります。</span></li>
             </ol>
-            {errorMessage && <div className="inline-error">{errorMessage}</div>}
+            {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
             <button className="primary-action" disabled={!consent || sessionStarting} onClick={() => void prepareInterview()}>
               {sessionStarting ? "オンライン一次面接を準備中…" : "同意してオンライン一次面接を開始"} <span>→</span>
             </button>
@@ -1723,7 +1760,7 @@ export default function Home() {
                 <strong>{mode === "internal-test" ? "接続確認（選考対象外）" : "TOKYO DOGS オンライン一次面接"}</strong>
                 <p>{mode === "internal-test"
                   ? "入力内容は送信・保存せず、録画・文字起こし・採用評価を行いません。"
-                  : "ご回答、勤務条件、接客時の応対を採用選考の資料として確認します。生まれつきの顔立ちや容姿は評価しません。"}</p>
+                  : "ご回答、勤務条件、接客時の職務関連行動を採用選考の資料として確認します。容姿、笑顔の有無、機器や通信の不具合は評価しません。"}</p>
               </div>
               {mode === "voice" && <div className={`privacy-box recording-state ${recordingCaptureState}`}><strong>録画状態</strong><p>{recordingCaptureCopy}</p></div>}
             </aside>
@@ -1776,7 +1813,7 @@ export default function Home() {
                 {mode === "voice" && <button className={isMuted ? "control danger" : "control"} onClick={toggleMute}>{isMuted ? "マイクを再開" : "マイクをミュート"}</button>}
                 {connectionState === "error" && <button className="control" onClick={restartConnection}>最初から接続をやり直す</button>}
                 {connectionState === "error" && <button className="control" onClick={startInternalTest}>選考対象外の接続確認へ切り替える</button>}
-                <button className="finish-button" onClick={() => { if (window.confirm("オンライン一次面接を終了して採用担当者へ記録を送りますか？")) void completeInterview("candidate_requested_stop"); }}>面接を終了</button>
+                <button className="finish-button" onClick={() => { if (window.confirm("オンライン一次面接を中止し、ここまでの記録を採用担当者へ送りますか？")) { reportCandidateEvent("candidate_requested_stop", "USER_ACTION"); void completeInterview("candidate_requested_stop"); } }}>面接を中止</button>
               </div>
             </div>
           </div>

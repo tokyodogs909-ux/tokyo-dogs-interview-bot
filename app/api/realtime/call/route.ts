@@ -2,6 +2,7 @@ import {
   buildRealtimeSessionConfig,
 } from "@/lib/interview";
 import {
+  hasTrustedRequestOrigin,
   privacySafeIdentifier,
   readOpenAIError,
   requireOpenAIApiKey,
@@ -23,6 +24,9 @@ function noStoreText(body: string, status = 200, contentType = "text/plain; char
 
 export async function POST(request: Request) {
   try {
+    if (!hasTrustedRequestOrigin(request)) {
+      return noStoreText("TD-CONN-ORIGIN: リクエスト元を確認できません。", 403);
+    }
     const sessionId = request.headers.get("X-Interview-Session")?.trim() ?? "";
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreText("TD-CONN-SESSION: オンライン一次面接の接続情報が正しくありません。", 400);
@@ -30,6 +34,9 @@ export async function POST(request: Request) {
     const authorized = await authorizeInterviewRequest(request, sessionId);
     if (!authorized?.session) {
       return noStoreText("TD-CONN-AUTH: オンライン一次面接リンクの接続情報を確認できません。", 401);
+    }
+    if (!["created", "in_progress"].includes(authorized.session.status)) {
+      return noStoreText("TD-CONN-STATUS: このオンライン一次面接は再開できません。", 409);
     }
     const contentType = request.headers.get("Content-Type") ?? "";
     if (!contentType.toLowerCase().startsWith("application/sdp")) {

@@ -6,6 +6,7 @@ import {
 } from "@/lib/interview";
 import {
   noStoreJson,
+  hasTrustedRequestOrigin,
   privacySafeIdentifier,
   readOpenAIError,
   requireOpenAIApiKey,
@@ -17,6 +18,9 @@ import {
 
 export async function POST(request: Request) {
   try {
+    if (!hasTrustedRequestOrigin(request)) {
+      return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
+    }
     const payload = (await request.json()) as {
       sessionId?: string;
       employment?: string;
@@ -41,6 +45,9 @@ export async function POST(request: Request) {
         { error: "オンライン一次面接の有効期限または認証を確認してください。" },
         { status: 401 },
       );
+    }
+    if (!["created", "in_progress"].includes(authorized.session.status)) {
+      return noStoreJson({ error: "このオンライン一次面接は再開できません。採用担当者へご連絡ください。" }, { status: 409 });
     }
     if (
       authorized.session &&

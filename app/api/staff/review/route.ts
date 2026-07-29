@@ -4,7 +4,7 @@ import {
   saveHumanVideoReview,
   type VideoReviewScore,
 } from "@/lib/interview-persistence";
-import { noStoreJson } from "@/lib/openai-server";
+import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 function cleanScores(value: unknown): VideoReviewScore[] | null {
   if (!Array.isArray(value) || value.length !== VIDEO_REVIEW_DIMENSIONS.length) return null;
@@ -16,10 +16,12 @@ function cleanScores(value: unknown): VideoReviewScore[] | null {
     if (!raw) return null;
     const score = raw.score === null ? null : Number(raw.score);
     if (score !== null && (!Number.isInteger(score) || score < 1 || score > 5)) return null;
+    const note = typeof raw.note === "string" ? raw.note.replace(/\0/g, "").trim().slice(0, 1000) : "";
+    if (score !== null && note.length < 8) return null;
     return {
       name: dimension.name,
       score,
-      note: typeof raw.note === "string" ? raw.note.replace(/\0/g, "").trim().slice(0, 1000) : "",
+      note,
     };
   });
   return clean.every(Boolean) ? clean as VideoReviewScore[] : null;
@@ -27,6 +29,9 @@ function cleanScores(value: unknown): VideoReviewScore[] | null {
 
 export async function POST(request: Request) {
   try {
+    if (!hasTrustedRequestOrigin(request)) {
+      return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
+    }
     const reviewer = await authorizeReviewerRequest(request);
     if (!reviewer) {
       return noStoreJson({ error: "採用担当者の認証を確認できませんでした。" }, { status: 401 });
@@ -43,7 +48,7 @@ export async function POST(request: Request) {
     const sessionId = payload.sessionId?.trim() ?? "";
     const scores = cleanScores(payload.scores);
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId) || !scores) {
-      return noStoreJson({ error: "面接IDまたは映像評価を確認してください。" }, { status: 400 });
+      return noStoreJson({ error: "面接IDと映像評価を確認してください。点数を付けた項目には具体的な職務行動の根拠が必要です。" }, { status: 400 });
     }
     const saved = await saveHumanVideoReview({
       sessionId,

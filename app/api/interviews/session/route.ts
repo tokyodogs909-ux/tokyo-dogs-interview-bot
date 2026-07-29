@@ -1,10 +1,17 @@
 import { EMPLOYMENT_OPTIONS, LOCATION_OPTIONS } from "@/lib/interview";
 import { createInterviewSession } from "@/lib/interview-persistence";
-import { noStoreJson } from "@/lib/openai-server";
+import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 export async function POST(request: Request) {
   try {
-    const payload = (await request.json()) as {
+    if (!hasTrustedRequestOrigin(request)) {
+      return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
+    }
+    const rawBody = await request.text();
+    if (rawBody.length > 4_000) {
+      return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
+    }
+    const payload = JSON.parse(rawBody) as {
       employment?: string;
       location?: string;
       consent?: boolean;

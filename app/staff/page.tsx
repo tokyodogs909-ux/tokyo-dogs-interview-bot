@@ -31,10 +31,23 @@ type ReviewRecord = {
     overallNote: string;
     updatedAt: string;
   }>;
+  technicalEvents: Array<{
+    type: string;
+    detail: Record<string, unknown>;
+    createdAt: string;
+  }>;
+};
+
+const technicalEventLabels: Record<string, string> = {
+  audio_playback_blocked: "担当者音声の再生停止",
+  transcription_failed: "回答の文字起こし失敗",
+  recording_unavailable: "録画または双方音声の欠落",
+  connection_failed: "音声・通信接続の失敗",
+  candidate_requested_stop: "応募者による中止",
 };
 
 const recommendationLabels = {
-  next_interview_recommended: "次選考を検討",
+  job_related_evidence_complete: "職務関連根拠の確認が可能",
   human_review: "人による要確認",
   insufficient_information: "情報不足",
 } as const;
@@ -104,15 +117,7 @@ export default function StaffReviewPage() {
     setScores((current) => current.map((item) => item.name === name ? { ...item, ...patch } : item));
   }
 
-  const weightedVideoScore = review
-    ? review.videoReviewRubric.reduce((total, dimension) => {
-      const value = scores.find((item) => item.name === dimension.name)?.score;
-      return total + (value === null || value === undefined ? 0 : value * dimension.weight);
-    }, 0) / review.videoReviewRubric.reduce((total, dimension) => {
-      const value = scores.find((item) => item.name === dimension.name)?.score;
-      return total + (value === null || value === undefined ? 0 : dimension.weight);
-    }, 0)
-    : Number.NaN;
+  const reviewedVideoDimensions = scores.filter((item) => item.score !== null).length;
 
   async function saveVideoReview() {
     if (!review) return;
@@ -160,19 +165,22 @@ export default function StaffReviewPage() {
         <section className="staff-review">
           <div className="staff-meta"><div><span>面接ID</span><strong>{review.sessionId}</strong></div><div><span>雇用形態</span><strong>{review.employment}</strong></div><div><span>希望店舗</span><strong>{review.location}</strong></div><div><span>状態</span><strong>{review.status}</strong></div></div>
 
+          {review.technicalEvents.length > 0 && <div className="staff-message"><strong>技術・中断フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>これらの事象と映像・音声品質は、応募者の不利益な評価に使用しません。</p></div>}
+
           <div className="staff-grid">
             <article className="staff-panel recording-panel">
               <div className="panel-title"><p>録画確認</p><h2>接客ロールプレイ</h2></div>
               {recordingUrl ? <video src={recordingUrl} controls playsInline /> : <div className="recording-empty">録画を取得できないか、録画がまだ保存されていません。</div>}
-              <p className="guardrail-copy">接客ロールプレイ中の笑顔を含む表情、聞く姿勢、落ち着き、応対態度、説明、安全配慮を確認します。生まれつきの顔立ち・容姿、服装、背景、カメラ品質、障害や健康状態の推測は評価しません。</p>
+              <p className="guardrail-copy">接客ロールプレイ中の傾聴、理解確認、落ち着いた応対、説明、安全配慮など、職務上観察できる行動だけを確認します。笑顔の有無、顔立ち・容姿、服装、背景、カメラ品質、障害や健康状態の推測は評価しません。</p>
             </article>
 
             <article className="staff-panel">
-              <div className="panel-title"><p>映像審査</p><h2>{reviewer}の確認{Number.isFinite(weightedVideoScore) ? ` / ${weightedVideoScore.toFixed(1)}点` : ""}</h2></div>
+              <div className="panel-title"><p>映像確認</p><h2>{reviewer}の確認 / {reviewedVideoDimensions}/{VIDEO_REVIEW_DIMENSIONS.length}項目</h2></div>
+              <div className="validation-box"><strong>判断前の必須確認</strong><p>技術不具合、映像・音声品質、配慮の申出は不利益に扱わず、未確認とします。一部項目だけの平均点や総合点は表示しません。自動評価は合否を決めず、笠間・山本が求人要件と根拠を確認します。</p></div>
               <div className="video-rubric">
                 {review.videoReviewRubric.map((dimension) => {
                   const score = scores.find((item) => item.name === dimension.name) ?? { name: dimension.name, score: null, note: "" };
-                  return <div className="rubric-item" key={dimension.name}><h3>{dimension.name}{dimension.weight === 2 && <span className="priority-badge">重点項目</span>}</h3><p>{dimension.criterion}</p><div className="score-buttons">{[1, 2, 3, 4, 5].map((value) => <button key={value} className={score.score === value ? "active" : ""} onClick={() => updateScore(dimension.name, { score: value })}>{value}</button>)}<button className={score.score === null ? "active" : ""} onClick={() => updateScore(dimension.name, { score: null })}>未確認</button></div><textarea value={score.note} onChange={(event) => updateScore(dimension.name, { note: event.target.value })} placeholder="映像内で確認した職務関連の根拠を記録" rows={2} /></div>;
+                  return <div className="rubric-item" key={dimension.name}><h3>{dimension.name}{dimension.weight === 2 && <span className="priority-badge">重点項目</span>}</h3><p>{dimension.criterion}</p><div className="score-buttons">{[1, 2, 3, 4, 5].map((value) => <button key={value} className={score.score === value ? "active" : ""} onClick={() => updateScore(dimension.name, { score: value })}>{value}</button>)}<button className={score.score === null ? "active" : ""} onClick={() => updateScore(dimension.name, { score: null, note: "" })}>未確認</button></div><textarea value={score.note} onChange={(event) => updateScore(dimension.name, { note: event.target.value })} placeholder={score.score === null ? "未確認の場合は空欄で構いません" : "点数の根拠となる、映像内の具体的な職務行動を記録（必須）"} rows={2} /></div>;
                 })}
               </div>
               <label className="overall-note">総合メモ<textarea value={overallNote} onChange={(event) => setOverallNote(event.target.value)} rows={4} placeholder="追加確認事項。合否はこの画面だけで自動決定しません。" /></label>

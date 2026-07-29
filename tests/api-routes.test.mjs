@@ -76,6 +76,17 @@ class FakeD1Statement {
         overall_note: overallNote,
         updated_at: updatedAt,
       });
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("VALUES (?, ?, ?, 'candidate', ?)")
+    ) {
+      const [, sessionId, eventType, detailJson] = this.values;
+      this.database.auditEvents.push({
+        event_type: eventType,
+        detail_json: detailJson,
+        created_at: new Date().toISOString(),
+        session_id: sessionId,
+      });
     }
     return { success: true };
   }
@@ -108,6 +119,16 @@ class FakeD1Statement {
           .map(([, value]) => value),
       };
     }
+    if (this.sql.startsWith("SELECT event_type, detail_json, created_at")) {
+      const technicalEventTypes = new Set([
+        "audio_playback_blocked", "transcription_failed", "recording_unavailable",
+        "connection_failed", "candidate_requested_stop",
+      ]);
+      return {
+        results: this.database.auditEvents.filter((event) =>
+          event.session_id === this.values[0] && technicalEventTypes.has(event.event_type)),
+      };
+    }
     return { results: [] };
   }
 
@@ -118,6 +139,7 @@ class FakeD1 {
     this.sessions = new Map();
     this.artifacts = [];
     this.humanReviews = new Map();
+    this.auditEvents = [];
   }
 
   prepare(sql) {
@@ -164,6 +186,7 @@ test("health endpoint reports server credential presence without returning the k
   assert.deepEqual(await response.json(), { configured: true });
   assert.equal(response.headers.get("permissions-policy"), "camera=(self), microphone=(self), display-capture=(self)");
   assert.equal(response.headers.get("x-frame-options"), "DENY");
+  assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
 });
 
 test("interview session uses a one-time bearer token and stores a recording without a candidate name", async () => {
@@ -186,8 +209,9 @@ test("interview session uses a one-time bearer token and stores a recording with
   assert.equal(typeof session.accessToken, "string");
   assert.ok(session.accessToken.length > 20);
   assert.notEqual(database.sessions.get(session.sessionId).access_token_hash, session.accessToken);
-  assert.equal(session.storagePolicy, "manual-deletion-only");
-  assert.equal(database.sessions.get(session.sessionId).retention_until, "manual-deletion-only");
+  assert.equal(session.storagePolicy, "manual-deletion-only-policy-pending");
+  assert.equal(database.sessions.get(session.sessionId).retention_until, "manual-deletion-only-policy-pending");
+  database.sessions.get(session.sessionId).status = "in_progress";
 
   const recordingBody = new TextEncoder().encode("small-webm-fixture");
   const uploadResponse = await request("/api/interviews/recording", {
@@ -206,7 +230,7 @@ test("interview session uses a one-time bearer token and stores a recording with
   assert.equal("objectKey" in upload, false);
   const storedObjectKey = `interviews/${session.sessionId}/recording.webm`;
   assert.equal(recordings.objects.has(storedObjectKey), true);
-  assert.equal(recordings.objects.get(storedObjectKey).options.customMetadata.storagePolicy, "manual-deletion-only");
+  assert.equal(recordings.objects.get(storedObjectKey).options.customMetadata.storagePolicy, "manual-deletion-only-policy-pending");
   assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
 
   const unauthorized = await request("/api/interviews/recording", {
@@ -233,6 +257,45 @@ test("interview session uses a one-time bearer token and stores a recording with
   assert.equal(staffRecording.status, 200);
   assert.equal(staffRecording.headers.get("content-type"), "video/webm");
   assert.equal(await staffRecording.text(), "small-webm-fixture");
+});
+
+test("candidate technical incidents are audited and cross-origin mutations are rejected", async () => {
+  process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const rejected = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "https://attacker.example" },
+    body: JSON.stringify({ employment: "正社員", location: "越谷店", consent: true }),
+  }, env);
+  assert.equal(rejected.status, 403);
+
+  const session = await createTestInterviewSession(env);
+  const incident = await request("/api/interviews/event", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+      Origin: "http://localhost",
+    },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      eventType: "transcription_failed",
+      code: "TRANSCRIPTION_FAILED",
+    }),
+  }, env);
+  assert.equal(incident.status, 200);
+  assert.equal(database.auditEvents.some((event) => event.event_type === "transcription_failed"), true);
+
+  const staffResponse = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+    headers: {
+      Authorization: "Bearer kasama-review-secret",
+      "X-Interview-Reviewer": "kasama",
+    },
+  }, env);
+  const staffPayload = await staffResponse.json();
+  assert.equal(staffResponse.status, 200);
+  assert.equal(staffPayload.review.technicalEvents[0].type, "transcription_failed");
 });
 
 test("realtime endpoint mints a short-lived token with the interview safety settings", async () => {
@@ -285,7 +348,8 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
     assert.match(capturedBody.session.instructions, /ドッグトレーナー、ペット業界の中でも東京DOGS/);
     assert.match(capturedBody.session.instructions, /清掃、安全管理、飼い主対応、記録、報告/);
     assert.match(capturedBody.session.instructions, /既存資料の「違和感」は自動不採用に使わない/);
-    assert.match(capturedBody.session.instructions, /笑顔を含む表情、話を聞く反応、姿勢、応対態度/);
+    assert.match(capturedBody.session.instructions, /笑顔の有無/);
+    assert.match(capturedBody.session.instructions, /傾聴、理解確認/);
     assert.match(capturedBody.session.instructions, /犬を通して、人々を幸せに/);
     assert.match(capturedBody.session.instructions, /仕事選びの基準は、まず本人の言葉で三つ/);
     assert.match(capturedBody.session.instructions, /希望店舗以外への配属や他店舗ヘルプが実際に発生する可能性/);
@@ -434,7 +498,7 @@ const candidateTurns = dimensionNames.map((name, index) => ({
 
 function modelEvaluation({ invalidEvidence = false } = {}) {
   return {
-    recommendation: "next_interview_recommended",
+    recommendation: "job_related_evidence_complete",
     summary: "職務に関連する具体的な経験を確認できました。",
     dimensions: dimensionNames.map((name, index) => ({
       name,
@@ -467,6 +531,7 @@ async function runEvaluationApi(invalidEvidence) {
     body: JSON.stringify({ employment: "正社員", location: "越谷店", consent: true }),
   }, env);
   const session = await sessionResponse.json();
+  database.sessions.get(session.sessionId).status = "in_progress";
   const originalFetch = globalThis.fetch;
   try {
     globalThis.fetch = async (url, init) => {
@@ -526,16 +591,16 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
   }, env);
   const staffPayload = await staffResponse.json();
   assert.equal(staffResponse.status, 200);
-  assert.equal(staffPayload.review.evaluation.recommendation, "next_interview_recommended");
+  assert.equal(staffPayload.review.evaluation.recommendation, "job_related_evidence_complete");
   assert.equal(staffPayload.review.evaluation.evidenceValidationWarnings.length, 0);
   assert.equal(staffPayload.review.evaluation.dimensions.every((item) => item.evidence[0].verified), true);
   assert.deepEqual(staffPayload.review.authorizedReviewers, ["笠間", "山本"]);
 
   const videoScores = [
-    { name: "接客時の表情・姿勢・態度", score: 4, note: "ロールプレイ中の応対を確認" },
-    { name: "接客ロールプレイの進行", score: 4, note: "順序立てて説明" },
-    { name: "安全説明の具体性", score: 5, note: "相談と安全確保を説明" },
-    { name: "相手への配慮と分かりやすさ", score: 4, note: "責めない説明" },
+    { name: "接客時の傾聴・姿勢・態度", score: 4, note: "相手の話を遮らず理解を確認した" },
+    { name: "接客ロールプレイの進行", score: 4, note: "挨拶、要望確認、説明の順で進行した" },
+    { name: "安全説明の具体性", score: 5, note: "犬と人の距離を取り、独断せず相談すると説明した" },
+    { name: "相手への配慮と分かりやすさ", score: 4, note: "飼い主を責めず、専門用語を言い換えて説明した" },
   ];
   const saveReview = await request("/api/staff/review", {
     method: "POST",

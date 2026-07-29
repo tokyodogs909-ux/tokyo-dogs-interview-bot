@@ -3,13 +3,16 @@ import {
   hasRecordingStorage,
   saveInterviewRecording,
 } from "@/lib/interview-persistence";
-import { noStoreJson } from "@/lib/openai-server";
+import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 const MAX_RECORDING_BYTES = 95 * 1024 * 1024;
 const ALLOWED_TYPES = new Set(["video/webm", "audio/webm", "video/mp4", "audio/mp4"]);
 
 export async function POST(request: Request) {
   try {
+    if (!hasTrustedRequestOrigin(request)) {
+      return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
+    }
     const sessionId = request.headers.get("X-Interview-Session")?.trim() ?? "";
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreJson({ error: "オンライン一次面接の接続情報が正しくありません。" }, { status: 400 });
@@ -17,6 +20,9 @@ export async function POST(request: Request) {
     const authorized = await authorizeInterviewRequest(request, sessionId);
     if (!authorized?.session) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
+    }
+    if (!["in_progress", "evaluation_pending", "completed"].includes(authorized.session.status)) {
+      return noStoreJson({ error: "このオンライン一次面接は録画を受け付ける状態ではありません。" }, { status: 409 });
     }
     if (!hasRecordingStorage()) {
       return noStoreJson({ error: "録画の保存領域を準備できませんでした。" }, { status: 503 });
