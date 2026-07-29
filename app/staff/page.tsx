@@ -17,6 +17,7 @@ type VideoScore = {
 
 type ReviewRecord = {
   sessionId: string;
+  candidateName: string;
   employment: string;
   location: string;
   status: string;
@@ -163,7 +164,7 @@ export default function StaffReviewPage() {
 
       {review && (
         <section className="staff-review">
-          <div className="staff-meta"><div><span>面接ID</span><strong>{review.sessionId}</strong></div><div><span>雇用形態</span><strong>{review.employment}</strong></div><div><span>希望店舗</span><strong>{review.location}</strong></div><div><span>状態</span><strong>{review.status}</strong></div></div>
+          <div className="staff-meta"><div><span>氏名</span><strong>{review.candidateName || "旧テスト記録"}</strong></div><div><span>面接ID</span><strong>{review.sessionId}</strong></div><div><span>雇用形態</span><strong>{review.employment}</strong></div><div><span>希望店舗</span><strong>{review.location}</strong></div><div><span>状態</span><strong>{review.status}</strong></div></div>
 
           {review.technicalEvents.length > 0 && <div className="staff-message"><strong>技術・中断フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>これらの事象と映像・音声品質は、応募者の不利益な評価に使用しません。</p></div>}
 

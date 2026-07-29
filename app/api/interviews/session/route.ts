@@ -12,14 +12,19 @@ export async function POST(request: Request) {
       return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
     }
     const payload = JSON.parse(rawBody) as {
+      candidateName?: string;
       employment?: string;
       location?: string;
       consent?: boolean;
     };
+    const candidateName = payload.candidateName?.normalize("NFKC").replace(/\s+/g, " ").trim() ?? "";
     const employment = payload.employment?.trim() ?? "";
     const location = payload.location?.trim() ?? "";
     if (payload.consent !== true) {
       return noStoreJson({ error: "録音・録画と文字起こしへの同意が必要です。" }, { status: 400 });
+    }
+    if (!candidateName || candidateName.length > 60 || /[\u0000-\u001F\u007F]/.test(candidateName)) {
+      return noStoreJson({ error: "氏名を60文字以内で入力してください。" }, { status: 400 });
     }
     if (!(EMPLOYMENT_OPTIONS as readonly string[]).includes(employment)) {
       return noStoreJson({ error: "雇用形態を確認してください。" }, { status: 400 });
@@ -27,7 +32,7 @@ export async function POST(request: Request) {
     if (!(LOCATION_OPTIONS as readonly string[]).includes(location)) {
       return noStoreJson({ error: "希望店舗を確認してください。" }, { status: 400 });
     }
-    const session = await createInterviewSession({ employment, location });
+    const session = await createInterviewSession({ candidateName, employment, location });
     return noStoreJson(session, { status: 201 });
   } catch (error) {
     const unavailable = error instanceof Error && error.message === "INTERVIEW_DATABASE_UNAVAILABLE";

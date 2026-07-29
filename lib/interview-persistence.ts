@@ -15,6 +15,7 @@ type InterviewBindings = {
 export type InterviewSessionRecord = {
   id: string;
   access_token_hash: string;
+  candidate_name: string;
   employment: string;
   preferred_location: string;
   status: string;
@@ -93,6 +94,7 @@ async function ensureSchema(db: D1Database) {
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_sessions (
       id TEXT PRIMARY KEY NOT NULL,
       access_token_hash TEXT NOT NULL,
+      candidate_name TEXT DEFAULT '' NOT NULL,
       employment TEXT NOT NULL,
       preferred_location TEXT NOT NULL,
       consent_version TEXT NOT NULL,
@@ -144,6 +146,11 @@ async function ensureSchema(db: D1Database) {
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_human_reviews_session_idx ON interview_human_reviews (session_id)"),
   ]);
+  const sessionColumns = await db.prepare("PRAGMA table_info(interview_sessions)")
+    .all<{ name: string }>();
+  if (!(sessionColumns.results ?? []).some((column) => column.name === "candidate_name")) {
+    await db.prepare("ALTER TABLE interview_sessions ADD COLUMN candidate_name TEXT DEFAULT '' NOT NULL").run();
+  }
 }
 
 async function audit(
@@ -158,6 +165,7 @@ async function audit(
 }
 
 export async function createInterviewSession(input: {
+  candidateName: string;
   employment: string;
   location: string;
 }) {
@@ -170,12 +178,13 @@ export async function createInterviewSession(input: {
   const accessToken = randomToken();
   const expiresAt = new Date(now.getTime() + SESSION_TTL_MS).toISOString();
   await db.prepare(`INSERT INTO interview_sessions (
-    id, access_token_hash, employment, preferred_location, consent_version,
+    id, access_token_hash, candidate_name, employment, preferred_location, consent_version,
     consented_at, status, expires_at, retention_until, created_at, updated_at
-  ) VALUES (?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?)`)
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?)`)
     .bind(
       sessionId,
       await sha256(accessToken),
+      input.candidateName,
       input.employment,
       input.location,
       CONSENT_VERSION,
@@ -198,7 +207,7 @@ export async function authorizeInterviewRequest(request: Request, sessionId: str
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
   if (!token) return null;
   const session = await db.prepare(
-    "SELECT id, access_token_hash, employment, preferred_location, status, expires_at, retention_until FROM interview_sessions WHERE id = ? LIMIT 1",
+    "SELECT id, access_token_hash, candidate_name, employment, preferred_location, status, expires_at, retention_until FROM interview_sessions WHERE id = ? LIMIT 1",
   ).bind(sessionId).first<InterviewSessionRecord>();
   if (!session || session.access_token_hash !== await sha256(token)) return null;
   if (Date.parse(session.expires_at) <= Date.now()) return null;
@@ -317,7 +326,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
   const session = await db.prepare(`SELECT
-    id, employment, preferred_location, status, recording_status,
+    id, candidate_name, employment, preferred_location, status, recording_status,
     transcript_json, evaluation_json, summary, completed_at, created_at, updated_at
     FROM interview_sessions WHERE id = ? LIMIT 1`)
     .bind(sessionId)
@@ -339,6 +348,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     .bind(crypto.randomUUID(), sessionId, JSON.stringify({ reviewer })).run();
   return {
     sessionId,
+    candidateName: session.candidate_name,
     employment: session.employment,
     location: session.preferred_location,
     status: session.status,

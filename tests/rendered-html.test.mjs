@@ -42,7 +42,11 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.match(html, /オンライン採用担当者 茂木/);
   assert.match(html, /評価は笠間・山本だけが確認/);
   assert.match(html, /録画・文字起こし・選考利用に同意する/);
-  assert.match(html, /上の同意欄を押してチェックしてください/);
+  assert.match(html, /<label for="candidate-name">氏名<\/label>/);
+  assert.match(html, /placeholder="例：山田 花子"/);
+  assert.match(html, /採用記録の照合と保存管理に使用します/);
+  assert.match(html, /氏名を入力してください。/);
+  assert.match(html, /入力した氏名は採用記録の照合と保存管理に使用します/);
   assert.match(html, /同意してオンライン一次面接を開始/);
   assert.match(html, /カメラ・マイクを許可/);
   assert.match(html, /この画面を共有/);

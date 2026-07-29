@@ -1,0 +1,1 @@
+ALTER TABLE `interview_sessions` ADD `candidate_name` text DEFAULT '' NOT NULL;

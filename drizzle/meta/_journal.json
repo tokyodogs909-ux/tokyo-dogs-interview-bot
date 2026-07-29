@@ -15,6 +15,13 @@
       "when": 1785287511699,
       "tag": "0001_rare_iceman",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1785321043248,
+      "tag": "0002_unique_ricochet",
+      "breakpoints": true
     }
   ]
 }

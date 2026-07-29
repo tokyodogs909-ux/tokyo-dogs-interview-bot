@@ -31,11 +31,12 @@ class FakeD1Statement {
 
   async run() {
     if (this.sql.startsWith("INSERT INTO interview_sessions")) {
-      const [id, accessTokenHash, employment, preferredLocation, consentVersion,
+      const [id, accessTokenHash, candidateName, employment, preferredLocation, consentVersion,
         consentedAt, expiresAt, retentionUntil, createdAt, updatedAt] = this.values;
       this.database.sessions.set(id, {
         id,
         access_token_hash: accessTokenHash,
+        candidate_name: candidateName,
         employment,
         preferred_location: preferredLocation,
         consent_version: consentVersion,
@@ -95,7 +96,7 @@ class FakeD1Statement {
     if (this.sql.startsWith("SELECT id, access_token_hash")) {
       return this.database.sessions.get(this.values[0]) ?? null;
     }
-    if (this.sql.startsWith("SELECT id, employment, preferred_location")) {
+    if (this.sql.startsWith("SELECT id, candidate_name, employment, preferred_location")) {
       return this.database.sessions.get(this.values[0]) ?? null;
     }
     if (this.sql.startsWith("SELECT id FROM interview_sessions")) {
@@ -111,6 +112,9 @@ class FakeD1Statement {
   }
 
   async all() {
+    if (this.sql.startsWith("PRAGMA table_info(interview_sessions)")) {
+      return { results: [{ name: "candidate_name" }] };
+    }
     if (this.sql.startsWith("SELECT reviewer_name, video_scores_json")) {
       const sessionId = this.values[0];
       return {
@@ -173,7 +177,7 @@ async function createTestInterviewSession(env, employment = "正社員", locatio
   const response = await request("/api/interviews/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ employment, location, consent: true }),
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment, location, consent: true }),
   }, env);
   assert.equal(response.status, 201);
   return response.json();
@@ -189,7 +193,7 @@ test("health endpoint reports server credential presence without returning the k
   assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
 });
 
-test("interview session uses a one-time bearer token and stores a recording without a candidate name", async () => {
+test("interview session stores the candidate name and protects the recording with a one-time bearer token", async () => {
   process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
   const database = new FakeD1();
   const recordings = new FakeR2();
@@ -198,6 +202,7 @@ test("interview session uses a one-time bearer token and stores a recording with
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      candidateName: "山田 花子",
       employment: "正社員",
       location: "越谷店",
       consent: true,
@@ -209,6 +214,7 @@ test("interview session uses a one-time bearer token and stores a recording with
   assert.equal(typeof session.accessToken, "string");
   assert.ok(session.accessToken.length > 20);
   assert.notEqual(database.sessions.get(session.sessionId).access_token_hash, session.accessToken);
+  assert.equal(database.sessions.get(session.sessionId).candidate_name, "山田 花子");
   assert.equal(session.storagePolicy, "manual-deletion-only-policy-pending");
   assert.equal(database.sessions.get(session.sessionId).retention_until, "manual-deletion-only-policy-pending");
   database.sessions.get(session.sessionId).status = "in_progress";
@@ -266,7 +272,7 @@ test("candidate technical incidents are audited and cross-origin mutations are r
   const rejected = await request("/api/interviews/session", {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: "https://attacker.example" },
-    body: JSON.stringify({ employment: "正社員", location: "越谷店", consent: true }),
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
   }, env);
   assert.equal(rejected.status, 403);
 
@@ -431,7 +437,7 @@ test("same-origin realtime call authorizes the exact new interview session and p
   const sessionResponse = await request("/api/interviews/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ employment: "正社員", location: "越谷店", consent: true }),
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
   }, env);
   const session = await sessionResponse.json();
   const originalFetch = globalThis.fetch;
@@ -528,7 +534,7 @@ async function runEvaluationApi(invalidEvidence) {
   const sessionResponse = await request("/api/interviews/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ employment: "正社員", location: "越谷店", consent: true }),
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
   }, env);
   const session = await sessionResponse.json();
   database.sessions.get(session.sessionId).status = "in_progress";

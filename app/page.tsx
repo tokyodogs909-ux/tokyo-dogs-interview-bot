@@ -132,6 +132,7 @@ function validateCompletionArguments(args: CompletionArguments) {
 export default function Home() {
   const [stage, setStage] = useState<Stage>("intro");
   const [sessionId, setSessionId] = useState("TD-PENDING");
+  const [candidateName, setCandidateName] = useState("");
   const [employment, setEmployment] = useState<(typeof EMPLOYMENT_OPTIONS)[number]>("正社員");
   const [location, setLocation] = useState<(typeof LOCATION_OPTIONS)[number]>("越谷店");
   const [consent, setConsent] = useState(false);
@@ -818,6 +819,10 @@ export default function Home() {
 
   async function prepareInterview() {
     if (!consent || sessionStarting) return;
+    if (!candidateName.trim()) {
+      setErrorMessage("氏名を入力してください。");
+      return;
+    }
     primeRemoteAudioPlayback();
     speakOnDevice("オンライン一次面接の音声を準備しています。カメラとマイクの許可画面をご確認ください。", false, true);
     setSessionStarting(true);
@@ -910,7 +915,7 @@ export default function Home() {
       const response = await fetch("/api/interviews/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ employment, location, consent: true }),
+        body: JSON.stringify({ candidateName, employment, location, consent: true }),
       });
       const data = (await response.json()) as {
         sessionId?: string;
@@ -1694,9 +1699,12 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="start-panel">
-            <div className="panel-number">01</div>
-            <div className="panel-title"><p>選考情報</p><h2>オンライン一次面接を開始</h2></div>
+            <div className="start-panel">
+              <div className="panel-number">01</div>
+              <div className="panel-title"><p>選考情報</p><h2>オンライン一次面接を開始</h2></div>
+            <label htmlFor="candidate-name">氏名</label>
+            <input id="candidate-name" className="candidate-name-input" type="text" value={candidateName} onChange={(event) => setCandidateName(event.target.value)} maxLength={60} autoComplete="name" required aria-required="true" placeholder="例：山田 花子" />
+            <p className="field-help">採用記録の照合と保存管理に使用します。社内確認では実在しないテスト名を入力してください。</p>
             <span className="field-label" id="employment-label">雇用形態</span>
             <div className="segmented-control" role="group" aria-labelledby="employment-label">
               {EMPLOYMENT_OPTIONS.map((item) => (
@@ -1716,9 +1724,9 @@ export default function Home() {
                 <small>評価は笠間・山本だけが確認し、求職者には表示されません。</small>
               </span>
             </label>
-            <details className="consent-details"><summary id="consent-detail-summary">録画とデータの詳しい取り扱い</summary><div><p><strong>利用目的</strong><br />録画はカメラ映像と双方の音声を含み、接客ロールプレイなどの職務関連行動、文字起こしの照合、通信トラブル時の記録確認に使用します。</p><p><strong>処理と閲覧</strong><br />音声と回答は外部の音声・文字処理サービスで処理されます。録画、文字起こし、評価補助は認証された笠間・山本が確認します。自動処理だけで合否を決定しません。</p><p><strong>保管</strong><br />現在の社内確認環境では自動削除しません。保管期間、削除責任者、開示等の受付方法は本番利用前に社内規程で確定します。</p><p><strong>公平性とご相談</strong><br />笑顔の有無、顔立ち・容姿、服装、背景、カメラ・音声品質、声質、障害・健康状態の推測は評価しません。技術不具合は不利益に扱わず、情報不足として採用担当者が確認します。機器操作や進行方法に配慮が必要な場合は、応募時に利用した連絡経路で採用担当者へご相談ください。面接中も中止できます。</p></div></details>
-            <p className={`consent-status ${consent ? "ready" : ""}`} role="status">
-              {consent ? "✓ 同意が確認されました。面接を開始できます。" : "上の同意欄を押してチェックしてください。"}
+            <details className="consent-details"><summary id="consent-detail-summary">録画とデータの詳しい取り扱い</summary><div><p><strong>利用目的</strong><br />入力した氏名は採用記録の照合と保存管理に使用します。録画はカメラ映像と双方の音声を含み、接客ロールプレイなどの職務関連行動、文字起こしの照合、通信トラブル時の記録確認に使用します。</p><p><strong>処理と閲覧</strong><br />音声と回答は外部の音声・文字処理サービスで処理されます。氏名、録画、文字起こし、評価補助は認証された笠間・山本が確認します。自動処理だけで合否を決定しません。</p><p><strong>保管</strong><br />現在の社内確認環境では自動削除しません。保管期間、削除責任者、開示等の受付方法は本番利用前に社内規程で確定します。</p><p><strong>公平性とご相談</strong><br />笑顔の有無、顔立ち・容姿、服装、背景、カメラ・音声品質、声質、障害・健康状態の推測は評価しません。技術不具合は不利益に扱わず、情報不足として採用担当者が確認します。機器操作や進行方法に配慮が必要な場合は、応募時に利用した連絡経路で採用担当者へご相談ください。面接中も中止できます。</p></div></details>
+            <p className={`consent-status ${consent && candidateName.trim() ? "ready" : ""}`} role="status">
+              {!candidateName.trim() ? "氏名を入力してください。" : consent ? "✓ 氏名と同意が確認されました。面接を開始できます。" : "上の同意欄を押してチェックしてください。"}
             </p>
             <div className={`speaker-test ${speakerTestState}`}>
               <div><strong>端末の音声を確認</strong><span>{speakerTestState === "playing" ? "音声を再生しています" : speakerTestState === "passed" ? "確認音声を再生しました" : speakerTestState === "error" ? "端末の音量設定をご確認ください" : "開始前に茂木の確認音声を聞けます"}</span></div>
@@ -1730,12 +1738,12 @@ export default function Home() {
               <li><strong>3. この画面を共有</strong><span>共有の確認画面が表示された場合は、この面接画面を選びます。その後、オンライン一次面接と録画が始まります。</span></li>
             </ol>
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
-            <button className="primary-action" disabled={!consent || sessionStarting} onClick={() => void prepareInterview()}>
+            <button className="primary-action" disabled={!candidateName.trim() || !consent || sessionStarting} onClick={() => void prepareInterview()}>
               {sessionStarting ? "オンライン一次面接を準備中…" : "同意してオンライン一次面接を開始"} <span>→</span>
             </button>
             <button className="internal-test-button" onClick={startInternalTest}>接続確認（選考対象外）</button>
             <p className="internal-test-note">録画・音声接続・採用評価を行わず、文字入力で面接画面の操作を確認します。</p>
-            <p className="fine-print">推奨ブラウザは最新版のSafariまたはChromeです。現在は社内確認環境のため、氏名・連絡先などの個人情報は入力しないでください。</p>
+            <p className="fine-print">推奨ブラウザは最新版のSafariまたはChromeです。現在は社内確認環境のため、氏名欄には実在しないテスト名を使用し、連絡先などは入力しないでください。</p>
           </div>
         </section>
       )}
@@ -1754,7 +1762,7 @@ export default function Home() {
               </div>
               <div className="candidate-details">
                 <span>POSITION</span><strong>犬の幼稚園スタッフ<br />トレーナー候補</strong>
-                <dl><div><dt>雇用形態</dt><dd>{employment}</dd></div><div><dt>希望店舗</dt><dd>{location}</dd></div></dl>
+                <dl><div><dt>氏名</dt><dd>{mode === "internal-test" ? "接続確認" : candidateName.trim()}</dd></div><div><dt>雇用形態</dt><dd>{employment}</dd></div><div><dt>希望店舗</dt><dd>{location}</dd></div></dl>
               </div>
               <div className="privacy-box">
                 <strong>{mode === "internal-test" ? "接続確認（選考対象外）" : "TOKYO DOGS オンライン一次面接"}</strong>
