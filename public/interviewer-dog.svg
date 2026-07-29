@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" role="img" aria-labelledby="title desc">
+  <title id="title">TOKYO DOGS オンライン一次面接</title>
+  <desc id="desc">濃紺と淡いブルーで描かれた、オンライン一次面接用の旧案内イラスト</desc>
+  <rect width="240" height="240" rx="72" fill="#d9eef9"/>
+  <path d="M49 91c-14-30-7-54 13-57 21-3 34 20 40 43M191 91c14-30 7-54-13-57-21-3-34 20-40 43" fill="#0a4269"/>
+  <path d="M61 112c0-47 27-75 59-75s59 28 59 75v18c0 45-23 77-59 77s-59-32-59-77z" fill="#f8fcff" stroke="#0a4269" stroke-width="9"/>
+  <path d="M82 113c9-9 21-9 30 0M128 113c9-9 21-9 30 0" fill="none" stroke="#0a4269" stroke-width="7" stroke-linecap="round"/>
+  <path d="M106 139c0-9 7-15 14-15s14 6 14 15c0 8-7 13-14 13s-14-5-14-13z" fill="#0a4269"/>
+  <path d="M98 163c14 13 30 13 44 0" fill="none" stroke="#0a4269" stroke-width="7" stroke-linecap="round"/>
+  <path d="M75 202c11-23 27-34 45-34s34 11 45 34" fill="#77bfe3" stroke="#0a4269" stroke-width="8" stroke-linejoin="round"/>
+  <path d="M120 169v31" stroke="#0a4269" stroke-width="7"/>
+  <circle cx="120" cy="202" r="8" fill="#f8fcff" stroke="#0a4269" stroke-width="5"/>
+</svg>
