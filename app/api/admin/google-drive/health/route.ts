@@ -1,4 +1,4 @@
-import { authorizeInterviewAdmin } from "@/lib/admin-auth";
+import { authorizeInterviewAdminOrSetupSession } from "@/lib/admin-auth";
 import {
   missingGoogleDriveConfiguration,
   validateGoogleDriveRoot,
@@ -7,10 +7,10 @@ import { noStoreJson } from "@/lib/openai-server";
 
 export async function GET(request: Request) {
   try {
-    if (!await authorizeInterviewAdmin(request)) {
+    if (!await authorizeInterviewAdminOrSetupSession(request)) {
       return noStoreJson({ error: "管理者認証を確認できません。" }, { status: 401 });
     }
-    const missing = missingGoogleDriveConfiguration();
+    const missing = await missingGoogleDriveConfiguration();
     if (missing.length > 0) {
       return noStoreJson({
         configured: false,

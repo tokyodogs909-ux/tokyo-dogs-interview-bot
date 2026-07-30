@@ -138,6 +138,18 @@ test("server-renders the protected recruiter review entry", async () => {
   assert.doesNotMatch(html, /kasama-review-secret|INTERVIEW_REVIEW_TOKEN/);
 });
 
+test("server-renders the administrator-only Google Drive setup entry without secrets", async () => {
+  const response = await render("/staff/google-drive");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /面接記録の/);
+  assert.match(html, /保存先設定/);
+  assert.match(html, /管理者アクセスキー/);
+  assert.match(html, /オンライン一次面接_自動格納/);
+  assert.match(html, /長期認証情報は暗号化して保管/);
+  assert.doesNotMatch(html, /GOOGLE_DRIVE_CLIENT_SECRET|GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET|refresh_token/);
+});
+
 test("server-renders the selection-excluded portal check", async () => {
   const response = await render("/mobile-test");
   assert.equal(response.status, 200);

@@ -89,3 +89,15 @@ export const interviewExternalSyncs = sqliteTable("interview_external_syncs", {
   uniqueIndex("interview_external_syncs_session_provider_unique").on(table.sessionId, table.provider),
   index("interview_external_syncs_status_idx").on(table.status),
 ]);
+
+export const googleDriveConnection = sqliteTable("google_drive_connection", {
+  id: integer("id").primaryKey(),
+  refreshTokenCiphertext: text("refresh_token_ciphertext").notNull(),
+  refreshTokenIv: text("refresh_token_iv").notNull(),
+  rootFolderId: text("root_folder_id"),
+  rootFolderName: text("root_folder_name"),
+  rootFolderUrl: text("root_folder_url"),
+  scope: text("scope").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});

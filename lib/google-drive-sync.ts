@@ -3,7 +3,6 @@ import {
   DRIVE_API_ENDPOINT,
   DRIVE_UPLOAD_ENDPOINT,
   fetchGoogleDriveAccessToken,
-  googleDriveRootFolderId,
   missingGoogleDriveConfiguration,
   validateGoogleDriveRoot,
 } from "@/lib/google-drive-auth";
@@ -416,7 +415,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
   }).formatToParts(date);
   const year = parts.find((part) => part.type === "year")?.value ?? String(date.getUTCFullYear());
   const month = parts.find((part) => part.type === "month")?.value ?? String(date.getUTCMonth() + 1).padStart(2, "0");
-  const yearFolder = await ensureFolder(accessToken, googleDriveRootFolderId(), year, "tokyoDogsInterviewYear", year);
+  const yearFolder = await ensureFolder(accessToken, root.id, year, "tokyoDogsInterviewYear", year);
   const monthKey = `${year}-${month}`;
   const monthFolder = await ensureFolder(accessToken, yearFolder.id, month, "tokyoDogsInterviewMonth", monthKey);
   const candidateFolder = await ensureFolder(
@@ -517,7 +516,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
 }
 
 export async function syncInterviewToGoogleDrive(sessionId: string): Promise<GoogleDriveSyncResult> {
-  if (missingGoogleDriveConfiguration().length > 0) {
+  if ((await missingGoogleDriveConfiguration()).length > 0) {
     throw new Error("GOOGLE_DRIVE_CONFIGURATION_MISSING");
   }
   await requestExternalSync(sessionId);
@@ -562,7 +561,6 @@ export async function syncInterviewToGoogleDrive(sessionId: string): Promise<Goo
 }
 
 export function scheduleGoogleDriveSync(sessionId: string) {
-  if (missingGoogleDriveConfiguration().length > 0) return false;
   const promise = syncInterviewToGoogleDrive(sessionId).catch(() => undefined);
   const context = getRequestExecutionContext();
   if (context) context.waitUntil(promise);

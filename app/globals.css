@@ -342,6 +342,8 @@ select, .candidate-name-input { padding: 13px 14px; }
 
 .staff-shell { min-height: 100vh; background: var(--brand-blue-soft); padding-bottom: 100px; }
 .staff-header { position: static; }
+.staff-header-actions { display: flex; align-items: center; gap: 12px; }
+.staff-header-actions > a { border-bottom: 1px solid var(--brand-navy); color: var(--brand-navy); font-size: 10px; font-weight: 800; text-decoration: none; }
 .staff-login, .staff-review { width: min(1180px, calc(100% - 48px)); margin: 0 auto; }
 .staff-login { padding: 62px 0 34px; display: grid; grid-template-columns: 1fr 440px; align-items: end; gap: 70px; }
 .staff-login h1 { margin: 8px 0 12px; color: var(--brand-navy); font-size: clamp(38px, 5vw, 64px); letter-spacing: -.05em; }
@@ -387,6 +389,30 @@ select, .candidate-name-input { padding: 13px 14px; }
 .human-review-list > div { background: var(--brand-blue-soft); border-radius: 14px; padding: 16px; display: grid; gap: 7px; }
 .human-review-list strong { color: var(--brand-navy); }
 .human-review-list span, .human-review-list p { color: var(--muted); font-size: 10px; margin: 0; }
+
+.drive-setup-shell { padding-bottom: 60px; }
+.drive-setup-card { width: min(1080px, calc(100% - 48px)); margin: 0 auto; padding: 64px 0; display: grid; grid-template-columns: .9fr 1.1fr; gap: 72px; align-items: start; }
+.drive-setup-heading h1 { margin: 10px 0 20px; color: var(--brand-navy); font-size: clamp(44px, 6vw, 74px); line-height: 1.04; letter-spacing: -.055em; }
+.drive-setup-heading > p:last-child { max-width: 480px; color: var(--muted); font-size: 13px; line-height: 1.9; }
+.drive-setup-panel { border-radius: 28px; padding: 30px; background: white; box-shadow: 0 22px 70px rgba(7,66,105,.1); }
+.drive-setup-step { display: grid; grid-template-columns: 34px 1fr; gap: 13px; align-items: center; padding: 13px 0; border-bottom: 1px solid var(--line); }
+.drive-setup-step > span { width: 34px; height: 34px; border-radius: 50%; background: var(--brand-navy); color: white; display: grid; place-items: center; font: 800 11px var(--font-geist-mono), monospace; }
+.drive-setup-step > div { display: grid; gap: 4px; }
+.drive-setup-step strong { color: var(--brand-navy); font-size: 12px; }
+.drive-setup-step small { color: var(--muted); font-size: 10px; line-height: 1.55; }
+.drive-admin-key { display: grid; gap: 8px; margin-top: 24px; color: var(--brand-navy); font-size: 10px; font-weight: 800; letter-spacing: .06em; }
+.drive-admin-key input { width: 100%; border: 1px solid rgba(7,66,105,.18); border-radius: 12px; padding: 13px 14px; background: #f8fcff; color: var(--brand-navy); font: inherit; outline: none; }
+.drive-admin-key input:focus { border-color: var(--brand-blue); box-shadow: 0 0 0 3px rgba(72,158,205,.12); }
+.drive-admin-key .primary-action, .drive-folder-action .primary-action { width: 100%; justify-content: space-between; margin-top: 4px; }
+.drive-folder-action { display: grid; gap: 10px; margin-top: 24px; }
+.drive-connected-badge { border: 1px solid #9ad2b5; border-radius: 12px; padding: 11px 13px; background: #e7f7ef; color: #16623a; font-size: 11px; font-weight: 800; text-align: center; }
+.drive-setup-message { margin-top: 14px; border-radius: 12px; padding: 12px 14px; background: var(--brand-blue-soft); color: var(--brand-navy); font-size: 11px; line-height: 1.65; }
+.drive-root-readback { margin-top: 14px; border: 1px solid rgba(7,66,105,.14); border-radius: 14px; padding: 15px; display: grid; gap: 5px; }
+.drive-root-readback span { color: var(--muted); font-size: 9px; letter-spacing: .1em; }
+.drive-root-readback strong { color: var(--brand-navy); font-size: 14px; }
+.drive-root-readback small { color: #16623a; font-size: 10px; }
+.drive-root-readback a { margin-top: 5px; color: var(--brand-navy); font-size: 10px; font-weight: 800; }
+.drive-security-note { margin: 18px 0 0; color: var(--muted); font-size: 9px; line-height: 1.7; }
 
 .site-footer { width: min(1240px, calc(100% - 48px)); margin: 0 auto; min-height: 66px; border-top: 1px solid var(--line); color: var(--muted); display: flex; justify-content: space-between; align-items: center; font-size: 9px; letter-spacing: .1em; }
 
@@ -453,11 +479,16 @@ select, .candidate-name-input { padding: 13px 14px; }
   .staff-login { grid-template-columns: 1fr; gap: 26px; padding-top: 38px; }
   .staff-grid { grid-template-columns: 1fr; }
   .human-review-list { grid-template-columns: 1fr; }
+  .drive-setup-card { grid-template-columns: 1fr; gap: 30px; padding-top: 40px; }
 }
 
 @media (max-width: 620px) {
   .site-header, .intro-layout, .setup-layout, .interview-page, .review-page, .site-footer { width: min(100% - 28px, 1240px); }
   .site-header { height: 78px; gap: 8px; }
+  .staff-header-actions > a { display: none; }
+  .drive-setup-card { width: min(100% - 28px, 520px); padding: 34px 0; }
+  .drive-setup-heading h1 { font-size: 46px; }
+  .drive-setup-panel { padding: 20px; border-radius: 22px; }
   .brand-button img { width: 46px; height: 46px; }
   .brand-button { gap: 9px; min-width: 0; }
   .brand-button strong { font-size: 11px; }

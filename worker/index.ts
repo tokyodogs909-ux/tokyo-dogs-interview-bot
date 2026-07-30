@@ -14,6 +14,10 @@ interface Env {
   GOOGLE_DRIVE_REFRESH_TOKEN?: string;
   GOOGLE_DRIVE_ROOT_FOLDER_ID?: string;
   GOOGLE_DRIVE_EXPECTED_ROOT_NAME?: string;
+  GOOGLE_DRIVE_OAUTH_REDIRECT_URI?: string;
+  GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET?: string;
+  GOOGLE_PICKER_API_KEY?: string;
+  GOOGLE_CLOUD_PROJECT_NUMBER?: string;
   INTERVIEW_INVITE_SIGNING_SECRET?: string;
   INTERVIEW_REQUIRE_SIGNED_INVITE?: string;
   IMAGES: {
@@ -38,11 +42,26 @@ function withSecurityHeaders(response: Response, request?: Request) {
   headers.set("X-Frame-Options", "DENY");
   headers.set("Cross-Origin-Resource-Policy", "same-origin");
   headers.set("Cross-Origin-Opener-Policy", "same-origin");
-  headers.set("Content-Security-Policy", "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests");
+  headers.set("Content-Security-Policy", [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "script-src 'self' 'unsafe-inline' https://apis.google.com https://accounts.google.com",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "media-src 'self' blob:",
+    "connect-src 'self' https://api.openai.com wss://api.openai.com https://accounts.google.com https://www.googleapis.com",
+    "frame-src https://accounts.google.com https://docs.google.com https://drive.google.com",
+    "worker-src 'self' blob:",
+    "upgrade-insecure-requests",
+  ].join("; "));
   if (request && new URL(request.url).protocol === "https:") {
     headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
-  if (request && ["/", "/staff"].includes(new URL(request.url).pathname)) {
+  if (request && (new URL(request.url).pathname === "/" || new URL(request.url).pathname.startsWith("/staff"))) {
     headers.set("Cache-Control", "private, no-store");
   }
   return new Response(response.body, {
@@ -76,6 +95,10 @@ const worker = {
         | "GOOGLE_DRIVE_REFRESH_TOKEN"
         | "GOOGLE_DRIVE_ROOT_FOLDER_ID"
         | "GOOGLE_DRIVE_EXPECTED_ROOT_NAME"
+        | "GOOGLE_DRIVE_OAUTH_REDIRECT_URI"
+        | "GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET"
+        | "GOOGLE_PICKER_API_KEY"
+        | "GOOGLE_CLOUD_PROJECT_NUMBER"
         | "INTERVIEW_INVITE_SIGNING_SECRET"
         | "INTERVIEW_REQUIRE_SIGNED_INVITE"
       >;
@@ -90,6 +113,10 @@ const worker = {
       GOOGLE_DRIVE_REFRESH_TOKEN: bindings.GOOGLE_DRIVE_REFRESH_TOKEN,
       GOOGLE_DRIVE_ROOT_FOLDER_ID: bindings.GOOGLE_DRIVE_ROOT_FOLDER_ID,
       GOOGLE_DRIVE_EXPECTED_ROOT_NAME: bindings.GOOGLE_DRIVE_EXPECTED_ROOT_NAME,
+      GOOGLE_DRIVE_OAUTH_REDIRECT_URI: bindings.GOOGLE_DRIVE_OAUTH_REDIRECT_URI,
+      GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: bindings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET,
+      GOOGLE_PICKER_API_KEY: bindings.GOOGLE_PICKER_API_KEY,
+      GOOGLE_CLOUD_PROJECT_NUMBER: bindings.GOOGLE_CLOUD_PROJECT_NUMBER,
       INTERVIEW_INVITE_SIGNING_SECRET: bindings.INTERVIEW_INVITE_SIGNING_SECRET,
       INTERVIEW_REQUIRE_SIGNED_INVITE: bindings.INTERVIEW_REQUIRE_SIGNED_INVITE,
     };

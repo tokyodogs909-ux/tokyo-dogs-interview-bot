@@ -1,3 +1,8 @@
+import {
+  expectedGoogleDriveRootName,
+  readStoredGoogleDriveConnection,
+} from "@/lib/google-drive-connection";
+
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 export const DRIVE_API_ENDPOINT = "https://www.googleapis.com/drive/v3";
 export const DRIVE_UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3";
@@ -43,28 +48,57 @@ function setting(name: keyof GoogleDriveBindings) {
   return (bound ?? local ?? "").trim();
 }
 
-export function missingGoogleDriveConfiguration() {
-  const required: Array<keyof GoogleDriveBindings> = [
-    "GOOGLE_DRIVE_CLIENT_ID",
-    "GOOGLE_DRIVE_CLIENT_SECRET",
-    "GOOGLE_DRIVE_REFRESH_TOKEN",
-    "GOOGLE_DRIVE_ROOT_FOLDER_ID",
-  ];
-  return required.filter((name) => !setting(name));
-}
-
-function configuredDriveRoot() {
-  const missing = missingGoogleDriveConfiguration();
-  if (missing.length > 0) {
-    throw new Error(`GOOGLE_DRIVE_CONFIGURATION_MISSING:${missing.join(",")}`);
-  }
+async function resolvedDriveConfiguration() {
+  const staticRefreshToken = setting("GOOGLE_DRIVE_REFRESH_TOKEN");
+  const staticRootFolderId = setting("GOOGLE_DRIVE_ROOT_FOLDER_ID");
+  const hasCompleteStaticConfiguration = Boolean(staticRefreshToken && staticRootFolderId);
+  const stored = hasCompleteStaticConfiguration
+    ? null
+    : await readStoredGoogleDriveConnection();
   return {
     clientId: setting("GOOGLE_DRIVE_CLIENT_ID"),
     clientSecret: setting("GOOGLE_DRIVE_CLIENT_SECRET"),
-    refreshToken: setting("GOOGLE_DRIVE_REFRESH_TOKEN"),
-    rootFolderId: setting("GOOGLE_DRIVE_ROOT_FOLDER_ID"),
-    expectedRootName: setting("GOOGLE_DRIVE_EXPECTED_ROOT_NAME") || "オンライン一次面接_自動格納",
+    refreshToken: hasCompleteStaticConfiguration ? staticRefreshToken : stored?.refreshToken || "",
+    rootFolderId: hasCompleteStaticConfiguration ? staticRootFolderId : stored?.rootFolderId || "",
+    expectedRootName: expectedGoogleDriveRootName(),
   };
+}
+
+export async function missingGoogleDriveConfiguration() {
+  const config = await resolvedDriveConfiguration();
+  return [
+    ["GOOGLE_DRIVE_CLIENT_ID", config.clientId],
+    ["GOOGLE_DRIVE_CLIENT_SECRET", config.clientSecret],
+    ["GOOGLE_DRIVE_REFRESH_TOKEN", config.refreshToken],
+    ["GOOGLE_DRIVE_ROOT_FOLDER_ID", config.rootFolderId],
+  ].filter(([, value]) => !value).map(([name]) => name);
+}
+
+async function configuredDriveRoot() {
+  const config = await resolvedDriveConfiguration();
+  const missing = [
+    ["GOOGLE_DRIVE_CLIENT_ID", config.clientId],
+    ["GOOGLE_DRIVE_CLIENT_SECRET", config.clientSecret],
+    ["GOOGLE_DRIVE_REFRESH_TOKEN", config.refreshToken],
+    ["GOOGLE_DRIVE_ROOT_FOLDER_ID", config.rootFolderId],
+  ].filter(([, value]) => !value).map(([name]) => name);
+  if (missing.length > 0) {
+    throw new Error(`GOOGLE_DRIVE_CONFIGURATION_MISSING:${missing.join(",")}`);
+  }
+  return config;
+}
+
+async function configuredDriveCredentials() {
+  const config = await resolvedDriveConfiguration();
+  const missing = [
+    ["GOOGLE_DRIVE_CLIENT_ID", config.clientId],
+    ["GOOGLE_DRIVE_CLIENT_SECRET", config.clientSecret],
+    ["GOOGLE_DRIVE_REFRESH_TOKEN", config.refreshToken],
+  ].filter(([, value]) => !value).map(([name]) => name);
+  if (missing.length > 0) {
+    throw new Error(`GOOGLE_DRIVE_CONFIGURATION_MISSING:${missing.join(",")}`);
+  }
+  return config;
 }
 
 async function readJson(response: Response) {
@@ -76,7 +110,7 @@ async function readJson(response: Response) {
 }
 
 export async function fetchGoogleDriveAccessToken() {
-  const config = configuredDriveRoot();
+  const config = await configuredDriveCredentials();
   const response = await fetch(TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -96,11 +130,23 @@ export async function fetchGoogleDriveAccessToken() {
 }
 
 export async function validateGoogleDriveRoot(accessTokenOverride?: string): Promise<SafeDriveRootMetadata> {
-  const config = configuredDriveRoot();
+  const config = await configuredDriveRoot();
   const accessToken = accessTokenOverride || await fetchGoogleDriveAccessToken();
+  return validateGoogleDriveFolderSelection(config.rootFolderId, accessToken, config.expectedRootName);
+}
+
+export async function validateGoogleDriveFolderSelection(
+  folderId: string,
+  accessToken: string,
+  expectedName = expectedGoogleDriveRootName(),
+): Promise<SafeDriveRootMetadata> {
+  const normalizedFolderId = folderId.trim();
+  if (!/^[A-Za-z0-9_-]{10,200}$/.test(normalizedFolderId)) {
+    throw new Error("GOOGLE_DRIVE_ROOT_ID_INVALID");
+  }
   const fields = "id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren)";
   const response = await fetch(
-    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(config.rootFolderId)}?supportsAllDrives=true&fields=${encodeURIComponent(fields)}`,
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(normalizedFolderId)}?supportsAllDrives=true&fields=${encodeURIComponent(fields)}`,
     {
       headers: { Authorization: `Bearer ${accessToken}` },
     },
@@ -108,8 +154,8 @@ export async function validateGoogleDriveRoot(accessTokenOverride?: string): Pro
   const folder = await readJson(response) as DriveFolderMetadata;
   if (!response.ok) throw new Error("GOOGLE_DRIVE_ROOT_LOOKUP_FAILED");
   if (
-    folder.id !== config.rootFolderId ||
-    folder.name !== config.expectedRootName ||
+    folder.id !== normalizedFolderId ||
+    folder.name !== expectedName ||
     folder.mimeType !== FOLDER_MIME_TYPE ||
     folder.trashed === true
   ) {
@@ -125,8 +171,4 @@ export async function validateGoogleDriveRoot(accessTokenOverride?: string): Pro
     locationType: folder.driveId ? "shared_drive" : "my_drive",
     webViewLink: typeof folder.webViewLink === "string" ? folder.webViewLink : null,
   };
-}
-
-export function googleDriveRootFolderId() {
-  return configuredDriveRoot().rootFolderId;
 }

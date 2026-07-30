@@ -175,6 +175,30 @@ class FakeD1Statement {
         created_at: new Date().toISOString(),
         session_id: sessionId,
       });
+    } else if (this.sql.startsWith("INSERT INTO google_drive_connection")) {
+      const [ciphertext, iv, scope, createdAt, updatedAt] = this.values;
+      this.database.driveConnection = {
+        refresh_token_ciphertext: ciphertext,
+        refresh_token_iv: iv,
+        root_folder_id: this.database.driveConnection?.root_folder_id ?? null,
+        root_folder_name: this.database.driveConnection?.root_folder_name ?? null,
+        root_folder_url: this.database.driveConnection?.root_folder_url ?? null,
+        scope,
+        created_at: this.database.driveConnection?.created_at ?? createdAt,
+        updated_at: updatedAt,
+      };
+      changes = 1;
+    } else if (this.sql.startsWith("UPDATE google_drive_connection SET")) {
+      if (this.database.driveConnection) {
+        const [folderId, folderName, folderUrl, updatedAt] = this.values;
+        Object.assign(this.database.driveConnection, {
+          root_folder_id: folderId,
+          root_folder_name: folderName,
+          root_folder_url: folderUrl,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
     }
     return { success: true, meta: { changes } };
   }
@@ -197,6 +221,9 @@ class FakeD1Statement {
     }
     if (this.sql.startsWith("SELECT provider, status, requested_at")) {
       return this.database.externalSyncs.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT refresh_token_ciphertext")) {
+      return this.database.driveConnection;
     }
     return null;
   }
@@ -236,6 +263,7 @@ class FakeD1 {
     this.auditEvents = [];
     this.invites = new Map();
     this.externalSyncs = new Map();
+    this.driveConnection = null;
   }
 
   prepare(sql) {
@@ -353,6 +381,182 @@ test("Google Drive admin health check refreshes OAuth and verifies only the appr
     assert.equal(responseText.includes("google-client-secret"), false);
     assert.equal(responseText.includes("google-refresh-token"), false);
     assert.equal(responseText.includes("temporary-google-access-token"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Google Drive setup starts with PKCE and grants a short-lived HttpOnly admin session", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    INTERVIEW_ADMIN_TOKEN: "drive-admin-secret",
+    GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+    GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+    GOOGLE_DRIVE_OAUTH_REDIRECT_URI: "http://localhost/api/admin/google-drive/oauth/callback",
+    GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: "test-only-encryption-material-over-32-characters",
+    GOOGLE_PICKER_API_KEY: "public-picker-browser-key",
+    GOOGLE_CLOUD_PROJECT_NUMBER: "123456789012",
+  };
+  const response = await request("/api/admin/google-drive/oauth/start", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer drive-admin-secret",
+      Origin: "http://localhost",
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  const authorizationUrl = new URL(payload.authorizationUrl);
+  assert.equal(authorizationUrl.origin, "https://accounts.google.com");
+  assert.equal(authorizationUrl.searchParams.get("scope"), "https://www.googleapis.com/auth/drive.file");
+  assert.equal(authorizationUrl.searchParams.get("code_challenge_method"), "S256");
+  assert.ok(authorizationUrl.searchParams.get("code_challenge"));
+  assert.ok(authorizationUrl.searchParams.get("state"));
+  const setCookies = response.headers.getSetCookie();
+  assert.equal(setCookies.some((value) => value.startsWith("td_drive_admin_setup=")), true);
+  assert.equal(setCookies.some((value) => value.startsWith("td_drive_oauth_state=")), true);
+  assert.equal(setCookies.some((value) => value.startsWith("td_drive_oauth_verifier=")), true);
+  assert.equal(setCookies.every((value) => value.includes("HttpOnly") && value.includes("SameSite=Lax")), true);
+  const responseText = JSON.stringify(payload) + setCookies.join(";");
+  assert.equal(responseText.includes("google-client-secret"), false);
+  assert.equal(responseText.includes("drive-admin-secret"), false);
+});
+
+test("Google Drive setup session can mint only a short-lived Picker token and invalid callbacks fail closed", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const rootFolderId = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
+  const env = {
+    ...workerEnv,
+    DB: database,
+    INTERVIEW_ADMIN_TOKEN: "drive-admin-secret",
+    GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+    GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+    GOOGLE_DRIVE_REFRESH_TOKEN: "google-refresh-token",
+    GOOGLE_DRIVE_ROOT_FOLDER_ID: rootFolderId,
+    GOOGLE_DRIVE_OAUTH_REDIRECT_URI: "http://localhost/api/admin/google-drive/oauth/callback",
+    GOOGLE_PICKER_API_KEY: "public-picker-browser-key",
+    GOOGLE_CLOUD_PROJECT_NUMBER: "123456789012",
+    GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: "test-only-encryption-material-over-32-characters",
+  };
+  try {
+    const start = await request("/api/admin/google-drive/oauth/start", {
+      method: "POST",
+      headers: { Authorization: "Bearer drive-admin-secret", Origin: "http://localhost" },
+    }, env);
+    const setupCookie = start.headers.getSetCookie()
+      .find((value) => value.startsWith("td_drive_admin_setup="))
+      ?.split(";", 1)[0];
+    assert.ok(setupCookie);
+    globalThis.fetch = async (url) => {
+      assert.equal(url, "https://oauth2.googleapis.com/token");
+      return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+    };
+    const token = await request("/api/admin/google-drive/oauth/token", {
+      headers: { Cookie: setupCookie },
+    }, env);
+    const tokenPayload = await token.json();
+    assert.equal(token.status, 200, JSON.stringify(tokenPayload));
+    assert.equal(tokenPayload.accessToken, "temporary-google-access-token");
+    assert.equal(tokenPayload.projectNumber, "123456789012");
+    assert.equal(JSON.stringify(tokenPayload).includes("google-client-secret"), false);
+    assert.equal(JSON.stringify(tokenPayload).includes("google-refresh-token"), false);
+
+    const invalidCallback = await request("/api/admin/google-drive/oauth/callback?code=unused&state=invalid", {}, env);
+    assert.equal(invalidCallback.status, 303);
+    assert.equal(new URL(invalidCallback.headers.get("location")).pathname, "/staff/google-drive");
+    assert.equal(new URL(invalidCallback.headers.get("location")).searchParams.get("error"), "oauth_failed");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Google Drive OAuth callback encrypts the refresh token and the approved folder is read back", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const rootFolderId = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
+  const env = {
+    ...workerEnv,
+    DB: database,
+    INTERVIEW_ADMIN_TOKEN: "drive-admin-secret",
+    GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+    GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+    GOOGLE_DRIVE_OAUTH_REDIRECT_URI: "http://localhost/api/admin/google-drive/oauth/callback",
+    GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: "test-only-encryption-material-over-32-characters",
+    GOOGLE_PICKER_API_KEY: "public-picker-browser-key",
+    GOOGLE_CLOUD_PROJECT_NUMBER: "123456789012",
+    GOOGLE_DRIVE_EXPECTED_ROOT_NAME: "オンライン一次面接_自動格納",
+  };
+  try {
+    const start = await request("/api/admin/google-drive/oauth/start", {
+      method: "POST",
+      headers: { Authorization: "Bearer drive-admin-secret", Origin: "http://localhost" },
+    }, env);
+    const startPayload = await start.json();
+    const authorizationUrl = new URL(startPayload.authorizationUrl);
+    const state = authorizationUrl.searchParams.get("state");
+    const cookieHeader = start.headers.getSetCookie().map((value) => value.split(";", 1)[0]).join("; ");
+    const setupCookie = cookieHeader.split("; ").find((value) => value.startsWith("td_drive_admin_setup="));
+    assert.ok(state);
+    assert.ok(setupCookie);
+
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        const body = new URLSearchParams(String(init.body));
+        if (body.get("grant_type") === "authorization_code") {
+          assert.equal(body.get("code"), "authorization-code-from-google");
+          assert.ok(body.get("code_verifier"));
+          return Response.json({
+            refresh_token: "stored-google-refresh-token-never-returned",
+            scope: "https://www.googleapis.com/auth/drive.file",
+          });
+        }
+        assert.equal(body.get("grant_type"), "refresh_token");
+        assert.equal(body.get("refresh_token"), "stored-google-refresh-token-never-returned");
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      if (href.includes(`/drive/v3/files/${rootFolderId}`)) {
+        assert.equal(init.headers.Authorization, "Bearer temporary-google-access-token");
+        return Response.json({
+          id: rootFolderId,
+          name: "オンライン一次面接_自動格納",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+          webViewLink: `https://drive.google.com/drive/folders/${rootFolderId}`,
+        });
+      }
+      throw new Error(`Unexpected Google request: ${href}`);
+    };
+
+    const callback = await request(`/api/admin/google-drive/oauth/callback?code=authorization-code-from-google&state=${encodeURIComponent(state)}`, {
+      headers: { Cookie: cookieHeader },
+    }, env);
+    assert.equal(callback.status, 303);
+    assert.equal(new URL(callback.headers.get("location")).searchParams.get("connected"), "1");
+    assert.ok(database.driveConnection);
+    assert.notEqual(database.driveConnection.refresh_token_ciphertext, "stored-google-refresh-token-never-returned");
+    assert.equal(JSON.stringify(database.driveConnection).includes("stored-google-refresh-token-never-returned"), false);
+
+    const rootResponse = await request("/api/admin/google-drive/root", {
+      method: "POST",
+      headers: {
+        Cookie: setupCookie,
+        Origin: "http://localhost",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ folderId: rootFolderId }),
+    }, env);
+    const rootPayload = await rootResponse.json();
+    assert.equal(rootResponse.status, 200, JSON.stringify(rootPayload));
+    assert.equal(rootPayload.saved, true);
+    assert.equal(rootPayload.root.id, rootFolderId);
+    assert.equal(database.driveConnection.root_folder_id, rootFolderId);
+    assert.equal(database.driveConnection.root_folder_name, "オンライン一次面接_自動格納");
+    assert.equal(JSON.stringify(rootPayload).includes("temporary-google-access-token"), false);
   } finally {
     globalThis.fetch = originalFetch;
   }
