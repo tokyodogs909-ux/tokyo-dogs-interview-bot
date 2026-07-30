@@ -402,7 +402,9 @@ select, .candidate-name-input { padding: 13px 14px; }
 .drive-setup-step small { color: var(--muted); font-size: 10px; line-height: 1.55; }
 .drive-admin-key { display: grid; gap: 8px; margin-top: 24px; color: var(--brand-navy); font-size: 10px; font-weight: 800; letter-spacing: .06em; }
 .drive-admin-key input { width: 100%; border: 1px solid rgba(7,66,105,.18); border-radius: 12px; padding: 13px 14px; background: #f8fcff; color: var(--brand-navy); font: inherit; outline: none; }
+.drive-admin-key select { width: 100%; border: 1px solid rgba(7,66,105,.18); border-radius: 12px; padding: 13px 14px; background: #f8fcff; color: var(--brand-navy); font: inherit; outline: none; }
 .drive-admin-key input:focus { border-color: var(--brand-blue); box-shadow: 0 0 0 3px rgba(72,158,205,.12); }
+.drive-admin-key select:focus { border-color: var(--brand-blue); box-shadow: 0 0 0 3px rgba(72,158,205,.12); }
 .drive-admin-key .primary-action, .drive-folder-action .primary-action { width: 100%; justify-content: space-between; margin-top: 4px; }
 .drive-folder-action { display: grid; gap: 10px; margin-top: 24px; }
 .drive-connected-badge { border: 1px solid #9ad2b5; border-radius: 12px; padding: 11px 13px; background: #e7f7ef; color: #16623a; font-size: 11px; font-weight: 800; text-align: center; }
@@ -413,6 +415,11 @@ select, .candidate-name-input { padding: 13px 14px; }
 .drive-root-readback small { color: #16623a; font-size: 10px; }
 .drive-root-readback a { margin-top: 5px; color: var(--brand-navy); font-size: 10px; font-weight: 800; }
 .drive-security-note { margin: 18px 0 0; color: var(--muted); font-size: 9px; line-height: 1.7; }
+.invite-result { display: grid; gap: 9px; margin-top: 18px; padding: 16px; border: 1px solid rgba(7,66,105,.12); border-radius: 16px; background: #f8fcff; }
+.invite-result > span { color: var(--brand-navy); font-size: 10px; font-weight: 800; letter-spacing: .06em; }
+.invite-result textarea { width: 100%; resize: vertical; border: 1px solid rgba(7,66,105,.15); border-radius: 10px; padding: 11px; background: white; color: var(--brand-navy); font: 10px/1.55 var(--font-geist-mono), monospace; }
+.invite-result small { color: var(--muted); font-size: 9px; line-height: 1.6; }
+.invite-result .secondary-action { justify-content: center; }
 
 .site-footer { width: min(1240px, calc(100% - 48px)); margin: 0 auto; min-height: 66px; border-top: 1px solid var(--line); color: var(--muted); display: flex; justify-content: space-between; align-items: center; font-size: 9px; letter-spacing: .1em; }
 

@@ -188,7 +188,7 @@ export default function StaffReviewPage() {
           <img src="/tokyo-dogs-logo.jpg" alt="Tokyo Dogs" />
           <span><strong>TOKYO DOGS</strong><small>OFFICIAL SELECTION REVIEW</small></span>
         </div>
-        <div className="staff-header-actions"><a href="/staff/google-drive">Drive接続設定</a><span className="test-pill">笠間・山本 専用</span></div>
+        <div className="staff-header-actions"><a href="/staff/invites">候補者リンク発行</a><a href="/staff/google-drive">Drive接続設定</a><span className="test-pill">笠間・山本 専用</span></div>
       </header>
 
       <section className="staff-login">

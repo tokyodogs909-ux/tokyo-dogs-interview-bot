@@ -8,8 +8,8 @@ TOKYO DOGSの採用選考におけるオンライン一次面接を、オンラ�
 - 候補者画面と採用担当画面の分離、笠間・山本専用レビュー認証: 実装済み
 - OpenAI Realtimeの短期クライアントトークン発行: 接続確認済み
 - OpenAI Responsesによる実評価: 支払い反映後に接続成功
-- Google Drive自動格納: 実装・モック読戻し試験済み。Google Cloud利用規約同意と本番OAuth認証は本人操作待ち
-- 公開状態: 本番は未公開。選考対象外の確認環境と、2時間限定の完全版社内確認経路だけをHTTPS公開
+- Google Drive自動格納: 実装・モック読戻し試験済み。Google Authアプリ、`drive.file`、Picker APIは設定済みで、OAuthクライアント発行と本番OAuth認証は本人操作待ち
+- 公開状態: Sitesバージョン3を所有者限定の非公開本番へ反映済み。応募者向け一般公開は未実施
 - 実応募者データでの利用: 未実施
 
 ## 実装済み
@@ -41,6 +41,7 @@ TOKYO DOGSの採用選考におけるオンライン一次面接を、オンラ�
 - 採用担当画面のDrive保存状態、保存フォルダリンク、認証付き再格納操作
 - 2時間で失効するセッション資格情報、トークンのSHA-256ハッシュ保存
 - 管理者だけが発行できる、1回限り・有効期限付きの署名済み候補者URL
+- `/staff/invites` から候補者ごとに署名済みURLを発行・コピーする管理者画面
 - 面接終了後の7項目評価、回答根拠、確信度、未確認事項、矛盾、聞き漏れ
 - JSON結果のローカル保存
 - TOKYO DOGSロゴとコーポレートカラーによるレスポンシブ画面
@@ -95,7 +96,7 @@ OPENAI_API_KEY="$(security find-generic-password -a "$USER" -s "TOKYODOGS_AI_INT
 npm run check
 ```
 
-2026-07-29時点の結果は、自動テスト19件、Lint、本番ビルド、本番依存関係のhigh以上脆弱性監査が成功しています。希望店舗自由入力の正規化、署名付き招待URLの管理者限定発行、1回限り使用、改ざん・再利用拒否、Drive OAuth設定、承認済みルート照合、候補者フォルダ作成、録画・文字起こし・評価・PDF格納、保存後の読み戻し照合を自動テストで確認しました。
+2026-07-30時点の結果は、自動テスト、Lint、本番ビルド、本番依存関係のhigh以上脆弱性監査が成功しています。希望店舗自由入力の正規化、署名付き招待URLの管理者限定発行、1回限り使用、改ざん・再利用拒否、Drive OAuth設定、承認済みルート照合、候補者フォルダ作成、録画・文字起こし・評価・PDF格納、保存後の読み戻し照合を自動テストで確認しました。
 
 ## 本番公開前に必要
 
@@ -118,6 +119,7 @@ npm run check
 - `app/api/realtime/session/route.ts`: 短期トークン発行
 - `app/api/interviews/session/route.ts`: 同意記録と面接セッション発行
 - `app/api/admin/interviews/invite/route.ts`: 管理者限定の署名済み候補者URL発行
+- `app/staff/invites/page.tsx`: 候補者用の期限付き・1回限りリンクを発行する管理者画面
 - `app/api/admin/google-drive/health/route.ts`: Drive OAuthと承認済み保存先の読み戻し照合
 - `app/api/admin/google-drive/sync/route.ts`: 管理者認証付きのDrive再格納
 - `app/api/staff/google-drive/sync/route.ts`: 笠間・山本による面接単位のDrive再格納

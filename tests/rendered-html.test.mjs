@@ -150,6 +150,18 @@ test("server-renders the administrator-only Google Drive setup entry without sec
   assert.doesNotMatch(html, /GOOGLE_DRIVE_CLIENT_SECRET|GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET|refresh_token/);
 });
 
+test("server-renders the administrator-only one-time candidate invite entry", async () => {
+  const response = await render("/staff/invites");
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /候補者リンクの/);
+  assert.match(html, /安全な発行/);
+  assert.match(html, /管理者アクセスキー/);
+  assert.match(html, /1回限り使用できる/);
+  assert.match(html, /同じリンクの再利用・期限切れ・改ざんを自動で拒否/);
+  assert.doesNotMatch(html, /INTERVIEW_ADMIN_TOKEN|INTERVIEW_INVITE_SIGNING_SECRET/);
+});
+
 test("server-renders the selection-excluded portal check", async () => {
   const response = await render("/mobile-test");
   assert.equal(response.status, 200);
