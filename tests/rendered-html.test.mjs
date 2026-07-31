@@ -47,9 +47,9 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.match(html, /採用記録の照合と保存管理に使用します/);
   assert.match(html, /氏名を入力してください。/);
   assert.match(html, /入力した氏名は採用記録の照合と保存管理に使用します/);
-  assert.match(html, /同意してオンライン一次面接を開始/);
-  assert.match(html, /カメラ・マイクを許可/);
-  assert.match(html, /この画面を共有/);
+  assert.match(html, /カメラ・マイクを確認して開始/);
+  assert.match(html, /カメラとマイクの「許可」/);
+  assert.doesNotMatch(html, /この画面を共有/);
   assert.match(html, /当社が手動で削除するまで保管します/);
   assert.doesNotMatch(html, /社内確認環境|テスト名/);
   assert.match(html, /笑顔の有無、顔立ち・容姿/);
@@ -88,7 +88,7 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /data-testid="remote-audio-player"/);
   assert.match(source, /autoPlay\s+controls/);
   assert.match(source, /playSpeakerTest/);
-  assert.match(source, /オンライン一次面接の音声を準備しています/);
+  assert.match(source, /カメラとマイクを確認します/);
   assert.match(source, /readLatestInterviewerTurn/);
   assert.match(source, /queueRemoteAudioRecovery/);
   assert.match(source, /monitorAudioStats/);
@@ -112,7 +112,12 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /入力内容は端末内の画面確認だけに使用し、外部送信・保存・録画・文字起こし・採用評価を行っていません/);
   assert.match(source, /video\/mp4/);
   assert.match(source, /TD-CONN-RESPONSE/);
-  assert.match(source, /カメラ・マイクは開始していません/);
+  assert.match(source, /stage === "setup"/);
+  assert.match(source, /startMicrophoneMeter/);
+  assert.match(source, /stopRealtime\(\{ keepLocalStream: true \}\)/);
+  assert.match(source, /カメラとマイクは正常に確認できています/);
+  assert.match(source, /画面共有を追加（任意）/);
+  assert.match(source, /Line\|FBAN\|FBAV\|Instagram/);
   assert.match(source, /output_modalities: \["audio"\]/);
   assert.match(source, /自分の名前には敬称を付けず/);
   assert.match(styles, /\.remote-audio-player/);

@@ -151,6 +151,11 @@ select, .candidate-name-input { padding: 13px 14px; }
 .internal-test-button { width: 100%; margin-top: 11px; border: 1px solid rgba(0, 59, 99, .18); border-radius: 12px; padding: 12px 16px; background: white; color: var(--brand-navy); font-size: 10px; font-weight: 800; }
 .internal-test-button:hover { background: var(--brand-blue-soft); }
 .internal-test-note { margin: 7px 0 0; text-align: center; color: var(--muted); font-size: 8px; }
+.embedded-browser-notice { margin: 10px 0; border: 1px solid #e6b85f; border-radius: 14px; background: #fffaf0; padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.embedded-browser-notice > div { display: grid; gap: 4px; }
+.embedded-browser-notice strong { color: #744b08; font-size: 10px; }
+.embedded-browser-notice span { color: #826b43; font-size: 9px; line-height: 1.55; }
+.embedded-browser-notice button { flex: 0 0 auto; border: 1px solid rgba(116,75,8,.22); border-radius: 999px; background: white; color: #744b08; padding: 8px 11px; font-size: 9px; font-weight: 800; }
 
 .setup-layout { width: min(1120px, calc(100% - 48px)); margin: 0 auto; padding: 70px 0 110px; display: grid; grid-template-columns: .82fr 1.18fr; gap: 88px; align-items: center; }
 .text-button { border: 0; background: transparent; color: var(--muted); padding: 0; margin-bottom: 58px; font-size: 11px; }
@@ -160,12 +165,38 @@ select, .candidate-name-input { padding: 13px 14px; }
 .mode-note > span { min-width: 36px; height: 36px; display: grid; place-items: center; border-radius: 10px; background: var(--brand-blue); color: var(--brand-navy); font-weight: 900; font-size: 11px; }
 .mode-note p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.65; }
 .mode-note strong { display: block; color: var(--brand-navy); margin-bottom: 3px; }
-.device-card { border-radius: 28px; padding: 24px; }
+.device-card { border-radius: 28px; padding: 24px; background: white; box-shadow: var(--shadow); }
 .camera-preview { aspect-ratio: 16/9; border-radius: 20px; overflow: hidden; background: var(--brand-blue-soft); position: relative; }
 .camera-preview video, .candidate-preview video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
 .camera-empty { height: 100%; display: grid; place-content: center; justify-items: center; gap: 10px; color: var(--brand-navy); font-size: 10px; letter-spacing: .14em; }
 .camera-empty img { width: 100px; height: 100px; border-radius: 24px; object-fit: cover; opacity: .86; }
 .connection-ok { position: absolute; top: 14px; left: 14px; color: white; background: var(--success); border-radius: 999px; padding: 7px 10px; font-size: 9px; font-weight: 800; }
+.setup-status-card { margin-top: 28px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.72); padding: 14px 16px; display: flex; align-items: center; gap: 12px; }
+.setup-status-card > i { width: 11px; height: 11px; border-radius: 50%; background: var(--brand-blue); box-shadow: 0 0 0 6px rgba(184,218,236,.35); animation: statePulse 1.5s infinite; }
+.setup-status-card > div { display: grid; gap: 3px; }
+.setup-status-card strong { color: var(--brand-navy); font-size: 11px; }
+.setup-status-card span { color: var(--muted); font-size: 9px; }
+.setup-status-card.devices-ready > i { background: var(--success); animation: none; }
+.setup-status-card.error { border-color: rgba(169,69,69,.2); background: #fff7f7; }
+.setup-status-card.error > i { background: var(--danger); animation: none; box-shadow: 0 0 0 6px rgba(169,69,69,.1); }
+.microphone-meter { margin: 16px 0 12px; border: 1px solid var(--line); border-radius: 15px; padding: 13px 14px; }
+.microphone-meter > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.microphone-meter strong { color: var(--brand-navy); font-size: 10px; }
+.microphone-meter span, .microphone-meter small { color: var(--muted); font-size: 9px; }
+.microphone-meter small { display: block; margin-top: 7px; line-height: 1.45; }
+.meter-track { height: 8px; margin-top: 9px; border-radius: 999px; background: var(--brand-blue-soft); overflow: hidden; }
+.meter-track i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #5da9cf, var(--success)); transition: width .12s linear; }
+.device-check-list { margin-bottom: 13px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+.device-check-list > div { border-radius: 12px; background: var(--brand-blue-soft); padding: 10px 11px; display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; align-items: center; }
+.device-check-list i { grid-row: 1 / 3; width: 8px; height: 8px; border-radius: 50%; background: var(--brand-blue); animation: statePulse 1.6s infinite; }
+.device-check-list span { color: var(--muted); font-size: 8px; }
+.device-check-list strong { color: var(--brand-navy); font-size: 9px; }
+.device-check-list .passed i { background: var(--success); animation: none; }
+.device-check-list .failed i { background: var(--danger); animation: none; }
+.setup-recovery-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.setup-recovery-actions button { border: 1px solid rgba(0,59,99,.16); border-radius: 999px; background: white; color: var(--brand-navy); padding: 8px 12px; font-size: 9px; font-weight: 800; }
+.setup-connect-button { width: 100%; }
+.setup-footnote { margin: 10px 4px 0; color: var(--muted); text-align: center; font-size: 8px; line-height: 1.55; }
 .simple-switch { margin: 15px 0 !important; padding: 13px 15px; border-radius: 13px; background: var(--brand-blue-soft); display: flex !important; align-items: center; justify-content: space-between; }
 .simple-switch span { display: grid; gap: 3px; }
 .simple-switch strong { font-size: 11px; }
@@ -513,9 +544,15 @@ select, .candidate-name-input { padding: 13px 14px; }
   .feature-row div + div { border-left: 0; border-top: 1px solid var(--line); padding-left: 0; }
   .start-panel { padding: 25px 20px; }
   .connection-guide li { grid-template-columns: 1fr; gap: 3px; }
+  .embedded-browser-notice { align-items: stretch; flex-direction: column; }
+  .embedded-browser-notice button { width: 100%; }
   .panel-number { display: none; }
-  .setup-layout { padding-top: 40px; }
+  .setup-layout { padding: 30px 0 70px; gap: 28px; }
   .text-button { margin-bottom: 35px; }
+  .device-card { padding: 15px; border-radius: 22px; }
+  .camera-preview { border-radius: 15px; }
+  .setup-status-card { margin-top: 20px; }
+  .device-check-list { grid-template-columns: 1fr; }
   .device-actions { grid-template-columns: 1fr; }
   .interview-page { padding-top: 18px; }
   .interview-card { border-radius: 20px; }

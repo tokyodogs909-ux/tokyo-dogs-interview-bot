@@ -12,7 +12,7 @@ import {
   type TranscriptTurn,
 } from "@/lib/interview";
 
-type Stage = "intro" | "interview" | "evaluating" | "review";
+type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
 type InterviewMode = "voice" | "text" | "internal-test";
 type ConnectionState =
   | "idle"
@@ -28,6 +28,7 @@ type RemoteAudioState = "idle" | "waiting" | "receiving" | "playing" | "blocked"
 type NetworkAudioState = "idle" | "connecting" | "connected" | "reconnecting" | "error";
 type RecordingCaptureState = "idle" | "starting" | "recording" | "error";
 type SpeakerTestState = "idle" | "playing" | "passed" | "error";
+type SetupPhase = "idle" | "requesting" | "devices-ready" | "connecting" | "error";
 type RecordingAudioMix = {
   context: AudioContext;
   destination: MediaStreamAudioDestinationNode;
@@ -39,6 +40,11 @@ type RemotePlaybackGraph = {
   source: MediaStreamAudioSourceNode;
   gain: GainNode;
   streamId: string;
+};
+type MicrophoneMeter = {
+  source: MediaStreamAudioSourceNode;
+  analyser: AnalyserNode;
+  animationFrame: number;
 };
 
 type RealtimeEvent = {
@@ -157,6 +163,11 @@ export default function Home() {
   const [networkAudioState, setNetworkAudioState] = useState<NetworkAudioState>("idle");
   const [audioNotice, setAudioNotice] = useState("");
   const [speakerTestState, setSpeakerTestState] = useState<SpeakerTestState>("idle");
+  const [setupPhase, setSetupPhase] = useState<SetupPhase>("idle");
+  const [microphoneLevel, setMicrophoneLevel] = useState(0);
+  const [embeddedBrowser, setEmbeddedBrowser] = useState(false);
+  const [copiedPortalLink, setCopiedPortalLink] = useState(false);
+  const [screenShareSupported, setScreenShareSupported] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
@@ -175,6 +186,7 @@ export default function Home() {
   const recordingAudioMixRef = useRef<RecordingAudioMix | null>(null);
   const playbackAudioContextRef = useRef<AudioContext | null>(null);
   const remotePlaybackGraphRef = useRef<RemotePlaybackGraph | null>(null);
+  const microphoneMeterRef = useRef<MicrophoneMeter | null>(null);
   const playbackPrimeRef = useRef<{
     oscillator: OscillatorNode;
     gain: GainNode;
@@ -209,6 +221,17 @@ export default function Home() {
     streamRef.current = stream;
     if (videoRef.current) videoRef.current.srcObject = stream;
   }, [stream, stage]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      setEmbeddedBrowser(/(?:Line|FBAN|FBAV|Instagram)\//i.test(navigator.userAgent));
+      setScreenShareSupported(
+        typeof navigator.mediaDevices?.getDisplayMedia === "function" &&
+        window.matchMedia("(pointer: fine)").matches,
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
 
   useEffect(() => {
     if (stage !== "interview") return;
@@ -256,6 +279,7 @@ export default function Home() {
       if (statsTimerRef.current) window.clearInterval(statsTimerRef.current);
       playbackRetryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
       cleanupRecordingAudioMix();
+      stopMicrophoneMeter();
       disconnectRemoteSpeaker();
       stopAudioPrime();
       void recordingAudioContextRef.current?.close();
@@ -269,6 +293,90 @@ export default function Home() {
       playbackAudioContextRef.current = new AudioContext();
     }
     return playbackAudioContextRef.current;
+  }
+
+  function playStartupChime(updateSpeakerTest = false) {
+    try {
+      const context = getPlaybackAudioContext();
+      if (updateSpeakerTest) setSpeakerTestState("playing");
+      void context.resume().then(() => {
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(660, context.currentTime);
+        oscillator.frequency.setValueAtTime(880, context.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.0001, context.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.12, context.currentTime + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.22);
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+        oscillator.start(context.currentTime);
+        oscillator.stop(context.currentTime + 0.24);
+        oscillator.addEventListener("ended", () => {
+          oscillator.disconnect();
+          gain.disconnect();
+          if (updateSpeakerTest) setSpeakerTestState("passed");
+        }, { once: true });
+      }).catch(() => {
+        if (updateSpeakerTest) setSpeakerTestState("error");
+      });
+    } catch {
+      if (updateSpeakerTest) setSpeakerTestState("error");
+      // The spoken confirmation and remote-audio recovery button remain available.
+    }
+  }
+
+  function stopMicrophoneMeter() {
+    const meter = microphoneMeterRef.current;
+    if (!meter) return;
+    window.cancelAnimationFrame(meter.animationFrame);
+    try {
+      meter.source.disconnect();
+      meter.analyser.disconnect();
+    } catch {
+      // The audio graph can already be disconnected after an iOS audio-session reset.
+    }
+    microphoneMeterRef.current = null;
+    setMicrophoneLevel(0);
+  }
+
+  async function startMicrophoneMeter(activeStream: MediaStream) {
+    stopMicrophoneMeter();
+    const audioTrack = activeStream.getAudioTracks()[0];
+    if (!audioTrack) return;
+    try {
+      let context = recordingAudioContextRef.current;
+      if (!context || context.state === "closed") {
+        context = new AudioContext();
+        recordingAudioContextRef.current = context;
+      }
+      if (context.state !== "running") await context.resume();
+      const source = context.createMediaStreamSource(new MediaStream([audioTrack]));
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.72;
+      source.connect(analyser);
+      const samples = new Uint8Array(analyser.fftSize);
+      const meter: MicrophoneMeter = { source, analyser, animationFrame: 0 };
+      const update = () => {
+        analyser.getByteTimeDomainData(samples);
+        let sum = 0;
+        for (const sample of samples) {
+          const normalized = (sample - 128) / 128;
+          sum += normalized * normalized;
+        }
+        const rms = Math.sqrt(sum / samples.length);
+        const level = Math.min(100, Math.round(rms * 520));
+        setMicrophoneLevel((current) => Math.abs(current - level) >= 2 ? level : current);
+        if (level >= 4) setCandidateAudioState("detected");
+        else if (audioTrack.enabled && !audioTrack.muted) setCandidateAudioState("ready");
+        meter.animationFrame = window.requestAnimationFrame(update);
+      };
+      microphoneMeterRef.current = meter;
+      update();
+    } catch {
+      setMicrophoneLevel(0);
+    }
   }
 
   function stopAudioPrime() {
@@ -400,7 +508,18 @@ export default function Home() {
   function playSpeakerTest() {
     setSpeakerTestState("playing");
     primeRemoteAudioPlayback();
+    playStartupChime(true);
     speakOnDevice("音声テストです。オンライン採用担当者の茂木です。音声が聞こえていれば準備は完了です。", true);
+  }
+
+  async function copyPortalLink() {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      setCopiedPortalLink(true);
+      window.setTimeout(() => setCopiedPortalLink(false), 2_000);
+    } catch {
+      setCopiedPortalLink(false);
+    }
   }
 
   function readLatestInterviewerTurn() {
@@ -818,6 +937,105 @@ export default function Home() {
     setRecordingCaptureState("recording");
   }
 
+  function deviceErrorMessage(error: unknown) {
+    const name = error instanceof DOMException ? error.name : "";
+    if (name === "NotAllowedError" || name === "SecurityError") {
+      return embeddedBrowser
+        ? "TD-CONN-MEDIA: この画面内ではカメラ・マイクを開始できませんでした。右上または右下のメニューから、端末の標準ブラウザで開いてください。"
+        : "TD-CONN-MEDIA: ブラウザのサイト設定から、カメラとマイクを「許可」にしてもう一度お試しください。";
+    }
+    if (name === "NotFoundError") return "TD-CONN-MEDIA: 使用できるカメラまたはマイクが見つかりません。端末の設定をご確認ください。";
+    if (name === "NotReadableError") return "TD-CONN-MEDIA: カメラまたはマイクをほかのアプリが使用しています。通話・撮影アプリを閉じてもう一度お試しください。";
+    if (error instanceof Error && (error.message.startsWith("オンライン一次面接") || error.message.startsWith("TD-CONN"))) return error.message;
+    return "TD-CONN-MEDIA: カメラとマイクを開始できませんでした。「許可」を選び、もう一度お試しください。";
+  }
+
+  async function enableScreenCapture() {
+    if (typeof navigator.mediaDevices?.getDisplayMedia !== "function") {
+      setScreenCaptureState("unavailable");
+      return;
+    }
+    try {
+      displayStreamRef.current?.getTracks().forEach((track) => track.stop());
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 15, max: 20 } },
+        audio: false,
+      });
+      displayStreamRef.current = displayStream;
+      setScreenCaptureState("ready");
+      displayStream.getVideoTracks()[0]?.addEventListener("ended", () => {
+        displayStreamRef.current = null;
+        setScreenCaptureState("ended");
+      });
+    } catch {
+      setScreenCaptureState("unavailable");
+    }
+  }
+
+  async function connectPreparedInterview() {
+    const activeStream = streamRef.current;
+    if (!activeStream || sessionStarting) return;
+    const preferredLocation = normalizePreferredLocation(location);
+    if (!preferredLocation) return;
+    setSessionStarting(true);
+    setSetupPhase("connecting");
+    setConnectionState("connecting");
+    setConnectionStep("session");
+    setNetworkAudioState("connecting");
+    setRemoteAudioState("waiting");
+    setErrorMessage("");
+    try {
+      const healthController = new AbortController();
+      const healthTimeout = window.setTimeout(() => healthController.abort(), 8_000);
+      let healthResponse: Response;
+      try {
+        healthResponse = await fetch("/api/health", { cache: "no-store", signal: healthController.signal });
+      } finally {
+        window.clearTimeout(healthTimeout);
+      }
+      if (!healthResponse.ok) {
+        throw new Error("オンライン一次面接の音声回線は現在準備中です。カメラとマイクは正常に確認できています。採用担当者からの案内後、この画面で再接続してください。");
+      }
+
+      let activeSessionId = sessionIdRef.current;
+      let activeAccessToken = accessTokenRef.current;
+      if (!activeSessionId || activeSessionId === "TD-PENDING" || !activeAccessToken) {
+        const response = await fetch("/api/interviews/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            candidateName,
+            employment,
+            location: preferredLocation,
+            consent: true,
+            inviteToken: new URLSearchParams(window.location.search).get("invite")?.trim() ?? "",
+          }),
+        });
+        const data = (await response.json()) as { sessionId?: string; accessToken?: string; error?: string };
+        if (!response.ok || !data.sessionId || !data.accessToken) {
+          throw new Error(data.error || "オンライン一次面接の記録を準備できませんでした。");
+        }
+        activeSessionId = data.sessionId;
+        activeAccessToken = data.accessToken;
+        accessTokenRef.current = activeAccessToken;
+        sessionIdRef.current = activeSessionId;
+        setSessionId(activeSessionId);
+      }
+      await connectRealtime("voice", { sessionId: activeSessionId, accessToken: activeAccessToken });
+    } catch (error) {
+      setStage("setup");
+      setSetupPhase("error");
+      setConnectionState("error");
+      setNetworkAudioState("error");
+      setRemoteAudioState("waiting");
+      setErrorMessage(error instanceof DOMException && error.name === "AbortError"
+        ? "オンライン一次面接の音声回線が応答していません。カメラとマイクは確認済みです。通信を確認して再接続してください。"
+        : error instanceof Error ? error.message : "オンライン一次面接の音声回線へ接続できませんでした。");
+    } finally {
+      setSessionStarting(false);
+    }
+  }
+
   async function prepareInterview() {
     if (!consent || sessionStarting) return;
     if (!candidateName.trim()) {
@@ -830,31 +1048,26 @@ export default function Home() {
       return;
     }
     setLocation(preferredLocation);
-    primeRemoteAudioPlayback();
-    speakOnDevice("オンライン一次面接の音声を準備しています。カメラとマイクの許可画面をご確認ください。", false, true);
+    setStage("setup");
+    setSetupPhase("requesting");
     setSessionStarting(true);
     setErrorMessage("");
     setAudioNotice("");
     setConnectionStep("permissions");
     setScreenCaptureState("idle");
+    setMicrophoneLevel(0);
     setRecordingCaptureState("idle");
     setRecordingHasBothAudio(null);
     setCandidateAudioState("checking");
     setRemoteAudioState("waiting");
-    setNetworkAudioState("connecting");
+    setNetworkAudioState("idle");
+    primeRemoteAudioPlayback();
+    playStartupChime(true);
+    speakOnDevice("カメラとマイクを確認します。表示された許可画面で、許可を選んでください。", true, true);
     let nextStream: MediaStream | null = null;
-    let nextDisplayStream: MediaStream | null = null;
     try {
-      const healthController = new AbortController();
-      const healthTimeout = window.setTimeout(() => healthController.abort(), 8_000);
-      let healthResponse: Response;
-      try {
-        healthResponse = await fetch("/api/health", { cache: "no-store", signal: healthController.signal });
-      } finally {
-        window.clearTimeout(healthTimeout);
-      }
-      if (!healthResponse.ok) {
-        throw new Error("オンライン一次面接は現在準備中です。カメラ・マイクは開始していません。採用担当者からの案内後にもう一度お試しください。");
+      if (!window.isSecureContext || typeof navigator.mediaDevices?.getUserMedia !== "function") {
+        throw new Error("TD-CONN-MEDIA: この画面ではカメラ・マイク機能を利用できません。端末の標準ブラウザで開いてください。");
       }
       try {
         if (!recordingAudioContextRef.current || recordingAudioContextRef.current.state === "closed") {
@@ -864,53 +1077,21 @@ export default function Home() {
           void recordingAudioContextRef.current.resume().catch(() => undefined);
         }
       } catch {
-        // Recording can continue with the local track if Web Audio is unavailable.
+        // Camera preview remains available when Web Audio is unavailable.
       }
-      let acceptDisplayStream = true;
-      const rawDisplayPromise = typeof navigator.mediaDevices.getDisplayMedia === "function"
-        ? navigator.mediaDevices.getDisplayMedia({
-          video: { frameRate: { ideal: 15, max: 20 } },
-          audio: false,
-        })
-        : Promise.resolve(null);
-      let displayTimeout = 0;
-      const displayPromise = new Promise<MediaStream | null>((resolve) => {
-        displayTimeout = window.setTimeout(() => {
-          acceptDisplayStream = false;
-          setScreenCaptureState("unavailable");
-          resolve(null);
-        }, 15_000);
-        rawDisplayPromise.then((displayStream) => {
-          if (!acceptDisplayStream) {
-            displayStream?.getTracks().forEach((track) => track.stop());
-            return;
-          }
-          window.clearTimeout(displayTimeout);
-          resolve(displayStream);
-        }).catch(() => {
-          window.clearTimeout(displayTimeout);
-          setScreenCaptureState("unavailable");
-          resolve(null);
-        });
-      });
-      const mediaPromise = navigator.mediaDevices.getUserMedia({
+      nextStream = await navigator.mediaDevices.getUserMedia({
         audio: AUDIO_CONSTRAINTS,
-        video: { facingMode: "user" },
+        video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 540 } },
       });
-      try {
-        nextStream = await mediaPromise;
-      } catch (mediaError) {
-        acceptDisplayStream = false;
-        window.clearTimeout(displayTimeout);
-        void rawDisplayPromise.then((displayStream) => {
-          displayStream?.getTracks().forEach((track) => track.stop());
-        }).catch(() => undefined);
-        throw mediaError;
-      }
-      nextDisplayStream = await displayPromise;
       const microphoneTrack = nextStream.getAudioTracks()[0];
-      if (!microphoneTrack) throw new Error("TD-CONN-MEDIA: 使用できるマイクが見つかりません。端末の設定をご確認ください。");
+      const cameraTrack = nextStream.getVideoTracks()[0];
+      if (!microphoneTrack || !cameraTrack) throw new Error("TD-CONN-MEDIA: カメラまたはマイクを確認できませんでした。端末の設定をご確認ください。");
+      streamRef.current = nextStream;
+      setStream(nextStream);
       setCandidateAudioState(microphoneTrack.muted ? "checking" : "ready");
+      setSetupPhase("devices-ready");
+      await startMicrophoneMeter(nextStream);
+      speakOnDevice("カメラとマイクを確認しました。オンライン一次面接へ接続します。", false, true);
       microphoneTrack.addEventListener("mute", () => {
         if (!endingRef.current) {
           setCandidateAudioState("error");
@@ -922,68 +1103,26 @@ export default function Home() {
         setAudioNotice("");
       });
       microphoneTrack.addEventListener("ended", () => {
-        if (!endingRef.current && peerRef.current) {
+        if (!endingRef.current) {
+          stopMicrophoneMeter();
           setCandidateAudioState("error");
-          setConnectionState("error");
-          setErrorMessage("TD-CONN-MIC: マイク接続が終了しました。端末の設定を確認し、接続をやり直してください。");
+          setSetupPhase("error");
+          setErrorMessage("TD-CONN-MIC: マイク接続が終了しました。端末の設定を確認し、最初からやり直してください。");
         }
-      });
-
-      setConnectionStep("session");
-      const response = await fetch("/api/interviews/session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          candidateName,
-          employment,
-          location: preferredLocation,
-          consent: true,
-          inviteToken: new URLSearchParams(window.location.search).get("invite")?.trim() ?? "",
-        }),
-      });
-      const data = (await response.json()) as {
-        sessionId?: string;
-        accessToken?: string;
-        error?: string;
-      };
-      if (!response.ok || !data.sessionId || !data.accessToken) {
-        throw new Error(data.error || "オンライン一次面接の準備を完了できませんでした。");
-      }
-      accessTokenRef.current = data.accessToken;
-      sessionIdRef.current = data.sessionId;
-      setSessionId(data.sessionId);
-      streamRef.current = nextStream;
-      setStream(nextStream);
-      if (nextDisplayStream) {
-        displayStreamRef.current = nextDisplayStream;
-        setScreenCaptureState("ready");
-        const displayTrack = nextDisplayStream.getVideoTracks()[0];
-        displayTrack?.addEventListener("ended", () => {
-          setScreenCaptureState("ended");
-          setErrorMessage("画面共有が終了しました。オンライン一次面接のカメラ・マイク録画は継続します。");
-        });
-      }
-      await connectRealtime("voice", {
-        sessionId: data.sessionId,
-        accessToken: data.accessToken,
       });
     } catch (error) {
       nextStream?.getTracks().forEach((track) => track.stop());
-      nextDisplayStream?.getTracks().forEach((track) => track.stop());
-      displayStreamRef.current = null;
+      streamRef.current = null;
       setStream(null);
       setStage("intro");
-      const name = error instanceof DOMException ? error.name : "";
-      setErrorMessage(name === "NotAllowedError"
-        ? "TD-CONN-MEDIA: Safariのアドレスバー左の設定から、カメラとマイクを「許可」にして再度お試しください。"
-        : name === "NotFoundError"
-          ? "TD-CONN-MEDIA: 使用できるカメラまたはマイクが見つかりません。端末の設定をご確認ください。"
-          : error instanceof Error && (error.message.startsWith("オンライン一次面接") || error.message.startsWith("TD-CONN"))
-            ? error.message
-            : "TD-CONN-MEDIA: カメラとマイクを開始できませんでした。「許可」を選び、もう一度お試しください。");
-    } finally {
+      setSetupPhase("error");
+      setCandidateAudioState("error");
+      setErrorMessage(deviceErrorMessage(error));
       setSessionStarting(false);
+      return;
     }
+    setSessionStarting(false);
+    await connectPreparedInterview();
   }
 
   function startInternalTest() {
@@ -1008,7 +1147,7 @@ export default function Home() {
     setStage("interview");
   }
 
-  function stopRealtime() {
+  function stopRealtime(options: { keepLocalStream?: boolean } = {}) {
     clearResponseWatchdog();
     clearCandidateResponseDelay();
     responseWaitingRef.current = false;
@@ -1026,7 +1165,9 @@ export default function Home() {
     const activeChannel = channelRef.current;
     channelRef.current = null;
     activeChannel?.close();
-    peerRef.current?.getSenders().forEach((sender) => sender.track?.stop());
+    if (!options.keepLocalStream) {
+      peerRef.current?.getSenders().forEach((sender) => sender.track?.stop());
+    }
     peerRef.current?.close();
     peerRef.current = null;
     if (disconnectTimerRef.current) window.clearTimeout(disconnectTimerRef.current);
@@ -1049,7 +1190,11 @@ export default function Home() {
     } else {
       cleanupRecordingAudioMix();
     }
-    streamRef.current?.getTracks().forEach((track) => track.stop());
+    if (!options.keepLocalStream) {
+      stopMicrophoneMeter();
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      setStream(null);
+    }
     displayStreamRef.current?.getTracks().forEach((track) => track.stop());
     remoteStreamRef.current?.getTracks().forEach((track) => track.stop());
     remoteStreamRef.current = null;
@@ -1058,7 +1203,6 @@ export default function Home() {
       remoteAudioRef.current.srcObject = null;
     }
     displayStreamRef.current = null;
-    setStream(null);
   }
 
   async function requestEvaluation() {
@@ -1330,17 +1474,17 @@ export default function Home() {
 
       const peer = new RTCPeerConnection();
       peerRef.current = peer;
-      if (selectedMode === "voice" && activeStream) {
-        await startRecording(activeStream, displayStreamRef.current, remoteStreamRef.current);
-      }
       const failActiveConnection = (message: string) => {
         if (endingRef.current || peerRef.current !== peer) return;
         reportCandidateEvent("connection_failed", message.split(":")[0]);
-        stopRealtime();
+        stopRealtime({ keepLocalStream: true });
+        if (streamRef.current) void startMicrophoneMeter(streamRef.current);
+        setStage("setup");
+        setSetupPhase("error");
         setConnectionState("error");
         setNetworkAudioState("error");
-        setCandidateAudioState("error");
-        setRemoteAudioState("error");
+        setCandidateAudioState(streamRef.current ? "ready" : "error");
+        setRemoteAudioState("waiting");
         setAudioNotice("");
         setErrorMessage(message);
       };
@@ -1425,6 +1569,7 @@ export default function Home() {
       channel.onopen = () => {
         if (channelOpenTimerRef.current) window.clearTimeout(channelOpenTimerRef.current);
         channelOpenTimerRef.current = null;
+        stopMicrophoneMeter();
         setConnectionState("ready");
         setConnectionStep("ready");
         setNetworkAudioState("connected");
@@ -1470,12 +1615,18 @@ export default function Home() {
           : "TD-CONN-VOICE: 音声通話を開始できませんでした。Wi-Fiと4G/5Gを切り替えて、最初からお試しください。");
       }
       await peer.setRemoteDescription({ type: "answer", sdp: await sdpResponse.text() });
+      if (selectedMode === "voice" && activeStream) {
+        await startRecording(activeStream, displayStreamRef.current, remoteStreamRef.current);
+      }
     } catch (error) {
-      stopRealtime();
+      stopRealtime({ keepLocalStream: true });
+      if (streamRef.current) void startMicrophoneMeter(streamRef.current);
+      setStage("setup");
+      setSetupPhase("error");
       setConnectionState("error");
       setNetworkAudioState("error");
-      setCandidateAudioState("error");
-      setRemoteAudioState("error");
+      setCandidateAudioState(streamRef.current ? "ready" : "error");
+      setRemoteAudioState("waiting");
       setErrorMessage(error instanceof DOMException && error.name === "AbortError"
         ? "TD-CONN-TIMEOUT: 音声回線への接続がタイムアウトしました。通信環境を確認して最初からお試しください。"
         : error instanceof Error ? error.message : "オンライン一次面接を開始できませんでした。");
@@ -1562,6 +1713,8 @@ export default function Home() {
     setRecordingCaptureState("idle");
     setRecordingHasBothAudio(null);
     setScreenCaptureState("idle");
+    setSetupPhase("idle");
+    setMicrophoneLevel(0);
     setCandidateAudioState("idle");
     setRemoteAudioState("idle");
     setNetworkAudioState("idle");
@@ -1585,6 +1738,8 @@ export default function Home() {
     setRecordingUploadState("idle");
     setRecordingCaptureState("idle");
     setScreenCaptureState("idle");
+    setSetupPhase("idle");
+    setMicrophoneLevel(0);
     setCandidateAudioState("idle");
     setRemoteAudioState("idle");
     setNetworkAudioState("idle");
@@ -1757,22 +1912,70 @@ export default function Home() {
                     ? "✓ 氏名、入職希望対象店舗、同意が確認されました。面接を開始できます。"
                     : "上の同意欄を押してチェックしてください。"}
             </p>
+            {embeddedBrowser && (
+              <div className="embedded-browser-notice" role="status">
+                <div><strong>SafariまたはChromeで開いてください</strong><span>LINE内の画面では、カメラや音声が止まることがあります。リンクをコピーし、端末の標準ブラウザで開いてください。</span></div>
+                <button type="button" onClick={() => void copyPortalLink()}>{copiedPortalLink ? "コピーしました" : "リンクをコピー"}</button>
+              </div>
+            )}
             <div className={`speaker-test ${speakerTestState}`}>
               <div><strong>端末の音声を確認</strong><span>{speakerTestState === "playing" ? "音声を再生しています" : speakerTestState === "passed" ? "確認音声を再生しました" : speakerTestState === "error" ? "端末の音量設定をご確認ください" : "開始前に茂木の確認音声を聞けます"}</span></div>
               <button type="button" onClick={playSpeakerTest}>{speakerTestState === "idle" ? "音声を確認" : "もう一度聞く"}</button>
             </div>
             <ol className="connection-guide">
               <li><strong>1. 同意欄をチェック</strong><span>録画・文字起こし・選考利用の内容を確認して、同意欄を押します。</span></li>
-              <li><strong>2. カメラ・マイクを許可</strong><span>ブラウザの確認画面で「許可」を選びます。</span></li>
-              <li><strong>3. この画面を共有</strong><span>共有の確認画面が表示された場合は、この面接画面を選びます。その後、オンライン一次面接と録画が始まります。</span></li>
+              <li><strong>2. 開始ボタンを押す</strong><span>表示される確認画面で、カメラとマイクの「許可」を選びます。</span></li>
+              <li><strong>3. 自動確認後に面接開始</strong><span>映像とマイク入力をこの画面で確認し、そのままオンライン一次面接へ接続します。</span></li>
             </ol>
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
             <button className="primary-action" disabled={!candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting} onClick={() => void prepareInterview()}>
-              {sessionStarting ? "オンライン一次面接を準備中…" : "同意してオンライン一次面接を開始"} <span>→</span>
+              {sessionStarting ? "カメラ・マイクを確認中…" : "カメラ・マイクを確認して開始"} <span>→</span>
             </button>
             <button className="internal-test-button" onClick={startInternalTest}>接続確認（選考対象外）</button>
             <p className="internal-test-note">録画・音声接続・採用評価を行わず、文字入力で面接画面の操作を確認します。</p>
             <p className="fine-print">推奨ブラウザは最新版のSafariまたはChromeです。氏名と採用選考に必要な回答以外の個人情報は入力しないでください。</p>
+          </div>
+        </section>
+      )}
+
+      {stage === "setup" && (
+        <section className="setup-layout">
+          <div className="setup-copy">
+            <button className="text-button" onClick={restartConnection}>← 入力画面に戻る</button>
+            <p className="eyebrow">DEVICE CHECK</p>
+            <h1>映像と音声を、<br />この画面で確認。</h1>
+            <p>自分の映像が表示され、声に合わせてメーターが動けば端末の準備は完了です。接続失敗時も、カメラとマイクはそのまま確認できます。</p>
+            <div className={`setup-status-card ${setupPhase}`} role="status">
+              <i />
+              <div><strong>{setupPhase === "requesting" ? "カメラとマイクの許可待ち" : setupPhase === "connecting" ? "安全な面接回線へ接続中" : setupPhase === "error" ? "端末の準備は完了・回線を再確認" : "カメラとマイクを確認済み"}</strong><span>{connectionStepCopy || "面接開始の準備が整いました。"}</span></div>
+            </div>
+          </div>
+
+          <div className="device-card">
+            <div className="camera-preview">
+              {stream ? <video ref={videoRef} autoPlay muted playsInline /> : <div className="camera-empty"><img src="/tokyo-dogs-logo.jpg" alt="" /><span>カメラの許可を待っています</span></div>}
+              {stream && <span className="connection-ok">カメラ接続済み</span>}
+            </div>
+            <div className="microphone-meter" aria-label="マイク入力レベル">
+              <div><strong>マイク入力</strong><span>{candidateAudioCopy}</span></div>
+              <div className="meter-track"><i style={{ width: `${Math.max(stream ? 4 : 0, microphoneLevel)}%` }} /></div>
+              <small>話しかけると、声に合わせてメーターが動きます。</small>
+            </div>
+            <div className="device-check-list">
+              <div className={stream?.getVideoTracks().some((track) => track.readyState === "live") ? "passed" : "checking"}><i /><span>カメラ</span><strong>{stream ? "映像を受信中" : "許可待ち"}</strong></div>
+              <div className={candidateAudioState === "detected" ? "passed" : stream ? "checking" : "checking"}><i /><span>マイク</span><strong>{candidateAudioState === "detected" ? "声を確認済み" : stream ? "声を確認中" : "許可待ち"}</strong></div>
+              <div className={speakerTestState === "passed" ? "passed" : "checking"}><i /><span>スピーカー</span><strong>{speakerTestState === "passed" ? "確認音を再生済み" : "自動再生を確認中"}</strong></div>
+              <div className={networkAudioState === "connected" ? "passed" : networkAudioState === "error" ? "failed" : "checking"}><i /><span>面接回線</span><strong>{networkAudioCopy}</strong></div>
+            </div>
+            {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
+            <div className="setup-recovery-actions">
+              <button type="button" onClick={playSpeakerTest}>確認音を再生</button>
+              {screenShareSupported && <button type="button" onClick={() => void enableScreenCapture()}>{screenCaptureState === "ready" ? "画面共有を追加済み" : "画面共有を追加（任意）"}</button>}
+            </div>
+            <button className="primary-action setup-connect-button" disabled={!stream || sessionStarting} onClick={() => void connectPreparedInterview()}>
+              {sessionStarting ? "オンライン一次面接へ接続中…" : setupPhase === "error" ? "面接回線へ再接続" : "オンライン一次面接へ接続"} <span>→</span>
+            </button>
+            <p className="setup-footnote">カメラ映像と音声の確認後に録画を開始します。画面共有はPCのみ任意で追加できます。</p>
           </div>
         </section>
       )}
