@@ -42,6 +42,8 @@ type ReviewRecord = {
     folderUrl: string | null;
     errorCode: string | null;
     updatedAt: string;
+    recordingIncluded: boolean;
+    archivedArtifactCount: number;
   } | null;
 };
 
@@ -158,7 +160,7 @@ export default function StaffReviewPage() {
       });
       const data = (await response.json()) as {
         synced?: boolean;
-        result?: { status: "completed" | "pending"; folderUrl: string };
+        result?: { status: "completed" | "pending"; folderUrl: string; recordingIncluded: boolean; uploaded: Record<string, unknown> };
         error?: string;
       };
       if (!response.ok || !data.result) throw new Error(data.error || "Google Driveへの格納を完了できませんでした。");
@@ -169,11 +171,15 @@ export default function StaffReviewPage() {
           folderUrl: data.result?.folderUrl ?? null,
           errorCode: null,
           updatedAt: new Date().toISOString(),
+          recordingIncluded: data.result?.recordingIncluded === true,
+          archivedArtifactCount: Object.keys(data.result?.uploaded ?? {}).length,
         },
       } : current);
       setState("ready");
       setMessage(data.result.status === "completed"
-        ? "Google Driveへの格納とPDF作成を完了しました。"
+        ? data.result.recordingIncluded
+          ? "Google Driveへの録画・文字起こし・評価・PDFの格納を完了しました。"
+          : "文字起こし・評価・PDFを格納しましたが、録画はまだ格納されていません。録画保存状態を確認してください。"
         : "Google Driveへの再格納を予約しました。");
     } catch (error) {
       setState("ready");
@@ -212,7 +218,7 @@ export default function StaffReviewPage() {
             <p>面接完了後、応募者氏名と面接IDの専用フォルダへ、録画・文字起こし・評価データ・PDFレポート・格納結果を保存します。同じ面接IDで再実行しても既存ファイルを更新します。</p>
             <div className="drive-sync-actions">
               <span className={`drive-sync-status drive-sync-${review.driveSync?.status ?? "not-started"}`}>
-                {review.driveSync?.status === "completed" ? "格納完了"
+                {review.driveSync?.status === "completed" ? review.driveSync.recordingIncluded ? "録画を含め格納完了" : "録画未格納"
                   : review.driveSync?.status === "running" ? "格納中"
                     : review.driveSync?.status === "pending" ? "格納待ち"
                       : review.driveSync?.status === "failed" ? "要再実行"
@@ -224,6 +230,8 @@ export default function StaffReviewPage() {
               </button>
             </div>
             {review.driveSync?.status === "failed" && <p className="guardrail-copy">認証・保存先・通信状態を確認し、再実行してください。応募者の評価状態には影響しません。</p>}
+            {review.driveSync?.status === "completed" && !review.driveSync.recordingIncluded && <p className="guardrail-copy"><strong>録画はDriveへ格納されていません。</strong> 文字起こし・評価・PDFのみ格納済みです。録画状態が「stored」になった後に再格納してください。</p>}
+            {review.driveSync?.status === "completed" && review.driveSync.recordingIncluded && <p className="guardrail-copy">録画を含む{review.driveSync.archivedArtifactCount}種類の格納結果をDrive側で再照合済みです。</p>}
           </section>
 
           {review.technicalEvents.length > 0 && <div className="staff-message"><strong>技術・中断フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>これらの事象と映像・音声品質は、応募者の不利益な評価に使用しません。</p></div>}

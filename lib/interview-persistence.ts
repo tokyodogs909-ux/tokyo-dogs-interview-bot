@@ -435,6 +435,8 @@ export type ExternalSyncStatus = {
   updatedAt: string;
 };
 
+const EXTERNAL_SYNC_STALE_AFTER_MS = 15 * 60 * 1_000;
+
 type ExternalSyncRow = {
   provider: string;
   status: string;
@@ -491,6 +493,17 @@ export async function requestExternalSync(sessionId: string) {
     status = CASE WHEN interview_external_syncs.status = 'running' THEN 'running' ELSE 'pending' END,
     updated_at = excluded.updated_at`)
     .bind(sessionId, now, now).run();
+  const staleBefore = new Date(Date.now() - EXTERNAL_SYNC_STALE_AFTER_MS).toISOString();
+  const recovered = await db.prepare(`UPDATE interview_external_syncs SET
+    status = 'pending', started_at = NULL, completed_at = NULL,
+    error_code = NULL, updated_at = ?
+    WHERE session_id = ? AND provider = 'google_drive' AND status = 'running'
+      AND started_at IS NOT NULL AND started_at <= ?`)
+    .bind(now, sessionId, staleBefore).run();
+  if (Number(recovered.meta?.changes ?? 0) === 1) {
+    await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'google_drive_sync_stale_recovered', 'system', ?)")
+      .bind(crypto.randomUUID(), sessionId, JSON.stringify({ staleBefore })).run();
+  }
   return now;
 }
 
@@ -641,6 +654,10 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     .bind(sessionId)
     .all<Record<string, unknown>>();
   const driveSync = await getExternalSyncStatus(sessionId);
+  const manifestFiles = driveSync?.manifest?.files;
+  const archivedArtifactCount = manifestFiles && typeof manifestFiles === "object" && !Array.isArray(manifestFiles)
+    ? Object.keys(manifestFiles).length
+    : 0;
   await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'review_opened', 'recruiter', ?)")
     .bind(crypto.randomUUID(), sessionId, JSON.stringify({ reviewer })).run();
   return {
@@ -667,7 +684,11 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
       detail: parseJson<Record<string, unknown>>(event.detail_json, {}),
       createdAt: event.created_at,
     })),
-    driveSync,
+    driveSync: driveSync ? {
+      ...driveSync,
+      recordingIncluded: driveSync.manifest?.recordingIncluded === true,
+      archivedArtifactCount,
+    } : null,
   };
 }
 

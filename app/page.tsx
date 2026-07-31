@@ -845,6 +845,17 @@ export default function Home() {
     let nextStream: MediaStream | null = null;
     let nextDisplayStream: MediaStream | null = null;
     try {
+      const healthController = new AbortController();
+      const healthTimeout = window.setTimeout(() => healthController.abort(), 8_000);
+      let healthResponse: Response;
+      try {
+        healthResponse = await fetch("/api/health", { cache: "no-store", signal: healthController.signal });
+      } finally {
+        window.clearTimeout(healthTimeout);
+      }
+      if (!healthResponse.ok) {
+        throw new Error("オンライン一次面接は現在準備中です。カメラ・マイクは開始していません。採用担当者からの案内後にもう一度お試しください。");
+      }
       try {
         if (!recordingAudioContextRef.current || recordingAudioContextRef.current.state === "closed") {
           recordingAudioContextRef.current = new AudioContext();

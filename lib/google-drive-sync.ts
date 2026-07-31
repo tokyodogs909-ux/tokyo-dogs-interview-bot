@@ -18,6 +18,7 @@ import {
 const FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
 const DRIVE_PROVIDER = "google_drive";
+const TRANSIENT_DRIVE_RETRY_DELAY_MS = 600;
 
 type DriveFile = {
   id: string;
@@ -42,6 +43,17 @@ export type GoogleDriveSyncResult = {
 function safeErrorCode(error: unknown) {
   const code = error instanceof Error ? error.message : "GOOGLE_DRIVE_SYNC_FAILED";
   return /^[A-Z0-9_:-]{3,120}$/.test(code) ? code.slice(0, 120) : "GOOGLE_DRIVE_SYNC_FAILED";
+}
+
+function isTransientDriveError(error: unknown) {
+  const code = safeErrorCode(error);
+  return /^(?:GOOGLE_DRIVE_(?:API|EXPORT|RESUMABLE_INIT|RESUMABLE_UPLOAD)_)(?:429|500|502|503|504)$/.test(code) ||
+    code === "GOOGLE_DRIVE_TOKEN_REFRESH_FAILED" ||
+    code === "GOOGLE_DRIVE_ROOT_LOOKUP_FAILED";
+}
+
+function wait(milliseconds: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function driveQueryValue(value: string) {
@@ -515,10 +527,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
   };
 }
 
-export async function syncInterviewToGoogleDrive(sessionId: string): Promise<GoogleDriveSyncResult> {
-  if ((await missingGoogleDriveConfiguration()).length > 0) {
-    throw new Error("GOOGLE_DRIVE_CONFIGURATION_MISSING");
-  }
+async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<GoogleDriveSyncResult> {
   await requestExternalSync(sessionId);
   let lastCompleted: GoogleDriveSyncResult | null = null;
   for (let pass = 0; pass < 2; pass += 1) {
@@ -558,6 +567,19 @@ export async function syncInterviewToGoogleDrive(sessionId: string): Promise<Goo
   }
   if (lastCompleted) return { ...lastCompleted, status: "pending" };
   throw new Error("GOOGLE_DRIVE_SYNC_DEFERRED");
+}
+
+export async function syncInterviewToGoogleDrive(sessionId: string): Promise<GoogleDriveSyncResult> {
+  if ((await missingGoogleDriveConfiguration()).length > 0) {
+    throw new Error("GOOGLE_DRIVE_CONFIGURATION_MISSING");
+  }
+  try {
+    return await syncInterviewToGoogleDriveOnce(sessionId);
+  } catch (error) {
+    if (!isTransientDriveError(error)) throw error;
+    await wait(TRANSIENT_DRIVE_RETRY_DELAY_MS);
+    return await syncInterviewToGoogleDriveOnce(sessionId);
+  }
 }
 
 export function scheduleGoogleDriveSync(sessionId: string) {

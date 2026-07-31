@@ -113,6 +113,19 @@ class FakeD1Statement {
         });
         changes = 1;
       }
+    } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = 'pending'")) {
+      const [updatedAt, sessionId, staleBefore] = this.values;
+      const sync = this.database.externalSyncs.get(sessionId);
+      if (sync?.status === "running" && sync.started_at && sync.started_at <= staleBefore) {
+        Object.assign(sync, {
+          status: "pending",
+          started_at: null,
+          completed_at: null,
+          error_code: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = CASE")) {
       const [startedAtForStatus, , completedAt, folderId, folderUrl, manifestJson,
         updatedAt, sessionId, expectedStartedAt] = this.values;
@@ -614,6 +627,18 @@ test("completed interview archive creates candidate folders and stores recording
     "test-etag",
     "manual-deletion-only-policy-pending",
   ]);
+  database.externalSyncs.set(session.sessionId, {
+    provider: "google_drive",
+    status: "running",
+    requested_at: "2026-07-29T02:00:00.000Z",
+    started_at: "2026-07-29T02:00:00.000Z",
+    completed_at: null,
+    folder_id: null,
+    folder_url: null,
+    manifest_json: null,
+    error_code: null,
+    updated_at: "2026-07-29T02:00:00.000Z",
+  });
 
   let nextFile = 0;
   const uploadedNames = [];
@@ -737,6 +762,7 @@ test("completed interview archive creates candidate folders and stores recording
       `${session.sessionId}_格納結果.json`,
     ]));
     assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
+    assert.notEqual(database.externalSyncs.get(session.sessionId).started_at, "2026-07-29T02:00:00.000Z");
     const responseText = JSON.stringify(payload);
     assert.equal(responseText.includes("google-client-secret"), false);
     assert.equal(responseText.includes("google-refresh-token"), false);

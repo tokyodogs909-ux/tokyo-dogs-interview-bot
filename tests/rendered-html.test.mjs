@@ -112,6 +112,7 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /入力内容は端末内の画面確認だけに使用し、外部送信・保存・録画・文字起こし・採用評価を行っていません/);
   assert.match(source, /video\/mp4/);
   assert.match(source, /TD-CONN-RESPONSE/);
+  assert.match(source, /カメラ・マイクは開始していません/);
   assert.match(source, /output_modalities: \["audio"\]/);
   assert.match(source, /自分の名前には敬称を付けず/);
   assert.match(styles, /\.remote-audio-player/);
@@ -136,6 +137,9 @@ test("server-renders the protected recruiter review entry", async () => {
   assert.match(html, /笠間・山本 専用/);
   assert.match(html, /アクセスは監査ログへ記録/);
   assert.doesNotMatch(html, /kasama-review-secret|INTERVIEW_REVIEW_TOKEN/);
+  const source = await readFile(new URL("../app/staff/page.tsx", import.meta.url), "utf8");
+  assert.match(source, /録画未格納/);
+  assert.match(source, /録画を含め格納完了/);
 });
 
 test("server-renders the administrator-only Google Drive setup entry without secrets", async () => {
