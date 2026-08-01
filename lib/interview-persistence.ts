@@ -568,7 +568,7 @@ export async function completeExternalSync(input: {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   const now = new Date().toISOString();
-  await db.batch([
+  const results = await db.batch([
     db.prepare(`UPDATE interview_external_syncs SET
       status = CASE WHEN requested_at > ? THEN 'pending' ELSE 'completed' END,
       completed_at = CASE WHEN requested_at > ? THEN NULL ELSE ? END,
@@ -585,9 +585,24 @@ export async function completeExternalSync(input: {
         input.sessionId,
         input.startedAt,
       ),
-    db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'google_drive_sync_completed', 'system', ?)")
-      .bind(crypto.randomUUID(), input.sessionId, JSON.stringify({ folderId: input.folderId })),
+    db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json
+    ) SELECT ?, ?, 'google_drive_sync_completed', 'system', ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_external_syncs
+        WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?
+      )`)
+      .bind(
+        crypto.randomUUID(),
+        input.sessionId,
+        JSON.stringify({ folderId: input.folderId }),
+        input.sessionId,
+        input.startedAt,
+      ),
   ]);
+  if (Number(results[0]?.meta?.changes ?? 0) !== 1) {
+    throw new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
+  }
   return (await getExternalSyncStatus(input.sessionId))?.status === "pending";
 }
 

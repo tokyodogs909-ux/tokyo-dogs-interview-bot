@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   initialTurnTakingState,
   isNewInterviewRecord,
+  isExpectedResponseCancelError,
   reduceTurnTaking,
   replayTurnTaking,
   selectRecordingMimeType,
@@ -172,6 +173,14 @@ test("a rejected barge-in cancel resumes the interview instead of ending it", ()
   assert.equal(state.candidateTurnPending, false);
 });
 
+test("only the error correlated to our recent response.cancel is treated as harmless", () => {
+  const pending = new Map([["cancel-1", 1_000]]);
+  assert.equal(isExpectedResponseCancelError("cancel-1", pending, 2_000, 5_000), true);
+  assert.equal(isExpectedResponseCancelError("different-event", pending, 2_000, 5_000), false);
+  assert.equal(isExpectedResponseCancelError(undefined, pending, 2_000, 5_000), false);
+  assert.equal(isExpectedResponseCancelError("cancel-1", pending, 7_001, 5_000), false);
+});
+
 test("no realtime event order can leave the interview stalled or talking over the candidate", () => {
   // Exhaustive replay of every event order up to length 5. Two invariants:
   //   1. a question is never started from a state where the candidate is speaking
@@ -252,6 +261,8 @@ test("app/page.tsx drives the audited turn-taking rules instead of its own copy"
   assert.match(source, /applyTurnTaking\("candidate_speech_stopped"\)/);
   assert.match(source, /applyTurnTaking\("response_done"/);
   assert.match(source, /applyTurnTaking\("response_cancel_rejected"\)/);
+  assert.match(source, /event\.error\?\.event_id/);
+  assert.match(source, /isExpectedResponseCancelError\(/);
   assert.match(source, /supportedRecordingMimeTypes\(/);
   assert.match(source, /isNewInterviewRecord\(recordedInterviewSessionRef\.current, activeSessionId\)/);
   // The pre-refactor duplicates must be gone, or the audited rules and the

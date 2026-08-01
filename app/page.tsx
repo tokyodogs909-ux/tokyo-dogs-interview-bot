@@ -14,6 +14,7 @@ import {
 import {
   initialTurnTakingState,
   isNewInterviewRecord,
+  isExpectedResponseCancelError,
   reduceTurnTaking,
   supportedRecordingMimeTypes,
 } from "@/lib/interview-turn-taking";
@@ -65,7 +66,13 @@ type RealtimeEvent = {
   name?: string;
   call_id?: string;
   arguments?: string;
-  error?: { message?: string };
+  error?: {
+    message?: string;
+    type?: string;
+    code?: string;
+    event_id?: string;
+    param?: string;
+  };
   item?: {
     id?: string;
     type?: string;
@@ -220,7 +227,7 @@ export default function Home() {
   const resumeRemoteAudioActionRef = useRef<(showNotice: boolean) => Promise<boolean>>(async () => false);
   const previousAudioStatsRef = useRef({ sent: 0, received: 0 });
   const turnStateRef = useRef(initialTurnTakingState());
-  const cancelSentAtRef = useRef(0);
+  const pendingCancelEventsRef = useRef(new Map<string, number>());
   const recordingGenerationRef = useRef(0);
   const reportedCandidateEventsRef = useRef(new Set<string>());
 
@@ -564,8 +571,17 @@ export default function Home() {
   function sendResponseCancel() {
     const channel = channelRef.current;
     if (!channel || channel.readyState !== "open") return;
-    cancelSentAtRef.current = Date.now();
-    channel.send(JSON.stringify({ type: "response.cancel" }));
+    const now = Date.now();
+    for (const [eventId, sentAt] of pendingCancelEventsRef.current) {
+      if (now - sentAt > CANCEL_RACE_GRACE_MS) pendingCancelEventsRef.current.delete(eventId);
+    }
+    const eventId = `cancel_${crypto.randomUUID()}`;
+    pendingCancelEventsRef.current.set(eventId, now);
+    try {
+      channel.send(JSON.stringify({ type: "response.cancel", event_id: eventId }));
+    } catch {
+      pendingCancelEventsRef.current.delete(eventId);
+    }
   }
 
   // Applies one realtime turn-taking event to the shared state machine and runs
@@ -1505,9 +1521,15 @@ export default function Home() {
       // answers with an error. That is a normal end of the interviewer's turn, not
       // a broken interview, so it must not drop the candidate into the error
       // screen. The channel is still open here, and the turn continues.
-      const cancelRace = Date.now() - cancelSentAtRef.current < CANCEL_RACE_GRACE_MS;
+      const cancelEventId = event.error?.event_id;
+      const cancelRace = isExpectedResponseCancelError(
+        cancelEventId,
+        pendingCancelEventsRef.current,
+        Date.now(),
+        CANCEL_RACE_GRACE_MS,
+      );
       if (cancelRace && channelRef.current?.readyState === "open" && !pendingCompletionReasonRef.current) {
-        cancelSentAtRef.current = 0;
+        if (cancelEventId) pendingCancelEventsRef.current.delete(cancelEventId);
         applyTurnTaking("response_cancel_rejected");
         setNetworkAudioState("connected");
         return;
@@ -1548,7 +1570,7 @@ export default function Home() {
     assistantPartialsRef.current.clear();
     processedCompletionCallsRef.current.clear();
     turnStateRef.current = initialTurnTakingState();
-    cancelSentAtRef.current = 0;
+    pendingCancelEventsRef.current.clear();
     clearCandidateResponseDelay();
     endingRef.current = false;
 
@@ -1801,7 +1823,7 @@ export default function Home() {
     processedCompletionCallsRef.current.clear();
     reportedCandidateEventsRef.current.clear();
     turnStateRef.current = initialTurnTakingState();
-    cancelSentAtRef.current = 0;
+    pendingCancelEventsRef.current.clear();
     recordedInterviewSessionRef.current = null;
     setProcessingWarning("");
     setErrorMessage("");
@@ -1833,7 +1855,7 @@ export default function Home() {
     setTranscript([]);
     processedCompletionCallsRef.current.clear();
     turnStateRef.current = initialTurnTakingState();
-    cancelSentAtRef.current = 0;
+    pendingCancelEventsRef.current.clear();
     // A restart issues a brand new interview id, so the next connection must not
     // resume the abandoned transcript and recording chunks.
     recordedInterviewSessionRef.current = null;

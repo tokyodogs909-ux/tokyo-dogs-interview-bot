@@ -429,6 +429,43 @@ async function verifyDriveArchive(input: {
  */
 type DriveSyncProgress = () => Promise<void>;
 
+const DRIVE_CLAIM_HEARTBEAT_INTERVAL_MS = 60_000;
+
+function startDriveClaimHeartbeat(sessionId: string, startedAt: string) {
+  let stopped = false;
+  let failure: unknown = null;
+  let inFlight = Promise.resolve();
+
+  const pulse = () => {
+    inFlight = inFlight.then(async () => {
+      if (stopped || failure) return;
+      if (!await heartbeatExternalSync(sessionId, startedAt)) {
+        throw new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
+      }
+    }).catch((error) => {
+      failure = error;
+    });
+  };
+
+  const timer = setInterval(pulse, DRIVE_CLAIM_HEARTBEAT_INTERVAL_MS);
+  return {
+    reportProgress: async () => {
+      await inFlight;
+      if (failure) throw failure;
+      if (!await heartbeatExternalSync(sessionId, startedAt)) {
+        failure = new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
+        throw failure;
+      }
+    },
+    stop: async () => {
+      stopped = true;
+      clearInterval(timer);
+      await inFlight;
+      if (failure) throw failure;
+    },
+  };
+}
+
 async function performDriveSync(
   source: ArchiveSource,
   reportProgress: DriveSyncProgress,
@@ -575,15 +612,12 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
       }
       throw new Error("GOOGLE_DRIVE_SYNC_ALREADY_RUNNING");
     }
-    const reportProgress = async () => {
-      if (!await heartbeatExternalSync(sessionId, startedAt)) {
-        throw new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
-      }
-    };
+    const claimHeartbeat = startDriveClaimHeartbeat(sessionId, startedAt);
     try {
       const source = await getInterviewArchiveSource(sessionId);
       if (!source) throw new Error("INTERVIEW_NOT_FOUND");
-      lastCompleted = await performDriveSync(source, reportProgress);
+      lastCompleted = await performDriveSync(source, claimHeartbeat.reportProgress);
+      await claimHeartbeat.stop();
       const retryRequested = await completeExternalSync({
         sessionId,
         startedAt,
@@ -596,6 +630,7 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
       });
       if (!retryRequested) return lastCompleted;
     } catch (error) {
+      await claimHeartbeat.stop().catch(() => undefined);
       await failExternalSync({ sessionId, startedAt, errorCode: safeErrorCode(error) });
       throw error;
     }
