@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import test from "node:test";
 
 async function render(path = "/") {
@@ -140,7 +140,23 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /data-testid="remote-audio-player"/);
   assert.match(source, /autoPlay\s+controls/);
   assert.match(source, /playSpeakerTest/);
-  assert.match(source, /カメラとマイクを確認します/);
+  assert.match(source, /data-testid="prepared-audio-player"/);
+  assert.match(source, /playPreparedAudio/);
+  assert.match(source, /\/audio\/motegi-speaker-check\.mp3/);
+  assert.match(source, /\/audio\/motegi-device-permission\.mp3/);
+  assert.match(source, /\/audio\/motegi-devices-ready\.mp3/);
+  assert.doesNotMatch(source, /playStartupChime/);
+  const speakerTestBody = source.match(/function playSpeakerTest\(\) \{([\s\S]*?)\n  \}/)?.[1] ?? "";
+  assert.match(speakerTestBody, /playPreparedAudio/);
+  assert.doesNotMatch(speakerTestBody, /speakOnDevice|speechSynthesis/);
+  for (const asset of [
+    "motegi-speaker-check.mp3",
+    "motegi-device-permission.mp3",
+    "motegi-devices-ready.mp3",
+  ]) {
+    const audio = await stat(new URL(`../public/audio/${asset}`, import.meta.url));
+    assert.ok(audio.size > 10_000, `${asset}: prepared audio asset is unexpectedly small`);
+  }
   assert.match(source, /readLatestInterviewerTurn/);
   assert.match(source, /queueRemoteAudioRecovery/);
   assert.match(source, /monitorAudioStats/);

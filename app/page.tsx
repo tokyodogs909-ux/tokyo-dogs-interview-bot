@@ -222,6 +222,7 @@ export default function Home() {
   const [inviteGate, setInviteGate] = useState<InviteGate>("checking");
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const preparedAudioRef = useRef<HTMLAudioElement>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
   const conversationRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -331,6 +332,7 @@ export default function Home() {
   });
 
   useEffect(() => {
+    const preparedAudio = preparedAudioRef.current;
     return () => {
       channelRef.current?.close();
       peerRef.current?.close();
@@ -347,6 +349,11 @@ export default function Home() {
       stopMicrophoneMeter();
       disconnectRemoteSpeaker();
       stopAudioPrime();
+      if (preparedAudio) {
+        preparedAudio.pause();
+        preparedAudio.removeAttribute("src");
+        preparedAudio.load();
+      }
       void recordingAudioContextRef.current?.close();
       void playbackAudioContextRef.current?.close();
       window.speechSynthesis?.cancel();
@@ -358,37 +365,6 @@ export default function Home() {
       playbackAudioContextRef.current = new AudioContext();
     }
     return playbackAudioContextRef.current;
-  }
-
-  function playStartupChime(updateSpeakerTest = false) {
-    try {
-      const context = getPlaybackAudioContext();
-      if (updateSpeakerTest) setSpeakerTestState("playing");
-      void context.resume().then(() => {
-        const oscillator = context.createOscillator();
-        const gain = context.createGain();
-        oscillator.type = "sine";
-        oscillator.frequency.setValueAtTime(660, context.currentTime);
-        oscillator.frequency.setValueAtTime(880, context.currentTime + 0.1);
-        gain.gain.setValueAtTime(0.0001, context.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.12, context.currentTime + 0.015);
-        gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.22);
-        oscillator.connect(gain);
-        gain.connect(context.destination);
-        oscillator.start(context.currentTime);
-        oscillator.stop(context.currentTime + 0.24);
-        oscillator.addEventListener("ended", () => {
-          oscillator.disconnect();
-          gain.disconnect();
-          if (updateSpeakerTest) setSpeakerTestState("passed");
-        }, { once: true });
-      }).catch(() => {
-        if (updateSpeakerTest) setSpeakerTestState("error");
-      });
-    } catch {
-      if (updateSpeakerTest) setSpeakerTestState("error");
-      // The spoken confirmation and remote-audio recovery button remain available.
-    }
   }
 
   function stopMicrophoneMeter() {
@@ -570,11 +546,58 @@ export default function Home() {
     window.speechSynthesis.speak(utterance);
   }
 
+  async function playPreparedAudio(
+    source: string,
+    options: { updateSpeakerTest?: boolean; keepAudioPrimed?: boolean } = {},
+  ) {
+    const audio = preparedAudioRef.current;
+    if (!audio) {
+      if (options.updateSpeakerTest) setSpeakerTestState("error");
+      setAudioNotice("確認音声の準備ができませんでした。ページを再読み込みして、もう一度お試しください。");
+      return false;
+    }
+
+    audio.pause();
+    audio.onplaying = null;
+    audio.onended = null;
+    audio.onerror = null;
+    audio.src = source;
+    audio.currentTime = 0;
+    audio.muted = false;
+    audio.volume = 1;
+    audio.setAttribute("playsinline", "");
+    if (options.updateSpeakerTest) setSpeakerTestState("playing");
+
+    const fail = () => {
+      if (options.updateSpeakerTest) setSpeakerTestState("error");
+      if (!options.keepAudioPrimed && !remoteStreamRef.current) stopAudioPrime();
+      setAudioNotice("確認音声を再生できませんでした。端末の消音を解除し、音量を上げて「もう一度聞く」を押してください。");
+    };
+    audio.onplaying = () => {
+      if (options.updateSpeakerTest) setSpeakerTestState("playing");
+      setAudioNotice("");
+    };
+    audio.onended = () => {
+      if (options.updateSpeakerTest) setSpeakerTestState("passed");
+      if (!options.keepAudioPrimed && !remoteStreamRef.current) stopAudioPrime();
+    };
+    audio.onerror = fail;
+
+    try {
+      await audio.play();
+      return true;
+    } catch {
+      fail();
+      return false;
+    }
+  }
+
   function playSpeakerTest() {
-    setSpeakerTestState("playing");
     primeRemoteAudioPlayback();
-    playStartupChime(true);
-    speakOnDevice("音声テストです。オンライン採用担当者の茂木です。音声が聞こえていれば準備は完了です。", true);
+    void playPreparedAudio("/audio/motegi-speaker-check.mp3", {
+      updateSpeakerTest: true,
+      keepAudioPrimed: stage === "setup" || Boolean(streamRef.current),
+    });
   }
 
   async function copyPortalLink() {
@@ -1176,10 +1199,13 @@ export default function Home() {
       setErrorMessage("入職希望対象店舗を120文字以内で入力してください。");
       return;
     }
-    // Stop here — before the camera/microphone prompt, before any audio playback, and
+    // Stop here — before the camera/microphone prompt and before audible playback —
     // before the candidate is moved off this screen — when this browser has no usable
     // signed invite. Re-checked at click time (not just on mount) so a gate that is
-    // still resolving cannot let a plain top-level visit through.
+    // still resolving cannot let a plain top-level visit through. The silent playback
+    // prime runs inside the candidate's button gesture so iOS will allow the remote
+    // interviewer stream after this asynchronous pre-flight finishes.
+    primeRemoteAudioPlayback();
     setSessionStarting(true);
     const access = inviteGate === "ok" ? "ok" : await checkInterviewAccess();
     setInviteGate(access);
@@ -1202,9 +1228,10 @@ export default function Home() {
     setCandidateAudioState("checking");
     setRemoteAudioState("waiting");
     setNetworkAudioState("idle");
-    primeRemoteAudioPlayback();
-    playStartupChime(true);
-    speakOnDevice("カメラとマイクを確認します。表示された許可画面で、許可を選んでください。", true, true);
+    void playPreparedAudio("/audio/motegi-device-permission.mp3", {
+      updateSpeakerTest: true,
+      keepAudioPrimed: true,
+    });
     let nextStream: MediaStream | null = null;
     try {
       if (!window.isSecureContext || typeof navigator.mediaDevices?.getUserMedia !== "function") {
@@ -1232,7 +1259,10 @@ export default function Home() {
       setCandidateAudioState(microphoneTrack.muted ? "checking" : "ready");
       setSetupPhase("devices-ready");
       await startMicrophoneMeter(nextStream);
-      speakOnDevice("カメラとマイクを確認しました。オンライン一次面接へ接続します。", false, true);
+      void playPreparedAudio("/audio/motegi-devices-ready.mp3", {
+        updateSpeakerTest: true,
+        keepAudioPrimed: true,
+      });
       microphoneTrack.addEventListener("mute", () => {
         if (!endingRef.current) {
           setCandidateAudioState("error");
@@ -1990,6 +2020,15 @@ export default function Home() {
   return (
     <main className="site-shell">
       <audio
+        className="prepared-audio-player"
+        data-testid="prepared-audio-player"
+        ref={preparedAudioRef}
+        tabIndex={-1}
+        playsInline
+        preload="auto"
+        aria-label="オンライン一次面接の接続案内音声"
+      />
+      <audio
         className="remote-audio-player"
         data-testid="remote-audio-player"
         ref={remoteAudioRef}
@@ -2119,8 +2158,8 @@ export default function Home() {
               </div>
             )}
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
-            <button className="primary-action" disabled={(inviteGate !== "checking" && inviteGate !== "ok") || !candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting} onClick={() => void prepareInterview()}>
-              {sessionStarting ? "カメラ・マイクを確認中…" : "カメラ・マイクを確認して開始"} <span>→</span>
+            <button className="primary-action" aria-label="カメラ・マイクを確認して開始" disabled={inviteGate !== "ok" || !candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting} onClick={() => void prepareInterview()}>
+              {inviteGate === "checking" ? "専用リンクを確認中…" : sessionStarting ? "カメラ・マイクを確認中…" : "カメラ・マイクを確認して開始"} <span>→</span>
             </button>
             <button className="internal-test-button" onClick={startInternalTest}>接続確認（選考対象外）</button>
             <p className="internal-test-note">録画・音声接続・採用評価を行わず、文字入力で面接画面の操作を確認します。</p>

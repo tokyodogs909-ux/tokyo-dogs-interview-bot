@@ -29,6 +29,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible, input:focus-
   outline-offset: 3px;
 }
 button:disabled { opacity: .4; cursor: not-allowed; }
+.prepared-audio-player,
 .remote-audio-player {
   position: fixed;
   left: 0;
