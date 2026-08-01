@@ -195,6 +195,7 @@ export default function Home() {
   const accessTokenRef = useRef("");
   const sessionIdRef = useRef("TD-PENDING");
   const transcriptRef = useRef<TranscriptTurn[]>([]);
+  const recordedInterviewSessionRef = useRef<string | null>(null);
   const assistantPartialsRef = useRef(new Map<string, string>());
   const processedCompletionCallsRef = useRef(new Set<string>());
   const endingRef = useRef(false);
@@ -224,7 +225,10 @@ export default function Home() {
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      setEmbeddedBrowser(/(?:Line|FBAN|FBAV|Instagram)\//i.test(navigator.userAgent));
+      // Instagram's in-app browser UA has no trailing slash after "Instagram"
+      // (e.g. "... Instagram 275.0.0.27.98 (iPhone14,2; ...)"), unlike LINE/Facebook's
+      // "Line/13.x" and "FBAN/FBIOS", so it needs its own unslashed alternative.
+      setEmbeddedBrowser(/(?:Line|FBAN|FBAV)\/|Instagram/i.test(navigator.userAgent));
       setScreenShareSupported(
         typeof navigator.mediaDevices?.getDisplayMedia === "function" &&
         window.matchMedia("(pointer: fine)").matches,
@@ -765,6 +769,7 @@ export default function Home() {
     activeStream: MediaStream | null,
     displayStream: MediaStream | null,
     remoteStream: MediaStream | null,
+    options: { resume?: boolean } = {},
   ) {
     if (!activeStream || typeof MediaRecorder === "undefined") {
       setRecordingCaptureState("error");
@@ -773,7 +778,12 @@ export default function Home() {
     }
     setRecordingCaptureState("starting");
     setRecordingHasBothAudio(null);
-    chunksRef.current = [];
+    // A reconnect (options.resume) restarts the MediaRecorder but must keep the
+    // chunks captured before the disconnect so the final blob still contains the
+    // full interview instead of only the segment recorded after recovery.
+    if (!options.resume) {
+      chunksRef.current = [];
+    }
     recordingBlobRef.current = null;
     recordingPromiseRef.current = new Promise((resolve) => {
       recordingResolveRef.current = resolve;
@@ -1378,7 +1388,14 @@ export default function Home() {
       type === "response.audio_transcript.done" ||
       type === "response.output_text.done";
     if (isAssistantDelta || isAssistantDone) {
-      armResponseWatchdog(false);
+      // A barge-in (input_audio_buffer.speech_started) already cancelled the response and
+      // cleared responseWaitingRef. Late-arriving deltas/done events for that cancelled
+      // response must not re-arm the watchdog, or the next input_audio_buffer.speech_stopped
+      // will see responseWaitingRef=true and skip scheduling the next question, stalling the
+      // interview with no further prompts.
+      if (!candidateSpeakingRef.current) {
+        armResponseWatchdog(false);
+      }
       const id = `${event.response_id || "response"}-${event.output_index || 0}-${event.content_index || 0}`;
       const current = assistantPartialsRef.current.get(id) ?? "";
       const text = isAssistantDone
@@ -1439,6 +1456,11 @@ export default function Home() {
     selectedMode: InterviewMode,
     credentials?: { sessionId: string; accessToken: string },
   ) {
+    const activeSessionId = credentials?.sessionId ?? sessionId;
+    // Reconnecting to the same interview session must not discard the transcript and
+    // recording already captured before the disconnect (TD-CONN-* recovery paths reuse
+    // the same session id). Only a genuinely new session starts from a blank record.
+    const isNewInterviewSession = recordedInterviewSessionRef.current !== activeSessionId;
     setMode(selectedMode);
     setErrorMessage("");
     setAudioNotice("");
@@ -1447,9 +1469,12 @@ export default function Home() {
     setRemoteAudioState(selectedMode === "voice" ? "waiting" : "idle");
     setConnectionStep("voice");
     setStage("interview");
-    setElapsed(0);
-    transcriptRef.current = [];
-    setTranscript([]);
+    if (isNewInterviewSession) {
+      setElapsed(0);
+      transcriptRef.current = [];
+      setTranscript([]);
+      recordedInterviewSessionRef.current = activeSessionId;
+    }
     assistantPartialsRef.current.clear();
     processedCompletionCallsRef.current.clear();
     candidateSpeakingRef.current = false;
@@ -1457,7 +1482,6 @@ export default function Home() {
     endingRef.current = false;
 
     try {
-      const activeSessionId = credentials?.sessionId ?? sessionId;
       const activeAccessToken = credentials?.accessToken ?? accessTokenRef.current;
       if (!activeSessionId || activeSessionId === "TD-PENDING" || !activeAccessToken) {
         throw new Error("TD-CONN-SESSION: オンライン一次面接の接続情報が整っていません。最初から接続をやり直してください。");
@@ -1616,7 +1640,9 @@ export default function Home() {
       }
       await peer.setRemoteDescription({ type: "answer", sdp: await sdpResponse.text() });
       if (selectedMode === "voice" && activeStream) {
-        await startRecording(activeStream, displayStreamRef.current, remoteStreamRef.current);
+        await startRecording(activeStream, displayStreamRef.current, remoteStreamRef.current, {
+          resume: !isNewInterviewSession,
+        });
       }
     } catch (error) {
       stopRealtime({ keepLocalStream: true });

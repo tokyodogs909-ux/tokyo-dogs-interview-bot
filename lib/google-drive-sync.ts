@@ -49,7 +49,13 @@ function isTransientDriveError(error: unknown) {
   const code = safeErrorCode(error);
   return /^(?:GOOGLE_DRIVE_(?:API|EXPORT|RESUMABLE_INIT|RESUMABLE_UPLOAD)_)(?:429|500|502|503|504)$/.test(code) ||
     code === "GOOGLE_DRIVE_TOKEN_REFRESH_FAILED" ||
-    code === "GOOGLE_DRIVE_ROOT_LOOKUP_FAILED";
+    code === "GOOGLE_DRIVE_ROOT_LOOKUP_FAILED" ||
+    // safeErrorCode() falls back to this generic code for any error whose message
+    // isn't already one of our own UPPER_CASE codes above (e.g. `TypeError: fetch
+    // failed` / DNS failures thrown by fetch() itself). Those raw network failures
+    // are exactly the kind of transient condition this retry exists for; without
+    // this, an ordinary network blip skips the retry and fails the whole sync.
+    code === "GOOGLE_DRIVE_SYNC_FAILED";
 }
 
 function wait(milliseconds: number) {

@@ -156,7 +156,10 @@ ${SOURCE_GROUNDED_EVALUATION_GUIDE}`,
       "evidenceValidationWarnings" | "humanReviewRequired"
     >;
     const evaluation = validateEvaluation(parsed, transcript);
-    await saveInterviewEvaluation({ sessionId, transcript, evaluation });
+    const saved = await saveInterviewEvaluation({ sessionId, transcript, evaluation });
+    if (!saved) {
+      return noStoreJson({ error: "このオンライン一次面接の評価受付は完了しています。" }, { status: 409 });
+    }
     scheduleGoogleDriveSync(sessionId);
     return noStoreJson({
       stored: true,

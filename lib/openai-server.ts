@@ -24,14 +24,12 @@ export function hasTrustedRequestOrigin(request: Request) {
   const origin = request.headers.get("Origin");
   if (!origin) return true;
   try {
+    // Only request.url's own origin is trustworthy here. X-Forwarded-Host/Proto are
+    // ordinary request headers a client can set on any cross-origin fetch, so honoring
+    // them to widen the allowed set would let an attacker's own origin pass this check
+    // and defeat the same-origin protection this function exists to provide.
     const requestUrl = new URL(request.url);
-    const forwardedHost = request.headers.get("X-Forwarded-Host")?.trim();
-    const forwardedProtocol = request.headers.get("X-Forwarded-Proto") === "https" ? "https" : requestUrl.protocol.replace(":", "");
-    const allowedOrigins = new Set([requestUrl.origin]);
-    if (forwardedHost && /^[a-z0-9.:[\]-]+$/i.test(forwardedHost)) {
-      allowedOrigins.add(`${forwardedProtocol}://${forwardedHost}`);
-    }
-    return allowedOrigins.has(new URL(origin).origin);
+    return requestUrl.origin === new URL(origin).origin;
   } catch {
     return false;
   }

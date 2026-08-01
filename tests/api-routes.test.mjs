@@ -161,14 +161,17 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'completed'")) {
       const [transcriptJson, evaluationJson, summary, completedAt, updatedAt, id] = this.values;
       const session = this.database.sessions.get(id);
-      if (session) Object.assign(session, {
-        status: "completed",
-        transcript_json: transcriptJson,
-        evaluation_json: evaluationJson,
-        summary,
-        completed_at: completedAt,
-        updated_at: updatedAt,
-      });
+      if (session && session.status !== "completed") {
+        Object.assign(session, {
+          status: "completed",
+          transcript_json: transcriptJson,
+          evaluation_json: evaluationJson,
+          summary,
+          completed_at: completedAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
     } else if (this.sql.startsWith("INSERT INTO interview_human_reviews")) {
       const [, sessionId, reviewerName, videoScoresJson, overallNote, , updatedAt] = this.values;
       this.database.humanReviews.set(`${sessionId}:${reviewerName}`, {
@@ -959,6 +962,56 @@ test("interview session stores the candidate name and protects the recording wit
   assert.equal(await staffRecording.text(), "small-webm-fixture");
 });
 
+test("recording upload survives one transient D1 failure after the R2 object is already stored", async () => {
+  process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
+  class FlakyD1 extends FakeD1 {
+    constructor() {
+      super();
+      this.artifactBatchAttempts = 0;
+    }
+
+    async batch(statements) {
+      if (statements.some((statement) => statement.sql.startsWith("INSERT INTO interview_artifacts"))) {
+        this.artifactBatchAttempts += 1;
+        if (this.artifactBatchAttempts === 1) throw new Error("D1_TRANSIENT_TEST_FAILURE");
+      }
+      return super.batch(statements);
+    }
+  }
+  const database = new FlakyD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const sessionResponse = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
+  }, env);
+  const session = await sessionResponse.json();
+  database.sessions.get(session.sessionId).status = "in_progress";
+
+  const recordingBody = new TextEncoder().encode("small-webm-fixture");
+  const storedObjectKey = `interviews/${session.sessionId}/recording.webm`;
+  const uploadResponse = await request("/api/interviews/recording", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "Content-Type": "video/webm",
+      "Content-Length": String(recordingBody.byteLength),
+    },
+    body: recordingBody,
+  }, env);
+  const upload = await uploadResponse.json();
+  assert.equal(uploadResponse.status, 200);
+  assert.equal(upload.stored, true);
+  assert.equal(database.artifactBatchAttempts, 2);
+  // The R2 object must not be re-uploaded or lost across the retry: it was already
+  // durably stored before the first (failing) D1 write attempt.
+  assert.equal(recordings.objects.has(storedObjectKey), true);
+  assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
+  assert.equal(database.artifacts.some((row) => row[2] === storedObjectKey), true);
+});
+
 test("candidate technical incidents are audited and cross-origin mutations are rejected", async () => {
   process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
   const database = new FakeD1();
@@ -969,6 +1022,20 @@ test("candidate technical incidents are audited and cross-origin mutations are r
     body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
   }, env);
   assert.equal(rejected.status, 403);
+
+  // A spoofed X-Forwarded-Host must not be able to make an attacker's own Origin pass
+  // the same-origin check, since it is an ordinary header any cross-origin fetch() can set.
+  const spoofed = await request("/api/interviews/session", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Origin: "https://attacker.example",
+      "X-Forwarded-Host": "attacker.example",
+      "X-Forwarded-Proto": "https",
+    },
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
+  }, env);
+  assert.equal(spoofed.status, 403);
 
   const session = await createTestInterviewSession(env);
   const incident = await request("/api/interviews/event", {
@@ -1341,4 +1408,54 @@ test("staff-only evaluation drops invented evidence and forces human review", as
   assert.equal(staffPayload.review.evaluation.dimensions[0].score, null);
   assert.equal(staffPayload.review.evaluation.dimensions[0].evidence.length, 0);
   assert.ok(staffPayload.review.evaluation.evidenceValidationWarnings.length >= 1);
+});
+
+test("concurrent evaluation submissions for the same session never both report success", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const sessionResponse = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
+  }, env);
+  const session = await sessionResponse.json();
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  try {
+    globalThis.fetch = async () => {
+      callCount += 1;
+      // Both requests pass the route's early "session not yet completed" check before
+      // either one's model call resolves, reproducing the race where two submissions
+      // for the same session reach saveInterviewEvaluation concurrently. The first
+      // fetch call resolves last so both handlers are guaranteed to be in flight at once.
+      await new Promise((resolve) => setTimeout(resolve, callCount === 1 ? 20 : 0));
+      return Response.json({
+        output: [{
+          type: "message",
+          content: [{ type: "output_text", text: JSON.stringify(modelEvaluation({ invalidEvidence: false })) }],
+        }],
+      });
+    };
+    const submit = () => request("/api/evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.accessToken}` },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+        transcript: candidateTurns,
+      }),
+    }, env);
+    const [first, second] = await Promise.all([submit(), submit()]);
+    // Exactly one submission must be treated as authoritative; the other must be
+    // rejected instead of silently no-oping while still claiming success.
+    const statuses = [first.status, second.status].sort();
+    assert.deepEqual(statuses, [200, 409]);
+    assert.equal(database.sessions.get(session.sessionId).status, "completed");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

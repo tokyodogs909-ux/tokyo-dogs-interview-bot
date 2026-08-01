@@ -361,9 +361,14 @@ export async function saveInterviewEvaluation(input: {
   evaluation: InterviewEvaluation;
 }) {
   const db = database();
-  if (!db) return;
+  if (!db) return false;
   const now = new Date().toISOString();
-  await db.batch([
+  // The UPDATE's "status <> 'completed'" guard silently no-ops on a duplicate/concurrent
+  // submission for an already-completed session (0 rows changed is not a batch failure),
+  // so the audit insert must be conditioned on that same guard. Otherwise a rejected
+  // duplicate would still write an 'evaluation_saved' audit row, misrepresenting it as
+  // having been persisted when the original evaluation was left untouched.
+  const results = await db.batch([
     db.prepare(`UPDATE interview_sessions SET
       status = 'completed', transcript_json = ?, evaluation_json = ?, summary = ?,
       completed_at = ?, updated_at = ? WHERE id = ? AND status <> 'completed'`)
@@ -375,9 +380,19 @@ export async function saveInterviewEvaluation(input: {
         now,
         input.sessionId,
       ),
-    db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'evaluation_saved', 'system', ?)")
-      .bind(crypto.randomUUID(), input.sessionId, JSON.stringify({ humanReviewRequired: true })),
+    db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json
+    ) SELECT ?, ?, 'evaluation_saved', 'system', ?
+      WHERE EXISTS (SELECT 1 FROM interview_sessions WHERE id = ? AND completed_at = ?)`)
+      .bind(
+        crypto.randomUUID(),
+        input.sessionId,
+        JSON.stringify({ humanReviewRequired: true }),
+        input.sessionId,
+        now,
+      ),
   ]);
+  return Number((results[0] as { meta?: { changes?: number } }).meta?.changes ?? 0) === 1;
 }
 
 export async function saveInterviewTranscript(input: {
@@ -749,7 +764,7 @@ export async function saveInterviewRecording(input: {
     },
   });
   const now = new Date().toISOString();
-  await db.batch([
+  const recordArtifact = () => db.batch([
     db.prepare(`INSERT INTO interview_artifacts (
       id, session_id, kind, object_key, content_type, byte_size, etag, retention_until
     ) VALUES (?, ?, 'recording', ?, ?, ?, ?, ?)
@@ -772,8 +787,22 @@ export async function saveInterviewRecording(input: {
     db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'recording_stored', 'system', ?)")
       .bind(crypto.randomUUID(), input.session.id, JSON.stringify({ byteSize: input.byteSize, contentType: input.contentType })),
   ]);
-
-  return { objectKey, etag: object.etag };
+  // The recording is already durably stored in R2 at this point (objectKey is
+  // deterministic and future re-uploads overwrite it). A transient D1 failure here
+  // would otherwise leave that object with no interview_artifacts row, making it
+  // undiscoverable to staff even though nothing was actually lost. Retry briefly
+  // before surfacing the failure to the candidate.
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await recordArtifact();
+      return { objectKey, etag: object.etag };
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw lastError;
 }
 
 export async function getInterviewRecording(sessionId: string, reviewer: AuthorizedReviewer) {

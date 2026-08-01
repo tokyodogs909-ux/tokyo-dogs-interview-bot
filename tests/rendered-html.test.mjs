@@ -102,7 +102,11 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /channel\.onclose/);
   assert.match(source, /channelOpenTimerRef/);
   assert.match(source, /attachRemoteAudioToRecording/);
-  assert.match(source, /await startRecording\(activeStream, displayStreamRef\.current, remoteStreamRef\.current\)/);
+  assert.match(source, /await startRecording\(activeStream, displayStreamRef\.current, remoteStreamRef\.current, \{/);
+  assert.match(source, /resume: !isNewInterviewSession/);
+  assert.match(source, /recordedInterviewSessionRef/);
+  assert.match(source, /if \(!options\.resume\) \{\s*chunksRef\.current = \[\];/);
+  assert.match(source, /if \(!candidateSpeakingRef\.current\) \{\s*armResponseWatchdog\(false\);/);
   assert.match(source, /typeof canvas\.captureStream !== "function"/);
   assert.match(source, /conversation\.item\.input_audio_transcription\.failed/);
   assert.match(source, /scheduleInterviewCompletion/);
@@ -117,7 +121,6 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /stopRealtime\(\{ keepLocalStream: true \}\)/);
   assert.match(source, /カメラとマイクは正常に確認できています/);
   assert.match(source, /画面共有を追加（任意）/);
-  assert.match(source, /Line\|FBAN\|FBAV\|Instagram/);
   assert.match(source, /output_modalities: \["audio"\]/);
   assert.match(source, /自分の名前には敬称を付けず/);
   assert.match(styles, /\.remote-audio-player/);
@@ -131,6 +134,27 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(gatewaySource, /permissions-policy/);
   assert.match(gatewaySource, /server\.on\("upgrade"/);
   assert.match(gatewaySource, /upstreamSocket\.pipe\(socket\)/);
+});
+
+test("in-app browser detection matches real LINE, Facebook, and Instagram user agents", async () => {
+  const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const match = source.match(/setEmbeddedBrowser\((\/.*?\/i)\.test\(navigator\.userAgent\)\)/);
+  assert.ok(match, "embedded-browser detection regex not found in app/page.tsx");
+  const detectEmbeddedBrowser = new Function("ua", `return (${match[1]}).test(ua);`);
+
+  const lineIos = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Line/13.15.0";
+  const facebookIos = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBAV/450.0.0.0;FBBV/500;]";
+  const instagramIos = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 275.0.0.27.98 (iPhone14,2; iOS 17_0; en_US; en-US; scale=3.00; 1170x2532; 458229237)";
+  const instagramAndroid = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36 Instagram 310.0.0.32.120 Android (34/14; 420dpi; 1080x2280; Google/google; Pixel 8; husky; husky; en_US; 543980000)";
+  const safariIos = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+  const chromeAndroid = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+
+  assert.equal(detectEmbeddedBrowser(lineIos), true, "LINE in-app browser must be detected");
+  assert.equal(detectEmbeddedBrowser(facebookIos), true, "Facebook in-app browser must be detected");
+  assert.equal(detectEmbeddedBrowser(instagramIos), true, "Instagram in-app browser (iOS) must be detected");
+  assert.equal(detectEmbeddedBrowser(instagramAndroid), true, "Instagram in-app browser (Android) must be detected");
+  assert.equal(detectEmbeddedBrowser(safariIos), false, "regular Safari must not be flagged as an in-app browser");
+  assert.equal(detectEmbeddedBrowser(chromeAndroid), false, "regular Chrome must not be flagged as an in-app browser");
 });
 
 test("server-renders the protected recruiter review entry", async () => {
