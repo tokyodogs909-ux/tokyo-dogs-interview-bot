@@ -368,7 +368,9 @@ export type InterviewInviteStatus =
 export async function describeInterviewInvite(
   token: string | undefined,
 ): Promise<{ status: InterviewInviteStatus; nonceHash: string | null }> {
-  if (!signedInvitesRequired()) return { status: "not-required", nonceHash: null };
+  // Common-entry mode accepts the plain URL, while an explicitly supplied legacy
+  // or optional individual invite still keeps its expiry and single-use semantics.
+  if (!signedInvitesRequired() && !token) return { status: "not-required", nonceHash: null };
   assertSignedInviteConfigured();
   if (!token) return { status: "missing", nonceHash: null };
   const inspected = await inspectInterviewInviteToken(token);

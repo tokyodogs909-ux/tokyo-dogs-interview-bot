@@ -1020,6 +1020,7 @@ test("common entry URL creates separate sessions and throttles repeated paid sta
   const env = {
     ...workerEnv,
     DB: database,
+    INTERVIEW_ADMIN_TOKEN: "test-admin-secret",
     INTERVIEW_INVITE_SIGNING_SECRET: "test-signing-secret-with-sufficient-entropy",
     INTERVIEW_REQUIRE_SIGNED_INVITE: "false",
   };
@@ -1062,6 +1063,32 @@ test("common entry URL creates separate sessions and throttles repeated paid sta
   }
   const sourceThrottled = await start("接続元制限 9", "203.0.113.12");
   assert.equal(sourceThrottled.status, 429);
+
+  const issuedResponse = await request("/api/admin/interviews/invite", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer test-admin-secret",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ expiresInHours: 24 }),
+  }, env);
+  assert.equal(issuedResponse.status, 201);
+  const individualToken = new URL((await issuedResponse.json()).link).searchParams.get("invite");
+  const individual = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "個別 招待者",
+      employment: "正社員",
+      location: "越谷店",
+      consent: true,
+      inviteToken: individualToken,
+    }),
+  }, env);
+  assert.equal(individual.status, 201);
+  const reused = await request(`/api/interviews/invite?token=${encodeURIComponent(individualToken)}`, undefined, env);
+  assert.equal(reused.status, 403);
+  assert.equal((await reused.json()).status, "used");
 });
 
 test("invite pre-flight rejects cross-origin callers", async () => {
