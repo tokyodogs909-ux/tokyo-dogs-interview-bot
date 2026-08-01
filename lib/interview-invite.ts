@@ -62,6 +62,20 @@ async function hmac(value: string) {
   return new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
 }
 
+/**
+ * Produces a non-reversible, server-peppered identifier for the public-entry
+ * throttle. Raw IP addresses and user-agent strings must never be persisted.
+ */
+export async function hashPublicEntrySource(value: string) {
+  if (setting("INTERVIEW_INVITE_SIGNING_SECRET")) {
+    return toBase64Url(await hmac(`public-entry-v1:${value}`));
+  }
+  // Keeps local/test invite-free mode usable without inventing a stored secret.
+  // Production has a signing secret configured and therefore always takes the
+  // HMAC branch above; neither branch persists the source value itself.
+  return sha256Hex(`public-entry-local-v1:${value}`);
+}
+
 function constantTimeEqual(left: Uint8Array, right: Uint8Array) {
   if (left.byteLength !== right.byteLength) return false;
   let difference = 0;

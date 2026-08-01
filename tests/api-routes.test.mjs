@@ -66,6 +66,27 @@ class FakeD1Statement {
         session_id: null,
       });
       changes = 1;
+    } else if (this.sql.startsWith("INSERT INTO interview_public_entries")) {
+      const [id, sourceHash, candidateHash, createdAt, sourceToCount, sourceCutoff, sourceLimit,
+        candidateToCount, candidateCutoff, candidateLimit] = this.values;
+      const sourceCount = this.database.publicEntries.filter((entry) =>
+        entry.source_hash === sourceToCount && entry.created_at > sourceCutoff).length;
+      const candidateCount = this.database.publicEntries.filter((entry) =>
+        entry.candidate_hash === candidateToCount && entry.created_at > candidateCutoff).length;
+      if (sourceCount < sourceLimit && candidateCount < candidateLimit) {
+        this.database.publicEntries.push({
+          id,
+          source_hash: sourceHash,
+          candidate_hash: candidateHash,
+          created_at: createdAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("DELETE FROM interview_public_entries")) {
+      const [staleBefore] = this.values;
+      const previousLength = this.database.publicEntries.length;
+      this.database.publicEntries = this.database.publicEntries.filter((entry) => entry.created_at > staleBefore);
+      changes = previousLength - this.database.publicEntries.length;
     } else if (this.sql.startsWith("UPDATE interview_invites SET used_at")) {
       const [usedAt, sessionId, nonceHash, comparedAt] = this.values;
       const invite = this.database.invites.get(nonceHash);
@@ -291,6 +312,7 @@ class FakeD1 {
     this.humanReviews = new Map();
     this.auditEvents = [];
     this.invites = new Map();
+    this.publicEntries = [];
     this.externalSyncs = new Map();
     this.driveConnection = null;
   }
@@ -991,6 +1013,55 @@ test("invite pre-flight opens up only when signed invites are not required", asy
   assert.equal(response.status, 200);
   assert.equal(payload.status, "ok");
   assert.equal(payload.inviteRequired, false);
+});
+
+test("common entry URL creates separate sessions and throttles repeated paid starts", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    INTERVIEW_INVITE_SIGNING_SECRET: "test-signing-secret-with-sufficient-entropy",
+    INTERVIEW_REQUIRE_SIGNED_INVITE: "false",
+  };
+  const start = (candidateName, address = "203.0.113.10") => request("/api/interviews/session", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "CF-Connecting-IP": address,
+      "User-Agent": "TOKYO-DOGS-COMMON-ENTRY-TEST",
+    },
+    body: JSON.stringify({
+      candidateName,
+      employment: "正社員",
+      location: "越谷店",
+      consent: true,
+    }),
+  }, env);
+
+  const first = await start("共通 一郎");
+  const second = await start("共通 二郎");
+  assert.equal(first.status, 201);
+  assert.equal(second.status, 201);
+  const firstPayload = await first.json();
+  const secondPayload = await second.json();
+  assert.notEqual(firstPayload.sessionId, secondPayload.sessionId);
+  assert.notEqual(firstPayload.accessToken, secondPayload.accessToken);
+  assert.equal(database.publicEntries.length, 2);
+  assert.equal("source_address" in database.publicEntries[0], false);
+  assert.doesNotMatch(JSON.stringify(database.publicEntries), /203\.0\.113|共通/);
+
+  assert.equal((await start("同一 応募者", "203.0.113.11")).status, 201);
+  assert.equal((await start("同一 応募者", "203.0.113.11")).status, 201);
+  assert.equal((await start("同一 応募者", "203.0.113.11")).status, 201);
+  const throttled = await start("同一 応募者", "203.0.113.11");
+  assert.equal(throttled.status, 429);
+  assert.match((await throttled.json()).error, /6時間/);
+
+  for (let index = 0; index < 8; index += 1) {
+    assert.equal((await start(`接続元制限 ${index}`, "203.0.113.12")).status, 201);
+  }
+  const sourceThrottled = await start("接続元制限 9", "203.0.113.12");
+  assert.equal(sourceThrottled.status, 429);
 });
 
 test("invite pre-flight rejects cross-origin callers", async () => {

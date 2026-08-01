@@ -73,6 +73,16 @@ export const interviewInvites = sqliteTable("interview_invites", {
   index("interview_invites_expiry_idx").on(table.expiresAt),
 ]);
 
+export const interviewPublicEntries = sqliteTable("interview_public_entries", {
+  id: text("id").primaryKey(),
+  sourceHash: text("source_hash").notNull(),
+  candidateHash: text("candidate_hash").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  index("interview_public_entries_source_idx").on(table.sourceHash, table.createdAt),
+  index("interview_public_entries_candidate_idx").on(table.candidateHash, table.createdAt),
+]);
+
 export const interviewExternalSyncs = sqliteTable("interview_external_syncs", {
   sessionId: text("session_id").notNull().references(() => interviewSessions.id, { onDelete: "cascade" }),
   provider: text("provider").notNull(),

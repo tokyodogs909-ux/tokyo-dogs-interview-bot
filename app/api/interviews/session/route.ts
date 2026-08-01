@@ -4,7 +4,12 @@ import {
   isValidPreferredLocation,
   normalizePreferredLocation,
 } from "@/lib/interview";
-import { createInterviewSession, describeInterviewInvite } from "@/lib/interview-persistence";
+import { hashPublicEntrySource } from "@/lib/interview-invite";
+import {
+  createInterviewSession,
+  describeInterviewInvite,
+  reservePublicInterviewEntry,
+} from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 export async function POST(request: Request) {
@@ -45,6 +50,17 @@ export async function POST(request: Request) {
         { status: 403 },
       );
     }
+    if (invite.status === "not-required") {
+      const connectingAddress = request.headers.get("cf-connecting-ip")?.trim() ||
+        request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+        "address-unavailable";
+      const userAgent = request.headers.get("user-agent")?.slice(0, 512) || "agent-unavailable";
+      const sourceHash = await hashPublicEntrySource(`${connectingAddress}\n${userAgent}`);
+      const candidateHash = await hashPublicEntrySource(
+        `${candidateName.toLocaleLowerCase("ja-JP")}\n${employment}\n${location.toLocaleLowerCase("ja-JP")}`,
+      );
+      await reservePublicInterviewEntry({ sourceHash, candidateHash });
+    }
     const session = await createInterviewSession({
       candidateName,
       employment,
@@ -56,10 +72,16 @@ export async function POST(request: Request) {
     const unavailable = error instanceof Error && error.message === "INTERVIEW_DATABASE_UNAVAILABLE";
     const signingUnavailable = error instanceof Error && error.message === "INTERVIEW_INVITE_SIGNING_UNCONFIGURED";
     const invalidInvite = error instanceof Error && error.message === "INTERVIEW_INVITE_INVALID";
+    const publicEntryRateLimited = error instanceof Error && error.message === "INTERVIEW_PUBLIC_ENTRY_RATE_LIMITED";
     if (invalidInvite) {
       // The invite was usable moments ago but lost the race to consume it, so the
       // most accurate thing we can tell the candidate is that it is already used.
       return noStoreJson({ status: "used", error: INTERVIEW_ACCESS_MESSAGES.used }, { status: 403 });
+    }
+    if (publicEntryRateLimited) {
+      return noStoreJson({
+        error: "短時間に複数回の開始操作が確認されました。6時間ほど空けてから、もう一度お試しください。",
+      }, { status: 429 });
     }
     if (unavailable || signingUnavailable) {
       const status = unavailable ? "storage-unavailable" : "signing-unavailable";

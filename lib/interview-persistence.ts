@@ -162,6 +162,14 @@ async function ensureSchema(db: D1Database) {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_invites_expiry_idx ON interview_invites (expires_at)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_public_entries (
+      id TEXT PRIMARY KEY NOT NULL,
+      source_hash TEXT NOT NULL,
+      candidate_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_public_entries_source_idx ON interview_public_entries (source_hash, created_at)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_public_entries_candidate_idx ON interview_public_entries (candidate_hash, created_at)"),
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_external_syncs (
       session_id TEXT NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
       provider TEXT NOT NULL,
@@ -183,6 +191,54 @@ async function ensureSchema(db: D1Database) {
   if (!(sessionColumns.results ?? []).some((column) => column.name === "candidate_name")) {
     await db.prepare("ALTER TABLE interview_sessions ADD COLUMN candidate_name TEXT DEFAULT '' NOT NULL").run();
   }
+}
+
+const PUBLIC_ENTRY_WINDOW_MS = 6 * 60 * 60 * 1_000;
+const PUBLIC_ENTRY_SOURCE_LIMIT = 8;
+const PUBLIC_ENTRY_CANDIDATE_LIMIT = 3;
+
+/**
+ * Reserves capacity for an invite-free candidate before creating a paid interview
+ * session. A single SQL INSERT performs both count checks atomically, so concurrent
+ * requests cannot all pass the same stale count. Only HMAC identifiers are stored.
+ */
+export async function reservePublicInterviewEntry(input: {
+  sourceHash: string;
+  candidateHash: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const cutoffIso = new Date(now.getTime() - PUBLIC_ENTRY_WINDOW_MS).toISOString();
+  const staleBeforeIso = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1_000).toISOString();
+  const results = await db.batch([
+    db.prepare("DELETE FROM interview_public_entries WHERE created_at <= ?").bind(staleBeforeIso),
+    db.prepare(`INSERT INTO interview_public_entries (id, source_hash, candidate_hash, created_at)
+      SELECT ?, ?, ?, ?
+      WHERE (
+        SELECT COUNT(*) FROM interview_public_entries
+        WHERE source_hash = ? AND created_at > ?
+      ) < ?
+      AND (
+        SELECT COUNT(*) FROM interview_public_entries
+        WHERE candidate_hash = ? AND created_at > ?
+      ) < ?`).bind(
+        crypto.randomUUID(),
+        input.sourceHash,
+        input.candidateHash,
+        nowIso,
+        input.sourceHash,
+        cutoffIso,
+        PUBLIC_ENTRY_SOURCE_LIMIT,
+        input.candidateHash,
+        cutoffIso,
+        PUBLIC_ENTRY_CANDIDATE_LIMIT,
+      ),
+  ]);
+  const reserved = Number((results[1] as { meta?: { changes?: number } }).meta?.changes ?? 0) === 1;
+  if (!reserved) throw new Error("INTERVIEW_PUBLIC_ENTRY_RATE_LIMITED");
 }
 
 async function audit(
