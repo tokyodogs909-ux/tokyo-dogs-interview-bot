@@ -157,6 +157,11 @@ select, .candidate-name-input { padding: 13px 14px; }
 .embedded-browser-notice span { color: #826b43; font-size: 9px; line-height: 1.55; }
 .embedded-browser-notice button { flex: 0 0 auto; border: 1px solid rgba(116,75,8,.22); border-radius: 999px; background: white; color: #744b08; padding: 8px 11px; font-size: 9px; font-weight: 800; }
 
+.invite-required-notice { margin: 10px 0; border: 1px solid rgba(169,69,69,.28); border-radius: 14px; background: #fff7f7; padding: 13px 14px; display: grid; gap: 5px; }
+.invite-required-notice strong { color: #8c3a3a; font-size: 10px; }
+.invite-required-notice span { color: #6f4747; font-size: 10px; line-height: 1.65; }
+.invite-required-notice small { color: #8a6a6a; font-size: 9px; line-height: 1.55; }
+
 .setup-layout { width: min(1120px, calc(100% - 48px)); margin: 0 auto; padding: 70px 0 110px; display: grid; grid-template-columns: .82fr 1.18fr; gap: 88px; align-items: center; }
 .text-button { border: 0; background: transparent; color: var(--muted); padding: 0; margin-bottom: 58px; font-size: 11px; }
 .setup-copy h1 { font-size: clamp(48px, 5.5vw, 72px); }

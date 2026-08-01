@@ -7,9 +7,9 @@ import {
 import {
   assertSignedInviteConfigured,
   createInterviewInviteToken,
+  inspectInterviewInviteToken,
   sha256Hex,
   signedInvitesRequired,
-  verifyInterviewInviteToken,
 } from "@/lib/interview-invite";
 
 type InterviewBindings = {
@@ -292,12 +292,43 @@ export async function issueInterviewInvite(expiresInHours: number) {
   };
 }
 
-export async function validateInterviewInvite(token: string | undefined) {
-  if (!signedInvitesRequired()) return { required: false, nonceHash: null };
+export type InterviewInviteStatus =
+  | "not-required"
+  | "ok"
+  | "missing"
+  | "invalid"
+  | "expired"
+  | "used";
+
+/**
+ * Reports why a signed invite link cannot be used, so both the pre-flight check and
+ * the session route can tell the candidate whether the link is missing, expired, or
+ * already used. Throws INTERVIEW_INVITE_SIGNING_UNCONFIGURED / INTERVIEW_DATABASE_UNAVAILABLE
+ * for operator-side gaps; callers translate those into candidate-facing wording.
+ *
+ * This never grants access on its own — createInterviewSession still consumes the
+ * invite atomically, which is what actually enforces single use.
+ */
+export async function describeInterviewInvite(
+  token: string | undefined,
+): Promise<{ status: InterviewInviteStatus; nonceHash: string | null }> {
+  if (!signedInvitesRequired()) return { status: "not-required", nonceHash: null };
   assertSignedInviteConfigured();
-  if (!token) return null;
-  const verified = await verifyInterviewInviteToken(token);
-  return verified ? { required: true, nonceHash: verified.nonceHash } : null;
+  if (!token) return { status: "missing", nonceHash: null };
+  const inspected = await inspectInterviewInviteToken(token);
+  if (inspected.status === "expired") return { status: "expired", nonceHash: null };
+  if (inspected.status !== "valid") return { status: "invalid", nonceHash: null };
+
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const invite = await db.prepare(
+    "SELECT used_at, expires_at FROM interview_invites WHERE nonce_hash = ? LIMIT 1",
+  ).bind(inspected.nonceHash).first<{ used_at: string | null; expires_at: string }>();
+  if (!invite) return { status: "invalid", nonceHash: null };
+  if (invite.used_at) return { status: "used", nonceHash: null };
+  if (Date.parse(invite.expires_at) <= Date.now()) return { status: "expired", nonceHash: null };
+  return { status: "ok", nonceHash: inspected.nonceHash };
 }
 
 export async function authorizeInterviewRequest(request: Request, sessionId: string) {

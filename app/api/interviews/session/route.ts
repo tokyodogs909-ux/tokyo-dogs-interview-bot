@@ -1,9 +1,10 @@
 import {
   EMPLOYMENT_OPTIONS,
+  INTERVIEW_ACCESS_MESSAGES,
   isValidPreferredLocation,
   normalizePreferredLocation,
 } from "@/lib/interview";
-import { createInterviewSession, validateInterviewInvite } from "@/lib/interview-persistence";
+import { createInterviewSession, describeInterviewInvite } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 export async function POST(request: Request) {
@@ -37,9 +38,12 @@ export async function POST(request: Request) {
     if (!isValidPreferredLocation(location)) {
       return noStoreJson({ error: "入職希望対象店舗を120文字以内で入力してください。" }, { status: 400 });
     }
-    const invite = await validateInterviewInvite(payload.inviteToken?.trim());
-    if (!invite) {
-      return noStoreJson({ error: "このオンライン一次面接リンクは無効、使用済み、または期限切れです。採用担当者へご連絡ください。" }, { status: 403 });
+    const invite = await describeInterviewInvite(payload.inviteToken?.trim());
+    if (invite.status !== "ok" && invite.status !== "not-required") {
+      return noStoreJson(
+        { status: invite.status, error: INTERVIEW_ACCESS_MESSAGES[invite.status] },
+        { status: 403 },
+      );
     }
     const session = await createInterviewSession({
       candidateName,
@@ -53,17 +57,14 @@ export async function POST(request: Request) {
     const signingUnavailable = error instanceof Error && error.message === "INTERVIEW_INVITE_SIGNING_UNCONFIGURED";
     const invalidInvite = error instanceof Error && error.message === "INTERVIEW_INVITE_INVALID";
     if (invalidInvite) {
-      return noStoreJson({ error: "このオンライン一次面接リンクは無効、使用済み、または期限切れです。採用担当者へご連絡ください。" }, { status: 403 });
+      // The invite was usable moments ago but lost the race to consume it, so the
+      // most accurate thing we can tell the candidate is that it is already used.
+      return noStoreJson({ status: "used", error: INTERVIEW_ACCESS_MESSAGES.used }, { status: 403 });
     }
-    return noStoreJson(
-      {
-        error: unavailable
-          ? "オンライン一次面接記録の保存領域を準備できませんでした。"
-          : signingUnavailable
-            ? "オンライン一次面接リンクの署名設定が完了していません。"
-            : "オンライン一次面接を開始できませんでした。",
-      },
-      { status: unavailable || signingUnavailable ? 503 : 500 },
-    );
+    if (unavailable || signingUnavailable) {
+      const status = unavailable ? "storage-unavailable" : "signing-unavailable";
+      return noStoreJson({ status, error: INTERVIEW_ACCESS_MESSAGES[status] }, { status: 503 });
+    }
+    return noStoreJson({ error: "オンライン一次面接を開始できませんでした。" }, { status: 500 });
   }
 }

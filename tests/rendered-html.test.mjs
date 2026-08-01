@@ -70,6 +70,38 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.doesNotMatch(html, /codex-preview/);
 });
 
+test("the candidate bundle gates the start button on an invite pre-flight, not on camera access", async () => {
+  const html = await (await render()).text();
+  // The candidate-facing wording must ship, and must not name internal settings.
+  assert.match(html, /接続確認（選考対象外）/);
+  assert.doesNotMatch(html, /INTERVIEW_REQUIRE_SIGNED_INVITE|INTERVIEW_INVITE_SIGNING_SECRET/);
+
+  const { readdir } = await import("node:fs/promises");
+  const clientDir = new URL("../dist/client/assets/", import.meta.url);
+  const bundles = (await readdir(clientDir)).filter((name) => name.endsWith(".js"));
+  const sources = await Promise.all(
+    bundles.map((name) => readFile(new URL(name, clientDir), "utf8")),
+  );
+  const portal = sources.find((source) => source.includes("/api/interviews/invite"));
+  assert.ok(portal, "candidate bundle must call the invite pre-flight");
+  // The pre-flight has to gate the permission prompt, so the component that calls
+  // getUserMedia is the one that must also run the pre-flight.
+  assert.match(portal, /getUserMedia/);
+
+  // The candidate-facing reasons must ship, and no internal setting name may.
+  const client = sources.join("\n");
+  for (const message of [
+    /専用のリンクを開いてください/,
+    /使用済みです/,
+    /有効期限が切れています/,
+    /受付準備が完了していません/,
+    /保存領域を準備できませんでした/,
+  ]) {
+    assert.match(client, message);
+  }
+  assert.equal(/INTERVIEW_REQUIRE_SIGNED_INVITE|INTERVIEW_INVITE_SIGNING_SECRET/.test(client), false);
+});
+
 test("no page ships an inline event handler that the CSP would have to allow", async () => {
   // script-src still needs 'unsafe-inline' because the framework emits per-request
   // inline RSC payload scripts, whose bodies change on every render and cannot be

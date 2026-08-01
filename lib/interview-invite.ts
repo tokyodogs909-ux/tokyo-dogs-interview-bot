@@ -80,24 +80,48 @@ export async function createInterviewInviteToken(nonce: string, expiresAt: Date)
   return `${encoded}.${toBase64Url(await hmac(encoded))}`;
 }
 
-export async function verifyInterviewInviteToken(token: string) {
+export type InviteTokenInspection =
+  | { status: "malformed" }
+  | { status: "expired" }
+  | { status: "valid"; nonceHash: string; expiresAt: string };
+
+/**
+ * Separates "this link was never valid" from "this link has simply expired" so the
+ * candidate can be told which one happened. Expiry is only ever reported after the
+ * HMAC has been verified, so an unsigned or tampered token still looks uniformly
+ * malformed and reveals nothing about its contents.
+ */
+export async function inspectInterviewInviteToken(token: string): Promise<InviteTokenInspection> {
   const parts = token.split(".");
-  if (parts.length !== 2 || parts.some((part) => !/^[A-Za-z0-9_-]+$/.test(part))) return null;
+  if (parts.length !== 2 || parts.some((part) => !/^[A-Za-z0-9_-]+$/.test(part))) {
+    return { status: "malformed" };
+  }
   let actualSignature: Uint8Array;
   let payload: InvitePayload;
   try {
     actualSignature = fromBase64Url(parts[1]);
     payload = JSON.parse(new TextDecoder().decode(fromBase64Url(parts[0]))) as InvitePayload;
   } catch {
-    return null;
+    return { status: "malformed" };
   }
-  if (!constantTimeEqual(actualSignature, await hmac(parts[0]))) return null;
+  if (!constantTimeEqual(actualSignature, await hmac(parts[0]))) return { status: "malformed" };
   if (
     payload.v !== 1 ||
     typeof payload.nonce !== "string" ||
     !/^[0-9a-f-]{36}$/i.test(payload.nonce) ||
-    !Number.isInteger(payload.exp) ||
-    payload.exp <= Math.floor(Date.now() / 1000)
-  ) return null;
-  return { nonceHash: await sha256Hex(payload.nonce), expiresAt: new Date(payload.exp * 1000).toISOString() };
+    !Number.isInteger(payload.exp)
+  ) return { status: "malformed" };
+  if (payload.exp <= Math.floor(Date.now() / 1000)) return { status: "expired" };
+  return {
+    status: "valid",
+    nonceHash: await sha256Hex(payload.nonce),
+    expiresAt: new Date(payload.exp * 1000).toISOString(),
+  };
+}
+
+export async function verifyInterviewInviteToken(token: string) {
+  const inspected = await inspectInterviewInviteToken(token);
+  return inspected.status === "valid"
+    ? { nonceHash: inspected.nonceHash, expiresAt: inspected.expiresAt }
+    : null;
 }

@@ -229,6 +229,10 @@ class FakeD1Statement {
   }
 
   async first() {
+    if (this.sql.startsWith("SELECT used_at, expires_at FROM interview_invites")) {
+      const invite = this.database.invites.get(this.values[0]);
+      return invite ? { used_at: invite.used_at, expires_at: invite.expires_at } : null;
+    }
     if (this.sql.startsWith("SELECT id, access_token_hash")) {
       return this.database.sessions.get(this.values[0]) ?? null;
     }
@@ -843,8 +847,10 @@ test("production invite links are admin-only, expire, and can create exactly one
   assert.equal([...database.invites.values()][0].session_id, acceptedPayload.sessionId);
 
   const reused = await create();
+  const reusedPayload = await reused.json();
   assert.equal(reused.status, 403);
-  assert.match((await reused.json()).error, /使用済み/);
+  assert.equal(reusedPayload.status, "used");
+  assert.match(reusedPayload.error, /使用済み/);
   assert.equal(database.sessions.size, 1);
 });
 
@@ -859,9 +865,144 @@ test("required invite mode fails closed when the signing secret is not configure
     DB: database,
     INTERVIEW_REQUIRE_SIGNED_INVITE: "true",
   });
+  const payload = await response.json();
   assert.equal(response.status, 503);
-  assert.match((await response.json()).error, /署名設定/);
+  assert.equal(payload.status, "signing-unavailable");
+  assert.match(payload.error, /受付準備が完了していません/);
   assert.equal(database.sessions.size, 0);
+});
+
+test("invite pre-flight blocks the fixed top URL before camera and microphone permission", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    INTERVIEW_ADMIN_TOKEN: "interview-admin-secret",
+    INTERVIEW_INVITE_SIGNING_SECRET: "test-signing-secret-with-sufficient-entropy",
+    INTERVIEW_REQUIRE_SIGNED_INVITE: "true",
+  };
+
+  // The fixed top URL a candidate reaches without their personal link.
+  const noToken = await request("/api/interviews/invite", undefined, env);
+  const noTokenPayload = await noToken.json();
+  assert.equal(noToken.status, 403);
+  assert.equal(noTokenPayload.status, "missing");
+  assert.match(noTokenPayload.error, /専用のリンクを開いてください/);
+
+  const forged = await request("/api/interviews/invite?token=not-a-real-token", undefined, env);
+  const forgedPayload = await forged.json();
+  assert.equal(forged.status, 403);
+  assert.equal(forgedPayload.status, "invalid");
+
+  const issue = await request("/api/admin/interviews/invite", {
+    method: "POST",
+    headers: { Authorization: "Bearer interview-admin-secret", "Content-Type": "application/json" },
+    body: JSON.stringify({ expiresInHours: 24 }),
+  }, env);
+  const inviteToken = new URL((await issue.json()).link).searchParams.get("invite");
+
+  const valid = await request(`/api/interviews/invite?token=${encodeURIComponent(inviteToken)}`, undefined, env);
+  const validPayload = await valid.json();
+  assert.equal(valid.status, 200);
+  assert.equal(validPayload.status, "ok");
+  assert.equal(validPayload.inviteRequired, true);
+  // Pre-flight must not hand out anything usable or consume the invite.
+  assert.equal(validPayload.sessionId, undefined);
+  assert.equal(validPayload.accessToken, undefined);
+  assert.equal([...database.invites.values()][0].used_at, null);
+
+  // Once the invite is consumed, the same link reports "used" rather than "invalid".
+  await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "招待済み 候補者",
+      employment: "正社員",
+      location: "越谷店",
+      consent: true,
+      inviteToken,
+    }),
+  }, env);
+  const used = await request(`/api/interviews/invite?token=${encodeURIComponent(inviteToken)}`, undefined, env);
+  const usedPayload = await used.json();
+  assert.equal(used.status, 403);
+  assert.equal(usedPayload.status, "used");
+});
+
+test("invite pre-flight separates operator-side gaps and never names internal settings", async () => {
+  const signingMissing = await request("/api/interviews/invite?token=abc.def", undefined, {
+    ...workerEnv,
+    DB: new FakeD1(),
+    INTERVIEW_REQUIRE_SIGNED_INVITE: "true",
+  });
+  const signingPayload = await signingMissing.json();
+  assert.equal(signingMissing.status, 503);
+  assert.equal(signingPayload.status, "signing-unavailable");
+
+  // Signing configured and the link itself is genuine, but no storage binding is
+  // available to look the invite up.
+  const signingEnv = {
+    ...workerEnv,
+    DB: new FakeD1(),
+    INTERVIEW_ADMIN_TOKEN: "interview-admin-secret",
+    INTERVIEW_INVITE_SIGNING_SECRET: "test-signing-secret-with-sufficient-entropy",
+    INTERVIEW_REQUIRE_SIGNED_INVITE: "true",
+  };
+  const issue = await request("/api/admin/interviews/invite", {
+    method: "POST",
+    headers: { Authorization: "Bearer interview-admin-secret", "Content-Type": "application/json" },
+    body: JSON.stringify({ expiresInHours: 24 }),
+  }, signingEnv);
+  const genuineToken = new URL((await issue.json()).link).searchParams.get("invite");
+  const storageMissing = await request(`/api/interviews/invite?token=${encodeURIComponent(genuineToken)}`, undefined, {
+    ...workerEnv,
+    INTERVIEW_INVITE_SIGNING_SECRET: "test-signing-secret-with-sufficient-entropy",
+    INTERVIEW_REQUIRE_SIGNED_INVITE: "true",
+  });
+  const storagePayload = await storageMissing.json();
+  assert.equal(storageMissing.status, 503);
+  assert.equal(storagePayload.status, "storage-unavailable");
+  assert.match(storagePayload.error, /保存領域を準備できませんでした/);
+
+  for (const payload of [signingPayload, storagePayload]) {
+    const text = JSON.stringify(payload);
+    assert.equal(/INTERVIEW_|DB|RECORDINGS|OPENAI/.test(text), false);
+  }
+});
+
+test("connection check stays available on the fixed URL while signed invites are required", async () => {
+  const env = {
+    ...workerEnv,
+    DB: new FakeD1(),
+    INTERVIEW_INVITE_SIGNING_SECRET: "test-signing-secret-with-sufficient-entropy",
+    INTERVIEW_REQUIRE_SIGNED_INVITE: "true",
+  };
+  // The connection check is client-only, so the portal itself must still be served
+  // on the fixed URL even though no interview can be started from it.
+  const page = await request("/", { headers: { accept: "text/html" } }, env);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.match(html, /接続確認（選考対象外）/);
+});
+
+test("invite pre-flight opens up only when signed invites are not required", async () => {
+  const response = await request("/api/interviews/invite", undefined, { ...workerEnv, DB: new FakeD1() });
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.status, "ok");
+  assert.equal(payload.inviteRequired, false);
+});
+
+test("invite pre-flight rejects cross-origin callers", async () => {
+  const response = await request("/api/interviews/invite", {
+    headers: { Origin: "https://attacker.example" },
+  }, {
+    ...workerEnv,
+    DB: new FakeD1(),
+    INTERVIEW_INVITE_SIGNING_SECRET: "test-signing-secret-with-sufficient-entropy",
+    INTERVIEW_REQUIRE_SIGNED_INVITE: "true",
+  });
+  assert.equal(response.status, 403);
 });
 
 test("candidate can freely enter one or more preferred work locations and the server normalizes them", async () => {

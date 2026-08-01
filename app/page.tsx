@@ -5,9 +5,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   EMPLOYMENT_OPTIONS,
   INTERNAL_TEST_QUESTIONS,
+  INTERVIEW_ACCESS_MESSAGES,
+  INTERVIEW_ACCESS_STATES,
   INTERVIEW_TOPIC_IDS,
   PREFERRED_LOCATION_MAX_LENGTH,
   normalizePreferredLocation,
+  type InterviewAccessState,
   type InterviewTopicId,
   type TranscriptTurn,
 } from "@/lib/interview";
@@ -20,6 +23,8 @@ import {
 } from "@/lib/interview-turn-taking";
 
 type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
+/** "checking" while the pre-flight is in flight; every other value mirrors InterviewAccessState. */
+type InviteGate = "checking" | InterviewAccessState;
 type InterviewMode = "voice" | "text" | "internal-test";
 type ConnectionState =
   | "idle"
@@ -94,6 +99,35 @@ const CANDIDATE_RESPONSE_DELAY_MS = 3_200;
 // the server rejecting that cancel (the response had already finished) instead
 // of a real interview failure.
 const CANCEL_RACE_GRACE_MS = 5_000;
+
+function inviteTokenFromLocation() {
+  return new URLSearchParams(window.location.search).get("invite")?.trim() ?? "";
+}
+
+function isInterviewAccessState(value: unknown): value is InterviewAccessState {
+  return (INTERVIEW_ACCESS_STATES as readonly string[]).includes(value as string);
+}
+
+/**
+ * Asks the server whether this browser holds a usable signed invite. Runs before the
+ * camera and microphone prompt so a candidate on the plain top-level URL is told to
+ * open their personal link instead of being walked through permissions only to fail
+ * at the end. Any unexpected response is treated as "not allowed to start" — this
+ * check must never be the thing that opens the interview up.
+ */
+async function checkInterviewAccess(): Promise<InterviewAccessState> {
+  try {
+    const response = await fetch(
+      `/api/interviews/invite?token=${encodeURIComponent(inviteTokenFromLocation())}`,
+      { headers: { Accept: "application/json" }, cache: "no-store" },
+    );
+    const data = (await response.json().catch(() => null)) as { status?: string } | null;
+    if (response.ok && data?.status === "ok") return "ok";
+    return isInterviewAccessState(data?.status) && data?.status !== "ok" ? data.status : "unreachable";
+  } catch {
+    return "unreachable";
+  }
+}
 
 function formatTime(totalSeconds: number) {
   const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
@@ -185,6 +219,7 @@ export default function Home() {
   const [embeddedBrowser, setEmbeddedBrowser] = useState(false);
   const [copiedPortalLink, setCopiedPortalLink] = useState(false);
   const [screenShareSupported, setScreenShareSupported] = useState(false);
+  const [inviteGate, setInviteGate] = useState<InviteGate>("checking");
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
@@ -253,6 +288,14 @@ export default function Home() {
       );
     });
     return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void checkInterviewAccess().then((state) => {
+      if (!cancelled) setInviteGate(state);
+    });
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -1094,7 +1137,7 @@ export default function Home() {
             employment,
             location: preferredLocation,
             consent: true,
-            inviteToken: new URLSearchParams(window.location.search).get("invite")?.trim() ?? "",
+            inviteToken: inviteTokenFromLocation(),
           }),
         });
         const data = (await response.json()) as { sessionId?: string; accessToken?: string; error?: string };
@@ -1131,6 +1174,18 @@ export default function Home() {
     const preferredLocation = normalizePreferredLocation(location);
     if (!preferredLocation || preferredLocation.length > PREFERRED_LOCATION_MAX_LENGTH) {
       setErrorMessage("入職希望対象店舗を120文字以内で入力してください。");
+      return;
+    }
+    // Stop here — before the camera/microphone prompt, before any audio playback, and
+    // before the candidate is moved off this screen — when this browser has no usable
+    // signed invite. Re-checked at click time (not just on mount) so a gate that is
+    // still resolving cannot let a plain top-level visit through.
+    setSessionStarting(true);
+    const access = inviteGate === "ok" ? "ok" : await checkInterviewAccess();
+    setInviteGate(access);
+    setSessionStarting(false);
+    if (access !== "ok") {
+      setErrorMessage(INTERVIEW_ACCESS_MESSAGES[access]);
       return;
     }
     setLocation(preferredLocation);
@@ -2056,8 +2111,15 @@ export default function Home() {
               <li><strong>2. 開始ボタンを押す</strong><span>表示される確認画面で、カメラとマイクの「許可」を選びます。</span></li>
               <li><strong>3. 自動確認後に面接開始</strong><span>映像とマイク入力をこの画面で確認し、そのままオンライン一次面接へ接続します。</span></li>
             </ol>
+            {inviteGate !== "checking" && inviteGate !== "ok" && (
+              <div className="invite-required-notice" role="alert">
+                <strong>{inviteGate === "missing" ? "専用リンクからお進みください" : "この専用リンクではお進みいただけません"}</strong>
+                <span>{INTERVIEW_ACCESS_MESSAGES[inviteGate]}</span>
+                <small>カメラ・マイクの許可は必要ありません。下の「接続確認（選考対象外）」は、この状態でもお使いいただけます。</small>
+              </div>
+            )}
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
-            <button className="primary-action" disabled={!candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting} onClick={() => void prepareInterview()}>
+            <button className="primary-action" disabled={(inviteGate !== "checking" && inviteGate !== "ok") || !candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting} onClick={() => void prepareInterview()}>
               {sessionStarting ? "カメラ・マイクを確認中…" : "カメラ・マイクを確認して開始"} <span>→</span>
             </button>
             <button className="internal-test-button" onClick={startInternalTest}>接続確認（選考対象外）</button>

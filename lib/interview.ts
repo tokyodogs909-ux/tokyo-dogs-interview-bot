@@ -18,6 +18,46 @@ export function isValidPreferredLocation(value: string) {
     !/[\u0000-\u001F\u007F]/.test(value);
 }
 
+/**
+ * Why an invite-only interview cannot start. Shared by the pre-flight check, the
+ * session route, and the candidate screen so the same wording is used everywhere.
+ * "unreachable" is client-only: the pre-flight request itself failed.
+ */
+export const INTERVIEW_ACCESS_STATES = [
+  "ok",
+  "missing",
+  "invalid",
+  "expired",
+  "used",
+  "signing-unavailable",
+  "storage-unavailable",
+  "unreachable",
+] as const;
+
+export type InterviewAccessState = (typeof INTERVIEW_ACCESS_STATES)[number];
+
+/**
+ * Candidate-facing wording only. These strings are shown to applicants and are
+ * intentionally free of environment variable names, binding names, and any other
+ * operator-side configuration detail.
+ */
+export const INTERVIEW_ACCESS_MESSAGES: Record<Exclude<InterviewAccessState, "ok">, string> = {
+  missing:
+    "このページからはオンライン一次面接を開始できません。採用担当者からメールまたはメッセージでお送りした、あなた専用のリンクを開いてください。",
+  invalid:
+    "この専用リンクはご利用いただけませんでした。リンクをもう一度開き直すか、採用担当者へご連絡ください。",
+  expired:
+    "この専用リンクは有効期限が切れています。お手数ですが、採用担当者へ新しいリンクをご依頼ください。",
+  used:
+    "この専用リンクは使用済みです。もう一度受ける必要がある場合は、採用担当者へご連絡ください。",
+  "signing-unavailable":
+    "オンライン一次面接の受付準備が完了していません。お手数ですが、採用担当者へご連絡ください。",
+  "storage-unavailable":
+    "オンライン一次面接記録の保存領域を準備できませんでした。お手数ですが、採用担当者へご連絡ください。",
+  unreachable:
+    "オンライン一次面接の受付状況を確認できませんでした。通信環境をご確認のうえ、専用リンクをもう一度開いてください。",
+};
+
 export const INTERNAL_TEST_QUESTIONS = [
   "まず、これまでの仕事や学校で経験したことを簡単に教えてください。",
   "仕事選びで大切にしている条件を三つと、その中で東京DOGSに魅力を感じた点を教えてください。",
