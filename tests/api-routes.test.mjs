@@ -87,9 +87,10 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("INSERT INTO interview_external_syncs")) {
       const [sessionId, requestedAt, updatedAt] = this.values;
       const current = this.database.externalSyncs.get(sessionId);
+      const stillRunning = current?.status === "running";
       this.database.externalSyncs.set(sessionId, {
         provider: "google_drive",
-        status: current?.status === "running" ? "running" : "pending",
+        status: stillRunning ? "running" : "pending",
         requested_at: requestedAt,
         started_at: current?.started_at ?? null,
         completed_at: current?.completed_at ?? null,
@@ -97,9 +98,17 @@ class FakeD1Statement {
         folder_url: current?.folder_url ?? null,
         manifest_json: current?.manifest_json ?? null,
         error_code: current?.error_code ?? null,
-        updated_at: updatedAt,
+        // A running claim keeps its own heartbeat; only a settled row is refreshed.
+        updated_at: stillRunning ? current.updated_at : updatedAt,
       });
       changes = 1;
+    } else if (this.sql.startsWith("UPDATE interview_external_syncs SET updated_at")) {
+      const [updatedAt, sessionId, expectedStartedAt] = this.values;
+      const sync = this.database.externalSyncs.get(sessionId);
+      if (sync?.status === "running" && sync.started_at === expectedStartedAt) {
+        sync.updated_at = updatedAt;
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = 'running'")) {
       const [startedAt, updatedAt, sessionId] = this.values;
       const sync = this.database.externalSyncs.get(sessionId);
@@ -116,7 +125,7 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = 'pending'")) {
       const [updatedAt, sessionId, staleBefore] = this.values;
       const sync = this.database.externalSyncs.get(sessionId);
-      if (sync?.status === "running" && sync.started_at && sync.started_at <= staleBefore) {
+      if (sync?.status === "running" && sync.started_at && sync.updated_at <= staleBefore) {
         Object.assign(sync, {
           status: "pending",
           started_at: null,
@@ -1288,7 +1297,7 @@ function modelEvaluation({ invalidEvidence = false } = {}) {
   };
 }
 
-async function runEvaluationApi(invalidEvidence) {
+async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
   const database = new FakeD1();
   const recordings = new FakeR2();
   const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
@@ -1314,7 +1323,7 @@ async function runEvaluationApi(invalidEvidence) {
           type: "message",
           content: [{
             type: "output_text",
-            text: JSON.stringify(modelEvaluation({ invalidEvidence })),
+            text: JSON.stringify(transform(modelEvaluation({ invalidEvidence }))),
           }],
         }],
       });
@@ -1410,6 +1419,36 @@ test("staff-only evaluation drops invented evidence and forces human review", as
   assert.ok(staffPayload.review.evaluation.evidenceValidationWarnings.length >= 1);
 });
 
+test("evaluation prose naming a prohibited attribute or blaming the equipment is flagged, not rewritten", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
+  const { response, env, session } = await runEvaluationApi(false, (evaluation) => ({
+    ...evaluation,
+    summary: "国籍と家族構成の話題が出ましたが、職務経験は確認できました。",
+    concerns: ["回線が不安定でカメラ映像が乱れたため、印象を確認しづらかった。"],
+  }));
+  assert.equal(response.status, 200);
+
+  const staffResponse = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+    headers: { Authorization: "Bearer kasama-review-secret", "X-Interview-Reviewer": "kasama" },
+  }, env);
+  const evaluation = (await staffResponse.json()).review.evaluation;
+  const warnings = evaluation.evidenceValidationWarnings.join("\n");
+  assert.match(warnings, /職務と無関係な属性/);
+  assert.match(warnings, /国籍/);
+  assert.match(warnings, /家族構成/);
+  assert.match(warnings, /機器・通信・外見/);
+  assert.match(warnings, /回線/);
+  assert.match(warnings, /カメラ/);
+  // A flagged evaluation is never auto-decided: it is routed to human review.
+  assert.equal(evaluation.recommendation, "human_review");
+  assert.equal(evaluation.humanReviewRequired, true);
+  // Detection only. Rewriting or dropping the sentence would hide the very text a
+  // recruiter has to re-read, and would risk deleting a legitimate one on a false match.
+  assert.equal(evaluation.summary, "国籍と家族構成の話題が出ましたが、職務経験は確認できました。");
+  assert.equal(evaluation.concerns[0], "回線が不安定でカメラ映像が乱れたため、印象を確認しづらかった。");
+});
+
 test("concurrent evaluation submissions for the same session never both report success", async () => {
   process.env.OPENAI_API_KEY = "test-key-never-returned";
   const database = new FakeD1();
@@ -1455,6 +1494,209 @@ test("concurrent evaluation submissions for the same session never both report s
     const statuses = [first.status, second.status].sort();
     assert.deepEqual(statuses, [200, 409]);
     assert.equal(database.sessions.get(session.sessionId).status, "completed");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+const DRIVE_ROOT_FOLDER_ID = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
+
+function driveSyncEnv(database) {
+  return {
+    ...workerEnv,
+    DB: database,
+    INTERVIEW_ADMIN_TOKEN: "interview-admin-secret",
+    GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+    GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+    GOOGLE_DRIVE_REFRESH_TOKEN: "google-refresh-token",
+    GOOGLE_DRIVE_ROOT_FOLDER_ID: DRIVE_ROOT_FOLDER_ID,
+    GOOGLE_DRIVE_EXPECTED_ROOT_NAME: "オンライン一次面接_自動格納",
+  };
+}
+
+async function seedCompletedInterview(env, database) {
+  const session = await createTestInterviewSession(env, "正社員", "越谷店");
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "completed";
+  stored.completed_at = "2026-07-29T03:00:00.000Z";
+  stored.transcript_json = JSON.stringify([
+    { id: "turn-1", speaker: "candidate", text: "接客経験があります。", createdAt: "2026-07-29T02:50:10.000Z" },
+  ]);
+  stored.evaluation_json = JSON.stringify({
+    recommendation: "human_review",
+    summary: "採用担当者による確認が必要です。",
+    dimensions: [],
+    strengths: [],
+    concerns: [],
+    contradictions: [],
+    missingTopics: [],
+    conditions: [],
+    evidenceValidationWarnings: [],
+    humanReviewRequired: true,
+  });
+  return session;
+}
+
+function requestAdminSync(sessionId, env) {
+  return request("/api/admin/google-drive/sync", {
+    method: "POST",
+    headers: { Authorization: "Bearer interview-admin-secret", "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId }),
+  }, env);
+}
+
+test("a Google Drive archive still reporting progress is never restarted underneath itself", async () => {
+  // Two workers archiving the same interview both create the candidate folder and
+  // both upload each artifact, so Drive ends up with duplicates and the read-back
+  // check rejects the archive. Reclaiming the claim is therefore only allowed once
+  // the owner has gone silent for the whole stale window, not merely once it has
+  // been running that long.
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1_000).toISOString();
+  database.externalSyncs.set(session.sessionId, {
+    provider: "google_drive",
+    status: "running",
+    requested_at: thirtyMinutesAgo,
+    started_at: thirtyMinutesAgo,
+    completed_at: null,
+    folder_id: null,
+    folder_url: null,
+    manifest_json: null,
+    error_code: null,
+    // The owning worker reported progress a moment ago: it is slow, not dead.
+    updated_at: new Date().toISOString(),
+  });
+
+  let driveCalls = 0;
+  try {
+    globalThis.fetch = async () => {
+      driveCalls += 1;
+      throw new Error("a second worker must never reach Google Drive");
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    assert.equal(response.status, 502);
+    assert.equal(driveCalls, 0, "the live archive must not be duplicated by a second worker");
+    const sync = database.externalSyncs.get(session.sessionId);
+    assert.equal(sync.status, "running");
+    assert.equal(sync.started_at, thirtyMinutesAgo, "the live claim must stay with its owner");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a Google Drive archive that stopped reporting progress is reclaimed", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1_000).toISOString();
+  database.externalSyncs.set(session.sessionId, {
+    provider: "google_drive",
+    status: "running",
+    requested_at: thirtyMinutesAgo,
+    started_at: thirtyMinutesAgo,
+    completed_at: null,
+    folder_id: null,
+    folder_url: null,
+    manifest_json: null,
+    error_code: null,
+    // No heartbeat for the whole stale window: the worker is gone.
+    updated_at: thirtyMinutesAgo,
+  });
+
+  try {
+    globalThis.fetch = async (url) => {
+      if (String(url) === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      // Stop the reclaimed run at the approved-root check so the test asserts the
+      // reclaim itself rather than a full archive.
+      return Response.json({
+        id: DRIVE_ROOT_FOLDER_ID,
+        name: "別のフォルダ",
+        mimeType: "application/vnd.google-apps.folder",
+        trashed: false,
+        capabilities: { canAddChildren: true },
+      });
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    assert.equal(response.status, 502);
+    const sync = database.externalSyncs.get(session.sessionId);
+    assert.equal(sync.status, "failed", "the abandoned claim must be taken over and settled");
+    assert.notEqual(sync.started_at, thirtyMinutesAgo);
+    assert.equal(sync.error_code, "GOOGLE_DRIVE_ROOT_MISMATCH");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a Google Drive worker that loses its claim stops before duplicating candidate files", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  const uploadedNames = [];
+  let nextFile = 0;
+  let reclaimed = false;
+
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      if (href.includes(`/drive/v3/files/${DRIVE_ROOT_FOLDER_ID}?`)) {
+        return Response.json({
+          id: DRIVE_ROOT_FOLDER_ID,
+          name: "オンライン一次面接_自動格納",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+        });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
+        return Response.json({ files: [] });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method === "POST") {
+        const metadata = JSON.parse(String(init.body));
+        const id = `folder-${++nextFile}`;
+        return Response.json({
+          id,
+          name: metadata.name,
+          mimeType: metadata.mimeType,
+          parents: metadata.parents,
+          appProperties: metadata.appProperties,
+          webViewLink: `https://drive.google.com/drive/folders/${id}`,
+        });
+      }
+      if (href.includes("uploadType=multipart")) {
+        const metadata = JSON.parse(await init.body.get("metadata").text());
+        uploadedNames.push(metadata.name);
+        if (!reclaimed) {
+          // Another worker takes the claim while this upload is in flight.
+          reclaimed = true;
+          database.externalSyncs.get(session.sessionId).started_at = "2099-01-01T00:00:00.000Z";
+        }
+        return Response.json({ id: `file-${++nextFile}`, name: metadata.name, size: "10" });
+      }
+      throw new Error(`Unexpected Drive request: ${href}`);
+    };
+
+    const response = await requestAdminSync(session.sessionId, env);
+    assert.equal(response.status, 502);
+    assert.deepEqual(
+      uploadedNames,
+      [`${session.sessionId}_文字起こし.txt`],
+      "the worker must stop at its next progress check instead of re-uploading every artifact",
+    );
+    const sync = database.externalSyncs.get(session.sessionId);
+    // The losing worker's failure write is fenced on its own claim, so it must not
+    // mark the archive that the new owner is now running as failed.
+    assert.equal(sync.started_at, "2099-01-01T00:00:00.000Z");
+    assert.notEqual(sync.status, "failed");
   } finally {
     globalThis.fetch = originalFetch;
   }

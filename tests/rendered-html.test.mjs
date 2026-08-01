@@ -70,6 +70,26 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.doesNotMatch(html, /codex-preview/);
 });
 
+test("no page ships an inline event handler that the CSP would have to allow", async () => {
+  // script-src still needs 'unsafe-inline' because the framework emits per-request
+  // inline RSC payload scripts, whose bodies change on every render and cannot be
+  // covered by hashes. script-src-attr 'none' therefore carries the inline-handler
+  // half of the protection, and it only holds while every page keeps rendering its
+  // handlers through React instead of as onclick="..." attributes.
+  for (const path of ["/", "/staff", "/staff/google-drive", "/staff/invites", "/mobile-test"]) {
+    const response = await render(path);
+    assert.equal(response.status, 200, path);
+    assert.match(
+      response.headers.get("content-security-policy") ?? "",
+      /script-src-attr 'none'/,
+      `${path}: missing script-src-attr`,
+    );
+    const html = await response.text();
+    assert.deepEqual([...html.matchAll(/\son[a-z]+\s*=\s*["']/gi)].map((match) => match[0]), [], path);
+    assert.doesNotMatch(html, /(?:href|src)="javascript:/i, path);
+  }
+});
+
 test("voice interview implements bidirectional audio health and recovery guards", async () => {
   const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
@@ -106,7 +126,9 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /resume: !isNewInterviewSession/);
   assert.match(source, /recordedInterviewSessionRef/);
   assert.match(source, /if \(!options\.resume\) \{\s*chunksRef\.current = \[\];/);
-  assert.match(source, /if \(!candidateSpeakingRef\.current\) \{\s*armResponseWatchdog\(false\);/);
+  // The turn-taking rules themselves are exercised by tests/interview-turn-taking.test.mjs
+  // against recorded realtime event orders; here we only pin the wiring.
+  assert.match(source, /applyTurnTaking\("assistant_output"\)/);
   assert.match(source, /typeof canvas\.captureStream !== "function"/);
   assert.match(source, /conversation\.item\.input_audio_transcription\.failed/);
   assert.match(source, /scheduleInterviewCompletion/);
@@ -114,8 +136,16 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /入力内容は送信・保存せず、録画・文字起こし・採用評価を行いません/);
   assert.match(source, /PORTAL CHECK COMPLETE/);
   assert.match(source, /入力内容は端末内の画面確認だけに使用し、外部送信・保存・録画・文字起こし・採用評価を行っていません/);
-  assert.match(source, /video\/mp4/);
+  const turnTakingSource = await readFile(new URL("../lib/interview-turn-taking.js", import.meta.url), "utf8");
+  assert.match(turnTakingSource, /video\/mp4/);
+  assert.match(turnTakingSource, /audio\/mp4/);
   assert.match(source, /TD-CONN-RESPONSE/);
+  // The recruiter must be able to see why an evaluation was flagged for review.
+  const staffSource = await readFile(new URL("../app/staff/page.tsx", import.meta.url), "utf8");
+  assert.match(staffSource, /evidenceValidationWarnings/);
+  assert.match(staffSource, /評価本文の要確認事項/);
+  const driveSyncSource = await readFile(new URL("../lib/google-drive-sync.ts", import.meta.url), "utf8");
+  assert.match(driveSyncSource, /評価本文の要確認事項/);
   assert.match(source, /stage === "setup"/);
   assert.match(source, /startMicrophoneMeter/);
   assert.match(source, /stopRealtime\(\{ keepLocalStream: true \}\)/);

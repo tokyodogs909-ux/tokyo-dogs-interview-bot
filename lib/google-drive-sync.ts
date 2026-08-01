@@ -12,6 +12,7 @@ import {
   failExternalSync,
   getExternalSyncStatus,
   getInterviewArchiveSource,
+  heartbeatExternalSync,
   requestExternalSync,
 } from "@/lib/interview-persistence";
 
@@ -157,6 +158,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Yu Gothic",san
 <p class="notice">本資料は採用担当者の確認資料です。システムは合否を自動決定しません。通信・録音・文字起こしの不具合や、顔立ち・容姿・表情・声質等を不利益な評価に使用しません。</p>
 <h2>回答評価</h2>
 <p>${escapeHtml(evaluation?.summary || "回答評価は未作成です。")}</p>
+${evaluation?.evidenceValidationWarnings.length
+    ? `<div class="notice"><strong>評価本文の要確認事項</strong><ul>${evaluation.evidenceValidationWarnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul></div>`
+    : ""}
 ${dimensions}
 <h2>映像確認</h2>
 ${humanReviews}
@@ -418,10 +422,21 @@ async function verifyDriveArchive(input: {
   }));
 }
 
-async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncResult> {
+/**
+ * Reports progress on the claim and confirms this worker still owns it. Called
+ * before every Drive write so a worker whose claim was reclaimed as stale stops
+ * before creating a second copy of a file in the candidate folder.
+ */
+type DriveSyncProgress = () => Promise<void>;
+
+async function performDriveSync(
+  source: ArchiveSource,
+  reportProgress: DriveSyncProgress,
+): Promise<GoogleDriveSyncResult> {
   if (source.status !== "completed" || !source.evaluation) {
     throw new Error("INTERVIEW_NOT_READY_FOR_DRIVE_SYNC");
   }
+  await reportProgress();
   const accessToken = await fetchGoogleDriveAccessToken();
   const root = await validateGoogleDriveRoot(accessToken);
   const date = new Date(source.completedAt || source.createdAt);
@@ -433,6 +448,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
   }).formatToParts(date);
   const year = parts.find((part) => part.type === "year")?.value ?? String(date.getUTCFullYear());
   const month = parts.find((part) => part.type === "month")?.value ?? String(date.getUTCMonth() + 1).padStart(2, "0");
+  await reportProgress();
   const yearFolder = await ensureFolder(accessToken, root.id, year, "tokyoDogsInterviewYear", year);
   const monthKey = `${year}-${month}`;
   const monthFolder = await ensureFolder(accessToken, yearFolder.id, month, "tokyoDogsInterviewMonth", monthKey);
@@ -448,6 +464,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
   const reportHtml = buildReportHtml(source);
   const filePrefix = source.sessionId;
   const uploaded: GoogleDriveSyncResult["uploaded"] = {};
+  await reportProgress();
   const transcriptFile = await uploadSmallFile({
     accessToken,
     folderId: candidateFolder.id,
@@ -457,6 +474,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
     body: transcript,
   });
   uploaded.transcript = fileSummary(transcriptFile, `${filePrefix}_文字起こし.txt`);
+  await reportProgress();
   const resultFile = await uploadSmallFile({
     accessToken,
     folderId: candidateFolder.id,
@@ -466,6 +484,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
     body: resultJson,
   });
   uploaded.evaluation = fileSummary(resultFile, `${filePrefix}_評価データ.json`);
+  await reportProgress();
   const reportDoc = await uploadSmallFile({
     accessToken,
     folderId: candidateFolder.id,
@@ -476,7 +495,9 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
     googleMimeType: GOOGLE_DOC_MIME_TYPE,
   });
   uploaded.reportDocument = fileSummary(reportDoc, `${filePrefix}_オンライン一次面接レポート`);
+  await reportProgress();
   const pdf = await exportGoogleDocToPdf(accessToken, reportDoc.id);
+  await reportProgress();
   const reportPdf = await uploadSmallFile({
     accessToken,
     folderId: candidateFolder.id,
@@ -487,6 +508,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
   });
   uploaded.reportPdf = fileSummary(reportPdf, `${filePrefix}_オンライン一次面接レポート.pdf`);
   if (source.recording) {
+    await reportProgress();
     const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
     const recording = await uploadRecording({
       accessToken,
@@ -507,6 +529,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
     recordingIncluded: Boolean(source.recording),
     files: uploaded,
   };
+  await reportProgress();
   const manifestFile = await uploadSmallFile({
     accessToken,
     folderId: candidateFolder.id,
@@ -516,6 +539,7 @@ async function performDriveSync(source: ArchiveSource): Promise<GoogleDriveSyncR
     body: JSON.stringify(manifest, null, 2),
   });
   uploaded.manifest = fileSummary(manifestFile, `${filePrefix}_格納結果.json`);
+  await reportProgress();
   const verifiedFiles = await verifyDriveArchive({
     accessToken,
     folder: candidateFolder,
@@ -551,10 +575,15 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
       }
       throw new Error("GOOGLE_DRIVE_SYNC_ALREADY_RUNNING");
     }
+    const reportProgress = async () => {
+      if (!await heartbeatExternalSync(sessionId, startedAt)) {
+        throw new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
+      }
+    };
     try {
       const source = await getInterviewArchiveSource(sessionId);
       if (!source) throw new Error("INTERVIEW_NOT_FOUND");
-      lastCompleted = await performDriveSync(source);
+      lastCompleted = await performDriveSync(source, reportProgress);
       const retryRequested = await completeExternalSync({
         sessionId,
         startedAt,

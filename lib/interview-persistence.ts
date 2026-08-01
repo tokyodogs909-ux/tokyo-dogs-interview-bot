@@ -500,26 +500,51 @@ export async function requestExternalSync(sessionId: string) {
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
   const now = new Date().toISOString();
+  // While a sync is running, updated_at belongs to that worker: it is the
+  // progress heartbeat the staleness check below reads. Overwriting it here
+  // would hide a genuinely stuck sync forever, so only a non-running row gets
+  // its updated_at refreshed.
   await db.prepare(`INSERT INTO interview_external_syncs (
     session_id, provider, status, requested_at, updated_at
   ) VALUES (?, 'google_drive', 'pending', ?, ?)
   ON CONFLICT(session_id, provider) DO UPDATE SET
     requested_at = excluded.requested_at,
     status = CASE WHEN interview_external_syncs.status = 'running' THEN 'running' ELSE 'pending' END,
-    updated_at = excluded.updated_at`)
+    updated_at = CASE WHEN interview_external_syncs.status = 'running'
+      THEN interview_external_syncs.updated_at ELSE excluded.updated_at END`)
     .bind(sessionId, now, now).run();
   const staleBefore = new Date(Date.now() - EXTERNAL_SYNC_STALE_AFTER_MS).toISOString();
+  // Reclaiming a running sync starts a second worker against the same Drive
+  // folder, and two concurrent workers create duplicate files that the archive
+  // read-back then rejects. The claim is therefore only reclaimed when the
+  // owner has not reported progress (heartbeatExternalSync) for the whole stale
+  // window, i.e. when it really is dead rather than merely slow.
   const recovered = await db.prepare(`UPDATE interview_external_syncs SET
     status = 'pending', started_at = NULL, completed_at = NULL,
     error_code = NULL, updated_at = ?
     WHERE session_id = ? AND provider = 'google_drive' AND status = 'running'
-      AND started_at IS NOT NULL AND started_at <= ?`)
+      AND started_at IS NOT NULL AND updated_at <= ?`)
     .bind(now, sessionId, staleBefore).run();
   if (Number(recovered.meta?.changes ?? 0) === 1) {
     await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'google_drive_sync_stale_recovered', 'system', ?)")
       .bind(crypto.randomUUID(), sessionId, JSON.stringify({ staleBefore })).run();
   }
   return now;
+}
+
+/**
+ * Reports that the worker holding `startedAt` is still making progress, and
+ * reports back whether it still owns the claim. A worker whose claim was
+ * reclaimed must stop touching Google Drive immediately, because another worker
+ * is now writing into the same candidate folder.
+ */
+export async function heartbeatExternalSync(sessionId: string, startedAt: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const result = await db.prepare(`UPDATE interview_external_syncs SET updated_at = ?
+    WHERE session_id = ? AND provider = 'google_drive' AND status = 'running' AND started_at = ?`)
+    .bind(new Date().toISOString(), sessionId, startedAt).run();
+  return Number(result.meta?.changes ?? 0) === 1;
 }
 
 export async function claimExternalSync(sessionId: string) {
@@ -574,13 +599,28 @@ export async function failExternalSync(input: {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   const now = new Date().toISOString();
+  // The UPDATE is fenced on started_at, so a worker whose claim was already
+  // reclaimed changes nothing. Its audit row must be suppressed the same way, or
+  // the log would report a failure against a sync another worker now owns.
   await db.batch([
     db.prepare(`UPDATE interview_external_syncs SET
       status = 'failed', error_code = ?, updated_at = ?
       WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?`)
       .bind(input.errorCode.slice(0, 120), now, input.sessionId, input.startedAt),
-    db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'google_drive_sync_failed', 'system', ?)")
-      .bind(crypto.randomUUID(), input.sessionId, JSON.stringify({ errorCode: input.errorCode.slice(0, 120) })),
+    db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json
+    ) SELECT ?, ?, 'google_drive_sync_failed', 'system', ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_external_syncs
+        WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?
+      )`)
+      .bind(
+        crypto.randomUUID(),
+        input.sessionId,
+        JSON.stringify({ errorCode: input.errorCode.slice(0, 120) }),
+        input.sessionId,
+        input.startedAt,
+      ),
   ]);
 }
 

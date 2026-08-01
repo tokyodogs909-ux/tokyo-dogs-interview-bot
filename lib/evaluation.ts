@@ -70,6 +70,78 @@ function normalize(value: string) {
   return value.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
 
+// Terms that must never justify a score. The evaluation prompt already forbids
+// them, but a prompt is not a control: this list is the code-side detector that
+// tells the recruiter which sentence to re-read. Detection only — the wording is
+// never rewritten or removed, because silently editing an evaluator's text would
+// hide the problem instead of surfacing it, and would also risk deleting a
+// legitimate job-related sentence on a false match.
+//
+// Kept deliberately narrow to terms that have no ordinary job-related reading in
+// this role, so an alert stays meaningful. Broad words that legitimately appear
+// in dog-care answers (年齢, 歳, 家族 alone, …) are excluded on purpose.
+const PROHIBITED_ATTRIBUTE_TERMS = [
+  "本籍", "出生地", "出身地", "国籍", "人種", "民族",
+  "宗教", "信仰", "支持政党", "思想信条", "労働組合", "学生運動",
+  "購読新聞", "愛読書", "家族構成", "親の職業", "世帯収入",
+  "配偶者", "既婚", "未婚", "婚姻", "妊娠", "出産予定",
+  "病歴", "持病", "通院", "診断名", "障害者手帳",
+  "前科", "犯罪歴", "資産", "持ち家", "生活保護",
+  "性的指向", "性自認", "生年月日",
+] as const;
+
+// Conditions the interview must treat as "情報不足", never as a demerit.
+const TECHNICAL_FAULT_TERMS = [
+  "笑顔", "容姿", "顔立ち", "服装", "髪型", "表情", "声質", "訛り",
+  "通信環境", "回線", "マイク", "カメラ", "音質", "画質", "文字起こしの不具合",
+] as const;
+
+function findTerms(text: string, terms: readonly string[]) {
+  const normalized = normalize(text);
+  return terms.filter((term) => normalized.includes(term));
+}
+
+function evaluatorFreeText(
+  raw: Omit<InterviewEvaluation, "evidenceValidationWarnings" | "humanReviewRequired">,
+) {
+  return [
+    raw.summary,
+    ...raw.strengths,
+    ...raw.concerns,
+    ...raw.contradictions,
+    ...raw.conditions,
+    ...raw.dimensions.flatMap((dimension) => [
+      dimension.rationale,
+      ...dimension.evidence.flatMap((evidence) => [evidence.quote, evidence.relevance]),
+    ]),
+  ].filter((value) => typeof value === "string" && value.length > 0);
+}
+
+/**
+ * Flags — never rewrites — evaluation prose that mentions a legally prohibited
+ * attribute or blames a technical fault, so the recruiter is told exactly what
+ * to re-check before using the evaluation.
+ */
+export function detectUnfairEvaluationLanguage(
+  raw: Omit<InterviewEvaluation, "evidenceValidationWarnings" | "humanReviewRequired">,
+) {
+  const text = evaluatorFreeText(raw);
+  const prohibited = [...new Set(text.flatMap((value) => findTerms(value, PROHIBITED_ATTRIBUTE_TERMS)))];
+  const technical = [...new Set(text.flatMap((value) => findTerms(value, TECHNICAL_FAULT_TERMS)))];
+  const warnings: string[] = [];
+  if (prohibited.length > 0) {
+    warnings.push(
+      `評価本文に職務と無関係な属性の記述が含まれる可能性があります（${prohibited.join("、")}）。該当箇所を確認し、採用判断に使用しないでください。`,
+    );
+  }
+  if (technical.length > 0) {
+    warnings.push(
+      `評価本文に機器・通信・外見に関する記述が含まれる可能性があります（${technical.join("、")}）。これらは不利益に扱わず、情報不足として確認してください。`,
+    );
+  }
+  return warnings;
+}
+
 function findCandidateTurn(turns: TranscriptTurn[], turnId: string) {
   return turns.find((turn) => turn.speaker === "candidate" && turn.id === turnId);
 }
@@ -131,6 +203,10 @@ export function validateEvaluation(
   const verifiedDimensionCount = dimensions.filter(
     (dimension) => dimension.score !== null && dimension.evidence.length > 0,
   ).length;
+
+  // Scanned after evidence verification so only text that actually reaches the
+  // recruiter's record is flagged.
+  warnings.push(...detectUnfairEvaluationLanguage({ ...raw, dimensions }));
 
   let recommendation = raw.recommendation;
   if (candidateCharacters < 220 || verifiedDimensionCount < 4) {

@@ -48,7 +48,13 @@ function withSecurityHeaders(response: Response, request?: Request) {
     "object-src 'none'",
     "frame-ancestors 'none'",
     "form-action 'self'",
+    // 'unsafe-inline' is still required: the framework emits per-request inline
+    // RSC payload scripts, so their content changes on every render and cannot be
+    // covered by hashes. script-src-attr 'none' closes the part of that gap that
+    // matters most for XSS by blocking inline event-handler attributes
+    // (onerror=, onclick=, …). No page in this app renders one.
     "script-src 'self' 'unsafe-inline' https://apis.google.com https://accounts.google.com",
+    "script-src-attr 'none'",
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob:",
     "font-src 'self' data:",

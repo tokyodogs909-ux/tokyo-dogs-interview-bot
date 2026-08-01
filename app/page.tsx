@@ -11,6 +11,12 @@ import {
   type InterviewTopicId,
   type TranscriptTurn,
 } from "@/lib/interview";
+import {
+  initialTurnTakingState,
+  isNewInterviewRecord,
+  reduceTurnTaking,
+  supportedRecordingMimeTypes,
+} from "@/lib/interview-turn-taking";
 
 type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
 type InterviewMode = "voice" | "text" | "internal-test";
@@ -77,6 +83,10 @@ const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
 };
 
 const CANDIDATE_RESPONSE_DELAY_MS = 3_200;
+// How long after sending response.cancel a realtime "error" event is treated as
+// the server rejecting that cancel (the response had already finished) instead
+// of a real interview failure.
+const CANCEL_RACE_GRACE_MS = 5_000;
 
 function formatTime(totalSeconds: number) {
   const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
@@ -208,9 +218,10 @@ export default function Home() {
   const statsTimerRef = useRef<number | null>(null);
   const playbackRetryTimersRef = useRef<number[]>([]);
   const resumeRemoteAudioActionRef = useRef<(showNotice: boolean) => Promise<boolean>>(async () => false);
-  const responseWaitingRef = useRef(false);
   const previousAudioStatsRef = useRef({ sent: 0, received: 0 });
-  const candidateSpeakingRef = useRef(false);
+  const turnStateRef = useRef(initialTurnTakingState());
+  const cancelSentAtRef = useRef(0);
+  const recordingGenerationRef = useRef(0);
   const reportedCandidateEventsRef = useRef(new Set<string>());
 
   const candidateTurns = useMemo(
@@ -542,6 +553,44 @@ export default function Home() {
     responseWatchdogRef.current = null;
   }
 
+  function isCandidateSpeaking() {
+    return turnStateRef.current.candidateSpeaking;
+  }
+
+  function isAwaitingResponse() {
+    return turnStateRef.current.awaitingResponse;
+  }
+
+  function sendResponseCancel() {
+    const channel = channelRef.current;
+    if (!channel || channel.readyState !== "open") return;
+    cancelSentAtRef.current = Date.now();
+    channel.send(JSON.stringify({ type: "response.cancel" }));
+  }
+
+  // Applies one realtime turn-taking event to the shared state machine and runs
+  // the side effects it asks for. Keeping the decisions in lib/interview-turn-taking.js
+  // lets the recorded event orders be regression-tested without a browser.
+  function applyTurnTaking(
+    event: Parameters<typeof reduceTurnTaking>[1],
+    options: { suppressNextQuestion?: boolean } = {},
+  ) {
+    const { state, actions } = reduceTurnTaking(turnStateRef.current, event);
+    turnStateRef.current = state;
+    let scheduledNextQuestion = false;
+    for (const action of actions) {
+      if (action === "cancelActiveResponse") sendResponseCancel();
+      else if (action === "clearNextQuestionDelay") clearCandidateResponseDelay();
+      else if (action === "clearResponseWatchdog") clearResponseWatchdog();
+      else if (action === "armResponseWatchdog") armResponseWatchdog(false);
+      else if (action === "scheduleNextQuestion" && !options.suppressNextQuestion) {
+        scheduleResponseAfterCandidatePause();
+        scheduledNextQuestion = true;
+      }
+    }
+    return { state, scheduledNextQuestion };
+  }
+
   function reportCandidateEvent(
     eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop",
     code = "",
@@ -571,11 +620,11 @@ export default function Home() {
 
   function scheduleResponseAfterCandidatePause() {
     clearCandidateResponseDelay();
-    if (endingRef.current || candidateSpeakingRef.current || responseWaitingRef.current) return;
+    if (endingRef.current || isCandidateSpeaking() || isAwaitingResponse()) return;
     setConnectionState("waiting-pause");
     candidateResponseDelayTimerRef.current = window.setTimeout(() => {
       candidateResponseDelayTimerRef.current = null;
-      if (endingRef.current || candidateSpeakingRef.current || responseWaitingRef.current) return;
+      if (endingRef.current || isCandidateSpeaking() || isAwaitingResponse()) return;
       const channel = channelRef.current;
       if (!channel || channel.readyState !== "open") {
         setConnectionState("error");
@@ -593,9 +642,9 @@ export default function Home() {
 
   function armResponseWatchdog(allowAutomaticRetry: boolean) {
     clearResponseWatchdog();
-    responseWaitingRef.current = true;
+    turnStateRef.current = { ...turnStateRef.current, awaitingResponse: true };
     responseWatchdogRef.current = window.setTimeout(() => {
-      if (!responseWaitingRef.current || endingRef.current) return;
+      if (!isAwaitingResponse() || endingRef.current) return;
       const channel = channelRef.current;
       if (allowAutomaticRetry && channel?.readyState === "open") {
         setNetworkAudioState("reconnecting");
@@ -609,7 +658,7 @@ export default function Home() {
         armResponseWatchdog(false);
         return;
       }
-      responseWaitingRef.current = false;
+      turnStateRef.current = { ...turnStateRef.current, awaitingResponse: false, candidateTurnPending: false };
       setConnectionState("error");
       setNetworkAudioState("error");
       setAudioNotice("");
@@ -696,7 +745,7 @@ export default function Home() {
         });
         const previous = previousAudioStatsRef.current;
         const microphoneEnabled = streamRef.current?.getAudioTracks()[0]?.enabled ?? false;
-        if (sent > previous.sent && microphoneEnabled && !candidateSpeakingRef.current) setCandidateAudioState("ready");
+        if (sent > previous.sent && microphoneEnabled && !isCandidateSpeaking()) setCandidateAudioState("ready");
         if (received > previous.received) {
           const remoteStream = remoteStreamRef.current;
           if (remoteStream && isRemoteAudioPlaybackActive(remoteStream)) {
@@ -784,6 +833,13 @@ export default function Home() {
     if (!options.resume) {
       chunksRef.current = [];
     }
+    // Each recorder belongs to one generation. A previous recorder's stop event
+    // can still be queued when a reconnect starts a new one; without this guard
+    // it would resolve the new promise with the pre-disconnect blob and the
+    // interview would be uploaded truncated.
+    const generation = recordingGenerationRef.current + 1;
+    recordingGenerationRef.current = generation;
+    const ownsRecording = () => recordingGenerationRef.current === generation;
     recordingBlobRef.current = null;
     recordingPromiseRef.current = new Promise((resolve) => {
       recordingResolveRef.current = resolve;
@@ -879,12 +935,14 @@ export default function Home() {
       ...audioTracks,
     ]);
     const hasVideo = recordingStream.getVideoTracks().length > 0;
-    const candidates = hasVideo
-      ? ["video/webm;codecs=vp8,opus", "video/webm", "video/mp4;codecs=h264,aac", "video/mp4"]
-      : ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+    // iOS Safari records MP4 only and Android/desktop Chrome WebM only, so the
+    // container is chosen per device instead of assumed.
+    const candidates = supportedRecordingMimeTypes(
+      hasVideo,
+      (mimeType) => MediaRecorder.isTypeSupported(mimeType),
+    );
     let selectedRecorder: MediaRecorder | null = null;
     for (const mimeType of candidates) {
-      if (!MediaRecorder.isTypeSupported(mimeType)) continue;
       try {
         const recorder = new MediaRecorder(recordingStream, {
           mimeType,
@@ -895,6 +953,7 @@ export default function Home() {
           if (event.data.size > 0) chunksRef.current.push(event.data);
         };
         recorder.onerror = () => {
+          if (!ownsRecording()) return;
           setRecordingCaptureState("error");
           reportCandidateEvent("recording_unavailable", "RECORDER_ERROR");
           setAudioNotice("録画を継続できませんでした。面接は受け付け、採用担当者が記録状態を確認します。");
@@ -911,6 +970,7 @@ export default function Home() {
           stopComposite?.();
           cleanupRecordingAudioMix();
           if (recorderRef.current === recorder) recorderRef.current = null;
+          if (!ownsRecording()) return;
           if (!chunksRef.current.length) {
             setRecordingCaptureState("error");
             recordingResolveRef.current?.(null);
@@ -1160,7 +1220,7 @@ export default function Home() {
   function stopRealtime(options: { keepLocalStream?: boolean } = {}) {
     clearResponseWatchdog();
     clearCandidateResponseDelay();
-    responseWaitingRef.current = false;
+    turnStateRef.current = { ...turnStateRef.current, awaitingResponse: false, candidateTurnPending: false };
     if (channelOpenTimerRef.current) window.clearTimeout(channelOpenTimerRef.current);
     channelOpenTimerRef.current = null;
     if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
@@ -1297,9 +1357,15 @@ export default function Home() {
       recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current),
       new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 6000)),
     ]);
+    // A missing blob (recorder never produced data, or the final assembly did not
+    // finish inside the timeout) and a failed upload both mean the recruiter has
+    // no recording for this interview. Both are recorded as technical incidents so
+    // the review screen shows the gap instead of the recording silently vanishing.
+    if (!recordingBlob) reportCandidateEvent("recording_unavailable", "NO_RECORDING_AT_COMPLETION");
     const recordingUpload = recordingBlob
       ? uploadRecording(recordingBlob).catch((error) => {
         setRecordingUploadState("error");
+        reportCandidateEvent("recording_unavailable", "UPLOAD_FAILED");
         void error;
       })
       : Promise.resolve();
@@ -1323,40 +1389,38 @@ export default function Home() {
   function handleRealtimeEvent(event: RealtimeEvent) {
     const type = event.type ?? "";
     if (type === "input_audio_buffer.speech_started") {
-      clearCandidateResponseDelay();
-      candidateSpeakingRef.current = true;
-      if (responseWaitingRef.current && channelRef.current?.readyState === "open") {
-        channelRef.current.send(JSON.stringify({ type: "response.cancel" }));
-        responseWaitingRef.current = false;
-        clearResponseWatchdog();
-      }
+      applyTurnTaking("candidate_speech_started");
       setConnectionState("candidate-speaking");
       setCandidateAudioState("detected");
       return;
     }
     if (type === "input_audio_buffer.speech_stopped") {
-      if (responseWaitingRef.current) return;
-      candidateSpeakingRef.current = false;
+      const { state } = applyTurnTaking("candidate_speech_stopped");
       setCandidateAudioState("ready");
-      scheduleResponseAfterCandidatePause();
+      // When a response was still in flight the next question is scheduled by
+      // response.done instead, so the candidate is never left waiting silently.
+      if (state.candidateTurnPending) setConnectionState("ai-speaking");
       return;
     }
     if (type === "response.created") {
-      clearCandidateResponseDelay();
-      setConnectionState("ai-speaking");
+      applyTurnTaking("response_created");
+      setConnectionState(isCandidateSpeaking() ? "candidate-speaking" : "ai-speaking");
       setNetworkAudioState("connected");
-      armResponseWatchdog(false);
       return;
     }
     if (type === "response.done") {
-      responseWaitingRef.current = false;
-      clearResponseWatchdog();
-      if (pendingCompletionReasonRef.current) {
+      const completionPending = Boolean(pendingCompletionReasonRef.current);
+      const { scheduledNextQuestion } = applyTurnTaking("response_done", {
+        suppressNextQuestion: completionPending,
+      });
+      if (completionPending) {
         if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
         pendingCompletionTimerRef.current = window.setTimeout(runPendingCompletion, 1_200);
         return;
       }
-      setConnectionState(candidateSpeakingRef.current ? "candidate-speaking" : "ready");
+      if (!scheduledNextQuestion) {
+        setConnectionState(isCandidateSpeaking() ? "candidate-speaking" : "ready");
+      }
       setNetworkAudioState("connected");
       return;
     }
@@ -1388,14 +1452,10 @@ export default function Home() {
       type === "response.audio_transcript.done" ||
       type === "response.output_text.done";
     if (isAssistantDelta || isAssistantDone) {
-      // A barge-in (input_audio_buffer.speech_started) already cancelled the response and
-      // cleared responseWaitingRef. Late-arriving deltas/done events for that cancelled
-      // response must not re-arm the watchdog, or the next input_audio_buffer.speech_stopped
-      // will see responseWaitingRef=true and skip scheduling the next question, stalling the
-      // interview with no further prompts.
-      if (!candidateSpeakingRef.current) {
-        armResponseWatchdog(false);
-      }
+      // A barge-in (input_audio_buffer.speech_started) already cancelled the response.
+      // Late-arriving deltas/done events for that cancelled response must not re-arm
+      // the watchdog while the candidate is still answering.
+      applyTurnTaking("assistant_output");
       const id = `${event.response_id || "response"}-${event.output_index || 0}-${event.content_index || 0}`;
       const current = assistantPartialsRef.current.get(id) ?? "";
       const text = isAssistantDone
@@ -1440,9 +1500,19 @@ export default function Home() {
       return;
     }
     if (type === "error") {
-      clearCandidateResponseDelay();
-      responseWaitingRef.current = false;
-      clearResponseWatchdog();
+      // A barge-in cancel races with the response finishing on the server: the
+      // response.cancel then arrives with nothing left to cancel and the server
+      // answers with an error. That is a normal end of the interviewer's turn, not
+      // a broken interview, so it must not drop the candidate into the error
+      // screen. The channel is still open here, and the turn continues.
+      const cancelRace = Date.now() - cancelSentAtRef.current < CANCEL_RACE_GRACE_MS;
+      if (cancelRace && channelRef.current?.readyState === "open" && !pendingCompletionReasonRef.current) {
+        cancelSentAtRef.current = 0;
+        applyTurnTaking("response_cancel_rejected");
+        setNetworkAudioState("connected");
+        return;
+      }
+      applyTurnTaking("response_failed");
       if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
       pendingCompletionTimerRef.current = null;
       pendingCompletionReasonRef.current = null;
@@ -1460,7 +1530,7 @@ export default function Home() {
     // Reconnecting to the same interview session must not discard the transcript and
     // recording already captured before the disconnect (TD-CONN-* recovery paths reuse
     // the same session id). Only a genuinely new session starts from a blank record.
-    const isNewInterviewSession = recordedInterviewSessionRef.current !== activeSessionId;
+    const isNewInterviewSession = isNewInterviewRecord(recordedInterviewSessionRef.current, activeSessionId);
     setMode(selectedMode);
     setErrorMessage("");
     setAudioNotice("");
@@ -1477,7 +1547,8 @@ export default function Home() {
     }
     assistantPartialsRef.current.clear();
     processedCompletionCallsRef.current.clear();
-    candidateSpeakingRef.current = false;
+    turnStateRef.current = initialTurnTakingState();
+    cancelSentAtRef.current = 0;
     clearCandidateResponseDelay();
     endingRef.current = false;
 
@@ -1729,7 +1800,9 @@ export default function Home() {
     setTranscript([]);
     processedCompletionCallsRef.current.clear();
     reportedCandidateEventsRef.current.clear();
-    candidateSpeakingRef.current = false;
+    turnStateRef.current = initialTurnTakingState();
+    cancelSentAtRef.current = 0;
+    recordedInterviewSessionRef.current = null;
     setProcessingWarning("");
     setErrorMessage("");
     recordingBlobRef.current = null;
@@ -1759,7 +1832,15 @@ export default function Home() {
     transcriptRef.current = [];
     setTranscript([]);
     processedCompletionCallsRef.current.clear();
-    candidateSpeakingRef.current = false;
+    turnStateRef.current = initialTurnTakingState();
+    cancelSentAtRef.current = 0;
+    // A restart issues a brand new interview id, so the next connection must not
+    // resume the abandoned transcript and recording chunks.
+    recordedInterviewSessionRef.current = null;
+    chunksRef.current = [];
+    recordingBlobRef.current = null;
+    recordingPromiseRef.current = null;
+    recordingResolveRef.current = null;
     setTextDraft("");
     setRecordingUploadState("idle");
     setRecordingCaptureState("idle");
