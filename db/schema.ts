@@ -13,6 +13,8 @@ export const interviewSessions = sqliteTable("interview_sessions", {
   recordingStatus: text("recording_status").notNull().default("not_started"),
   transcriptJson: text("transcript_json"),
   evaluationJson: text("evaluation_json"),
+  evaluationClaimId: text("evaluation_claim_id"),
+  evaluationStartedAt: text("evaluation_started_at"),
   summary: text("summary"),
   expiresAt: text("expires_at").notNull(),
   retentionUntil: text("retention_until").notNull(),

@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+// vinext evaluates the worker module at import time. Set a non-secret fixture
+// before that import so server-side credential helpers are testable regardless of
+// whether the bundler reads process.env lazily or snapshots it during evaluation.
+process.env.OPENAI_API_KEY = "test-key-never-returned";
+
 const workerUrl = new URL("../dist/server/index.js", import.meta.url);
 workerUrl.searchParams.set("api-test", `${process.pid}-${Date.now()}`);
 const { default: worker } = await import(workerUrl.href);
@@ -180,22 +185,79 @@ class FakeD1Statement {
         Object.assign(sync, { status: "failed", error_code: errorCode, updated_at: updatedAt });
         changes = 1;
       }
-    } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status")) {
-      const [, id] = this.values;
+    } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'uploading'")) {
+      const [updatedAt, id, staleBefore] = this.values;
       const session = this.database.sessions.get(id);
-      if (session) session.recording_status = "stored";
+      if (session && (
+        ["not_started", "failed"].includes(session.recording_status) ||
+        (session.recording_status === "uploading" && session.updated_at < staleBefore)
+      )) {
+        session.recording_status = "uploading";
+        session.updated_at = updatedAt;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'failed'")) {
+      const [updatedAt, id] = this.values;
+      const session = this.database.sessions.get(id);
+      if (session?.recording_status === "uploading") {
+        session.recording_status = "failed";
+        session.updated_at = updatedAt;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'stored'")) {
+      const [updatedAt, id] = this.values;
+      const session = this.database.sessions.get(id);
+      if (session) {
+        session.recording_status = "stored";
+        session.updated_at = updatedAt;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'evaluation_processing'")) {
+      const [transcriptJson, claimId, startedAt, updatedAt, id, staleBefore] = this.values;
+      const session = this.database.sessions.get(id);
+      if (session && (
+        ["in_progress", "evaluation_pending"].includes(session.status) ||
+        (session.status === "evaluation_processing" &&
+          (!session.evaluation_started_at || session.evaluation_started_at < staleBefore))
+      )) {
+        Object.assign(session, {
+          status: "evaluation_processing",
+          transcript_json: transcriptJson,
+          evaluation_claim_id: claimId,
+          evaluation_started_at: startedAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("UPDATE interview_sessions SET status = 'evaluation_pending'") &&
+      this.sql.includes("WHERE id = ? AND status = 'evaluation_processing'")
+    ) {
+      const [updatedAt, id, claimId] = this.values;
+      const session = this.database.sessions.get(id);
+      if (session?.status === "evaluation_processing" && session.evaluation_claim_id === claimId) {
+        Object.assign(session, {
+          status: "evaluation_pending",
+          evaluation_claim_id: null,
+          evaluation_started_at: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'evaluation_pending'")) {
       const [transcriptJson, updatedAt, id] = this.values;
       const session = this.database.sessions.get(id);
       if (session) Object.assign(session, { status: "evaluation_pending", transcript_json: transcriptJson, updated_at: updatedAt });
     } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'completed'")) {
-      const [transcriptJson, evaluationJson, summary, completedAt, updatedAt, id] = this.values;
+      const [transcriptJson, evaluationJson, summary, completedAt, updatedAt, id, claimId] = this.values;
       const session = this.database.sessions.get(id);
-      if (session && session.status !== "completed") {
+      if (session?.status === "evaluation_processing" && session.evaluation_claim_id === claimId) {
         Object.assign(session, {
           status: "completed",
           transcript_json: transcriptJson,
           evaluation_json: evaluationJson,
+          evaluation_claim_id: null,
+          evaluation_started_at: null,
           summary,
           completed_at: completedAt,
           updated_at: updatedAt,
@@ -210,6 +272,22 @@ class FakeD1Statement {
         overall_note: overallNote,
         updated_at: updatedAt,
       });
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'realtime_connection_reserved'")
+    ) {
+      const [, sessionId, detailJson, sessionToCount, limit] = this.values;
+      const attempts = this.database.auditEvents.filter((event) =>
+        event.session_id === sessionToCount && event.event_type === "realtime_connection_reserved").length;
+      if (attempts < limit) {
+        this.database.auditEvents.push({
+          event_type: "realtime_connection_reserved",
+          detail_json: detailJson,
+          created_at: new Date().toISOString(),
+          session_id: sessionId,
+        });
+        changes = 1;
+      }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("VALUES (?, ?, ?, 'candidate', ?)")
@@ -329,9 +407,11 @@ class FakeD1 {
 class FakeR2 {
   constructor() {
     this.objects = new Map();
+    this.putCount = 0;
   }
 
   async put(key, body, options) {
+    this.putCount += 1;
     this.objects.set(key, { body, options });
     return { etag: "test-etag" };
   }
@@ -354,14 +434,86 @@ async function createTestInterviewSession(env, employment = "正社員", locatio
   return response.json();
 }
 
-test("health endpoint reports server credential presence without returning the key", async () => {
+test("health endpoint verifies server authentication without returning the key", async () => {
   process.env.OPENAI_API_KEY = "test-key-never-returned";
-  const response = await request("/api/health");
+  const healthUrls = [];
+  const healthAuthorizations = [];
+  const openAIService = {
+    fetch: async (upstreamRequest) => {
+      healthUrls.push(upstreamRequest.url);
+      healthAuthorizations.push(upstreamRequest.headers.get("Authorization") ?? "");
+      return Response.json({ data: [] });
+    },
+  };
+  const response = await request("/api/health", {}, {
+    ...workerEnv,
+    OPENAI_API_KEY: "test-key-never-returned",
+    OPENAI_API: openAIService,
+  });
+  assert.deepEqual(healthUrls.sort(), [
+    "https://api.openai.com/v1/models/gpt-5.2",
+    "https://api.openai.com/v1/models/gpt-realtime",
+  ]);
+  assert.deepEqual(healthAuthorizations, [
+    "Bearer test-key-never-returned",
+    "Bearer test-key-never-returned",
+  ]);
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { configured: true });
   assert.equal(response.headers.get("permissions-policy"), "camera=(self), microphone=(self), display-capture=(self)");
   assert.equal(response.headers.get("x-frame-options"), "DENY");
   assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+});
+
+test("health endpoint fails closed when the configured OpenAI key is rejected", async () => {
+  process.env.OPENAI_API_KEY = "rejected-test-key-never-returned";
+  const response = await request("/api/health", {}, {
+    ...workerEnv,
+    OPENAI_API_KEY: "rejected-test-key-never-returned",
+    OPENAI_API: { fetch: async () => Response.json(
+      { error: { type: "invalid_request_error" } },
+      { status: 401 },
+    ) },
+  });
+  const responseText = await response.clone().text();
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { configured: false });
+  assert.equal(responseText.includes("rejected-test-key-never-returned"), false);
+});
+
+test("authenticated production readiness reports missing components without exposing secrets", async () => {
+  const unauthorized = await request("/api/admin/readiness", {}, {
+    ...workerEnv,
+    INTERVIEW_ADMIN_TOKEN: "readiness-admin-secret",
+  });
+  assert.equal(unauthorized.status, 401);
+
+  const response = await request("/api/admin/readiness", {
+    headers: { Authorization: "Bearer readiness-admin-secret" },
+  }, {
+    ...workerEnv,
+    INTERVIEW_ADMIN_TOKEN: "readiness-admin-secret",
+    OPENAI_API_KEY: "readiness-rejected-openai-key",
+    OPENAI_API: {
+      fetch: async () => Response.json({ error: { type: "invalid_request_error" } }, { status: 401 }),
+    },
+  });
+  const responseText = await response.clone().text();
+  const payload = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(payload.technicallyReady, false);
+  assert.equal(payload.openAIAuthenticated, false);
+  assert.equal(payload.database, false);
+  assert.equal(payload.recordingStorage, false);
+  assert.deepEqual(payload.reviewerAuth, { kasama: false, yamamoto: false });
+  assert.ok(payload.missing.includes("OPENAI_AUTHENTICATION"));
+  assert.ok(payload.missing.includes("INTERVIEW_DATABASE"));
+  assert.ok(payload.missing.includes("RECORDING_STORAGE"));
+  assert.ok(payload.missing.includes("INTERVIEW_REVIEW_TOKEN_KASAMA"));
+  assert.ok(payload.missing.includes("INTERVIEW_REVIEW_TOKEN_YAMAMOTO"));
+  assert.ok(payload.missing.includes("GOOGLE_DRIVE_REFRESH_TOKEN"));
+  assert.equal(responseText.includes("readiness-admin-secret"), false);
+  assert.equal(responseText.includes("readiness-rejected-openai-key"), false);
 });
 
 test("Google Drive admin health check fails closed without secrets or authorization", async () => {
@@ -1138,7 +1290,7 @@ test("candidate can freely enter one or more preferred work locations and the se
   assert.equal(tooLong.status, 400);
 });
 
-test("interview session stores the candidate name and protects the recording with a one-time bearer token", async () => {
+test("interview session stores the candidate name and protects the recording with a scoped bearer token", async () => {
   process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
   const database = new FakeD1();
   const recordings = new FakeR2();
@@ -1183,6 +1335,19 @@ test("interview session stores the candidate name and protects the recording wit
   assert.equal(recordings.objects.has(storedObjectKey), true);
   assert.equal(recordings.objects.get(storedObjectKey).options.customMetadata.storagePolicy, "manual-deletion-only-policy-pending");
   assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
+
+  const duplicate = await request("/api/interviews/recording", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "Content-Type": "video/webm",
+      "Content-Length": String(recordingBody.byteLength),
+    },
+    body: recordingBody,
+  }, env);
+  assert.equal(duplicate.status, 409);
+  assert.equal(recordings.putCount, 1);
 
   const unauthorized = await request("/api/interviews/recording", {
     method: "POST",
@@ -1329,7 +1494,7 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
       return Response.json({
         value: "ek_test_ephemeral",
         expires_at: 9999999999,
-        session: { model: "gpt-realtime-2.1" },
+        session: { model: "gpt-realtime" },
       });
     };
 
@@ -1348,7 +1513,7 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
     const payload = await response.json();
     assert.equal(response.status, 200);
     assert.equal(payload.value, "ek_test_ephemeral");
-    assert.equal(payload.model, "gpt-realtime-2.1");
+    assert.equal(payload.model, "gpt-realtime");
     assert.equal(capturedAuthorization, "Bearer test-key-never-returned");
     assert.equal(capturedBody.session.audio.input.turn_detection.type, "semantic_vad");
     assert.equal(capturedBody.session.audio.input.turn_detection.eagerness, "low");
@@ -1409,6 +1574,58 @@ test("realtime endpoint distinguishes missing quota from temporary congestion", 
     const payload = await response.json();
     assert.equal(response.status, 429);
     assert.match(payload.error, /オンライン一次面接の接続設定が完了していません/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("one interview token cannot create unbounded paid realtime connections", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const session = await createTestInterviewSession(env);
+  const originalFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  try {
+    globalThis.fetch = async () => {
+      upstreamCalls += 1;
+      return Response.json({
+        value: "ek_test_ephemeral",
+        expires_at: 9999999999,
+        session: { model: "gpt-realtime" },
+      });
+    };
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const response = await request("/api/realtime/session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.accessToken}`,
+        },
+        body: JSON.stringify({
+          sessionId: session.sessionId,
+          employment: "正社員",
+          location: "越谷店",
+        }),
+      }, env);
+      assert.equal(response.status, 200);
+    }
+    const blocked = await request("/api/realtime/session", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${session.accessToken}`,
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+      }),
+    }, env);
+    assert.equal(blocked.status, 429);
+    assert.equal(upstreamCalls, 12);
+    assert.equal(database.auditEvents.filter((event) =>
+      event.event_type === "realtime_connection_reserved").length, 12);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1475,7 +1692,7 @@ test("same-origin realtime call authorizes the exact new interview session and p
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("content-type"), "application/sdp");
     assert.equal(await response.text(), "v=0\r\no=test-answer\r\n");
-    assert.equal(capturedSession.model, "gpt-realtime-2.1");
+    assert.equal(capturedSession.model, "gpt-realtime");
     assert.equal(capturedSession.audio.input.turn_detection.type, "semantic_vad");
 
     const rejected = await request("/api/realtime/call", {
@@ -1553,7 +1770,7 @@ async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
       assert.equal(url, "https://api.openai.com/v1/responses");
       const body = JSON.parse(init.body);
       assert.equal(body.store, false);
-      assert.equal(body.model, "gpt-5.6-sol");
+      assert.equal(body.model, "gpt-5.2");
       assert.equal(body.text.format.strict, true);
       assert.match(body.instructions, /総合評価は過去応募者との順位比較ではなく/);
       assert.match(body.instructions, /部活経験の有無そのものは評価しない/);
@@ -1705,11 +1922,7 @@ test("concurrent evaluation submissions for the same session never both report s
   try {
     globalThis.fetch = async () => {
       callCount += 1;
-      // Both requests pass the route's early "session not yet completed" check before
-      // either one's model call resolves, reproducing the race where two submissions
-      // for the same session reach saveInterviewEvaluation concurrently. The first
-      // fetch call resolves last so both handlers are guaranteed to be in flight at once.
-      await new Promise((resolve) => setTimeout(resolve, callCount === 1 ? 20 : 0));
+      await new Promise((resolve) => setTimeout(resolve, 20));
       return Response.json({
         output: [{
           type: "message",
@@ -1732,6 +1945,52 @@ test("concurrent evaluation submissions for the same session never both report s
     // rejected instead of silently no-oping while still claiming success.
     const statuses = [first.status, second.status].sort();
     assert.deepEqual(statuses, [200, 409]);
+    assert.equal(callCount, 1, "the duplicate must be rejected before a second paid model call");
+    assert.equal(database.sessions.get(session.sessionId).status, "completed");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a failed evaluation releases its claim so the candidate record can be retried", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  try {
+    globalThis.fetch = async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return Response.json({ error: { code: "rate_limit_exceeded" } }, { status: 429 });
+      }
+      return Response.json({
+        output: [{
+          type: "message",
+          content: [{ type: "output_text", text: JSON.stringify(modelEvaluation()) }],
+        }],
+      });
+    };
+    const submit = () => request("/api/evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.accessToken}` },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+        transcript: candidateTurns,
+      }),
+    }, env);
+
+    const failed = await submit();
+    assert.equal(failed.status, 429);
+    assert.equal(database.sessions.get(session.sessionId).status, "evaluation_pending");
+
+    const retried = await submit();
+    assert.equal(retried.status, 200);
+    assert.equal(callCount, 2);
     assert.equal(database.sessions.get(session.sessionId).status, "completed");
   } finally {
     globalThis.fetch = originalFetch;

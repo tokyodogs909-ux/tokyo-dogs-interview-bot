@@ -1,7 +1,9 @@
 import { SOURCE_GROUNDED_INTERVIEW_GUIDE } from "./interview-knowledge";
 
-export const REALTIME_MODEL = "gpt-realtime-2.1";
-export const EVALUATION_MODEL = "gpt-5.6-sol";
+// Public API model IDs verified against the official Models and Realtime API
+// references. Internal Codex model labels must never be sent to the public API.
+export const REALTIME_MODEL = "gpt-realtime";
+export const EVALUATION_MODEL = "gpt-5.2";
 
 export const EMPLOYMENT_OPTIONS = ["正社員", "アルバイト・パート"] as const;
 export const PREFERRED_LOCATION_MAX_LENGTH = 120;

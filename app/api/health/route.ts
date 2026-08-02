@@ -1,11 +1,10 @@
-import { noStoreJson, requireOpenAIApiKey } from "@/lib/openai-server";
+import { noStoreJson, verifyOpenAIAuthentication } from "@/lib/openai-server";
 
 export async function GET() {
   try {
-    requireOpenAIApiKey();
-    return noStoreJson({ configured: true });
+    if (await verifyOpenAIAuthentication()) return noStoreJson({ configured: true });
+    return noStoreJson({ configured: false }, { status: 503 });
   } catch {
     return noStoreJson({ configured: false }, { status: 503 });
   }
 }
-

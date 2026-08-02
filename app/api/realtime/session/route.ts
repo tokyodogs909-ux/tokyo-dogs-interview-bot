@@ -15,6 +15,7 @@ import {
 import {
   authorizeInterviewRequest,
   markInterviewStarted,
+  reserveInterviewRealtimeConnection,
 } from "@/lib/interview-persistence";
 
 export async function POST(request: Request) {
@@ -60,6 +61,11 @@ export async function POST(request: Request) {
         authorized.session.preferred_location !== location)
     ) {
       return noStoreJson({ error: "応募条件とオンライン一次面接の接続情報が一致しません。" }, { status: 409 });
+    }
+    if (!await reserveInterviewRealtimeConnection(sessionId)) {
+      return noStoreJson({
+        error: "音声回線への再接続回数が上限に達しました。採用担当者へご連絡ください。",
+      }, { status: 429 });
     }
 
     const apiKey = requireOpenAIApiKey();

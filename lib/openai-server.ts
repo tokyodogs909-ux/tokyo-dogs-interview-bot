@@ -1,4 +1,10 @@
+import { EVALUATION_MODEL, REALTIME_MODEL } from "@/lib/interview";
+
 function processApiKey() {
+  const bound = (globalThis as typeof globalThis & {
+    __TOKYO_DOGS_INTERVIEW_BINDINGS__?: { OPENAI_API_KEY?: string };
+  }).__TOKYO_DOGS_INTERVIEW_BINDINGS__?.OPENAI_API_KEY;
+  if (bound?.trim()) return bound.trim();
   if (typeof process === "undefined") return undefined;
   return process.env.OPENAI_API_KEY?.trim();
 }
@@ -9,6 +15,64 @@ export function requireOpenAIApiKey() {
     throw new Error("OPENAI_API_KEY is not configured on the server");
   }
   return apiKey;
+}
+
+type OpenAIHealthCache = {
+  apiKeyHash: string;
+  checkedAt: number;
+  healthy: boolean;
+};
+
+function openAIServiceBinding() {
+  return (globalThis as typeof globalThis & {
+    __TOKYO_DOGS_INTERVIEW_BINDINGS__?: { OPENAI_API?: Fetcher };
+  }).__TOKYO_DOGS_INTERVIEW_BINDINGS__?.OPENAI_API;
+}
+
+let openAIHealthCache: OpenAIHealthCache | null = null;
+const OPENAI_HEALTHY_CACHE_MS = 5 * 60 * 1000;
+const OPENAI_UNHEALTHY_CACHE_MS = 30 * 1000;
+
+/**
+ * The candidate readiness endpoint must not report green merely because a string
+ * named OPENAI_API_KEY exists. A revoked, mistyped, or billing-disabled key looks
+ * configured locally but makes every real interview fail only after camera/mic
+ * permission. This zero-token models request verifies server authentication without
+ * exposing the key or creating a paid response. The short module cache prevents the
+ * public readiness check from becoming an upstream request amplifier.
+ */
+export async function verifyOpenAIAuthentication() {
+  const apiKey = requireOpenAIApiKey();
+  const apiKeyHash = await privacySafeIdentifier(apiKey);
+  const now = Date.now();
+  if (openAIHealthCache?.apiKeyHash === apiKeyHash) {
+    const ttl = openAIHealthCache.healthy ? OPENAI_HEALTHY_CACHE_MS : OPENAI_UNHEALTHY_CACHE_MS;
+    if (now - openAIHealthCache.checkedAt < ttl) return openAIHealthCache.healthy;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const requests = [REALTIME_MODEL, EVALUATION_MODEL].map((model) => new Request(
+      `https://api.openai.com/v1/models/${encodeURIComponent(model)}`,
+      {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: controller.signal,
+      },
+    ));
+    // The optional Fetcher binding is used by deterministic Worker tests and can
+    // also support a future egress proxy. Production normally takes global fetch.
+    const service = openAIServiceBinding();
+    const responses = await Promise.all(requests.map((request) =>
+      service ? service.fetch(request) : fetch(request)));
+    const healthy = responses.every((response) => response.ok);
+    openAIHealthCache = { apiKeyHash, checkedAt: now, healthy };
+    return healthy;
+  } catch {
+    openAIHealthCache = { apiKeyHash, checkedAt: now, healthy: false };
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function privacySafeIdentifier(value: string) {

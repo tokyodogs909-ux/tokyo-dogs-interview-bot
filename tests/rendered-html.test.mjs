@@ -257,6 +257,8 @@ test("server-renders the administrator-only Google Drive setup entry without sec
   assert.match(html, /保存先設定/);
   assert.match(html, /管理者アクセスキー/);
   assert.match(html, /オンライン一次面接_自動格納/);
+  assert.match(html, /本番稼働条件を一括確認/);
+  assert.match(html, /秘密値は画面へ表示しません/);
   assert.match(html, /長期認証情報は暗号化して保管/);
   assert.doesNotMatch(html, /GOOGLE_DRIVE_CLIENT_SECRET|GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET|refresh_token/);
 });

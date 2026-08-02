@@ -19,8 +19,9 @@ import {
 } from "@/lib/openai-server";
 import {
   authorizeInterviewRequest,
+  claimInterviewEvaluation,
+  failInterviewEvaluation,
   saveInterviewEvaluation,
-  saveInterviewTranscript,
 } from "@/lib/interview-persistence";
 import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
 
@@ -75,7 +76,7 @@ export async function POST(request: Request) {
         { status: 401 },
       );
     }
-    if (!["in_progress", "evaluation_pending"].includes(authorized.session.status)) {
+    if (!["in_progress", "evaluation_pending", "evaluation_processing"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接の評価受付は完了しています。" }, { status: 409 });
     }
     if (
@@ -86,11 +87,15 @@ export async function POST(request: Request) {
       return noStoreJson({ error: "応募条件とオンライン一次面接の接続情報が一致しません。" }, { status: 409 });
     }
 
-    await saveInterviewTranscript({ sessionId, transcript });
+    const evaluationClaimId = await claimInterviewEvaluation({ sessionId, transcript });
+    if (!evaluationClaimId) {
+      return noStoreJson({ error: "このオンライン一次面接の評価処理は進行中、または完了しています。" }, { status: 409 });
+    }
 
-    const apiKey = requireOpenAIApiKey();
-    const safetyIdentifier = await privacySafeIdentifier(sessionId);
-    const response = await fetch("https://api.openai.com/v1/responses", {
+    try {
+      const apiKey = requireOpenAIApiKey();
+      const safetyIdentifier = await privacySafeIdentifier(sessionId);
+      const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -137,34 +142,45 @@ ${SOURCE_GROUNDED_EVALUATION_GUIDE}`,
           },
         },
       }),
-    });
+      });
 
-    if (!response.ok) {
-      return noStoreJson(
-        { error: await readOpenAIError(response) },
-        { status: response.status === 429 ? 429 : 502 },
-      );
-    }
+      if (!response.ok) {
+        await failInterviewEvaluation(sessionId, evaluationClaimId);
+        return noStoreJson(
+          { error: await readOpenAIError(response) },
+          { status: response.status === 429 ? 429 : 502 },
+        );
+      }
 
-    const responseBody = await response.json();
-    const outputText = extractResponseText(responseBody);
-    if (!outputText) {
-      return noStoreJson({ error: "評価結果を読み取れませんでした。" }, { status: 502 });
+      const responseBody = await response.json();
+      const outputText = extractResponseText(responseBody);
+      if (!outputText) {
+        await failInterviewEvaluation(sessionId, evaluationClaimId);
+        return noStoreJson({ error: "評価結果を読み取れませんでした。" }, { status: 502 });
+      }
+      const parsed = JSON.parse(outputText) as Omit<
+        InterviewEvaluation,
+        "evidenceValidationWarnings" | "humanReviewRequired"
+      >;
+      const evaluation = validateEvaluation(parsed, transcript);
+      const saved = await saveInterviewEvaluation({
+        sessionId,
+        transcript,
+        evaluation,
+        claimId: evaluationClaimId,
+      });
+      if (!saved) {
+        return noStoreJson({ error: "このオンライン一次面接の評価受付は完了しています。" }, { status: 409 });
+      }
+      scheduleGoogleDriveSync(sessionId);
+      return noStoreJson({
+        stored: true,
+        humanReviewRequired: true,
+      });
+    } catch (error) {
+      await failInterviewEvaluation(sessionId, evaluationClaimId);
+      throw error;
     }
-    const parsed = JSON.parse(outputText) as Omit<
-      InterviewEvaluation,
-      "evidenceValidationWarnings" | "humanReviewRequired"
-    >;
-    const evaluation = validateEvaluation(parsed, transcript);
-    const saved = await saveInterviewEvaluation({ sessionId, transcript, evaluation });
-    if (!saved) {
-      return noStoreJson({ error: "このオンライン一次面接の評価受付は完了しています。" }, { status: 409 });
-    }
-    scheduleGoogleDriveSync(sessionId);
-    return noStoreJson({
-      stored: true,
-      humanReviewRequired: true,
-    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     const status = message.includes("OPENAI_API_KEY") ? 503 : 500;

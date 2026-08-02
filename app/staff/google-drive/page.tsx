@@ -11,6 +11,17 @@ type DriveRoot = {
   webViewLink: string | null;
 };
 
+type ProductionReadiness = {
+  technicallyReady: boolean;
+  openAIAuthenticated: boolean;
+  database: boolean;
+  recordingStorage: boolean;
+  reviewerAuth: { kasama: boolean; yamamoto: boolean };
+  drive: { authenticated: boolean; name?: string; locationType?: string };
+  candidateEntryMode: "signed_invite" | "common_url";
+  missing: string[];
+};
+
 type PickerDocument = { id?: string; name?: string };
 type PickerResult = { action?: string; docs?: PickerDocument[] };
 type PickerInstance = { setVisible(visible: boolean): void };
@@ -89,6 +100,8 @@ export default function GoogleDriveSetupPage() {
   const [phase, setPhase] = useState<"idle" | "connecting" | "connected" | "selecting" | "ready">("idle");
   const [message, setMessage] = useState("");
   const [root, setRoot] = useState<DriveRoot | null>(null);
+  const [readiness, setReadiness] = useState<ProductionReadiness | null>(null);
+  const [readinessChecking, setReadinessChecking] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -202,6 +215,31 @@ export default function GoogleDriveSetupPage() {
     }
   }
 
+  async function checkProductionReadiness() {
+    setReadinessChecking(true);
+    setMessage("");
+    try {
+      const response = await fetch("/api/admin/readiness", {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: accessKey ? { Authorization: `Bearer ${accessKey}` } : {},
+      });
+      const payload = await response.json() as ProductionReadiness & { error?: string };
+      if (typeof payload.technicallyReady !== "boolean") {
+        throw new Error(payload.error || "本番稼働条件を確認できませんでした。");
+      }
+      setReadiness(payload);
+      setMessage(payload.technicallyReady
+        ? "本番の技術設定をすべて確認しました。"
+        : "未完了の設定があります。下の赤い項目を確認してください。");
+    } catch (error) {
+      setReadiness(null);
+      setMessage(error instanceof Error ? error.message : "本番稼働条件を確認できませんでした。");
+    } finally {
+      setReadinessChecking(false);
+    }
+  }
+
   return (
     <main className="staff-shell drive-setup-shell">
       <header className="site-header staff-header">
@@ -254,6 +292,22 @@ export default function GoogleDriveSetupPage() {
               <strong>{root.name}</strong>
               <small>{root.locationType === "shared_drive" ? "共有ドライブ" : "マイドライブ"}・追加権限確認済み</small>
               {root.webViewLink && <a href={root.webViewLink} target="_blank" rel="noreferrer">保存先をGoogle Driveで確認 ↗</a>}
+            </div>
+          )}
+          <div className="readiness-action">
+            <button className="secondary-action" type="button" onClick={() => void checkProductionReadiness()} disabled={readinessChecking}>
+              {readinessChecking ? "本番設定を確認中…" : "本番稼働条件を一括確認"}
+            </button>
+            <small>管理者アクセスキーを入力したまま、またはGoogle接続直後に確認できます。秘密値は画面へ表示しません。</small>
+          </div>
+          {readiness && (
+            <div className={`readiness-readback ${readiness.technicallyReady ? "ready" : "blocked"}`}>
+              <div className="readiness-summary"><strong>{readiness.technicallyReady ? "技術設定 完了" : "本番開始を保留"}</strong><span>{readiness.candidateEntryMode === "common_url" ? "共通URL方式" : "候補者別リンク方式"}</span></div>
+              <div className={readiness.openAIAuthenticated ? "passed" : "failed"}><span>音声・評価モデル</span><strong>{readiness.openAIAuthenticated ? "認証済み" : "要設定"}</strong></div>
+              <div className={readiness.database ? "passed" : "failed"}><span>面接記録データベース</span><strong>{readiness.database ? "接続済み" : "要設定"}</strong></div>
+              <div className={readiness.recordingStorage ? "passed" : "failed"}><span>録画保存領域</span><strong>{readiness.recordingStorage ? "接続済み" : "要設定"}</strong></div>
+              <div className={readiness.reviewerAuth.kasama && readiness.reviewerAuth.yamamoto ? "passed" : "failed"}><span>笠間・山本の閲覧認証</span><strong>{readiness.reviewerAuth.kasama && readiness.reviewerAuth.yamamoto ? "設定済み" : "要設定"}</strong></div>
+              <div className={readiness.drive.authenticated ? "passed" : "failed"}><span>Google Drive自動格納</span><strong>{readiness.drive.authenticated ? "読戻し済み" : "要確認"}</strong></div>
             </div>
           )}
           <p className="drive-security-note">接続に使う長期認証情報は暗号化して保管し、採用担当者の画面・応募者画面・格納レポートには表示しません。</p>

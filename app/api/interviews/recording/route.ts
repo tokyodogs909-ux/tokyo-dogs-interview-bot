@@ -1,5 +1,7 @@
 import {
   authorizeInterviewRequest,
+  claimInterviewRecordingUpload,
+  failInterviewRecordingUpload,
   hasRecordingStorage,
   saveInterviewRecording,
 } from "@/lib/interview-persistence";
@@ -22,7 +24,7 @@ export async function POST(request: Request) {
     if (!authorized?.session) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
     }
-    if (!["in_progress", "evaluation_pending", "completed"].includes(authorized.session.status)) {
+    if (!["in_progress", "evaluation_pending", "evaluation_processing", "completed"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接は録画を受け付ける状態ではありません。" }, { status: 409 });
     }
     if (!hasRecordingStorage()) {
@@ -42,12 +44,20 @@ export async function POST(request: Request) {
     if (!request.body) {
       return noStoreJson({ error: "録画データがありません。" }, { status: 400 });
     }
-    await saveInterviewRecording({
-      session: authorized.session,
-      body: request.body,
-      contentType,
-      byteSize: contentLength,
-    });
+    if (!await claimInterviewRecordingUpload(sessionId)) {
+      return noStoreJson({ error: "録画はすでに保存済み、または現在保存中です。" }, { status: 409 });
+    }
+    try {
+      await saveInterviewRecording({
+        session: authorized.session,
+        body: request.body,
+        contentType,
+        byteSize: contentLength,
+      });
+    } catch (error) {
+      await failInterviewRecordingUpload(sessionId);
+      throw error;
+    }
     scheduleGoogleDriveSync(sessionId);
     return noStoreJson({ stored: true });
   } catch {

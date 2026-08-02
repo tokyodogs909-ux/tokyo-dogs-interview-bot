@@ -6,6 +6,8 @@ interface Env {
   ASSETS: Fetcher;
   DB?: D1Database;
   RECORDINGS?: R2Bucket;
+  OPENAI_API_KEY?: string;
+  OPENAI_API?: Fetcher;
   INTERVIEW_REVIEW_TOKEN_KASAMA?: string;
   INTERVIEW_REVIEW_TOKEN_YAMAMOTO?: string;
   INTERVIEW_ADMIN_TOKEN?: string;
@@ -93,6 +95,8 @@ const worker = {
       __TOKYO_DOGS_INTERVIEW_BINDINGS__?: Pick<Env,
         | "DB"
         | "RECORDINGS"
+        | "OPENAI_API_KEY"
+        | "OPENAI_API"
         | "INTERVIEW_REVIEW_TOKEN_KASAMA"
         | "INTERVIEW_REVIEW_TOKEN_YAMAMOTO"
         | "INTERVIEW_ADMIN_TOKEN"
@@ -111,6 +115,8 @@ const worker = {
     }).__TOKYO_DOGS_INTERVIEW_BINDINGS__ = {
       DB: bindings.DB,
       RECORDINGS: bindings.RECORDINGS,
+      OPENAI_API_KEY: bindings.OPENAI_API_KEY,
+      OPENAI_API: bindings.OPENAI_API,
       INTERVIEW_REVIEW_TOKEN_KASAMA: bindings.INTERVIEW_REVIEW_TOKEN_KASAMA,
       INTERVIEW_REVIEW_TOKEN_YAMAMOTO: bindings.INTERVIEW_REVIEW_TOKEN_YAMAMOTO,
       INTERVIEW_ADMIN_TOKEN: bindings.INTERVIEW_ADMIN_TOKEN,

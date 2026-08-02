@@ -28,6 +28,7 @@ export type InterviewSessionRecord = {
   employment: string;
   preferred_location: string;
   status: string;
+  recording_status: string;
   expires_at: string;
   retention_until: string;
 };
@@ -73,6 +74,17 @@ async function sha256(value: string) {
     .join("");
 }
 
+function constantTimeEqualText(left: string, right: string) {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  if (leftBytes.byteLength !== rightBytes.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < leftBytes.byteLength; index += 1) {
+    difference |= leftBytes[index] ^ rightBytes[index];
+  }
+  return difference === 0;
+}
+
 function randomToken() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
@@ -112,6 +124,8 @@ async function ensureSchema(db: D1Database) {
       recording_status TEXT DEFAULT 'not_started' NOT NULL,
       transcript_json TEXT,
       evaluation_json TEXT,
+      evaluation_claim_id TEXT,
+      evaluation_started_at TEXT,
       summary TEXT,
       expires_at TEXT NOT NULL,
       retention_until TEXT NOT NULL,
@@ -188,9 +202,33 @@ async function ensureSchema(db: D1Database) {
   ]);
   const sessionColumns = await db.prepare("PRAGMA table_info(interview_sessions)")
     .all<{ name: string }>();
-  if (!(sessionColumns.results ?? []).some((column) => column.name === "candidate_name")) {
-    await db.prepare("ALTER TABLE interview_sessions ADD COLUMN candidate_name TEXT DEFAULT '' NOT NULL").run();
-  }
+  const existingColumns = new Set((sessionColumns.results ?? []).map((column) => column.name));
+  const addColumnIfMissing = async (name: string, sql: string) => {
+    if (existingColumns.has(name)) return;
+    try {
+      await db.prepare(sql).run();
+      existingColumns.add(name);
+    } catch (error) {
+      // Another request may have applied the same migration between PRAGMA and
+      // ALTER. Re-read instead of failing a candidate request on that harmless race.
+      const refreshed = await db.prepare("PRAGMA table_info(interview_sessions)")
+        .all<{ name: string }>();
+      if (!(refreshed.results ?? []).some((column) => column.name === name)) throw error;
+      existingColumns.add(name);
+    }
+  };
+  await addColumnIfMissing(
+    "candidate_name",
+    "ALTER TABLE interview_sessions ADD COLUMN candidate_name TEXT DEFAULT '' NOT NULL",
+  );
+  await addColumnIfMissing(
+    "evaluation_claim_id",
+    "ALTER TABLE interview_sessions ADD COLUMN evaluation_claim_id TEXT",
+  );
+  await addColumnIfMissing(
+    "evaluation_started_at",
+    "ALTER TABLE interview_sessions ADD COLUMN evaluation_started_at TEXT",
+  );
 }
 
 const PUBLIC_ENTRY_WINDOW_MS = 6 * 60 * 60 * 1_000;
@@ -397,11 +435,37 @@ export async function authorizeInterviewRequest(request: Request, sessionId: str
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
   if (!token) return null;
   const session = await db.prepare(
-    "SELECT id, access_token_hash, candidate_name, employment, preferred_location, status, expires_at, retention_until FROM interview_sessions WHERE id = ? LIMIT 1",
+    "SELECT id, access_token_hash, candidate_name, employment, preferred_location, status, recording_status, expires_at, retention_until FROM interview_sessions WHERE id = ? LIMIT 1",
   ).bind(sessionId).first<InterviewSessionRecord>();
-  if (!session || session.access_token_hash !== await sha256(token)) return null;
+  if (!session || !constantTimeEqualText(session.access_token_hash, await sha256(token))) return null;
   if (Date.parse(session.expires_at) <= Date.now()) return null;
   return { session };
+}
+
+export async function claimInterviewRecordingUpload(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - 10 * 60 * 1000).toISOString();
+  const result = await db.prepare(`UPDATE interview_sessions SET
+    recording_status = 'uploading', updated_at = ?
+    WHERE id = ? AND (
+      recording_status IN ('not_started', 'failed') OR
+      (recording_status = 'uploading' AND updated_at < ?)
+    )`)
+    .bind(now.toISOString(), sessionId, staleBefore)
+    .run();
+  return Number(result.meta?.changes ?? 0) === 1;
+}
+
+export async function failInterviewRecordingUpload(sessionId: string) {
+  const db = database();
+  if (!db) return;
+  await db.prepare(`UPDATE interview_sessions SET
+    recording_status = 'failed', updated_at = ?
+    WHERE id = ? AND recording_status = 'uploading'`)
+    .bind(new Date().toISOString(), sessionId)
+    .run();
 }
 
 function reviewerSecret(name: AuthorizedReviewer) {
@@ -412,9 +476,21 @@ function reviewerSecret(name: AuthorizedReviewer) {
   return key?.trim() ?? "";
 }
 
+/**
+ * Returns configuration state only. Secret values are intentionally never
+ * exposed, even to the authenticated readiness endpoint.
+ */
+export function reviewerAuthenticationReadiness() {
+  return {
+    kasama: Boolean(reviewerSecret("笠間")),
+    yamamoto: Boolean(reviewerSecret("山本")),
+  };
+}
+
 async function secureTokenMatch(actual: string, expected: string) {
   if (!actual || !expected) return false;
-  return await sha256(actual) === await sha256(expected);
+  const [actualHash, expectedHash] = await Promise.all([sha256(actual), sha256(expected)]);
+  return constantTimeEqualText(actualHash, expectedHash);
 }
 
 export async function authorizeReviewerRequest(request: Request) {
@@ -444,23 +520,99 @@ export async function markInterviewStarted(sessionId: string) {
   ]);
 }
 
+const REALTIME_CONNECTION_LIMIT_PER_SESSION = 12;
+
+/**
+ * An access token is intentionally reusable for reconnects during its two-hour
+ * interview window. Without a separate budget, however, one leaked token can mint
+ * an unbounded number of paid realtime calls. The INSERT ... SELECT is a single D1
+ * statement so concurrent reconnects cannot all pass a read-then-write race.
+ */
+export async function reserveInterviewRealtimeConnection(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const result = await db.prepare(`INSERT INTO interview_audit_events (
+    id, session_id, event_type, actor_type, detail_json
+  ) SELECT ?, ?, 'realtime_connection_reserved', 'candidate', ?
+    WHERE (SELECT COUNT(*) FROM interview_audit_events
+      WHERE session_id = ? AND event_type = 'realtime_connection_reserved') < ?`)
+    .bind(
+      crypto.randomUUID(),
+      sessionId,
+      JSON.stringify({ limit: REALTIME_CONNECTION_LIMIT_PER_SESSION }),
+      sessionId,
+      REALTIME_CONNECTION_LIMIT_PER_SESSION,
+    )
+    .run();
+  return Number(result.meta?.changes ?? 0) === 1;
+}
+
+const EVALUATION_CLAIM_STALE_AFTER_MS = 10 * 60 * 1_000;
+
+/**
+ * Claims the one paid evaluation call for a session before contacting the model.
+ * A Worker that died after claiming can be recovered after ten minutes, while a
+ * concurrent or replayed request is rejected before incurring another model call.
+ */
+export async function claimInterviewEvaluation(input: {
+  sessionId: string;
+  transcript: TranscriptTurn[];
+}) {
+  const db = database();
+  if (!db) return null;
+  const now = new Date().toISOString();
+  const claimId = crypto.randomUUID();
+  const staleBefore = new Date(Date.now() - EVALUATION_CLAIM_STALE_AFTER_MS).toISOString();
+  const result = await db.prepare(`UPDATE interview_sessions SET
+    status = 'evaluation_processing', transcript_json = ?, evaluation_claim_id = ?,
+    evaluation_started_at = ?, updated_at = ?
+    WHERE id = ? AND (
+      status IN ('in_progress', 'evaluation_pending') OR
+      (status = 'evaluation_processing' AND
+        (evaluation_started_at IS NULL OR evaluation_started_at < ?))
+    )`)
+    .bind(JSON.stringify(input.transcript), claimId, now, now, input.sessionId, staleBefore)
+    .run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return null;
+  await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'evaluation_started', 'system', ?)")
+    .bind(crypto.randomUUID(), input.sessionId, JSON.stringify({ turnCount: input.transcript.length }))
+    .run();
+  return claimId;
+}
+
+export async function failInterviewEvaluation(sessionId: string, claimId: string) {
+  const db = database();
+  if (!db) return;
+  await db.prepare(`UPDATE interview_sessions SET
+    status = 'evaluation_pending', evaluation_claim_id = NULL,
+    evaluation_started_at = NULL, updated_at = ?
+    WHERE id = ? AND status = 'evaluation_processing' AND evaluation_claim_id = ?`)
+    .bind(new Date().toISOString(), sessionId, claimId)
+    .run();
+}
+
 export async function saveInterviewEvaluation(input: {
   sessionId: string;
   transcript: TranscriptTurn[];
   evaluation: InterviewEvaluation;
+  claimId: string;
 }) {
   const db = database();
   if (!db) return false;
   const now = new Date().toISOString();
-  // The UPDATE's "status <> 'completed'" guard silently no-ops on a duplicate/concurrent
-  // submission for an already-completed session (0 rows changed is not a batch failure),
-  // so the audit insert must be conditioned on that same guard. Otherwise a rejected
+  // Only the request holding the evaluation_processing claim may complete the
+  // session. A duplicate submission is rejected before the model call, and this
+  // final fence protects against a stale Worker whose claim was reclaimed.
+  // The UPDATE silently no-ops if this Worker no longer holds the claim, so the
+  // audit insert must be conditioned on that same guard. Otherwise a rejected
   // duplicate would still write an 'evaluation_saved' audit row, misrepresenting it as
   // having been persisted when the original evaluation was left untouched.
   const results = await db.batch([
     db.prepare(`UPDATE interview_sessions SET
       status = 'completed', transcript_json = ?, evaluation_json = ?, summary = ?,
-      completed_at = ?, updated_at = ? WHERE id = ? AND status <> 'completed'`)
+      evaluation_claim_id = NULL, evaluation_started_at = NULL,
+      completed_at = ?, updated_at = ? WHERE id = ?
+      AND status = 'evaluation_processing' AND evaluation_claim_id = ?`)
       .bind(
         JSON.stringify(input.transcript),
         JSON.stringify(input.evaluation),
@@ -468,6 +620,7 @@ export async function saveInterviewEvaluation(input: {
         now,
         now,
         input.sessionId,
+        input.claimId,
       ),
     db.prepare(`INSERT INTO interview_audit_events (
       id, session_id, event_type, actor_type, detail_json
@@ -482,22 +635,6 @@ export async function saveInterviewEvaluation(input: {
       ),
   ]);
   return Number((results[0] as { meta?: { changes?: number } }).meta?.changes ?? 0) === 1;
-}
-
-export async function saveInterviewTranscript(input: {
-  sessionId: string;
-  transcript: TranscriptTurn[];
-}) {
-  const db = database();
-  if (!db) return;
-  const now = new Date().toISOString();
-  await db.batch([
-    db.prepare(`UPDATE interview_sessions SET
-      status = 'evaluation_pending', transcript_json = ?, updated_at = ? WHERE id = ?`)
-      .bind(JSON.stringify(input.transcript), now, input.sessionId),
-    db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'transcript_saved', 'system', ?)")
-      .bind(crypto.randomUUID(), input.sessionId, JSON.stringify({ turnCount: input.transcript.length })),
-  ]);
 }
 
 export async function recordCandidateEvent(input: {

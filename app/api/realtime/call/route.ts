@@ -10,6 +10,7 @@ import {
 import {
   authorizeInterviewRequest,
   markInterviewStarted,
+  reserveInterviewRealtimeConnection,
 } from "@/lib/interview-persistence";
 
 function noStoreText(body: string, status = 200, contentType = "text/plain; charset=utf-8") {
@@ -45,6 +46,9 @@ export async function POST(request: Request) {
     const sdp = await request.text();
     if (!sdp || sdp.length > 120_000) {
       return noStoreText("TD-CONN-SDP: 音声通話の準備情報を確認できません。", 400);
+    }
+    if (!await reserveInterviewRealtimeConnection(sessionId)) {
+      return noStoreText("TD-CONN-LIMIT: 音声回線への再接続回数が上限に達しました。採用担当者へご連絡ください。", 429);
     }
 
     const apiKey = requireOpenAIApiKey();

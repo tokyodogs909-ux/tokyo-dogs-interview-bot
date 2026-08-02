@@ -26,6 +26,12 @@ type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
 /** "checking" while the pre-flight is in flight; every other value mirrors InterviewAccessState. */
 type InviteGate = "checking" | InterviewAccessState;
 type InterviewMode = "voice" | "text" | "internal-test";
+
+// Keep the final single-request upload below the server's 95 MiB limit even on
+// browsers that do not strictly honor the requested MediaRecorder bitrates.
+// The recorder emits one-second chunks, so stopping at the last complete chunk
+// also avoids retaining an unbounded video in mobile Safari memory.
+const MAX_CLIENT_RECORDING_BYTES = 90 * 1024 * 1024;
 type ConnectionState =
   | "idle"
   | "connecting"
@@ -232,6 +238,8 @@ export default function Home() {
   const channelRef = useRef<RTCDataChannel | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const recordingBytesRef = useRef(0);
+  const recordingSizeCappedRef = useRef(false);
   const recordingBlobRef = useRef<Blob | null>(null);
   const recordingPromiseRef = useRef<Promise<Blob | null> | null>(null);
   const recordingResolveRef = useRef<((blob: Blob | null) => void) | null>(null);
@@ -907,6 +915,19 @@ export default function Home() {
       recordingPromiseRef.current = Promise.resolve(null);
       return;
     }
+    // A recoverable WebRTC drop must not split the recording into independently
+    // encoded WebM/MP4 containers. Concatenating those byte streams can produce a
+    // file that only plays its first segment. Keep the original MediaRecorder
+    // running and attach the replacement remote audio track to the existing mix.
+    if (options.resume && recorderRef.current?.state === "recording") {
+      if (remoteStream) attachRemoteAudioToRecording(remoteStream);
+      setRecordingCaptureState("recording");
+      return;
+    }
+    if (options.resume && recordingSizeCappedRef.current) {
+      setRecordingCaptureState("error");
+      return;
+    }
     setRecordingCaptureState("starting");
     setRecordingHasBothAudio(null);
     // A reconnect (options.resume) restarts the MediaRecorder but must keep the
@@ -914,6 +935,8 @@ export default function Home() {
     // full interview instead of only the segment recorded after recovery.
     if (!options.resume) {
       chunksRef.current = [];
+      recordingBytesRef.current = 0;
+      recordingSizeCappedRef.current = false;
     }
     // Each recorder belongs to one generation. A previous recorder's stop event
     // can still be queued when a reconnect starts a new one; without this guard
@@ -1032,7 +1055,25 @@ export default function Home() {
           ...(hasVideo ? { videoBitsPerSecond: 360_000 } : {}),
         });
         recorder.ondataavailable = (event) => {
-          if (event.data.size > 0) chunksRef.current.push(event.data);
+          if (event.data.size <= 0 || recordingSizeCappedRef.current) return;
+          const nextSize = recordingBytesRef.current + event.data.size;
+          if (nextSize > MAX_CLIENT_RECORDING_BYTES) {
+            recordingSizeCappedRef.current = true;
+            reportCandidateEvent("recording_unavailable", "CLIENT_RECORDING_SIZE_LIMIT");
+            setRecordingCaptureState("error");
+            setAudioNotice("録画容量が安全上限に達したため、ここまでの録画を保護しました。面接は継続し、採用担当者が記録状態を確認します。");
+            if (recorder.state !== "inactive") {
+              try {
+                recorder.stop();
+              } catch {
+                recordingResolveRef.current?.(null);
+                recordingResolveRef.current = null;
+              }
+            }
+            return;
+          }
+          chunksRef.current.push(event.data);
+          recordingBytesRef.current = nextSize;
         };
         recorder.onerror = () => {
           if (!ownsRecording()) return;
@@ -1318,7 +1359,7 @@ export default function Home() {
     setStage("interview");
   }
 
-  function stopRealtime(options: { keepLocalStream?: boolean } = {}) {
+  function stopRealtime(options: { keepLocalStream?: boolean; keepRecorder?: boolean } = {}) {
     clearResponseWatchdog();
     clearCandidateResponseDelay();
     turnStateRef.current = { ...turnStateRef.current, awaitingResponse: false, candidateTurnPending: false };
@@ -1344,7 +1385,7 @@ export default function Home() {
     if (disconnectTimerRef.current) window.clearTimeout(disconnectTimerRef.current);
     disconnectTimerRef.current = null;
     const activeRecorder = recorderRef.current;
-    if (activeRecorder && activeRecorder.state !== "inactive") {
+    if (!options.keepRecorder && activeRecorder && activeRecorder.state !== "inactive") {
       try {
         activeRecorder.requestData();
       } catch {
@@ -1358,7 +1399,7 @@ export default function Home() {
         cleanupRecordingAudioMix();
       }
       if (!endingRef.current) setRecordingCaptureState("error");
-    } else {
+    } else if (!options.keepRecorder) {
       cleanupRecordingAudioMix();
     }
     if (!options.keepLocalStream) {
@@ -1679,7 +1720,10 @@ export default function Home() {
       const failActiveConnection = (message: string) => {
         if (endingRef.current || peerRef.current !== peer) return;
         reportCandidateEvent("connection_failed", message.split(":")[0]);
-        stopRealtime({ keepLocalStream: true });
+        // Preserve the single recording container while the candidate reconnects.
+        // Camera and local audio continue; the replacement remote track is mixed
+        // back in after the next WebRTC connection succeeds.
+        stopRealtime({ keepLocalStream: true, keepRecorder: true });
         if (streamRef.current) void startMicrophoneMeter(streamRef.current);
         setStage("setup");
         setSetupPhase("error");
@@ -1915,6 +1959,8 @@ export default function Home() {
     recordingBlobRef.current = null;
     recordingPromiseRef.current = null;
     recordingResolveRef.current = null;
+    recordingBytesRef.current = 0;
+    recordingSizeCappedRef.current = false;
     setRecordingUploadState("idle");
     setRecordingCaptureState("idle");
     setRecordingHasBothAudio(null);
@@ -1945,6 +1991,8 @@ export default function Home() {
     // resume the abandoned transcript and recording chunks.
     recordedInterviewSessionRef.current = null;
     chunksRef.current = [];
+    recordingBytesRef.current = 0;
+    recordingSizeCappedRef.current = false;
     recordingBlobRef.current = null;
     recordingPromiseRef.current = null;
     recordingResolveRef.current = null;

@@ -1,0 +1,65 @@
+import { authorizeInterviewAdminOrSetupSession } from "@/lib/admin-auth";
+import {
+  missingGoogleDriveConfiguration,
+  validateGoogleDriveRoot,
+} from "@/lib/google-drive-auth";
+import { signedInvitesRequired } from "@/lib/interview-invite";
+import {
+  hasInterviewDatabase,
+  hasRecordingStorage,
+  reviewerAuthenticationReadiness,
+} from "@/lib/interview-persistence";
+import { noStoreJson, verifyOpenAIAuthentication } from "@/lib/openai-server";
+
+export async function GET(request: Request) {
+  try {
+    if (!await authorizeInterviewAdminOrSetupSession(request)) {
+      return noStoreJson({ error: "管理者認証を確認できません。" }, { status: 401 });
+    }
+
+    const reviewerAuth = reviewerAuthenticationReadiness();
+    const database = hasInterviewDatabase();
+    const recordingStorage = hasRecordingStorage();
+    const driveMissing = await missingGoogleDriveConfiguration();
+    const [openAIAuthenticated, driveRoot] = await Promise.all([
+      verifyOpenAIAuthentication().catch(() => false),
+      driveMissing.length === 0
+        ? validateGoogleDriveRoot()
+          .then((root) => ({
+            authenticated: true as const,
+            name: root.name,
+            locationType: root.locationType,
+          }))
+          .catch(() => ({ authenticated: false as const }))
+        : Promise.resolve({ authenticated: false as const }),
+    ]);
+    const missing = [
+      ...(!openAIAuthenticated ? ["OPENAI_AUTHENTICATION"] : []),
+      ...(!database ? ["INTERVIEW_DATABASE"] : []),
+      ...(!recordingStorage ? ["RECORDING_STORAGE"] : []),
+      ...(!reviewerAuth.kasama ? ["INTERVIEW_REVIEW_TOKEN_KASAMA"] : []),
+      ...(!reviewerAuth.yamamoto ? ["INTERVIEW_REVIEW_TOKEN_YAMAMOTO"] : []),
+      ...driveMissing,
+      ...(driveMissing.length === 0 && !driveRoot.authenticated ? ["GOOGLE_DRIVE_AUTHENTICATION"] : []),
+    ];
+    const technicallyReady = missing.length === 0;
+
+    return noStoreJson({
+      technicallyReady,
+      openAIAuthenticated,
+      database,
+      recordingStorage,
+      reviewerAuth,
+      drive: driveRoot,
+      candidateEntryMode: signedInvitesRequired() ? "signed_invite" : "common_url",
+      missing,
+    }, { status: technicallyReady ? 200 : 503 });
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "";
+    return noStoreJson({
+      error: code === "INTERVIEW_ADMIN_AUTH_UNCONFIGURED"
+        ? "管理者用認証の設定が完了していません。"
+        : "本番稼働条件を確認できませんでした。",
+    }, { status: code === "INTERVIEW_ADMIN_AUTH_UNCONFIGURED" ? 503 : 500 });
+  }
+}

@@ -451,6 +451,20 @@ select, .candidate-name-input { padding: 13px 14px; }
 .drive-root-readback strong { color: var(--brand-navy); font-size: 14px; }
 .drive-root-readback small { color: #16623a; font-size: 10px; }
 .drive-root-readback a { margin-top: 5px; color: var(--brand-navy); font-size: 10px; font-weight: 800; }
+.readiness-action { display: grid; gap: 8px; margin-top: 16px; }
+.readiness-action .secondary-action { justify-content: center; }
+.readiness-action small { color: var(--muted); font-size: 9px; line-height: 1.6; }
+.readiness-readback { margin-top: 14px; border: 1px solid rgba(7,66,105,.14); border-radius: 14px; padding: 14px; display: grid; gap: 8px; }
+.readiness-readback.ready { border-color: #9ad2b5; background: #f2fbf6; }
+.readiness-readback.blocked { border-color: #e7aaa5; background: #fff8f7; }
+.readiness-summary, .readiness-readback > div:not(.readiness-summary) { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.readiness-summary { padding-bottom: 9px; border-bottom: 1px solid rgba(7,66,105,.1); color: var(--brand-navy); }
+.readiness-summary strong { font-size: 12px; }
+.readiness-summary span { color: var(--muted); font-size: 9px; }
+.readiness-readback > div:not(.readiness-summary) { font-size: 10px; }
+.readiness-readback > div:not(.readiness-summary) span { color: var(--muted); }
+.readiness-readback .passed strong { color: #16623a; }
+.readiness-readback .failed strong { color: #8c2d24; }
 .drive-security-note { margin: 18px 0 0; color: var(--muted); font-size: 9px; line-height: 1.7; }
 .invite-result { display: grid; gap: 9px; margin-top: 18px; padding: 16px; border: 1px solid rgba(7,66,105,.12); border-radius: 16px; background: #f8fcff; }
 .invite-result > span { color: var(--brand-navy); font-size: 10px; font-weight: 800; letter-spacing: .06em; }
