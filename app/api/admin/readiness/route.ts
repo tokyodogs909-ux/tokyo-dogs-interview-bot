@@ -3,6 +3,7 @@ import {
   missingGoogleDriveConfiguration,
   validateGoogleDriveRoot,
 } from "@/lib/google-drive-auth";
+import { missingGoogleDriveOAuthSetupConfiguration } from "@/lib/google-drive-connection";
 import { signedInvitesRequired } from "@/lib/interview-invite";
 import {
   hasInterviewDatabase,
@@ -21,6 +22,7 @@ export async function GET(request: Request) {
     const database = hasInterviewDatabase();
     const recordingStorage = hasRecordingStorage();
     const driveMissing = await missingGoogleDriveConfiguration();
+    const driveOAuthMissing = missingGoogleDriveOAuthSetupConfiguration();
     const [openAIAuthenticated, driveRoot] = await Promise.all([
       verifyOpenAIAuthentication().catch(() => false),
       driveMissing.length === 0
@@ -40,8 +42,9 @@ export async function GET(request: Request) {
       ...(!reviewerAuth.kasama ? ["INTERVIEW_REVIEW_TOKEN_KASAMA"] : []),
       ...(!reviewerAuth.yamamoto ? ["INTERVIEW_REVIEW_TOKEN_YAMAMOTO"] : []),
       ...driveMissing,
+      ...driveOAuthMissing,
       ...(driveMissing.length === 0 && !driveRoot.authenticated ? ["GOOGLE_DRIVE_AUTHENTICATION"] : []),
-    ];
+    ].filter((name, index, values) => values.indexOf(name) === index);
     const technicallyReady = missing.length === 0;
 
     return noStoreJson({
@@ -50,6 +53,7 @@ export async function GET(request: Request) {
       database,
       recordingStorage,
       reviewerAuth,
+      driveOAuthSetup: { configured: driveOAuthMissing.length === 0 },
       drive: driveRoot,
       candidateEntryMode: signedInvitesRequired() ? "signed_invite" : "common_url",
       missing,

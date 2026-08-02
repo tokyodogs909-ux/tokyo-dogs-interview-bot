@@ -512,6 +512,9 @@ test("authenticated production readiness reports missing components without expo
   assert.ok(payload.missing.includes("INTERVIEW_REVIEW_TOKEN_KASAMA"));
   assert.ok(payload.missing.includes("INTERVIEW_REVIEW_TOKEN_YAMAMOTO"));
   assert.ok(payload.missing.includes("GOOGLE_DRIVE_REFRESH_TOKEN"));
+  assert.equal(payload.driveOAuthSetup.configured, false);
+  assert.ok(payload.missing.includes("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET"));
+  assert.ok(payload.missing.includes("GOOGLE_PICKER_API_KEY"));
   assert.equal(responseText.includes("readiness-admin-secret"), false);
   assert.equal(responseText.includes("readiness-rejected-openai-key"), false);
 });

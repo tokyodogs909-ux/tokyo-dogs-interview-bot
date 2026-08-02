@@ -110,13 +110,26 @@ export function googleDriveOAuthClientSettings() {
 export function googleDriveOAuthRedirectUri(request: Request) {
   const configured = setting("GOOGLE_DRIVE_OAUTH_REDIRECT_URI");
   if (configured) return configured;
-  const requestUrl = new URL(request.url);
-  const forwardedHost = request.headers.get("X-Forwarded-Host")?.trim();
-  const forwardedProto = request.headers.get("X-Forwarded-Proto") === "https" ? "https" : requestUrl.protocol.replace(":", "");
-  const origin = forwardedHost && /^[a-z0-9.:[\]-]+$/i.test(forwardedHost)
-    ? `${forwardedProto}://${forwardedHost}`
-    : requestUrl.origin;
-  return `${origin}/api/admin/google-drive/oauth/callback`;
+  // request.url is set by the trusted Worker routing layer. Forwarded headers are
+  // ordinary client-controlled input at this boundary and must not be allowed to
+  // choose an OAuth redirect URI.
+  return `${new URL(request.url).origin}/api/admin/google-drive/oauth/callback`;
+}
+
+/**
+ * Returns configuration names only. This lets the authenticated operations page
+ * explain why Google OAuth cannot start without ever exposing secret values.
+ */
+export function missingGoogleDriveOAuthSetupConfiguration() {
+  const projectNumber = setting("GOOGLE_CLOUD_PROJECT_NUMBER");
+  return [
+    ["GOOGLE_DRIVE_CLIENT_ID", setting("GOOGLE_DRIVE_CLIENT_ID")],
+    ["GOOGLE_DRIVE_CLIENT_SECRET", setting("GOOGLE_DRIVE_CLIENT_SECRET")],
+    ["GOOGLE_DRIVE_OAUTH_REDIRECT_URI", setting("GOOGLE_DRIVE_OAUTH_REDIRECT_URI")],
+    ["GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET", setting("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET")],
+    ["GOOGLE_PICKER_API_KEY", setting("GOOGLE_PICKER_API_KEY")],
+    ["GOOGLE_CLOUD_PROJECT_NUMBER", /^\d{6,20}$/.test(projectNumber) ? projectNumber : ""],
+  ].filter(([, value]) => !value).map(([name]) => name);
 }
 
 export function googlePickerSettings() {
