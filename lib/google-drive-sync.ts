@@ -309,7 +309,11 @@ async function uploadSmallFile(input: {
   const formData = new FormData();
   formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json; charset=UTF-8" }));
   const bytes = typeof input.body === "string" ? new TextEncoder().encode(input.body) : input.body;
-  formData.append("media", new Blob([bytes], { type: input.contentType }));
+  // Copy into an ArrayBuffer-backed view. Cloudflare streams may expose an
+  // ArrayBufferLike view, while the standards Blob constructor accepts only an
+  // ArrayBuffer-backed BlobPart under strict TypeScript checking.
+  const blobBytes = Uint8Array.from(bytes);
+  formData.append("media", new Blob([blobBytes.buffer], { type: input.contentType }));
   const url = existing
     ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(existing.id)}?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`
     : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`;

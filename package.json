@@ -12,9 +12,10 @@
     "mobile:test": "node scripts/mobile-test-gateway.mjs",
     "test": "npm run build && node --test --test-concurrency=1 tests/*.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "audit:prod": "npm audit --omit=dev --audit-level=high",
-    "check": "npm run lint && npm test && npm run audit:prod"
+    "check": "npm run lint && npm run typecheck && npm test && npm run audit:prod"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
@@ -24,6 +25,7 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.48.0",
+    "@cloudflare/workers-types": "^5.20260722.1",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",

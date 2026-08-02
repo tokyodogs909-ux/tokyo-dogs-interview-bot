@@ -521,7 +521,7 @@ export default function Home() {
       }
       audio.srcObject = playbackPrimeRef.current.destination.stream;
       audio.autoplay = true;
-      audio.playsInline = true;
+      audio.setAttribute("playsinline", "true");
       audio.muted = false;
       audio.volume = 1;
       void audio.play().catch(() => undefined);
@@ -790,7 +790,7 @@ export default function Home() {
     stopAudioPrime();
     if (audio.srcObject !== remoteStream) audio.srcObject = remoteStream;
     audio.autoplay = true;
-    audio.playsInline = true;
+    audio.setAttribute("playsinline", "true");
     audio.volume = 1;
     try {
       const speakerConnected = await attachRemoteAudioToSpeaker(remoteStream);
