@@ -51,11 +51,11 @@ export async function POST(request: Request) {
       );
     }
     if (invite.status === "not-required") {
-      const connectingAddress = request.headers.get("cf-connecting-ip")?.trim() ||
-        request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-        "address-unavailable";
-      const userAgent = request.headers.get("user-agent")?.slice(0, 512) || "agent-unavailable";
-      const sourceHash = await hashPublicEntrySource(`${connectingAddress}\n${userAgent}`);
+      // Cloudflare overwrites CF-Connecting-IP at the trusted edge. User-Agent and
+      // X-Forwarded-For are caller-controlled and must not let one source mint a
+      // fresh throttle identity for every request.
+      const connectingAddress = request.headers.get("cf-connecting-ip")?.trim() || "address-unavailable";
+      const sourceHash = await hashPublicEntrySource(connectingAddress);
       const candidateHash = await hashPublicEntrySource(
         `${candidateName.toLocaleLowerCase("ja-JP")}\n${employment}\n${location.toLocaleLowerCase("ja-JP")}`,
       );
@@ -80,7 +80,7 @@ export async function POST(request: Request) {
     }
     if (publicEntryRateLimited) {
       return noStoreJson({
-        error: "短時間に複数回の開始操作が確認されました。6時間ほど空けてから、もう一度お試しください。",
+        error: "短時間に複数回の開始操作が確認されました。しばらく時間を空けてから、もう一度お試しください。",
       }, { status: 429 });
     }
     if (unavailable || signingUnavailable) {

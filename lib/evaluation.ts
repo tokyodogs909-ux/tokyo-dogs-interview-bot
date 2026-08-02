@@ -27,7 +27,12 @@ export const evaluationJsonSchema = {
         additionalProperties: false,
         properties: {
           name: { type: "string", enum: [...EVALUATION_DIMENSIONS] },
-          score: { type: "integer", minimum: 1, maximum: 5 },
+          score: {
+            anyOf: [
+              { type: "integer", minimum: 1, maximum: 5 },
+              { type: "null" },
+            ],
+          },
           confidence: { type: "string", enum: ["low", "medium", "high"] },
           rationale: { type: "string", maxLength: 500 },
           evidence: {
@@ -102,7 +107,7 @@ function findTerms(text: string, terms: readonly string[]) {
 }
 
 function evaluatorFreeText(
-  raw: Omit<InterviewEvaluation, "evidenceValidationWarnings" | "humanReviewRequired">,
+  raw: Omit<InterviewEvaluation, "transcriptProvenance" | "evidenceValidationWarnings" | "humanReviewRequired">,
 ) {
   return [
     raw.summary,
@@ -123,7 +128,7 @@ function evaluatorFreeText(
  * to re-check before using the evaluation.
  */
 export function detectUnfairEvaluationLanguage(
-  raw: Omit<InterviewEvaluation, "evidenceValidationWarnings" | "humanReviewRequired">,
+  raw: Omit<InterviewEvaluation, "transcriptProvenance" | "evidenceValidationWarnings" | "humanReviewRequired">,
 ) {
   const text = evaluatorFreeText(raw);
   const prohibited = [...new Set(text.flatMap((value) => findTerms(value, PROHIBITED_ATTRIBUTE_TERMS)))];
@@ -177,7 +182,7 @@ function verifyDimensionEvidence(
 }
 
 export function validateEvaluation(
-  raw: Omit<InterviewEvaluation, "evidenceValidationWarnings" | "humanReviewRequired">,
+  raw: Omit<InterviewEvaluation, "transcriptProvenance" | "evidenceValidationWarnings" | "humanReviewRequired">,
   turns: TranscriptTurn[],
 ): InterviewEvaluation {
   const warnings: string[] = [];
@@ -223,6 +228,7 @@ export function validateEvaluation(
     ...raw,
     recommendation,
     dimensions,
+    transcriptProvenance: "candidate_device_unverified",
     evidenceValidationWarnings: [...new Set(warnings)],
     humanReviewRequired: true,
   };

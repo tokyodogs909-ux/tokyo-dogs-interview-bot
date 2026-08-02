@@ -119,6 +119,11 @@ export type InterviewEvaluation = {
   contradictions: string[];
   missingTopics: string[];
   conditions: string[];
+  /**
+   * Realtime transcript events are assembled in the candidate browser. Scores
+   * remain provisional until a recruiter compares them with the stored recording.
+   */
+  transcriptProvenance: "candidate_device_unverified";
   evidenceValidationWarnings: string[];
   humanReviewRequired: true;
 };

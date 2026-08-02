@@ -75,6 +75,7 @@ export default function StaffReviewPage() {
   const [accessKey, setAccessKey] = useState("");
   const [review, setReview] = useState<ReviewRecord | null>(null);
   const [recordingUrl, setRecordingUrl] = useState("");
+  const [recordingAudioCoverage, setRecordingAudioCoverage] = useState<"both" | "candidate-only" | "unverified">("unverified");
   const [scores, setScores] = useState<VideoScore[]>(emptyScores);
   const [overallNote, setOverallNote] = useState("");
   const [state, setState] = useState<"idle" | "loading" | "ready" | "saving" | "syncing">("idle");
@@ -97,6 +98,7 @@ export default function StaffReviewPage() {
     setReview(null);
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
     setRecordingUrl("");
+    setRecordingAudioCoverage("unverified");
     try {
       const response = await fetch(`/api/staff/interview?sessionId=${encodeURIComponent(sessionId.trim())}`, {
         headers: authHeaders(),
@@ -113,7 +115,11 @@ export default function StaffReviewPage() {
           headers: authHeaders(),
           cache: "no-store",
         });
-        if (recordingResponse.ok) setRecordingUrl(URL.createObjectURL(await recordingResponse.blob()));
+        if (recordingResponse.ok) {
+          const coverage = recordingResponse.headers.get("X-Interview-Audio-Coverage");
+          setRecordingAudioCoverage(coverage === "both" || coverage === "candidate-only" ? coverage : "unverified");
+          setRecordingUrl(URL.createObjectURL(await recordingResponse.blob()));
+        }
       }
       setState("ready");
     } catch (error) {
@@ -235,11 +241,13 @@ export default function StaffReviewPage() {
           </section>
 
           {review.technicalEvents.length > 0 && <div className="staff-message"><strong>技術・中断フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>これらの事象と映像・音声品質は、応募者の不利益な評価に使用しません。</p></div>}
+          {review.evaluation && <p className="guardrail-copy"><strong>回答評価は応募者端末由来の文字起こしを基にした補助情報です。</strong> 合否判断前に、録画の実際の発言と根拠引用を採用担当者が照合してください。</p>}
 
           <div className="staff-grid">
             <article className="staff-panel recording-panel">
               <div className="panel-title"><p>録画確認</p><h2>接客ロールプレイ</h2></div>
               {recordingUrl ? <video src={recordingUrl} controls playsInline /> : <div className="recording-empty">録画を取得できないか、録画がまだ保存されていません。</div>}
+              {recordingUrl && recordingAudioCoverage !== "both" && <p className="guardrail-copy"><strong>録画内の双方音声は未確認です。</strong> 応募者音声のみ、または端末側で確認できなかった可能性があります。映像と文字起こしを照合し、技術不具合を不利益に扱わないでください。</p>}
               <p className="guardrail-copy">接客ロールプレイ中の傾聴、理解確認、落ち着いた応対、説明、安全配慮など、職務上観察できる行動だけを確認します。笑顔の有無、顔立ち・容姿、服装、背景、カメラ品質、障害や健康状態の推測は評価しません。</p>
             </article>
 

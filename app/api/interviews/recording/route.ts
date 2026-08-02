@@ -44,6 +44,10 @@ export async function POST(request: Request) {
     if (!request.body) {
       return noStoreJson({ error: "録画データがありません。" }, { status: 400 });
     }
+    const audioCoverage = request.headers.get("X-Interview-Audio-Coverage")?.trim() ?? "unverified";
+    if (!["both", "candidate-only", "unverified"].includes(audioCoverage)) {
+      return noStoreJson({ error: "録画の音声確認情報が正しくありません。" }, { status: 400 });
+    }
     if (!await claimInterviewRecordingUpload(sessionId)) {
       return noStoreJson({ error: "録画はすでに保存済み、または現在保存中です。" }, { status: 409 });
     }
@@ -53,6 +57,7 @@ export async function POST(request: Request) {
         body: request.body,
         contentType,
         byteSize: contentLength,
+        audioCoverage: audioCoverage as "both" | "candidate-only" | "unverified",
       });
     } catch (error) {
       await failInterviewRecordingUpload(sessionId);

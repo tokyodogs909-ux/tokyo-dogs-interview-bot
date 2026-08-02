@@ -73,12 +73,13 @@ class FakeD1Statement {
       changes = 1;
     } else if (this.sql.startsWith("INSERT INTO interview_public_entries")) {
       const [id, sourceHash, candidateHash, createdAt, sourceToCount, sourceCutoff, sourceLimit,
-        candidateToCount, candidateCutoff, candidateLimit] = this.values;
+        candidateToCount, candidateCutoff, candidateLimit, globalCutoff, globalLimit] = this.values;
       const sourceCount = this.database.publicEntries.filter((entry) =>
         entry.source_hash === sourceToCount && entry.created_at > sourceCutoff).length;
       const candidateCount = this.database.publicEntries.filter((entry) =>
         entry.candidate_hash === candidateToCount && entry.created_at > candidateCutoff).length;
-      if (sourceCount < sourceLimit && candidateCount < candidateLimit) {
+      const globalCount = this.database.publicEntries.filter((entry) => entry.created_at > globalCutoff).length;
+      if (sourceCount < sourceLimit && candidateCount < candidateLimit && globalCount < globalLimit) {
         this.database.publicEntries.push({
           id,
           source_hash: sourceHash,
@@ -419,7 +420,11 @@ class FakeR2 {
   async get(key) {
     const object = this.objects.get(key);
     if (!object) return null;
-    return { body: object.body, etag: "test-etag" };
+    return {
+      body: object.body,
+      etag: "test-etag",
+      customMetadata: object.options?.customMetadata ?? {},
+    };
   }
 
 }
@@ -1179,12 +1184,12 @@ test("common entry URL creates separate sessions and throttles repeated paid sta
     INTERVIEW_INVITE_SIGNING_SECRET: "test-signing-secret-with-sufficient-entropy",
     INTERVIEW_REQUIRE_SIGNED_INVITE: "false",
   };
-  const start = (candidateName, address = "203.0.113.10") => request("/api/interviews/session", {
+  const start = (candidateName, address = "203.0.113.10", userAgent = "TOKYO-DOGS-COMMON-ENTRY-TEST") => request("/api/interviews/session", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "CF-Connecting-IP": address,
-      "User-Agent": "TOKYO-DOGS-COMMON-ENTRY-TEST",
+      "User-Agent": userAgent,
     },
     body: JSON.stringify({
       candidateName,
@@ -1211,13 +1216,25 @@ test("common entry URL creates separate sessions and throttles repeated paid sta
   assert.equal((await start("同一 応募者", "203.0.113.11")).status, 201);
   const throttled = await start("同一 応募者", "203.0.113.11");
   assert.equal(throttled.status, 429);
-  assert.match((await throttled.json()).error, /6時間/);
+  assert.match((await throttled.json()).error, /時間を空けて/);
 
   for (let index = 0; index < 8; index += 1) {
     assert.equal((await start(`接続元制限 ${index}`, "203.0.113.12")).status, 201);
   }
   const sourceThrottled = await start("接続元制限 9", "203.0.113.12");
   assert.equal(sourceThrottled.status, 429);
+
+  for (let index = 0; index < 8; index += 1) {
+    assert.equal((await start(`UA変更制限 ${index}`, "203.0.113.13", `FORGED-UA-${index}`)).status, 201);
+  }
+  assert.equal((await start("UA変更制限 9", "203.0.113.13", "FORGED-UA-9")).status, 429);
+
+  let globalIndex = 0;
+  while (database.publicEntries.length < 60) {
+    assert.equal((await start(`全体上限 ${globalIndex}`, `198.51.100.${globalIndex + 1}`)).status, 201);
+    globalIndex += 1;
+  }
+  assert.equal((await start("全体上限 超過", "192.0.2.200")).status, 429);
 
   const issuedResponse = await request("/api/admin/interviews/invite", {
     method: "POST",
@@ -1325,6 +1342,7 @@ test("interview session stores the candidate name and protects the recording wit
     headers: {
       Authorization: `Bearer ${session.accessToken}`,
       "X-Interview-Session": session.sessionId,
+      "X-Interview-Audio-Coverage": "both",
       "Content-Type": "video/webm",
       "Content-Length": String(recordingBody.byteLength),
     },
@@ -1337,6 +1355,7 @@ test("interview session stores the candidate name and protects the recording wit
   const storedObjectKey = `interviews/${session.sessionId}/recording.webm`;
   assert.equal(recordings.objects.has(storedObjectKey), true);
   assert.equal(recordings.objects.get(storedObjectKey).options.customMetadata.storagePolicy, "manual-deletion-only-policy-pending");
+  assert.equal(recordings.objects.get(storedObjectKey).options.customMetadata.audioCoverage, "both");
   assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
 
   const duplicate = await request("/api/interviews/recording", {
@@ -1375,6 +1394,7 @@ test("interview session stores the candidate name and protects the recording wit
   }, env);
   assert.equal(staffRecording.status, 200);
   assert.equal(staffRecording.headers.get("content-type"), "video/webm");
+  assert.equal(staffRecording.headers.get("x-interview-audio-coverage"), "both");
   assert.equal(await staffRecording.text(), "small-webm-fixture");
 });
 
@@ -1828,6 +1848,7 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
   assert.equal(staffResponse.status, 200);
   assert.equal(staffPayload.review.evaluation.recommendation, "job_related_evidence_complete");
   assert.equal(staffPayload.review.evaluation.evidenceValidationWarnings.length, 0);
+  assert.equal(staffPayload.review.evaluation.transcriptProvenance, "candidate_device_unverified");
   assert.equal(staffPayload.review.evaluation.dimensions.every((item) => item.evidence[0].verified), true);
   assert.deepEqual(staffPayload.review.authorizedReviewers, ["笠間", "山本"]);
 

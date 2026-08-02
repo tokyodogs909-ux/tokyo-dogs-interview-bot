@@ -160,7 +160,7 @@ ${SOURCE_GROUNDED_EVALUATION_GUIDE}`,
       }
       const parsed = JSON.parse(outputText) as Omit<
         InterviewEvaluation,
-        "evidenceValidationWarnings" | "humanReviewRequired"
+        "transcriptProvenance" | "evidenceValidationWarnings" | "humanReviewRequired"
       >;
       const evaluation = validateEvaluation(parsed, transcript);
       const saved = await saveInterviewEvaluation({

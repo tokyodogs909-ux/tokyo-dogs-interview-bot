@@ -23,6 +23,7 @@ export async function GET(request: Request) {
         "Cache-Control": "private, no-store",
         "Content-Type": recording.contentType,
         "Content-Length": String(recording.byteSize),
+        "X-Interview-Audio-Coverage": recording.audioCoverage,
         ...(recording.etag ? { ETag: recording.etag } : {}),
       },
     });

@@ -109,6 +109,7 @@ function buildTranscriptText(source: ArchiveSource) {
     `雇用形態: ${source.employment}`,
     `入職希望対象店舗: ${source.preferredLocation}`,
     `面接完了日時: ${japaneseDate(source.completedAt)}`,
+    "確認区分: 応募者端末で生成された文字起こし（録画との照合が必要）",
     "",
   ];
   for (const turn of source.transcript) {
@@ -155,7 +156,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Yu Gothic",san
 <tr><th>面接完了日時</th><td>${escapeHtml(japaneseDate(source.completedAt))}</td></tr>
 <tr><th>録画状態</th><td>${escapeHtml(source.recordingStatus)}</td></tr>
 </table>
-<p class="notice">本資料は採用担当者の確認資料です。システムは合否を自動決定しません。通信・録音・文字起こしの不具合や、顔立ち・容姿・表情・声質等を不利益な評価に使用しません。</p>
+<p class="notice">本資料は採用担当者の確認資料です。システムは合否を自動決定しません。文字起こしは応募者端末由来のため録画との照合が必要です。通信・録音・文字起こしの不具合や、顔立ち・容姿・表情・声質等を不利益な評価に使用しません。</p>
 <h2>回答評価</h2>
 <p>${escapeHtml(evaluation?.summary || "回答評価は未作成です。")}</p>
 ${evaluation?.evidenceValidationWarnings.length

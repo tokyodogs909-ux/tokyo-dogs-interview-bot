@@ -163,6 +163,8 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /armResponseWatchdog/);
   assert.match(source, /CANDIDATE_RESPONSE_DELAY_MS = 3_200/);
   assert.match(source, /type: "response\.cancel"/);
+  assert.match(source, /type: "conversation\.item\.truncate"/);
+  assert.match(source, /remoteAudioRef\.current\?\.pause\(\)/);
   assert.match(source, /reportCandidateEvent/);
   assert.match(source, /scheduleResponseAfterCandidatePause/);
   assert.match(source, /clearCandidateResponseDelay/);
@@ -170,6 +172,10 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /channel\.onclose/);
   assert.match(source, /channelOpenTimerRef/);
   assert.match(source, /attachRemoteAudioToRecording/);
+  assert.match(source, /remoteAnalyser/);
+  assert.match(source, /REMOTE_AUDIO_SILENT/);
+  assert.match(source, /X-Interview-Audio-Coverage/);
+  assert.doesNotMatch(source, /Promise\.race\(\[\s*recordingPromiseRef/);
   assert.match(source, /await startRecording\(activeStream, displayStreamRef\.current, remoteStreamRef\.current, \{/);
   assert.match(source, /resume: !isNewInterviewSession/);
   assert.match(source, /recordedInterviewSessionRef/);
@@ -192,8 +198,11 @@ test("voice interview implements bidirectional audio health and recovery guards"
   const staffSource = await readFile(new URL("../app/staff/page.tsx", import.meta.url), "utf8");
   assert.match(staffSource, /evidenceValidationWarnings/);
   assert.match(staffSource, /評価本文の要確認事項/);
+  assert.match(staffSource, /録画内の双方音声は未確認です/);
+  assert.match(staffSource, /応募者端末由来の文字起こし/);
   const driveSyncSource = await readFile(new URL("../lib/google-drive-sync.ts", import.meta.url), "utf8");
   assert.match(driveSyncSource, /評価本文の要確認事項/);
+  assert.match(driveSyncSource, /応募者端末で生成された文字起こし/);
   assert.match(source, /stage === "setup"/);
   assert.match(source, /startMicrophoneMeter/);
   assert.match(source, /stopRealtime\(\{ keepLocalStream: true \}\)/);

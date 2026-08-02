@@ -234,6 +234,10 @@ async function ensureSchema(db: D1Database) {
 const PUBLIC_ENTRY_WINDOW_MS = 6 * 60 * 60 * 1_000;
 const PUBLIC_ENTRY_SOURCE_LIMIT = 8;
 const PUBLIC_ENTRY_CANDIDATE_LIMIT = 3;
+const PUBLIC_ENTRY_GLOBAL_WINDOW_MS = 24 * 60 * 60 * 1_000;
+// Expected volume is about 30 interviews/month. This hard ceiling keeps the
+// same-link workflow while stopping forged-source floods before paid calls.
+const PUBLIC_ENTRY_GLOBAL_LIMIT = 60;
 
 /**
  * Reserves capacity for an invite-free candidate before creating a paid interview
@@ -250,6 +254,7 @@ export async function reservePublicInterviewEntry(input: {
   const now = new Date();
   const nowIso = now.toISOString();
   const cutoffIso = new Date(now.getTime() - PUBLIC_ENTRY_WINDOW_MS).toISOString();
+  const globalCutoffIso = new Date(now.getTime() - PUBLIC_ENTRY_GLOBAL_WINDOW_MS).toISOString();
   const staleBeforeIso = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1_000).toISOString();
   const results = await db.batch([
     db.prepare("DELETE FROM interview_public_entries WHERE created_at <= ?").bind(staleBeforeIso),
@@ -262,6 +267,10 @@ export async function reservePublicInterviewEntry(input: {
       AND (
         SELECT COUNT(*) FROM interview_public_entries
         WHERE candidate_hash = ? AND created_at > ?
+      ) < ?
+      AND (
+        SELECT COUNT(*) FROM interview_public_entries
+        WHERE created_at > ?
       ) < ?`).bind(
         crypto.randomUUID(),
         input.sourceHash,
@@ -273,6 +282,8 @@ export async function reservePublicInterviewEntry(input: {
         input.candidateHash,
         cutoffIso,
         PUBLIC_ENTRY_CANDIDATE_LIMIT,
+        globalCutoffIso,
+        PUBLIC_ENTRY_GLOBAL_LIMIT,
       ),
   ]);
   const reserved = Number((results[1] as { meta?: { changes?: number } }).meta?.changes ?? 0) === 1;
@@ -1030,6 +1041,7 @@ export async function saveInterviewRecording(input: {
   body: ReadableStream;
   contentType: string;
   byteSize: number;
+  audioCoverage: "both" | "candidate-only" | "unverified";
 }) {
   const bucket = bindings().RECORDINGS;
   const db = database();
@@ -1042,6 +1054,7 @@ export async function saveInterviewRecording(input: {
     customMetadata: {
       sessionId: input.session.id,
       storagePolicy: STORAGE_POLICY,
+      audioCoverage: input.audioCoverage,
     },
   });
   const now = new Date().toISOString();
@@ -1066,7 +1079,11 @@ export async function saveInterviewRecording(input: {
     db.prepare("UPDATE interview_sessions SET recording_status = 'stored', updated_at = ? WHERE id = ?")
       .bind(now, input.session.id),
     db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'recording_stored', 'system', ?)")
-      .bind(crypto.randomUUID(), input.session.id, JSON.stringify({ byteSize: input.byteSize, contentType: input.contentType })),
+      .bind(crypto.randomUUID(), input.session.id, JSON.stringify({
+        byteSize: input.byteSize,
+        contentType: input.contentType,
+        audioCoverage: input.audioCoverage,
+      })),
   ]);
   // The recording is already durably stored in R2 at this point (objectKey is
   // deterministic and future re-uploads overwrite it). A transient D1 failure here
@@ -1106,5 +1123,6 @@ export async function getInterviewRecording(sessionId: string, reviewer: Authori
     contentType: artifact.content_type,
     byteSize: artifact.byte_size,
     etag: object.etag,
+    audioCoverage: object.customMetadata?.audioCoverage ?? "unverified",
   };
 }
