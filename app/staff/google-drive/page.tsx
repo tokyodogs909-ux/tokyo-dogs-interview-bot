@@ -23,79 +23,6 @@ type ProductionReadiness = {
   missing: string[];
 };
 
-type PickerDocument = { id?: string; name?: string };
-type PickerResult = { action?: string; docs?: PickerDocument[] };
-type PickerInstance = { setVisible(visible: boolean): void };
-type DocsViewInstance = {
-  setIncludeFolders(value: boolean): DocsViewInstance;
-  setSelectFolderEnabled(value: boolean): DocsViewInstance;
-  setMimeTypes(value: string): DocsViewInstance;
-};
-type PickerBuilderInstance = {
-  addView(view: DocsViewInstance): PickerBuilderInstance;
-  setOAuthToken(value: string): PickerBuilderInstance;
-  setDeveloperKey(value: string): PickerBuilderInstance;
-  setAppId(value: string): PickerBuilderInstance;
-  setOrigin(value: string): PickerBuilderInstance;
-  setCallback(callback: (result: PickerResult) => void): PickerBuilderInstance;
-  enableFeature(feature: string): PickerBuilderInstance;
-  build(): PickerInstance;
-};
-type GooglePickerRuntime = {
-  picker: {
-    DocsView: new (viewId: string) => DocsViewInstance;
-    PickerBuilder: new () => PickerBuilderInstance;
-    ViewId: { FOLDERS: string };
-    Feature: { SUPPORT_DRIVES: string };
-  };
-};
-type GapiRuntime = {
-  load(name: string, options: {
-    callback: () => void;
-    onerror: () => void;
-    timeout: number;
-    ontimeout: () => void;
-  }): void;
-};
-
-declare global {
-  interface Window {
-    gapi?: GapiRuntime;
-    google?: GooglePickerRuntime;
-  }
-}
-
-function loadGooglePicker() {
-  return new Promise<void>((resolve, reject) => {
-    const loadModule = () => {
-      if (!window.gapi) {
-        reject(new Error("保存先選択画面を読み込めませんでした。"));
-        return;
-      }
-      window.gapi.load("picker", {
-        callback: resolve,
-        onerror: () => reject(new Error("保存先選択画面を読み込めませんでした。")),
-        timeout: 10_000,
-        ontimeout: () => reject(new Error("保存先選択画面の読み込みがタイムアウトしました。")),
-      });
-    };
-    const existing = document.getElementById("google-picker-api") as HTMLScriptElement | null;
-    if (existing) {
-      if (window.gapi) loadModule();
-      else existing.addEventListener("load", loadModule, { once: true });
-      return;
-    }
-    const script = document.createElement("script");
-    script.id = "google-picker-api";
-    script.src = "https://apis.google.com/js/api.js";
-    script.async = true;
-    script.defer = true;
-    script.addEventListener("load", loadModule, { once: true });
-    script.addEventListener("error", () => reject(new Error("保存先選択画面を読み込めませんでした。")), { once: true });
-    document.head.appendChild(script);
-  });
-}
-
 export default function GoogleDriveSetupPage() {
   const [accessKey, setAccessKey] = useState("");
   const [phase, setPhase] = useState<"idle" | "connecting" | "connected" | "selecting" | "ready">("idle");
@@ -110,8 +37,9 @@ export default function GoogleDriveSetupPage() {
     const failed = params.has("error");
     queueMicrotask(() => {
       if (connected) {
-        setPhase("connected");
-        setMessage("Googleアカウントとの接続を確認しました。続けて保存先フォルダを選択してください。");
+        setPhase("selecting");
+        setMessage("Googleアカウントとの接続を確認しました。承認済み保存先を照合しています。");
+        void confirmApprovedFolder();
       } else if (failed) {
         setMessage("Googleアカウントとの接続を完了できませんでした。もう一度お試しください。");
       }
@@ -144,76 +72,24 @@ export default function GoogleDriveSetupPage() {
     }
   }
 
-  async function saveSelectedFolder(folderId: string) {
+  async function confirmApprovedFolder() {
+    setPhase("selecting");
+    setMessage("");
     const response = await fetch("/api/admin/google-drive/root", {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ folderId }),
+      body: JSON.stringify({}),
     });
     const payload = await response.json() as { saved?: boolean; root?: DriveRoot; error?: string };
     if (!response.ok || !payload.saved || !payload.root) {
-      throw new Error(payload.error || "保存先フォルダを登録できませんでした。");
+      setPhase("connected");
+      setMessage(payload.error || "承認済み保存先を確認できませんでした。");
+      return;
     }
     setRoot(payload.root);
     setPhase("ready");
-    setMessage("保存先を確認し、自動格納の設定を完了しました。");
-  }
-
-  async function chooseFolder() {
-    setPhase("selecting");
-    setMessage("");
-    try {
-      const tokenResponse = await fetch("/api/admin/google-drive/oauth/token", {
-        credentials: "same-origin",
-        cache: "no-store",
-      });
-      const tokenPayload = await tokenResponse.json() as {
-        accessToken?: string;
-        apiKey?: string;
-        projectNumber?: string;
-        error?: string;
-      };
-      if (!tokenResponse.ok || !tokenPayload.accessToken || !tokenPayload.apiKey || !tokenPayload.projectNumber) {
-        throw new Error(tokenPayload.error || "Google Driveの接続を確認できませんでした。");
-      }
-      await loadGooglePicker();
-      const pickerRuntime = window.google?.picker;
-      if (!pickerRuntime) throw new Error("保存先選択画面を読み込めませんでした。");
-      const view = new pickerRuntime.DocsView(pickerRuntime.ViewId.FOLDERS)
-        .setIncludeFolders(true)
-        .setSelectFolderEnabled(true)
-        .setMimeTypes("application/vnd.google-apps.folder");
-      const picker = new pickerRuntime.PickerBuilder()
-        .addView(view)
-        .setOAuthToken(tokenPayload.accessToken)
-        .setDeveloperKey(tokenPayload.apiKey)
-        .setAppId(tokenPayload.projectNumber)
-        .setOrigin(window.location.origin)
-        .enableFeature(pickerRuntime.Feature.SUPPORT_DRIVES)
-        .setCallback((result) => {
-          if (result.action === "picked") {
-            const folderId = result.docs?.[0]?.id;
-            if (!folderId) {
-              setPhase("connected");
-              setMessage("保存先フォルダを確認できませんでした。");
-              return;
-            }
-            void saveSelectedFolder(folderId).catch((error: unknown) => {
-              setPhase("connected");
-              setMessage(error instanceof Error ? error.message : "保存先フォルダを登録できませんでした。");
-            });
-          } else if (result.action === "cancel") {
-            setPhase("connected");
-            setMessage("保存先の選択を取り消しました。");
-          }
-        })
-        .build();
-      picker.setVisible(true);
-    } catch (error) {
-      setPhase("connected");
-      setMessage(error instanceof Error ? error.message : "保存先フォルダを選択できませんでした。");
-    }
+    setMessage("承認済み保存先を確認し、自動格納の設定を完了しました。");
   }
 
   async function checkProductionReadiness() {
@@ -260,7 +136,7 @@ export default function GoogleDriveSetupPage() {
 
         <div className="drive-setup-panel">
           <div className="drive-setup-step"><span>1</span><div><strong>Googleアカウントへ接続</strong><small>面接記録の保存に必要な範囲だけを許可します。</small></div></div>
-          <div className="drive-setup-step"><span>2</span><div><strong>専用フォルダを選択</strong><small>「オンライン一次面接_自動格納」を選んでください。</small></div></div>
+          <div className="drive-setup-step"><span>2</span><div><strong>承認済み保存先を自動確認</strong><small>「オンライン一次面接_自動格納」だけを照合します。</small></div></div>
           <div className="drive-setup-step"><span>3</span><div><strong>自動格納を開始</strong><small>面接完了後、応募者別フォルダへ安全に整理します。</small></div></div>
 
           {phase === "idle" || phase === "connecting" ? (
@@ -280,8 +156,8 @@ export default function GoogleDriveSetupPage() {
           ) : (
             <div className="drive-folder-action">
               <div className="drive-connected-badge">Googleアカウント 接続済み</div>
-              <button className="primary-action" onClick={() => void chooseFolder()} disabled={phase === "selecting" || phase === "ready"}>
-                {phase === "selecting" ? "選択画面を準備中…" : phase === "ready" ? "設定完了" : "保存先フォルダを選ぶ"} <span>→</span>
+              <button className="primary-action" onClick={() => void confirmApprovedFolder()} disabled={phase === "selecting" || phase === "ready"}>
+                {phase === "selecting" ? "承認済み保存先を確認中…" : phase === "ready" ? "設定完了" : "承認済み保存先を確認"} <span>→</span>
               </button>
             </div>
           )}

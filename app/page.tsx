@@ -1255,6 +1255,7 @@ export default function Home() {
     setNetworkAudioState("connecting");
     setRemoteAudioState("waiting");
     setErrorMessage("");
+    let continueWithRecordedInterview = false;
     try {
       let activeSessionId = sessionIdRef.current;
       let activeAccessToken = accessTokenRef.current;
@@ -1281,17 +1282,24 @@ export default function Home() {
         setSessionId(activeSessionId);
       }
       await connectRealtime("voice", { sessionId: activeSessionId, accessToken: activeAccessToken });
-    } catch (error) {
+    } catch {
       setStage("setup");
       setSetupPhase("error");
       setConnectionState("error");
       setNetworkAudioState("error");
       setRemoteAudioState("waiting");
-      setErrorMessage(error instanceof DOMException && error.name === "AbortError"
-        ? "オンライン一次面接の音声回線が応答していません。カメラとマイクは確認済みです。通信を確認して再接続してください。"
-        : error instanceof Error ? error.message : "オンライン一次面接の音声回線へ接続できませんでした。");
+      setErrorMessage("自然音声の回線を確認できなかったため、録画式のオンライン一次面接へ自動で切り替えます。カメラとマイクは確認済みです。");
+      continueWithRecordedInterview = Boolean(
+        streamRef.current &&
+        sessionIdRef.current &&
+        sessionIdRef.current !== "TD-PENDING" &&
+        accessTokenRef.current,
+      );
     } finally {
       setSessionStarting(false);
+    }
+    if (continueWithRecordedInterview) {
+      await startRecordedFallback({ continueCurrentAttempt: true });
     }
   }
 
@@ -1332,11 +1340,17 @@ export default function Home() {
     }, 2_800);
   }
 
-  async function startRecordedFallback() {
+  async function startRecordedFallback(options: { continueCurrentAttempt?: boolean } = {}) {
     const activeStream = streamRef.current;
     const activeSessionId = sessionIdRef.current;
     const activeAccessToken = accessTokenRef.current;
-    if (!activeStream || !activeSessionId || activeSessionId === "TD-PENDING" || !activeAccessToken || sessionStarting) {
+    if (
+      !activeStream ||
+      !activeSessionId ||
+      activeSessionId === "TD-PENDING" ||
+      !activeAccessToken ||
+      (sessionStarting && !options.continueCurrentAttempt)
+    ) {
       setErrorMessage("面接記録の準備情報を確認できません。入力画面からもう一度開始してください。");
       return;
     }
@@ -2495,7 +2509,7 @@ export default function Home() {
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
             {setupPhase === "error" && accessTokenRef.current && (
               <div className="recorded-fallback-card" role="status">
-                <strong>予備方式で一次面接を続けられます</strong>
+                <strong>録画式のオンライン一次面接で続けます</strong>
                 <span>質問を画面と端末音声で案内します。声で回答し、話し終えたら次へ進んでください。録画は選考資料として笠間・山本が確認します。</span>
                 <button type="button" disabled={sessionStarting} onClick={() => void startRecordedFallback()}>{sessionStarting ? "予備方式を準備中…" : "録画式のオンライン一次面接へ進む"}</button>
               </div>
@@ -2504,8 +2518,8 @@ export default function Home() {
               <button type="button" onClick={playSpeakerTest}>確認音を再生</button>
               {screenShareSupported && <button type="button" onClick={() => void enableScreenCapture()}>{screenCaptureState === "ready" ? "画面共有を追加済み" : "画面共有を追加（任意）"}</button>}
             </div>
-            <button className="primary-action setup-connect-button" disabled={!stream || sessionStarting} onClick={() => void connectPreparedInterview()}>
-              {sessionStarting ? "オンライン一次面接へ接続中…" : setupPhase === "error" ? "面接回線へ再接続" : "オンライン一次面接へ接続"} <span>→</span>
+            <button className="primary-action setup-connect-button" disabled={!stream || sessionStarting} onClick={() => void (setupPhase === "error" ? startRecordedFallback() : connectPreparedInterview())}>
+              {sessionStarting ? "オンライン一次面接へ接続中…" : setupPhase === "error" ? "録画式のオンライン一次面接へ進む" : "オンライン一次面接へ接続"} <span>→</span>
             </button>
             <p className="setup-footnote">カメラ映像と音声の確認後に録画を開始します。画面共有はPCのみ任意で追加できます。</p>
           </div>

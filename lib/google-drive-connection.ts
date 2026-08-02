@@ -6,9 +6,8 @@ type GoogleDriveConnectionBindings = {
   GOOGLE_DRIVE_CLIENT_SECRET?: string;
   GOOGLE_DRIVE_OAUTH_REDIRECT_URI?: string;
   GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET?: string;
+  INTERVIEW_ADMIN_TOKEN?: string;
   GOOGLE_DRIVE_EXPECTED_ROOT_NAME?: string;
-  GOOGLE_PICKER_API_KEY?: string;
-  GOOGLE_CLOUD_PROJECT_NUMBER?: string;
 };
 
 type StoredConnectionRow = {
@@ -58,10 +57,26 @@ function fromBase64Url(value: string) {
 }
 
 async function encryptionKey() {
-  const secret = setting("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET");
-  if (secret.length < 32) throw new Error("GOOGLE_DRIVE_ENCRYPTION_SECRET_MISSING");
+  const dedicatedSecret = setting("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET");
+  const adminSecret = setting("INTERVIEW_ADMIN_TOKEN");
+  // A dedicated key remains the preferred stable configuration. For the
+  // common one-administrator deployment, the already-required high-entropy
+  // admin secret can safely provide domain-separated encryption material and
+  // avoids asking the owner to manage another password. Rotating that fallback
+  // secret requires reconnecting Google Drive.
+  const secret = dedicatedSecret.length >= 32
+    ? dedicatedSecret
+    : adminSecret.length >= 32
+      ? `TOKYO_DOGS_DRIVE_TOKEN_V1:${adminSecret}`
+      : "";
+  if (!secret) throw new Error("GOOGLE_DRIVE_ENCRYPTION_SECRET_MISSING");
   const material = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
   return crypto.subtle.importKey("raw", material, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+function hasGoogleDriveEncryptionMaterial() {
+  return setting("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET").length >= 32 ||
+    setting("INTERVIEW_ADMIN_TOKEN").length >= 32;
 }
 
 async function encryptRefreshToken(refreshToken: string) {
@@ -121,22 +136,12 @@ export function googleDriveOAuthRedirectUri(request: Request) {
  * explain why Google OAuth cannot start without ever exposing secret values.
  */
 export function missingGoogleDriveOAuthSetupConfiguration() {
-  const projectNumber = setting("GOOGLE_CLOUD_PROJECT_NUMBER");
   return [
     ["GOOGLE_DRIVE_CLIENT_ID", setting("GOOGLE_DRIVE_CLIENT_ID")],
     ["GOOGLE_DRIVE_CLIENT_SECRET", setting("GOOGLE_DRIVE_CLIENT_SECRET")],
     ["GOOGLE_DRIVE_OAUTH_REDIRECT_URI", setting("GOOGLE_DRIVE_OAUTH_REDIRECT_URI")],
-    ["GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET", setting("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET")],
-    ["GOOGLE_PICKER_API_KEY", setting("GOOGLE_PICKER_API_KEY")],
-    ["GOOGLE_CLOUD_PROJECT_NUMBER", /^\d{6,20}$/.test(projectNumber) ? projectNumber : ""],
+    ["GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET", hasGoogleDriveEncryptionMaterial() ? "configured" : ""],
   ].filter(([, value]) => !value).map(([name]) => name);
-}
-
-export function googlePickerSettings() {
-  const apiKey = setting("GOOGLE_PICKER_API_KEY");
-  const projectNumber = setting("GOOGLE_CLOUD_PROJECT_NUMBER");
-  if (!apiKey || !/^\d{6,20}$/.test(projectNumber)) throw new Error("GOOGLE_PICKER_CONFIGURATION_MISSING");
-  return { apiKey, projectNumber };
 }
 
 export function expectedGoogleDriveRootName() {
@@ -150,7 +155,6 @@ export function googleDriveScope() {
 export async function assertGoogleDriveConnectionStorageReady() {
   if (!database()) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await encryptionKey();
-  googlePickerSettings();
 }
 
 export async function saveGoogleDriveRefreshToken(refreshToken: string) {
@@ -204,7 +208,7 @@ export async function saveGoogleDriveRoot(input: {
 
 export async function readStoredGoogleDriveConnection(): Promise<StoredGoogleDriveConnection | null> {
   const db = database();
-  if (!db || !setting("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET")) return null;
+  if (!db || !hasGoogleDriveEncryptionMaterial()) return null;
   await ensureConnectionSchema(db);
   const row = await db.prepare(`SELECT
     refresh_token_ciphertext, refresh_token_iv, root_folder_id, root_folder_name,

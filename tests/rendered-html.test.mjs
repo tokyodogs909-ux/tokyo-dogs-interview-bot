@@ -208,6 +208,8 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /stopRealtime\(\{ keepLocalStream: true \}\)/);
   assert.doesNotMatch(source, /fetch\("\/api\/health"/);
   assert.match(source, /録画式のオンライン一次面接へ進む/);
+  assert.match(source, /startRecordedFallback\(\{ continueCurrentAttempt: true \}\)/);
+  assert.doesNotMatch(source, /面接回線へ再接続/);
   assert.match(source, /\/api\/interviews\/recorded\/start/);
   assert.match(source, /\/api\/interviews\/recorded\/complete/);
   assert.match(source, /回答本文の自動文字起こしと自動評価は行わず/);
@@ -273,6 +275,9 @@ test("server-renders the administrator-only Google Drive setup entry without sec
   assert.match(html, /本番稼働条件を一括確認/);
   const source = await readFile(new URL("../app/staff/google-drive/page.tsx", import.meta.url), "utf8");
   assert.match(source, /Google接続・暗号化設定/);
+  assert.match(source, /承認済み保存先を照合しています/);
+  assert.match(source, /body: JSON\.stringify\(\{\}\)/);
+  assert.doesNotMatch(source, /apis\.google\.com\/js\/api\.js/);
   assert.match(html, /秘密値は画面へ表示しません/);
   assert.match(html, /長期認証情報は暗号化して保管/);
   assert.doesNotMatch(html, /GOOGLE_DRIVE_CLIENT_SECRET|GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET|refresh_token/);

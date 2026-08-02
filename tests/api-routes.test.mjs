@@ -464,8 +464,8 @@ test("health endpoint verifies server authentication without returning the key",
     OPENAI_API: openAIService,
   });
   assert.deepEqual(healthUrls.sort(), [
-    "https://api.openai.com/v1/models/gpt-5.2",
-    "https://api.openai.com/v1/models/gpt-realtime",
+    "https://api.openai.com/v1/models/gpt-5.6-sol",
+    "https://api.openai.com/v1/models/gpt-realtime-2.1",
   ]);
   assert.deepEqual(healthAuthorizations, [
     "Bearer test-key-never-returned",
@@ -527,7 +527,7 @@ test("authenticated production readiness reports missing components without expo
   assert.ok(payload.missing.includes("GOOGLE_DRIVE_REFRESH_TOKEN"));
   assert.equal(payload.driveOAuthSetup.configured, false);
   assert.ok(payload.missing.includes("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET"));
-  assert.ok(payload.missing.includes("GOOGLE_PICKER_API_KEY"));
+  assert.equal(payload.missing.includes("GOOGLE_PICKER_API_KEY"), false);
   assert.equal(responseText.includes("readiness-admin-secret"), false);
   assert.equal(responseText.includes("readiness-rejected-openai-key"), false);
 });
@@ -643,53 +643,42 @@ test("Google Drive setup starts with PKCE and grants a short-lived HttpOnly admi
   assert.equal(responseText.includes("drive-admin-secret"), false);
 });
 
-test("Google Drive setup session can mint only a short-lived Picker token and invalid callbacks fail closed", async () => {
-  const originalFetch = globalThis.fetch;
+test("Google Drive setup can derive separated token encryption from a strong admin secret", async () => {
+  const strongAdminSecret = "test-admin-secret-64-characters-or-more-1234567890-abcdef";
+  const response = await request("/api/admin/google-drive/oauth/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${strongAdminSecret}`,
+      Origin: "http://localhost",
+    },
+  }, {
+    ...workerEnv,
+    DB: new FakeD1(),
+    INTERVIEW_ADMIN_TOKEN: strongAdminSecret,
+    GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+    GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+    GOOGLE_DRIVE_OAUTH_REDIRECT_URI: "http://localhost/api/admin/google-drive/oauth/callback",
+  });
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.equal(JSON.stringify(payload).includes(strongAdminSecret), false);
+});
+
+test("Google Drive invalid OAuth callbacks fail closed", async () => {
   const database = new FakeD1();
-  const rootFolderId = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
   const env = {
     ...workerEnv,
     DB: database,
     INTERVIEW_ADMIN_TOKEN: "drive-admin-secret",
     GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
     GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
-    GOOGLE_DRIVE_REFRESH_TOKEN: "google-refresh-token",
-    GOOGLE_DRIVE_ROOT_FOLDER_ID: rootFolderId,
     GOOGLE_DRIVE_OAUTH_REDIRECT_URI: "http://localhost/api/admin/google-drive/oauth/callback",
-    GOOGLE_PICKER_API_KEY: "public-picker-browser-key",
-    GOOGLE_CLOUD_PROJECT_NUMBER: "123456789012",
     GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: "test-only-encryption-material-over-32-characters",
   };
-  try {
-    const start = await request("/api/admin/google-drive/oauth/start", {
-      method: "POST",
-      headers: { Authorization: "Bearer drive-admin-secret", Origin: "http://localhost" },
-    }, env);
-    const setupCookie = start.headers.getSetCookie()
-      .find((value) => value.startsWith("td_drive_admin_setup="))
-      ?.split(";", 1)[0];
-    assert.ok(setupCookie);
-    globalThis.fetch = async (url) => {
-      assert.equal(url, "https://oauth2.googleapis.com/token");
-      return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
-    };
-    const token = await request("/api/admin/google-drive/oauth/token", {
-      headers: { Cookie: setupCookie },
-    }, env);
-    const tokenPayload = await token.json();
-    assert.equal(token.status, 200, JSON.stringify(tokenPayload));
-    assert.equal(tokenPayload.accessToken, "temporary-google-access-token");
-    assert.equal(tokenPayload.projectNumber, "123456789012");
-    assert.equal(JSON.stringify(tokenPayload).includes("google-client-secret"), false);
-    assert.equal(JSON.stringify(tokenPayload).includes("google-refresh-token"), false);
-
-    const invalidCallback = await request("/api/admin/google-drive/oauth/callback?code=unused&state=invalid", {}, env);
-    assert.equal(invalidCallback.status, 303);
-    assert.equal(new URL(invalidCallback.headers.get("location")).pathname, "/staff/google-drive");
-    assert.equal(new URL(invalidCallback.headers.get("location")).searchParams.get("error"), "oauth_failed");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  const invalidCallback = await request("/api/admin/google-drive/oauth/callback?code=unused&state=invalid", {}, env);
+  assert.equal(invalidCallback.status, 303);
+  assert.equal(new URL(invalidCallback.headers.get("location")).pathname, "/staff/google-drive");
+  assert.equal(new URL(invalidCallback.headers.get("location")).searchParams.get("error"), "oauth_failed");
 });
 
 test("Google Drive OAuth callback encrypts the refresh token and the approved folder is read back", async () => {
@@ -707,6 +696,7 @@ test("Google Drive OAuth callback encrypts the refresh token and the approved fo
     GOOGLE_PICKER_API_KEY: "public-picker-browser-key",
     GOOGLE_CLOUD_PROJECT_NUMBER: "123456789012",
     GOOGLE_DRIVE_EXPECTED_ROOT_NAME: "オンライン一次面接_自動格納",
+    GOOGLE_DRIVE_ROOT_FOLDER_ID: rootFolderId,
   };
   try {
     const start = await request("/api/admin/google-drive/oauth/start", {
@@ -767,7 +757,7 @@ test("Google Drive OAuth callback encrypts the refresh token and the approved fo
         Origin: "http://localhost",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ folderId: rootFolderId }),
+      body: JSON.stringify({}),
     }, env);
     const rootPayload = await rootResponse.json();
     assert.equal(rootResponse.status, 200, JSON.stringify(rootPayload));
@@ -1582,7 +1572,7 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
       return Response.json({
         value: "ek_test_ephemeral",
         expires_at: 9999999999,
-        session: { model: "gpt-realtime" },
+        session: { model: "gpt-realtime-2.1" },
       });
     };
 
@@ -1601,7 +1591,7 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
     const payload = await response.json();
     assert.equal(response.status, 200);
     assert.equal(payload.value, "ek_test_ephemeral");
-    assert.equal(payload.model, "gpt-realtime");
+    assert.equal(payload.model, "gpt-realtime-2.1");
     assert.equal(capturedAuthorization, "Bearer test-key-never-returned");
     assert.equal(capturedBody.session.audio.input.turn_detection.type, "semantic_vad");
     assert.equal(capturedBody.session.audio.input.turn_detection.eagerness, "low");
@@ -1680,7 +1670,7 @@ test("one interview token cannot create unbounded paid realtime connections", as
       return Response.json({
         value: "ek_test_ephemeral",
         expires_at: 9999999999,
-        session: { model: "gpt-realtime" },
+        session: { model: "gpt-realtime-2.1" },
       });
     };
     for (let attempt = 0; attempt < 12; attempt += 1) {
@@ -1780,7 +1770,7 @@ test("same-origin realtime call authorizes the exact new interview session and p
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("content-type"), "application/sdp");
     assert.equal(await response.text(), "v=0\r\no=test-answer\r\n");
-    assert.equal(capturedSession.model, "gpt-realtime");
+    assert.equal(capturedSession.model, "gpt-realtime-2.1");
     assert.equal(capturedSession.audio.input.turn_detection.type, "semantic_vad");
 
     const rejected = await request("/api/realtime/call", {
@@ -1858,7 +1848,7 @@ async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
       assert.equal(url, "https://api.openai.com/v1/responses");
       const body = JSON.parse(init.body);
       assert.equal(body.store, false);
-      assert.equal(body.model, "gpt-5.2");
+      assert.equal(body.model, "gpt-5.6-sol");
       assert.equal(body.text.format.strict, true);
       assert.match(body.instructions, /総合評価は過去応募者との順位比較ではなく/);
       assert.match(body.instructions, /部活経験の有無そのものは評価しない/);

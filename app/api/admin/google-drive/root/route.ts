@@ -1,5 +1,9 @@
 import { authorizeInterviewAdminOrSetupSession } from "@/lib/admin-auth";
-import { fetchGoogleDriveAccessToken, validateGoogleDriveFolderSelection } from "@/lib/google-drive-auth";
+import {
+  configuredGoogleDriveRootId,
+  fetchGoogleDriveAccessToken,
+  validateGoogleDriveFolderSelection,
+} from "@/lib/google-drive-auth";
 import { saveGoogleDriveRoot } from "@/lib/google-drive-connection";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
@@ -13,8 +17,11 @@ export async function POST(request: Request) {
     }
     const rawBody = await request.text();
     if (rawBody.length > 500) return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
-    const payload = JSON.parse(rawBody) as { folderId?: unknown };
-    const folderId = typeof payload.folderId === "string" ? payload.folderId.trim() : "";
+    const payload = rawBody ? JSON.parse(rawBody) as { folderId?: unknown } : {};
+    const requestedFolderId = typeof payload.folderId === "string" ? payload.folderId.trim() : "";
+    // Normal operation uses the one approved destination configured by the
+    // administrator. An explicit ID remains supported for controlled recovery.
+    const folderId = requestedFolderId || configuredGoogleDriveRootId();
     const accessToken = await fetchGoogleDriveAccessToken();
     const root = await validateGoogleDriveFolderSelection(folderId, accessToken);
     await saveGoogleDriveRoot({ id: root.id, name: root.name, webViewLink: root.webViewLink });

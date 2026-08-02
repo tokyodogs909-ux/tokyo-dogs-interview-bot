@@ -48,6 +48,10 @@ function setting(name: keyof GoogleDriveBindings) {
   return (bound ?? local ?? "").trim();
 }
 
+export function configuredGoogleDriveRootId() {
+  return setting("GOOGLE_DRIVE_ROOT_FOLDER_ID");
+}
+
 async function resolvedDriveConfiguration() {
   const staticRefreshToken = setting("GOOGLE_DRIVE_REFRESH_TOKEN");
   const staticRootFolderId = setting("GOOGLE_DRIVE_ROOT_FOLDER_ID");
@@ -59,7 +63,11 @@ async function resolvedDriveConfiguration() {
     clientId: setting("GOOGLE_DRIVE_CLIENT_ID"),
     clientSecret: setting("GOOGLE_DRIVE_CLIENT_SECRET"),
     refreshToken: hasCompleteStaticConfiguration ? staticRefreshToken : stored?.refreshToken || "",
-    rootFolderId: hasCompleteStaticConfiguration ? staticRootFolderId : stored?.rootFolderId || "",
+    // The approved destination is intentionally managed as a Sites setting even
+    // when OAuth stores the refresh token in D1. Requiring Picker to write the
+    // same ID into D1 created an avoidable second setup step and left a valid
+    // OAuth connection unusable on mobile.
+    rootFolderId: staticRootFolderId || stored?.rootFolderId || "",
     expectedRootName: expectedGoogleDriveRootName(),
   };
 }
