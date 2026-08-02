@@ -16,7 +16,7 @@ type ProductionReadiness = {
   openAIAuthenticated: boolean;
   database: boolean;
   recordingStorage: boolean;
-  reviewerAuth: { kasama: boolean; yamamoto: boolean };
+  reviewerAuth: { configured: boolean; dedicated: boolean };
   driveOAuthSetup: { configured: boolean };
   drive: { authenticated: boolean; name?: string; locationType?: string };
   candidateEntryMode: "signed_invite" | "common_url";
@@ -183,7 +183,7 @@ export default function GoogleDriveSetupPage() {
               <div className={readiness.openAIAuthenticated ? "passed" : "failed"}><span>音声・評価モデル</span><strong>{readiness.openAIAuthenticated ? "認証済み" : "要設定"}</strong></div>
               <div className={readiness.database ? "passed" : "failed"}><span>面接記録データベース</span><strong>{readiness.database ? "接続済み" : "要設定"}</strong></div>
               <div className={readiness.recordingStorage ? "passed" : "failed"}><span>録画保存領域</span><strong>{readiness.recordingStorage ? "接続済み" : "要設定"}</strong></div>
-              <div className={readiness.reviewerAuth.kasama && readiness.reviewerAuth.yamamoto ? "passed" : "failed"}><span>笠間・山本の閲覧認証</span><strong>{readiness.reviewerAuth.kasama && readiness.reviewerAuth.yamamoto ? "設定済み" : "要設定"}</strong></div>
+              <div className={readiness.reviewerAuth.configured ? "passed" : "failed"}><span>採用担当者の閲覧認証</span><strong>{readiness.reviewerAuth.configured ? "設定済み" : "要設定"}</strong></div>
               <div className={readiness.driveOAuthSetup.configured ? "passed" : "failed"}><span>Google接続・暗号化設定</span><strong>{readiness.driveOAuthSetup.configured ? "設定済み" : "要設定"}</strong></div>
               <div className={readiness.drive.authenticated ? "passed" : "failed"}><span>Google Drive自動格納</span><strong>{readiness.drive.authenticated ? "読戻し済み" : "要確認"}</strong></div>
             </div>

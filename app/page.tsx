@@ -1414,7 +1414,7 @@ export default function Home() {
     });
     const nextIndex = recordedQuestionIndex + 1;
     if (nextIndex >= RECORDED_FALLBACK_QUESTIONS.length) {
-      const closing = "オンライン一次面接は以上です。回答と録画は採用選考の重要な判断資料として、採用担当者の笠間と山本が確認します。ご回答ありがとうございました。";
+      const closing = "オンライン一次面接は以上です。回答と録画は採用選考の重要な判断資料として、権限を付与された採用担当者が確認します。ご回答ありがとうございました。";
       upsertTurn({
         id: "recorded-fallback-closing",
         speaker: "interviewer",
@@ -2431,10 +2431,10 @@ export default function Home() {
               <span className="consent-copy">
                 <strong>録画・文字起こし・選考利用に同意する</strong>
                 <span id="consent-summary">面接の映像・双方の音声・回答内容を、採用選考と記録の照合に使用します。</span>
-                <small>評価は笠間・山本だけが確認し、求職者には表示されません。</small>
+                <small>評価は権限を付与された採用担当者だけが確認し、求職者には表示されません。</small>
               </span>
             </label>
-            <details className="consent-details"><summary id="consent-detail-summary">録画とデータの詳しい取り扱い</summary><div><p><strong>利用目的</strong><br />入力した氏名は採用記録の照合と保存管理に使用します。録画はカメラ映像と双方の音声を含み、接客ロールプレイなどの職務関連行動、文字起こしの照合、通信トラブル時の記録確認に使用します。</p><p><strong>処理と閲覧</strong><br />音声と回答は外部の音声・文字処理サービスで処理されます。氏名、録画、文字起こし、評価補助は認証された笠間・山本が確認します。自動処理だけで合否を決定しません。</p><p><strong>保管</strong><br />氏名、録画、文字起こし、評価補助は自動削除せず、当社が手動で削除するまで保管します。削除や開示等のご相談は、応募時に利用した連絡経路で採用担当者へご連絡ください。</p><p><strong>公平性とご相談</strong><br />笑顔の有無、顔立ち・容姿、服装、背景、カメラ・音声品質、声質、障害・健康状態の推測は評価しません。技術不具合は不利益に扱わず、情報不足として採用担当者が確認します。機器操作や進行方法に配慮が必要な場合は、応募時に利用した連絡経路で採用担当者へご相談ください。面接中も中止できます。</p></div></details>
+            <details className="consent-details"><summary id="consent-detail-summary">録画とデータの詳しい取り扱い</summary><div><p><strong>利用目的</strong><br />入力した氏名は採用記録の照合と保存管理に使用します。録画はカメラ映像と双方の音声を含み、接客ロールプレイなどの職務関連行動、文字起こしの照合、通信トラブル時の記録確認に使用します。</p><p><strong>処理と閲覧</strong><br />音声と回答は外部の音声・文字処理サービスで処理されます。氏名、録画、文字起こし、評価補助は権限を付与された採用担当者が確認します。自動処理だけで合否を決定しません。</p><p><strong>保管</strong><br />氏名、録画、文字起こし、評価補助は自動削除せず、当社が手動で削除するまで保管します。削除や開示等のご相談は、応募時に利用した連絡経路で採用担当者へご連絡ください。</p><p><strong>公平性とご相談</strong><br />笑顔の有無、顔立ち・容姿、服装、背景、カメラ・音声品質、声質、障害・健康状態の推測は評価しません。技術不具合は不利益に扱わず、情報不足として採用担当者が確認します。機器操作や進行方法に配慮が必要な場合は、応募時に利用した連絡経路で採用担当者へご相談ください。面接中も中止できます。</p></div></details>
             <p className={`consent-status ${consent && candidateName.trim() && normalizePreferredLocation(location) ? "ready" : ""}`} role="status">
               {!candidateName.trim()
                 ? "氏名を入力してください。"
@@ -2510,7 +2510,7 @@ export default function Home() {
             {setupPhase === "error" && accessTokenRef.current && (
               <div className="recorded-fallback-card" role="status">
                 <strong>録画式のオンライン一次面接で続けます</strong>
-                <span>質問を画面と端末音声で案内します。声で回答し、話し終えたら次へ進んでください。録画は選考資料として笠間・山本が確認します。</span>
+                <span>質問を画面と端末音声で案内します。声で回答し、話し終えたら次へ進んでください。録画は選考資料として権限を付与された採用担当者が確認します。</span>
                 <button type="button" disabled={sessionStarting} onClick={() => void startRecordedFallback()}>{sessionStarting ? "予備方式を準備中…" : "録画式のオンライン一次面接へ進む"}</button>
               </div>
             )}
@@ -2529,7 +2529,7 @@ export default function Home() {
       {stage === "interview" && (
         <section className="interview-page">
           {mode === "internal-test" && <div className="internal-test-banner"><strong>接続確認</strong><span>選考対象外・録画・採用評価なし</span></div>}
-          {mode === "recorded-fallback" && <div className="recorded-fallback-banner"><strong>オンライン一次面接・予備方式</strong><span>選考対象・録画を笠間・山本が確認</span></div>}
+          {mode === "recorded-fallback" && <div className="recorded-fallback-banner"><strong>オンライン一次面接・予備方式</strong><span>選考対象・録画を採用担当者が確認</span></div>}
           <div className="interview-topline">
             <div className={`live-state ${connectionState}`}><i />{connectionCopy}</div>
             <div className="interview-time">{formatTime(elapsed)} {mode !== "internal-test" && <span>/ 目安 15–25分</span>}</div>
@@ -2627,7 +2627,7 @@ export default function Home() {
       {stage === "review" && (
         <section className="review-page">
           <div className="review-heading">
-            <div><p className="eyebrow">{mode === "internal-test" ? "PORTAL CHECK COMPLETE" : "ONLINE FIRST INTERVIEW RECEIVED"}</p><h1>{mode === "internal-test" ? "接続確認が完了しました。" : "オンライン一次面接を受け付けました。"}</h1><p>{mode === "internal-test" ? "録画・音声接続・採用評価は行っていません。この内容は採用判断には使用しません。" : "ご回答ありがとうございました。面接記録は採用担当者の笠間・山本が確認し、採用選考の判断資料として使用します。"}</p></div>
+            <div><p className="eyebrow">{mode === "internal-test" ? "PORTAL CHECK COMPLETE" : "ONLINE FIRST INTERVIEW RECEIVED"}</p><h1>{mode === "internal-test" ? "接続確認が完了しました。" : "オンライン一次面接を受け付けました。"}</h1><p>{mode === "internal-test" ? "録画・音声接続・採用評価は行っていません。この内容は採用判断には使用しません。" : "ご回答ありがとうございました。面接記録は権限を付与された採用担当者が確認し、採用選考の判断資料として使用します。"}</p></div>
             <div className="recommendation human_review"><span>受付番号</span><strong>{mode === "internal-test" ? "TEST COMPLETE" : sessionId}</strong><small>{mode === "internal-test" ? "採用判断には使用しません" : "採用担当者のみ閲覧可能"}</small></div>
           </div>
           <div className="summary-card">

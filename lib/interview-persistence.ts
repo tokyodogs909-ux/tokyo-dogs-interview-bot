@@ -1,5 +1,4 @@
 import {
-  AUTHORIZED_REVIEWERS,
   VIDEO_REVIEW_DIMENSIONS,
   type InterviewEvaluation,
   type TranscriptTurn,
@@ -15,8 +14,8 @@ import {
 type InterviewBindings = {
   DB?: D1Database;
   RECORDINGS?: R2Bucket;
-  INTERVIEW_REVIEW_TOKEN_KASAMA?: string;
-  INTERVIEW_REVIEW_TOKEN_YAMAMOTO?: string;
+  INTERVIEW_STAFF_TOKEN?: string;
+  INTERVIEW_ADMIN_TOKEN?: string;
   INTERVIEW_INVITE_SIGNING_SECRET?: string;
   INTERVIEW_REQUIRE_SIGNED_INVITE?: string;
 };
@@ -33,7 +32,7 @@ export type InterviewSessionRecord = {
   retention_until: string;
 };
 
-export type AuthorizedReviewer = (typeof AUTHORIZED_REVIEWERS)[number];
+export type AuthorizedReviewer = string;
 
 export type VideoReviewScore = {
   name: (typeof VIDEO_REVIEW_DIMENSIONS)[number]["name"];
@@ -479,12 +478,21 @@ export async function failInterviewRecordingUpload(sessionId: string) {
     .run();
 }
 
-function reviewerSecret(name: AuthorizedReviewer) {
+function reviewerSecret() {
   const bound = bindings();
-  const key = name === "笠間"
-    ? bound.INTERVIEW_REVIEW_TOKEN_KASAMA ?? (typeof process === "undefined" ? "" : process.env.INTERVIEW_REVIEW_TOKEN_KASAMA)
-    : bound.INTERVIEW_REVIEW_TOKEN_YAMAMOTO ?? (typeof process === "undefined" ? "" : process.env.INTERVIEW_REVIEW_TOKEN_YAMAMOTO);
-  return key?.trim() ?? "";
+  const candidates = [
+    bound.INTERVIEW_STAFF_TOKEN,
+    typeof process === "undefined" ? "" : process.env.INTERVIEW_STAFF_TOKEN,
+    bound.INTERVIEW_ADMIN_TOKEN,
+    typeof process === "undefined" ? "" : process.env.INTERVIEW_ADMIN_TOKEN,
+  ];
+  return candidates.find((candidate) => candidate?.trim())?.trim() ?? "";
+}
+
+export function normalizeReviewerName(value: string) {
+  const normalized = value.normalize("NFKC").replace(/\s+/gu, " ").trim();
+  if (!normalized || normalized.length > 40 || /[\u0000-\u001F\u007F]/u.test(normalized)) return null;
+  return normalized;
 }
 
 /**
@@ -492,9 +500,13 @@ function reviewerSecret(name: AuthorizedReviewer) {
  * exposed, even to the authenticated readiness endpoint.
  */
 export function reviewerAuthenticationReadiness() {
+  const dedicated = Boolean(
+    bindings().INTERVIEW_STAFF_TOKEN
+      ?? (typeof process === "undefined" ? "" : process.env.INTERVIEW_STAFF_TOKEN),
+  );
   return {
-    kasama: Boolean(reviewerSecret("笠間")),
-    yamamoto: Boolean(reviewerSecret("山本")),
+    configured: Boolean(reviewerSecret()),
+    dedicated,
   };
 }
 
@@ -505,14 +517,17 @@ async function secureTokenMatch(actual: string, expected: string) {
 }
 
 export async function authorizeReviewerRequest(request: Request) {
-  const reviewerCode = request.headers.get("X-Interview-Reviewer")?.trim().toLowerCase() ?? "";
-  const reviewer = reviewerCode === "kasama"
-    ? "笠間"
-    : reviewerCode === "yamamoto"
-      ? "山本"
-      : null;
+  const reviewerHeader = request.headers.get("X-Interview-Reviewer") ?? "";
+  if (reviewerHeader.length > 240) return null;
+  let decodedReviewer = "";
+  try {
+    decodedReviewer = decodeURIComponent(reviewerHeader);
+  } catch {
+    return null;
+  }
+  const reviewer = normalizeReviewerName(decodedReviewer);
   if (!reviewer) return null;
-  const expected = reviewerSecret(reviewer);
+  const expected = reviewerSecret();
   if (!expected) throw new Error("INTERVIEW_REVIEW_AUTH_UNCONFIGURED");
   const authorization = request.headers.get("Authorization") ?? "";
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
@@ -978,7 +993,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     evaluation: parseJson<InterviewEvaluation | null>(session.evaluation_json, null),
     completedAt: session.completed_at,
     createdAt: session.created_at,
-    authorizedReviewers: AUTHORIZED_REVIEWERS,
+    reviewPolicy: "authorized_staff",
     videoReviewRubric: VIDEO_REVIEW_DIMENSIONS,
     humanReviews: (reviews.results ?? []).map((review) => ({
       reviewerName: review.reviewer_name,

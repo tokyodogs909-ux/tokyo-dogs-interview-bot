@@ -518,12 +518,11 @@ test("authenticated production readiness reports missing components without expo
   assert.equal(payload.openAIAuthenticated, false);
   assert.equal(payload.database, false);
   assert.equal(payload.recordingStorage, false);
-  assert.deepEqual(payload.reviewerAuth, { kasama: false, yamamoto: false });
+  assert.deepEqual(payload.reviewerAuth, { configured: true, dedicated: false });
   assert.ok(payload.missing.includes("OPENAI_AUTHENTICATION"));
   assert.ok(payload.missing.includes("INTERVIEW_DATABASE"));
   assert.ok(payload.missing.includes("RECORDING_STORAGE"));
-  assert.ok(payload.missing.includes("INTERVIEW_REVIEW_TOKEN_KASAMA"));
-  assert.ok(payload.missing.includes("INTERVIEW_REVIEW_TOKEN_YAMAMOTO"));
+  assert.equal(payload.missing.includes("INTERVIEW_STAFF_AUTHENTICATION"), false);
   assert.ok(payload.missing.includes("GOOGLE_DRIVE_REFRESH_TOKEN"));
   assert.equal(payload.driveOAuthSetup.configured, false);
   assert.ok(payload.missing.includes("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET"));
@@ -1309,7 +1308,7 @@ test("candidate can freely enter one or more preferred work locations and the se
 });
 
 test("interview session stores the candidate name and protects the recording with a scoped bearer token", async () => {
-  process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const database = new FakeD1();
   const recordings = new FakeR2();
   const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
@@ -1386,18 +1385,37 @@ test("interview session stores the candidate name and protects the recording wit
   assert.equal(protectedRecording.status, 401);
   const staffRecording = await request(`/api/staff/recording?sessionId=${session.sessionId}`, {
     headers: {
-      Authorization: "Bearer kasama-review-secret",
-      "X-Interview-Reviewer": "kasama",
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
     },
   }, env);
   assert.equal(staffRecording.status, 200);
   assert.equal(staffRecording.headers.get("content-type"), "video/webm");
   assert.equal(staffRecording.headers.get("x-interview-audio-coverage"), "both");
   assert.equal(await staffRecording.text(), "small-webm-fixture");
+
+  const missingOperatorName = await request(`/api/staff/recording?sessionId=${session.sessionId}`, {
+    headers: { Authorization: "Bearer staff-review-secret" },
+  }, env);
+  assert.equal(missingOperatorName.status, 401);
+  const malformedOperatorName = await request(`/api/staff/recording?sessionId=${session.sessionId}`, {
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": "%E0%A4%A",
+    },
+  }, env);
+  assert.equal(malformedOperatorName.status, 401);
+  const oversizedOperatorName = await request(`/api/staff/recording?sessionId=${session.sessionId}`, {
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": "a".repeat(41),
+    },
+  }, env);
+  assert.equal(oversizedOperatorName.status, 401);
 });
 
 test("recording upload survives one transient D1 failure after the R2 object is already stored", async () => {
-  process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   class FlakyD1 extends FakeD1 {
     constructor() {
       super();
@@ -1447,7 +1465,7 @@ test("recording upload survives one transient D1 failure after the R2 object is 
 });
 
 test("candidate technical incidents are audited and cross-origin mutations are rejected", async () => {
-  process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database };
   const rejected = await request("/api/interviews/session", {
@@ -1490,8 +1508,8 @@ test("candidate technical incidents are audited and cross-origin mutations are r
 
   const staffResponse = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
     headers: {
-      Authorization: "Bearer kasama-review-secret",
-      "X-Interview-Reviewer": "kasama",
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
     },
   }, env);
   const staffPayload = await staffResponse.json();
@@ -1614,7 +1632,7 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
     assert.match(capturedBody.session.instructions, /普通自動車免許、送迎、当直/);
     assert.match(capturedBody.session.instructions, /通常数日〜1週間、長い場合は10日程度/);
     assert.match(capturedBody.session.instructions, /既存資料の「両親の反応」「家族構成」「家族間の仲」「住まい」は質問しない/);
-    assert.doesNotMatch(capturedBody.session.instructions, /笠間・山本・松尾/);
+    assert.doesNotMatch(capturedBody.session.instructions, /笠間|山本|松尾/);
     assert.equal(capturedBody.session.tools[0].name, "complete_interview");
     assert.deepEqual(
       capturedBody.session.tools[0].parameters.properties.topics_covered.items.enum,
@@ -1883,7 +1901,7 @@ async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
 
 test("candidate evaluation endpoint stores a verified result without disclosing it", async () => {
   process.env.OPENAI_API_KEY = "test-key-never-returned";
-  process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const { response, env, session } = await runEvaluationApi(false);
   const payload = await response.json();
   assert.equal(response.status, 200);
@@ -1895,8 +1913,8 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
   assert.equal(unauthorized.status, 401);
   const staffResponse = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
     headers: {
-      Authorization: "Bearer kasama-review-secret",
-      "X-Interview-Reviewer": "kasama",
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
     },
   }, env);
   const staffPayload = await staffResponse.json();
@@ -1905,7 +1923,8 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
   assert.equal(staffPayload.review.evaluation.evidenceValidationWarnings.length, 0);
   assert.equal(staffPayload.review.evaluation.transcriptProvenance, "candidate_device_unverified");
   assert.equal(staffPayload.review.evaluation.dimensions.every((item) => item.evidence[0].verified), true);
-  assert.deepEqual(staffPayload.review.authorizedReviewers, ["笠間", "山本"]);
+  assert.equal(staffPayload.review.reviewPolicy, "authorized_staff");
+  assert.equal("authorizedReviewers" in staffPayload.review, false);
 
   const videoScores = [
     { name: "接客時の傾聴・姿勢・態度", score: 4, note: "相手の話を遮らず理解を確認した" },
@@ -1916,8 +1935,8 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
   const saveReview = await request("/api/staff/review", {
     method: "POST",
     headers: {
-      Authorization: "Bearer kasama-review-secret",
-      "X-Interview-Reviewer": "kasama",
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ sessionId: session.sessionId, scores: videoScores, overallNote: "人による確認" }),
@@ -1925,26 +1944,26 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
   assert.equal(saveReview.status, 200);
   const refreshed = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
     headers: {
-      Authorization: "Bearer kasama-review-secret",
-      "X-Interview-Reviewer": "kasama",
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
     },
   }, env);
   const refreshedPayload = await refreshed.json();
-  assert.equal(refreshedPayload.review.humanReviews[0].reviewerName, "笠間");
+  assert.equal(refreshedPayload.review.humanReviews[0].reviewerName, "採用担当A");
   assert.equal(refreshedPayload.review.humanReviews[0].videoScores.length, 4);
 });
 
 test("staff-only evaluation drops invented evidence and forces human review", async () => {
   process.env.OPENAI_API_KEY = "test-key-never-returned";
-  process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const { response, env, session } = await runEvaluationApi(true);
   const payload = await response.json();
   assert.equal(response.status, 200);
   assert.equal("evaluation" in payload, false);
   const staffResponse = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
     headers: {
-      Authorization: "Bearer kasama-review-secret",
-      "X-Interview-Reviewer": "kasama",
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当B"),
     },
   }, env);
   const staffPayload = await staffResponse.json();
@@ -1956,7 +1975,7 @@ test("staff-only evaluation drops invented evidence and forces human review", as
 
 test("evaluation prose naming a prohibited attribute or blaming the equipment is flagged, not rewritten", async () => {
   process.env.OPENAI_API_KEY = "test-key-never-returned";
-  process.env.INTERVIEW_REVIEW_TOKEN_KASAMA = "kasama-review-secret";
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const { response, env, session } = await runEvaluationApi(false, (evaluation) => ({
     ...evaluation,
     summary: "国籍と家族構成の話題が出ましたが、職務経験は確認できました。",
@@ -1965,7 +1984,7 @@ test("evaluation prose naming a prohibited attribute or blaming the equipment is
   assert.equal(response.status, 200);
 
   const staffResponse = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
-    headers: { Authorization: "Bearer kasama-review-secret", "X-Interview-Reviewer": "kasama" },
+    headers: { Authorization: "Bearer staff-review-secret", "X-Interview-Reviewer": encodeURIComponent("採用担当B") },
   }, env);
   const evaluation = (await staffResponse.json()).review.evaluation;
   const warnings = evaluation.evidenceValidationWarnings.join("\n");

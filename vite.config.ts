@@ -16,11 +16,8 @@ const localBindingConfig = {
   compatibility_flags: ["nodejs_compat"],
   vars: {
     ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
-    ...(process.env.INTERVIEW_REVIEW_TOKEN_KASAMA
-      ? { INTERVIEW_REVIEW_TOKEN_KASAMA: process.env.INTERVIEW_REVIEW_TOKEN_KASAMA }
-      : {}),
-    ...(process.env.INTERVIEW_REVIEW_TOKEN_YAMAMOTO
-      ? { INTERVIEW_REVIEW_TOKEN_YAMAMOTO: process.env.INTERVIEW_REVIEW_TOKEN_YAMAMOTO }
+    ...(process.env.INTERVIEW_STAFF_TOKEN
+      ? { INTERVIEW_STAFF_TOKEN: process.env.INTERVIEW_STAFF_TOKEN }
       : {}),
   },
   d1_databases: d1

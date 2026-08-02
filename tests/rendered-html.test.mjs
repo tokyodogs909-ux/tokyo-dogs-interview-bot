@@ -40,7 +40,7 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.match(html, /tokyo-dogs-logo\.jpg/);
   assert.match(html, /TOKYO DOGSの採用選考におけるオンライン一次面接/);
   assert.match(html, /オンライン採用担当者 茂木/);
-  assert.match(html, /評価は笠間・山本だけが確認/);
+  assert.match(html, /評価は権限を付与された採用担当者だけが確認/);
   assert.match(html, /録画・文字起こし・選考利用に同意する/);
   assert.match(html, /<label for="candidate-name">氏名<\/label>/);
   assert.match(html, /placeholder="例：山田 花子"/);
@@ -256,9 +256,11 @@ test("server-renders the protected recruiter review entry", async () => {
   const html = await response.text();
   assert.match(html, /公式選考レビュー/);
   assert.match(html, /OFFICIAL SELECTION REVIEW/);
-  assert.match(html, /笠間・山本 専用/);
+  assert.match(html, /採用担当者専用/);
+  assert.match(html, /担当者名/);
+  assert.match(html, /例：採用担当/);
   assert.match(html, /アクセスは監査ログへ記録/);
-  assert.doesNotMatch(html, /kasama-review-secret|INTERVIEW_REVIEW_TOKEN/);
+  assert.doesNotMatch(html, /staff-review-secret|INTERVIEW_STAFF_TOKEN/);
   const source = await readFile(new URL("../app/staff/page.tsx", import.meta.url), "utf8");
   assert.match(source, /録画未格納/);
   assert.match(source, /録画を含め格納完了/);
@@ -309,5 +311,5 @@ test("server-renders the selection-excluded portal check", async () => {
   assert.match(html, /接続確認をはじめる/);
   assert.match(html, /interviewer-woman-medium-v2\.png/);
   assert.doesNotMatch(html, /スマートフォン|スマホ|ONLINE INTERVIEW/);
-  assert.doesNotMatch(html, /求職者面談|公式面談|面談担当|INTERVIEW_REVIEW_TOKEN|OpenAI API/);
+  assert.doesNotMatch(html, /求職者面談|公式面談|面談担当|INTERVIEW_STAFF_TOKEN|OpenAI API/);
 });

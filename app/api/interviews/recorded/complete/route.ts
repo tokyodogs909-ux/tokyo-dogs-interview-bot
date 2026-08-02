@@ -35,7 +35,7 @@ function canonicalRecordedTranscript(): TranscriptTurn[] {
 function recordedFallbackEvaluation(): InterviewEvaluation {
   return {
     recommendation: "insufficient_information",
-    summary: "音声回線障害時の録画式予備面接です。回答本文の自動文字起こしと自動評価は未実施のため、笠間・山本が録画を確認します。",
+    summary: "音声回線障害時の録画式予備面接です。回答本文の自動文字起こしと自動評価は未実施のため、権限を付与された採用担当者が録画を確認します。",
     dimensions: EVALUATION_DIMENSIONS.map((name) => ({
       name,
       score: null,

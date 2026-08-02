@@ -3,7 +3,6 @@
 /* eslint-disable @next/next/no-img-element */
 import { useEffect, useState } from "react";
 import {
-  AUTHORIZED_REVIEWERS,
   VIDEO_REVIEW_DIMENSIONS,
   type InterviewEvaluation,
   type TranscriptTurn,
@@ -70,7 +69,7 @@ function emptyScores(): VideoScore[] {
 }
 
 export default function StaffReviewPage() {
-  const [reviewer, setReviewer] = useState<(typeof AUTHORIZED_REVIEWERS)[number]>("笠間");
+  const [reviewer, setReviewer] = useState("");
   const [sessionId, setSessionId] = useState("");
   const [accessKey, setAccessKey] = useState("");
   const [review, setReview] = useState<ReviewRecord | null>(null);
@@ -88,7 +87,7 @@ export default function StaffReviewPage() {
   function authHeaders() {
     return {
       Authorization: `Bearer ${accessKey}`,
-      "X-Interview-Reviewer": reviewer === "笠間" ? "kasama" : "yamamoto",
+      "X-Interview-Reviewer": encodeURIComponent(reviewer.normalize("NFKC").replace(/\s+/gu, " ").trim()),
     };
   }
 
@@ -107,7 +106,8 @@ export default function StaffReviewPage() {
       const data = (await response.json()) as { review?: ReviewRecord; error?: string };
       if (!response.ok || !data.review) throw new Error(data.error || "オンライン一次面接記録を取得できませんでした。");
       setReview(data.review);
-      const ownReview = data.review.humanReviews.find((item) => item.reviewerName === reviewer);
+      const normalizedReviewer = reviewer.normalize("NFKC").replace(/\s+/gu, " ").trim();
+      const ownReview = data.review.humanReviews.find((item) => item.reviewerName === normalizedReviewer);
       setScores(ownReview?.videoScores.length ? ownReview.videoScores : emptyScores());
       setOverallNote(ownReview?.overallNote ?? "");
       if (data.review.recordingStatus === "stored") {
@@ -147,7 +147,7 @@ export default function StaffReviewPage() {
       const data = (await response.json()) as { stored?: boolean; error?: string };
       if (!response.ok || !data.stored) throw new Error(data.error || "映像評価を保存できませんでした。");
       setState("ready");
-      setMessage(`${reviewer}の映像評価を保存しました。`);
+      setMessage(`${reviewer.normalize("NFKC").replace(/\s+/gu, " ").trim()}の映像評価を保存しました。`);
     } catch (error) {
       setState("ready");
       setMessage(error instanceof Error ? error.message : "映像評価を保存できませんでした。");
@@ -200,16 +200,16 @@ export default function StaffReviewPage() {
           <img src="/tokyo-dogs-logo.jpg" alt="Tokyo Dogs" />
           <span><strong>TOKYO DOGS</strong><small>OFFICIAL SELECTION REVIEW</small></span>
         </div>
-        <div className="staff-header-actions"><a href="/staff/invites">候補者リンク発行</a><a href="/staff/google-drive">Drive接続設定</a><span className="test-pill">笠間・山本 専用</span></div>
+        <div className="staff-header-actions"><a href="/staff/invites">候補者リンク発行</a><a href="/staff/google-drive">Drive接続設定</a><span className="test-pill">採用担当者専用</span></div>
       </header>
 
       <section className="staff-login">
         <div><p className="eyebrow">AUTHORIZED RECRUITER ACCESS</p><h1>公式選考レビュー</h1><p>評価本文、文字起こし、録画は認証された採用担当者だけが確認できます。アクセスは監査ログへ記録されます。</p></div>
         <div className="staff-login-form">
-          <label>採用担当者<select value={reviewer} onChange={(event) => setReviewer(event.target.value as typeof reviewer)}>{AUTHORIZED_REVIEWERS.map((name) => <option key={name}>{name}</option>)}</select></label>
+          <label>担当者名<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="例：採用担当" autoComplete="name" maxLength={40} /></label>
           <label>面接ID<input value={sessionId} onChange={(event) => setSessionId(event.target.value.toUpperCase())} placeholder="TD-..." autoCapitalize="characters" /></label>
           <label>アクセスキー<input type="password" value={accessKey} onChange={(event) => setAccessKey(event.target.value)} autoComplete="current-password" /></label>
-          <button className="primary-action" onClick={() => void loadReview()} disabled={!sessionId.trim() || !accessKey || state === "loading"}>{state === "loading" ? "確認中…" : "オンライン一次面接記録を開く"} <span>→</span></button>
+          <button className="primary-action" onClick={() => void loadReview()} disabled={!reviewer.trim() || !sessionId.trim() || !accessKey || state === "loading"}>{state === "loading" ? "確認中…" : "オンライン一次面接記録を開く"} <span>→</span></button>
         </div>
       </section>
 
@@ -253,7 +253,7 @@ export default function StaffReviewPage() {
 
             <article className="staff-panel">
               <div className="panel-title"><p>映像確認</p><h2>{reviewer}の確認 / {reviewedVideoDimensions}/{VIDEO_REVIEW_DIMENSIONS.length}項目</h2></div>
-              <div className="validation-box"><strong>判断前の必須確認</strong><p>技術不具合、映像・音声品質、配慮の申出は不利益に扱わず、未確認とします。一部項目だけの平均点や総合点は表示しません。自動評価は合否を決めず、笠間・山本が求人要件と根拠を確認します。</p></div>
+              <div className="validation-box"><strong>判断前の必須確認</strong><p>技術不具合、映像・音声品質、配慮の申出は不利益に扱わず、未確認とします。一部項目だけの平均点や総合点は表示しません。自動評価は合否を決めず、権限を付与された採用担当者が求人要件と根拠を確認します。</p></div>
               <div className="video-rubric">
                 {review.videoReviewRubric.map((dimension) => {
                   const score = scores.find((item) => item.name === dimension.name) ?? { name: dimension.name, score: null, note: "" };
