@@ -202,6 +202,10 @@ select, .candidate-name-input { padding: 13px 14px; }
 .setup-recovery-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
 .setup-recovery-actions button { border: 1px solid rgba(0,59,99,.16); border-radius: 999px; background: white; color: var(--brand-navy); padding: 8px 12px; font-size: 9px; font-weight: 800; }
 .setup-connect-button { width: 100%; }
+.recorded-fallback-card { margin: 13px 0; border: 1px solid rgba(0,59,99,.2); border-radius: 16px; background: var(--brand-blue-soft); padding: 14px; display: grid; gap: 7px; }
+.recorded-fallback-card strong { color: var(--brand-navy); font-size: 11px; }
+.recorded-fallback-card span { color: var(--ink); font-size: 9px; line-height: 1.65; }
+.recorded-fallback-card button { margin-top: 4px; border: 0; border-radius: 11px; background: var(--brand-navy); color: white; padding: 12px; font-size: 10px; font-weight: 800; }
 .setup-footnote { margin: 10px 4px 0; color: var(--muted); text-align: center; font-size: 8px; line-height: 1.55; }
 .simple-switch { margin: 15px 0 !important; padding: 13px 15px; border-radius: 13px; background: var(--brand-blue-soft); display: flex !important; align-items: center; justify-content: space-between; }
 .simple-switch span { display: grid; gap: 3px; }
@@ -216,6 +220,8 @@ select, .candidate-name-input { padding: 13px 14px; }
 .interview-page { width: min(1260px, calc(100% - 48px)); margin: 0 auto; padding: 32px 0 80px; }
 .internal-test-banner { margin-bottom: 13px; border: 1px solid rgba(0, 59, 99, .14); border-radius: 12px; padding: 10px 14px; background: var(--brand-blue-soft); color: var(--brand-navy); display: flex; justify-content: space-between; gap: 16px; font-size: 10px; }
 .internal-test-banner span { color: var(--muted); }
+.recorded-fallback-banner { margin-bottom: 13px; border: 1px solid rgba(28,118,103,.25); border-radius: 12px; padding: 10px 14px; background: #edf8f5; color: var(--brand-navy); display: flex; justify-content: space-between; gap: 16px; font-size: 10px; }
+.recorded-fallback-banner span { color: var(--success); }
 .interview-topline { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
 .live-state { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 10px; font-weight: 750; }
 .live-state i { width: 8px; height: 8px; border-radius: 50%; background: var(--success); }
@@ -243,6 +249,11 @@ select, .candidate-name-input { padding: 13px 14px; }
 .privacy-box strong { color: var(--brand-blue); font-size: 9px; letter-spacing: .13em; }
 .privacy-box p { margin: 7px 0 0; color: rgba(255,255,255,.7); font-size: 9px; line-height: 1.65; }
 .recording-state.error strong { color: #ffd1d1; }
+.recorded-answer-control { border-top: 1px solid var(--line); padding: 15px 24px; display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 18px; background: #f8fcfd; }
+.recorded-answer-control > div { display: grid; gap: 4px; }
+.recorded-answer-control strong { color: var(--brand-navy); font-size: 11px; }
+.recorded-answer-control span { color: var(--muted); font-size: 9px; line-height: 1.55; }
+.recorded-answer-control button { border: 0; border-radius: 11px; background: var(--brand-navy); color: white; padding: 12px 15px; font-size: 10px; font-weight: 800; }
 .conversation-area { background: white; display: grid; grid-template-rows: auto auto auto 1fr auto auto; min-width: 0; }
 .conversation-heading { padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .interviewer-profile { display: flex; align-items: center; gap: 12px; }
@@ -585,6 +596,9 @@ select, .candidate-name-input { padding: 13px 14px; }
   .conversation-log { padding: 18px 15px; min-height: 430px; }
   .message { max-width: 94%; }
   .answer-composer { padding: 12px; grid-template-columns: 1fr 58px; }
+  .recorded-answer-control { padding: 13px 12px; grid-template-columns: 1fr; }
+  .recorded-answer-control button { width: 100%; min-height: 50px; }
+  .recorded-fallback-banner { align-items: flex-start; flex-direction: column; }
   .interview-controls { padding: 0 12px 14px; flex-wrap: wrap; }
   .audio-health { padding: 9px 12px; grid-template-columns: 1fr; }
   .audio-notice { padding: 10px 12px; align-items: stretch; flex-direction: column; }

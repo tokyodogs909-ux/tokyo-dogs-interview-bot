@@ -213,6 +213,14 @@ class FakeD1Statement {
         session.updated_at = updatedAt;
         changes = 1;
       }
+    } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'in_progress'")) {
+      const [updatedAt, id] = this.values;
+      const session = this.database.sessions.get(id);
+      if (session && ["created", "in_progress"].includes(session.status)) {
+        session.status = "in_progress";
+        session.updated_at = updatedAt;
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'evaluation_processing'")) {
       const [transcriptJson, claimId, startedAt, updatedAt, id, staleBefore] = this.values;
       const session = this.database.sessions.get(id);
@@ -1499,6 +1507,63 @@ test("candidate technical incidents are audited and cross-origin mutations are r
   const staffPayload = await staffResponse.json();
   assert.equal(staffResponse.status, 200);
   assert.equal(staffPayload.review.technicalEvents[0].type, "transcription_failed");
+});
+
+test("recorded contingency interview completes without OpenAI and forces human recording review", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const session = await createTestInterviewSession(env);
+
+  const unauthorized = await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: { "X-Interview-Session": session.sessionId },
+  }, env);
+  assert.equal(unauthorized.status, 401);
+
+  const start = await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  assert.equal(start.status, 200);
+  assert.deepEqual(await start.json(), { started: true });
+  assert.equal(database.sessions.get(session.sessionId).status, "in_progress");
+
+  const complete = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 15 }),
+  }, env);
+  const payload = await complete.json();
+  assert.equal(complete.status, 200, JSON.stringify(payload));
+  assert.deepEqual(payload, { stored: true, humanReviewRequired: true });
+
+  const stored = database.sessions.get(session.sessionId);
+  assert.equal(stored.status, "completed");
+  const transcript = JSON.parse(stored.transcript_json);
+  const evaluation = JSON.parse(stored.evaluation_json);
+  assert.equal(transcript.length, 30);
+  assert.equal(transcript.filter((turn) => turn.speaker === "candidate").length, 15);
+  assert.ok(transcript.every((turn) => turn.speaker !== "candidate" || /録画音声/.test(turn.text)));
+  assert.equal(evaluation.recommendation, "insufficient_information");
+  assert.equal(evaluation.humanReviewRequired, true);
+  assert.ok(evaluation.dimensions.every((dimension) => dimension.score === null));
+  assert.match(evaluation.summary, /自動文字起こしと自動評価は未実施/);
+
+  const replay = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 15 }),
+  }, env);
+  assert.equal(replay.status, 409);
 });
 
 test("realtime endpoint mints a short-lived token with the interview safety settings", async () => {

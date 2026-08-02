@@ -67,6 +67,10 @@ export async function POST(request: Request) {
       body: formData,
     });
     if (!response.ok) {
+      console.warn("OPENAI_REALTIME_UPSTREAM_REJECTED", {
+        status: response.status,
+        requestId: response.headers.get("x-request-id") ?? "unavailable",
+      });
       return noStoreText(`TD-CONN-VOICE: ${await readOpenAIError(response)}`, response.status === 429 ? 429 : 502);
     }
     const answer = await response.text();

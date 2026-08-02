@@ -206,7 +206,11 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /stage === "setup"/);
   assert.match(source, /startMicrophoneMeter/);
   assert.match(source, /stopRealtime\(\{ keepLocalStream: true \}\)/);
-  assert.match(source, /カメラとマイクは正常に確認できています/);
+  assert.doesNotMatch(source, /fetch\("\/api\/health"/);
+  assert.match(source, /録画式のオンライン一次面接へ進む/);
+  assert.match(source, /\/api\/interviews\/recorded\/start/);
+  assert.match(source, /\/api\/interviews\/recorded\/complete/);
+  assert.match(source, /回答本文の自動文字起こしと自動評価は行わず/);
   assert.match(source, /画面共有を追加（任意）/);
   assert.match(source, /output_modalities: \["audio"\]/);
   assert.match(source, /自分の名前には敬称を付けず/);

@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   EMPLOYMENT_OPTIONS,
   INTERNAL_TEST_QUESTIONS,
+  RECORDED_FALLBACK_QUESTIONS,
   INTERVIEW_ACCESS_MESSAGES,
   INTERVIEW_ACCESS_STATES,
   INTERVIEW_TOPIC_IDS,
@@ -25,7 +26,7 @@ import {
 type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
 /** "checking" while the pre-flight is in flight; every other value mirrors InterviewAccessState. */
 type InviteGate = "checking" | InterviewAccessState;
-type InterviewMode = "voice" | "text" | "internal-test";
+type InterviewMode = "voice" | "text" | "recorded-fallback" | "internal-test";
 
 // Keep the final single-request upload below the server's 95 MiB limit even on
 // browsers that do not strictly honor the requested MediaRecorder bitrates.
@@ -230,6 +231,8 @@ export default function Home() {
   const [copiedPortalLink, setCopiedPortalLink] = useState(false);
   const [screenShareSupported, setScreenShareSupported] = useState(false);
   const [inviteGate, setInviteGate] = useState<InviteGate>("checking");
+  const [recordedQuestionIndex, setRecordedQuestionIndex] = useState(0);
+  const [recordedQuestionReady, setRecordedQuestionReady] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const preparedAudioRef = useRef<HTMLAudioElement>(null);
@@ -281,6 +284,8 @@ export default function Home() {
   const assistantAudioStartedAtRef = useRef<number | null>(null);
   const recordingGenerationRef = useRef(0);
   const reportedCandidateEventsRef = useRef(new Set<string>());
+  const recordedQuestionTimerRef = useRef<number | null>(null);
+  const recordedFallbackActiveRef = useRef(false);
 
   const candidateTurns = useMemo(
     () => transcript.filter((turn) => turn.speaker === "candidate").length,
@@ -359,6 +364,7 @@ export default function Home() {
       if (candidateResponseDelayTimerRef.current) window.clearTimeout(candidateResponseDelayTimerRef.current);
       if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
       if (statsTimerRef.current) window.clearInterval(statsTimerRef.current);
+      if (recordedQuestionTimerRef.current) window.clearTimeout(recordedQuestionTimerRef.current);
       playbackRetryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
       cleanupRecordingAudioMix();
       stopMicrophoneMeter();
@@ -1250,18 +1256,6 @@ export default function Home() {
     setRemoteAudioState("waiting");
     setErrorMessage("");
     try {
-      const healthController = new AbortController();
-      const healthTimeout = window.setTimeout(() => healthController.abort(), 8_000);
-      let healthResponse: Response;
-      try {
-        healthResponse = await fetch("/api/health", { cache: "no-store", signal: healthController.signal });
-      } finally {
-        window.clearTimeout(healthTimeout);
-      }
-      if (!healthResponse.ok) {
-        throw new Error("オンライン一次面接の音声回線は現在準備中です。カメラとマイクは正常に確認できています。採用担当者からの案内後、この画面で再接続してください。");
-      }
-
       let activeSessionId = sessionIdRef.current;
       let activeAccessToken = accessTokenRef.current;
       if (!activeSessionId || activeSessionId === "TD-PENDING" || !activeAccessToken) {
@@ -1299,6 +1293,135 @@ export default function Home() {
     } finally {
       setSessionStarting(false);
     }
+  }
+
+  function speakRecordedQuestion(text: string) {
+    return new Promise<void>((resolve) => {
+      if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
+        resolve();
+        return;
+      }
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "ja-JP";
+      utterance.rate = 0.92;
+      utterance.pitch = 1;
+      const voices = window.speechSynthesis.getVoices();
+      utterance.voice = voices.find((voice) => voice.lang.toLowerCase().startsWith("ja")) ?? null;
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      utterance.onend = finish;
+      utterance.onerror = finish;
+      window.setTimeout(finish, Math.min(24_000, Math.max(6_000, text.length * 180)));
+      window.speechSynthesis.speak(utterance);
+    });
+  }
+
+  function armRecordedAnswerButton() {
+    if (!recordedFallbackActiveRef.current) return;
+    if (recordedQuestionTimerRef.current) window.clearTimeout(recordedQuestionTimerRef.current);
+    setRecordedQuestionReady(false);
+    recordedQuestionTimerRef.current = window.setTimeout(() => {
+      recordedQuestionTimerRef.current = null;
+      setRecordedQuestionReady(true);
+      setConnectionState("candidate-speaking");
+    }, 2_800);
+  }
+
+  async function startRecordedFallback() {
+    const activeStream = streamRef.current;
+    const activeSessionId = sessionIdRef.current;
+    const activeAccessToken = accessTokenRef.current;
+    if (!activeStream || !activeSessionId || activeSessionId === "TD-PENDING" || !activeAccessToken || sessionStarting) {
+      setErrorMessage("面接記録の準備情報を確認できません。入力画面からもう一度開始してください。");
+      return;
+    }
+    setSessionStarting(true);
+    setErrorMessage("");
+    primeRemoteAudioPlayback();
+    try {
+      const response = await fetch("/api/interviews/recorded/start", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${activeAccessToken}`,
+          "X-Interview-Session": activeSessionId,
+        },
+      });
+      if (!response.ok) {
+        const data = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(data?.error || "録画式のオンライン一次面接を開始できませんでした。");
+      }
+      stopRealtime({ keepLocalStream: true });
+      recordedFallbackActiveRef.current = true;
+      stopMicrophoneMeter();
+      const firstQuestion = `TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。音声回線の予備方式で、画面の質問に声で回答し、話し終えたら次の質問へ進んでください。${RECORDED_FALLBACK_QUESTIONS[0]}`;
+      const firstTurn: TranscriptTurn = {
+        id: "recorded-fallback-question-1",
+        speaker: "interviewer",
+        text: firstQuestion,
+        createdAt: new Date().toISOString(),
+      };
+      setMode("recorded-fallback");
+      setRecordedQuestionIndex(0);
+      setElapsed(0);
+      setProcessingWarning("");
+      transcriptRef.current = [firstTurn];
+      setTranscript([firstTurn]);
+      recordedInterviewSessionRef.current = activeSessionId;
+      setConnectionState("ai-speaking");
+      setConnectionStep("ready");
+      setNetworkAudioState("idle");
+      setRemoteAudioState("idle");
+      setCandidateAudioState("ready");
+      setStage("interview");
+      await startRecording(activeStream, displayStreamRef.current, null, { resume: false });
+      void speakRecordedQuestion(firstQuestion).then(armRecordedAnswerButton);
+    } catch (error) {
+      setSetupPhase("error");
+      setErrorMessage(error instanceof Error ? error.message : "録画式のオンライン一次面接を開始できませんでした。");
+    } finally {
+      setSessionStarting(false);
+    }
+  }
+
+  async function advanceRecordedFallback() {
+    if (mode !== "recorded-fallback" || !recordedQuestionReady || endingRef.current) return;
+    setRecordedQuestionReady(false);
+    const answerNumber = recordedQuestionIndex + 1;
+    upsertTurn({
+      id: `recorded-fallback-answer-${answerNumber}`,
+      speaker: "candidate",
+      text: `回答${answerNumber}の発言内容は録画音声に記録されています。自動文字起こしではないため、採用担当者が録画を確認します。`,
+      createdAt: new Date().toISOString(),
+    });
+    const nextIndex = recordedQuestionIndex + 1;
+    if (nextIndex >= RECORDED_FALLBACK_QUESTIONS.length) {
+      const closing = "オンライン一次面接は以上です。回答と録画は採用選考の重要な判断資料として、採用担当者の笠間と山本が確認します。ご回答ありがとうございました。";
+      upsertTurn({
+        id: "recorded-fallback-closing",
+        speaker: "interviewer",
+        text: closing,
+        createdAt: new Date().toISOString(),
+      });
+      setConnectionState("ai-speaking");
+      await speakRecordedQuestion(closing);
+      await completeInterview("recorded_fallback_completed");
+      return;
+    }
+    const nextQuestion = RECORDED_FALLBACK_QUESTIONS[nextIndex];
+    setRecordedQuestionIndex(nextIndex);
+    setConnectionState("ai-speaking");
+    upsertTurn({
+      id: `recorded-fallback-question-${nextIndex + 1}`,
+      speaker: "interviewer",
+      text: nextQuestion,
+      createdAt: new Date().toISOString(),
+    });
+    void speakRecordedQuestion(nextQuestion).then(armRecordedAnswerButton);
   }
 
   async function prepareInterview() {
@@ -1444,6 +1567,10 @@ export default function Home() {
     statsTimerRef.current = null;
     playbackRetryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     playbackRetryTimersRef.current = [];
+    if (recordedQuestionTimerRef.current) window.clearTimeout(recordedQuestionTimerRef.current);
+    recordedQuestionTimerRef.current = null;
+    recordedFallbackActiveRef.current = false;
+    window.speechSynthesis?.cancel();
     disconnectRemoteSpeaker();
     stopAudioPrime();
     const activeChannel = channelRef.current;
@@ -1510,6 +1637,24 @@ export default function Home() {
     };
     if (!response.ok || !data.stored) {
       throw new Error(data.error || "評価を完了できませんでした。");
+    }
+  }
+
+  async function completeRecordedFallback() {
+    const response = await fetch("/api/interviews/recorded/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessTokenRef.current}`,
+      },
+      body: JSON.stringify({
+        sessionId,
+        questionCount: RECORDED_FALLBACK_QUESTIONS.length,
+      }),
+    });
+    const data = (await response.json().catch(() => null)) as { stored?: boolean; error?: string } | null;
+    if (!response.ok || !data?.stored) {
+      throw new Error(data?.error || "録画式面接の受付を完了できませんでした。");
     }
   }
 
@@ -1595,7 +1740,12 @@ export default function Home() {
       if (transcriptRef.current.length === 0) {
         throw new Error("評価に必要な回答記録がありません。オンライン一次面接を最初からお試しください。");
       }
-      await requestEvaluation();
+      if (mode === "recorded-fallback") {
+        await completeRecordedFallback();
+        setProcessingWarning("回答本文の自動文字起こしと自動評価は行わず、採用担当者が録画を確認します。");
+      } else {
+        await requestEvaluation();
+      }
     } catch (error) {
       setProcessingWarning("回答記録の自動整理を完了できませんでした。採用担当者が記録状態を確認します。");
       void error;
@@ -2099,6 +2249,8 @@ export default function Home() {
     setRemoteAudioState("idle");
     setNetworkAudioState("idle");
     setAudioNotice("");
+    setRecordedQuestionIndex(0);
+    setRecordedQuestionReady(false);
     setStage("intro");
     setErrorMessage("接続をやり直します。同意はそのままです。開始ボタンを押し、表示される許可画面をご確認ください。");
   }
@@ -2106,8 +2258,8 @@ export default function Home() {
   const connectionCopy = {
     idle: "待機中",
     connecting: "オンライン一次面接へ接続中",
-    ready: mode === "voice" ? "質問が終わったら、そのままお話しください" : "回答を入力してください",
-    "candidate-speaking": "お話を聞いています",
+    ready: mode === "voice" ? "質問が終わったら、そのままお話しください" : mode === "recorded-fallback" ? "回答後、「回答を終えて次の質問へ」を押してください" : "回答を入力してください",
+    "candidate-speaking": mode === "recorded-fallback" ? "回答を録画音声に記録中" : "お話を聞いています",
     "waiting-pause": "回答の続きがないか、少し待っています",
     "ai-speaking": "茂木が話しています",
     error: "接続を確認してください",
@@ -2143,7 +2295,9 @@ export default function Home() {
     error: "要確認",
   }[networkAudioState];
   const recordingCaptureCopy = recordingCaptureState === "recording"
-    ? recordingHasBothAudio === false
+    ? mode === "recorded-fallback"
+      ? "カメラ映像とあなたの音声を録画中です。質問文は画面の記録にも保存します。"
+      : recordingHasBothAudio === false
       ? "カメラ・応募者音声を録画中です。茂木の録音状態は採用担当者が確認します。"
       : screenCaptureState === "ready"
       ? "面接画面・カメラ・双方の音声を録画中です。"
@@ -2339,6 +2493,13 @@ export default function Home() {
               <div className={networkAudioState === "connected" ? "passed" : networkAudioState === "error" ? "failed" : "checking"}><i /><span>面接回線</span><strong>{networkAudioCopy}</strong></div>
             </div>
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
+            {setupPhase === "error" && accessTokenRef.current && (
+              <div className="recorded-fallback-card" role="status">
+                <strong>予備方式で一次面接を続けられます</strong>
+                <span>質問を画面と端末音声で案内します。声で回答し、話し終えたら次へ進んでください。録画は選考資料として笠間・山本が確認します。</span>
+                <button type="button" disabled={sessionStarting} onClick={() => void startRecordedFallback()}>{sessionStarting ? "予備方式を準備中…" : "録画式のオンライン一次面接へ進む"}</button>
+              </div>
+            )}
             <div className="setup-recovery-actions">
               <button type="button" onClick={playSpeakerTest}>確認音を再生</button>
               {screenShareSupported && <button type="button" onClick={() => void enableScreenCapture()}>{screenCaptureState === "ready" ? "画面共有を追加済み" : "画面共有を追加（任意）"}</button>}
@@ -2354,6 +2515,7 @@ export default function Home() {
       {stage === "interview" && (
         <section className="interview-page">
           {mode === "internal-test" && <div className="internal-test-banner"><strong>接続確認</strong><span>選考対象外・録画・採用評価なし</span></div>}
+          {mode === "recorded-fallback" && <div className="recorded-fallback-banner"><strong>オンライン一次面接・予備方式</strong><span>選考対象・録画を笠間・山本が確認</span></div>}
           <div className="interview-topline">
             <div className={`live-state ${connectionState}`}><i />{connectionCopy}</div>
             <div className="interview-time">{formatTime(elapsed)} {mode !== "internal-test" && <span>/ 目安 15–25分</span>}</div>
@@ -2373,7 +2535,7 @@ export default function Home() {
                   ? "入力内容は送信・保存せず、録画・文字起こし・採用評価を行いません。"
                   : "ご回答、勤務条件、接客時の職務関連行動を採用選考の資料として確認します。容姿、笑顔の有無、機器や通信の不具合は評価しません。"}</p>
               </div>
-              {mode === "voice" && <div className={`privacy-box recording-state ${recordingCaptureState}`}><strong>録画状態</strong><p>{recordingCaptureCopy}</p></div>}
+              {(mode === "voice" || mode === "recorded-fallback") && <div className={`privacy-box recording-state ${recordingCaptureState}`}><strong>録画状態</strong><p>{recordingCaptureCopy}</p></div>}
             </aside>
 
             <div className="conversation-area">
@@ -2416,12 +2578,19 @@ export default function Home() {
                   </article>
                 ))}
               </div>
-              <div className="answer-composer">
-                <textarea value={textDraft} onChange={(event) => setTextDraft(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") sendTextAnswer(); }} placeholder={mode === "voice" ? "聞き取りにくい時は、ここに入力できます" : "回答を入力してください"} rows={2} />
-                <button onClick={sendTextAnswer} disabled={!textDraft.trim() || connectionState === "idle" || connectionState === "connecting" || connectionState === "error"}>送信</button>
-              </div>
+              {mode === "recorded-fallback" ? (
+                <div className="recorded-answer-control">
+                  <div><strong>質問 {recordedQuestionIndex + 1} / {RECORDED_FALLBACK_QUESTIONS.length}</strong><span>回答はそのまま声でお話しください。話し終えた後にボタンを押します。</span></div>
+                  <button type="button" disabled={!recordedQuestionReady || endingRef.current} onClick={() => void advanceRecordedFallback()}>{recordedQuestionIndex + 1 === RECORDED_FALLBACK_QUESTIONS.length ? "回答を終えて面接を完了" : "回答を終えて次の質問へ"}</button>
+                </div>
+              ) : (
+                <div className="answer-composer">
+                  <textarea value={textDraft} onChange={(event) => setTextDraft(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") sendTextAnswer(); }} placeholder={mode === "voice" ? "聞き取りにくい時は、ここに入力できます" : "回答を入力してください"} rows={2} />
+                  <button onClick={sendTextAnswer} disabled={!textDraft.trim() || connectionState === "idle" || connectionState === "connecting" || connectionState === "error"}>送信</button>
+                </div>
+              )}
               <div className="interview-controls">
-                {mode === "voice" && <button className={isMuted ? "control danger" : "control"} onClick={toggleMute}>{isMuted ? "マイクを再開" : "マイクをミュート"}</button>}
+                {(mode === "voice" || mode === "recorded-fallback") && <button className={isMuted ? "control danger" : "control"} onClick={toggleMute}>{isMuted ? "マイクを再開" : "マイクをミュート"}</button>}
                 {connectionState === "error" && <button className="control" onClick={restartConnection}>最初から接続をやり直す</button>}
                 {connectionState === "error" && <button className="control" onClick={startInternalTest}>選考対象外の接続確認へ切り替える</button>}
                 <button className="finish-button" onClick={() => { if (window.confirm("オンライン一次面接を中止し、ここまでの記録を採用担当者へ送りますか？")) { reportCandidateEvent("candidate_requested_stop", "USER_ACTION"); void completeInterview("candidate_requested_stop"); } }}>面接を中止</button>
