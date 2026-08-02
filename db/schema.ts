@@ -52,6 +52,16 @@ export const interviewAuditEvents = sqliteTable("interview_audit_events", {
   index("interview_audit_events_session_idx").on(table.sessionId),
 ]);
 
+export const interviewStaffAuditEvents = sqliteTable("interview_staff_audit_events", {
+  id: text("id").primaryKey(),
+  reviewerName: text("reviewer_name").notNull(),
+  eventType: text("event_type").notNull(),
+  detailJson: text("detail_json"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("interview_staff_audit_events_created_idx").on(table.createdAt),
+]);
+
 export const interviewHumanReviews = sqliteTable("interview_human_reviews", {
   id: text("id").primaryKey(),
   sessionId: text("session_id").notNull().references(() => interviewSessions.id, { onDelete: "cascade" }),

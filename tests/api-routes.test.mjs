@@ -308,6 +308,15 @@ class FakeD1Statement {
         created_at: new Date().toISOString(),
         session_id: sessionId,
       });
+    } else if (this.sql.startsWith("INSERT INTO interview_staff_audit_events")) {
+      const [, reviewerName, detailJson] = this.values;
+      this.database.staffAuditEvents.push({
+        reviewer_name: reviewerName,
+        event_type: "interview_list_opened",
+        detail_json: detailJson,
+        created_at: new Date().toISOString(),
+      });
+      changes = 1;
     } else if (this.sql.startsWith("INSERT INTO google_drive_connection")) {
       const [ciphertext, iv, scope, createdAt, updatedAt] = this.values;
       this.database.driveConnection = {
@@ -377,6 +386,29 @@ class FakeD1Statement {
           .map(([, value]) => value),
       };
     }
+    if (this.sql.startsWith("SELECT s.id, s.candidate_name")) {
+      const limit = this.values[0];
+      return {
+        results: [...this.database.sessions.values()]
+          .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)))
+          .slice(0, limit)
+          .map((session) => {
+            const sync = this.database.externalSyncs.get(session.id);
+            return {
+              id: session.id,
+              candidate_name: session.candidate_name,
+              employment: session.employment,
+              preferred_location: session.preferred_location,
+              status: session.status,
+              recording_status: session.recording_status,
+              created_at: session.created_at,
+              completed_at: session.completed_at ?? null,
+              drive_status: sync?.status ?? null,
+              drive_folder_url: sync?.folder_url ?? null,
+            };
+          }),
+      };
+    }
     if (this.sql.startsWith("SELECT event_type, detail_json, created_at")) {
       const technicalEventTypes = new Set([
         "audio_playback_blocked", "transcription_failed", "recording_unavailable",
@@ -398,6 +430,7 @@ class FakeD1 {
     this.artifacts = [];
     this.humanReviews = new Map();
     this.auditEvents = [];
+    this.staffAuditEvents = [];
     this.invites = new Map();
     this.publicEntries = [];
     this.externalSyncs = new Map();
@@ -1412,6 +1445,40 @@ test("interview session stores the candidate name and protects the recording wit
     },
   }, env);
   assert.equal(oversizedOperatorName.status, 401);
+});
+
+test("staff inbox lists recent candidates with one shared login and records list access", async () => {
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const first = await createTestInterviewSession(env, "正社員", "越谷店");
+  const second = await createTestInterviewSession(env, "アルバイト・パート", "新宿エリア");
+  database.sessions.get(first.sessionId).candidate_name = "山田 花子";
+  database.sessions.get(second.sessionId).candidate_name = "佐藤 太郎";
+  database.sessions.get(second.sessionId).status = "completed";
+  database.externalSyncs.set(second.sessionId, {
+    status: "completed",
+    folder_url: "https://drive.google.com/drive/folders/test",
+  });
+
+  const unauthorized = await request("/api/staff/interviews", {}, env);
+  assert.equal(unauthorized.status, 401);
+  const response = await request("/api/staff/interviews", {
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当C"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.interviews.length, 2);
+  assert.deepEqual(new Set(payload.interviews.map((item) => item.candidateName)), new Set(["山田 花子", "佐藤 太郎"]));
+  const archived = payload.interviews.find((item) => item.sessionId === second.sessionId);
+  assert.equal(archived.driveStatus, "completed");
+  assert.equal(archived.driveFolderUrl, "https://drive.google.com/drive/folders/test");
+  assert.equal(database.staffAuditEvents.length, 1);
+  assert.equal(database.staffAuditEvents[0].reviewer_name, "採用担当C");
+  assert.deepEqual(JSON.parse(database.staffAuditEvents[0].detail_json), { resultCount: 2, limit: 50 });
 });
 
 test("recording upload survives one transient D1 failure after the R2 object is already stored", async () => {

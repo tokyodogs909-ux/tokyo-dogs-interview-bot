@@ -156,6 +156,14 @@ async function ensureSchema(db: D1Database) {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_audit_events_session_idx ON interview_audit_events (session_id)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_staff_audit_events (
+      id TEXT PRIMARY KEY NOT NULL,
+      reviewer_name TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      detail_json TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_staff_audit_events_created_idx ON interview_staff_audit_events (created_at)"),
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_human_reviews (
       id TEXT PRIMARY KEY NOT NULL,
       session_id TEXT NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
@@ -1012,6 +1020,55 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
       archivedArtifactCount,
     } : null,
   };
+}
+
+export type InterviewListItem = {
+  sessionId: string;
+  candidateName: string;
+  employment: string;
+  location: string;
+  status: string;
+  recordingStatus: string;
+  createdAt: string;
+  completedAt: string | null;
+  driveStatus: string | null;
+  driveFolderUrl: string | null;
+};
+
+export async function listInterviewSummaries(reviewer: AuthorizedReviewer, limit = 50) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
+  const rows = await db.prepare(`SELECT
+    s.id, s.candidate_name, s.employment, s.preferred_location,
+    s.status, s.recording_status, s.created_at, s.completed_at,
+    d.status AS drive_status, d.folder_url AS drive_folder_url
+    FROM interview_sessions AS s
+    LEFT JOIN interview_external_syncs AS d
+      ON d.session_id = s.id AND d.provider = 'google_drive'
+    ORDER BY s.created_at DESC
+    LIMIT ?`)
+    .bind(safeLimit)
+    .all<Record<string, unknown>>();
+  const items: InterviewListItem[] = (rows.results ?? []).map((row) => ({
+    sessionId: String(row.id ?? ""),
+    candidateName: String(row.candidate_name ?? ""),
+    employment: String(row.employment ?? ""),
+    location: String(row.preferred_location ?? ""),
+    status: String(row.status ?? ""),
+    recordingStatus: String(row.recording_status ?? ""),
+    createdAt: String(row.created_at ?? ""),
+    completedAt: typeof row.completed_at === "string" ? row.completed_at : null,
+    driveStatus: typeof row.drive_status === "string" ? row.drive_status : null,
+    driveFolderUrl: typeof row.drive_folder_url === "string" ? row.drive_folder_url : null,
+  }));
+  await db.prepare(`INSERT INTO interview_staff_audit_events (
+    id, reviewer_name, event_type, detail_json
+  ) VALUES (?, ?, 'interview_list_opened', ?)`)
+    .bind(crypto.randomUUID(), reviewer, JSON.stringify({ resultCount: items.length, limit: safeLimit }))
+    .run();
+  return items;
 }
 
 export async function saveHumanVideoReview(input: {

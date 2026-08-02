@@ -259,11 +259,17 @@ test("server-renders the protected recruiter review entry", async () => {
   assert.match(html, /採用担当者専用/);
   assert.match(html, /担当者名/);
   assert.match(html, /例：採用担当/);
-  assert.match(html, /アクセスは監査ログへ記録/);
+  assert.match(html, /候補者一覧を表示/);
+  assert.match(html, /候補者用URLをコピー/);
+  assert.match(html, /最近の候補者一覧から記録を選べます/);
+  assert.match(html, /閲覧と保存操作は監査ログへ記録/);
   assert.doesNotMatch(html, /staff-review-secret|INTERVIEW_STAFF_TOKEN/);
   const source = await readFile(new URL("../app/staff/page.tsx", import.meta.url), "utf8");
   assert.match(source, /録画未格納/);
   assert.match(source, /録画を含め格納完了/);
+  assert.match(source, /候補者を検索/);
+  assert.match(source, /面接IDを直接指定/);
+  assert.match(source, /navigator\.clipboard\.writeText/);
 });
 
 test("server-renders the administrator-only Google Drive setup entry without secrets", async () => {

@@ -46,6 +46,19 @@ type ReviewRecord = {
   } | null;
 };
 
+type InterviewListItem = {
+  sessionId: string;
+  candidateName: string;
+  employment: string;
+  location: string;
+  status: string;
+  recordingStatus: string;
+  createdAt: string;
+  completedAt: string | null;
+  driveStatus: string | null;
+  driveFolderUrl: string | null;
+};
+
 const technicalEventLabels: Record<string, string> = {
   audio_playback_blocked: "担当者音声の再生停止",
   transcription_failed: "回答の文字起こし失敗",
@@ -59,6 +72,33 @@ const recommendationLabels = {
   human_review: "人による要確認",
   insufficient_information: "情報不足",
 } as const;
+
+const interviewStatusLabels: Record<string, string> = {
+  created: "未開始",
+  in_progress: "面接中",
+  evaluation_processing: "評価処理中",
+  evaluation_pending: "評価待ち",
+  completed: "面接完了",
+};
+
+const recordingStatusLabels: Record<string, string> = {
+  not_started: "録画前",
+  uploading: "録画保存中",
+  stored: "録画保存済み",
+  failed: "録画要確認",
+};
+
+function formatInterviewDate(value: string) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "日時未確認";
+  return new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
 
 function emptyScores(): VideoScore[] {
   return VIDEO_REVIEW_DIMENSIONS.map((dimension) => ({
@@ -79,6 +119,9 @@ export default function StaffReviewPage() {
   const [overallNote, setOverallNote] = useState("");
   const [state, setState] = useState<"idle" | "loading" | "ready" | "saving" | "syncing">("idle");
   const [message, setMessage] = useState("");
+  const [recentInterviews, setRecentInterviews] = useState<InterviewListItem[] | null>(null);
+  const [listFilter, setListFilter] = useState("");
+  const [listLoading, setListLoading] = useState(false);
 
   useEffect(() => () => {
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
@@ -91,7 +134,10 @@ export default function StaffReviewPage() {
     };
   }
 
-  async function loadReview() {
+  async function loadReview(targetSessionId = sessionId) {
+    const requestedSessionId = targetSessionId.trim().toUpperCase();
+    if (!requestedSessionId) return;
+    setSessionId(requestedSessionId);
     setState("loading");
     setMessage("");
     setReview(null);
@@ -99,7 +145,7 @@ export default function StaffReviewPage() {
     setRecordingUrl("");
     setRecordingAudioCoverage("unverified");
     try {
-      const response = await fetch(`/api/staff/interview?sessionId=${encodeURIComponent(sessionId.trim())}`, {
+      const response = await fetch(`/api/staff/interview?sessionId=${encodeURIComponent(requestedSessionId)}`, {
         headers: authHeaders(),
         cache: "no-store",
       });
@@ -111,7 +157,7 @@ export default function StaffReviewPage() {
       setScores(ownReview?.videoScores.length ? ownReview.videoScores : emptyScores());
       setOverallNote(ownReview?.overallNote ?? "");
       if (data.review.recordingStatus === "stored") {
-        const recordingResponse = await fetch(`/api/staff/recording?sessionId=${encodeURIComponent(sessionId.trim())}`, {
+        const recordingResponse = await fetch(`/api/staff/recording?sessionId=${encodeURIComponent(requestedSessionId)}`, {
           headers: authHeaders(),
           cache: "no-store",
         });
@@ -128,11 +174,62 @@ export default function StaffReviewPage() {
     }
   }
 
+  async function loadInterviewList() {
+    setListLoading(true);
+    setMessage("");
+    try {
+      const response = await fetch("/api/staff/interviews", {
+        headers: authHeaders(),
+        cache: "no-store",
+      });
+      const data = (await response.json()) as { interviews?: InterviewListItem[]; error?: string };
+      if (!response.ok || !data.interviews) throw new Error(data.error || "候補者一覧を取得できませんでした。");
+      setRecentInterviews(data.interviews);
+      setMessage(data.interviews.length > 0
+        ? `最近のオンライン一次面接を${data.interviews.length}件表示しました。`
+        : "オンライン一次面接の記録はまだありません。");
+    } catch (error) {
+      setRecentInterviews(null);
+      setMessage(error instanceof Error ? error.message : "候補者一覧を取得できませんでした。");
+    } finally {
+      setListLoading(false);
+    }
+  }
+
+  function logoutStaff() {
+    if (recordingUrl) URL.revokeObjectURL(recordingUrl);
+    setReviewer("");
+    setAccessKey("");
+    setSessionId("");
+    setReview(null);
+    setRecordingUrl("");
+    setRecentInterviews(null);
+    setListFilter("");
+    setMessage("運営画面からログアウトしました。");
+    setState("idle");
+  }
+
+  async function copyCandidateLink() {
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}/`);
+      setMessage("候補者へ送る共通URLをコピーしました。");
+    } catch {
+      setMessage(`候補者用URL: ${window.location.origin}/`);
+    }
+  }
+
   function updateScore(name: VideoScore["name"], patch: Partial<VideoScore>) {
     setScores((current) => current.map((item) => item.name === name ? { ...item, ...patch } : item));
   }
 
   const reviewedVideoDimensions = scores.filter((item) => item.score !== null).length;
+  const normalizedFilter = listFilter.normalize("NFKC").trim().toLowerCase();
+  const filteredInterviews = (recentInterviews ?? []).filter((item) => !normalizedFilter || [
+    item.candidateName,
+    item.sessionId,
+    item.employment,
+    item.location,
+  ].some((value) => value.normalize("NFKC").toLowerCase().includes(normalizedFilter)));
 
   async function saveVideoReview() {
     if (!review) return;
@@ -200,20 +297,44 @@ export default function StaffReviewPage() {
           <img src="/tokyo-dogs-logo.jpg" alt="Tokyo Dogs" />
           <span><strong>TOKYO DOGS</strong><small>OFFICIAL SELECTION REVIEW</small></span>
         </div>
-        <div className="staff-header-actions"><a href="/staff/invites">候補者リンク発行</a><a href="/staff/google-drive">Drive接続設定</a><span className="test-pill">採用担当者専用</span></div>
+        <div className="staff-header-actions"><button type="button" onClick={() => void copyCandidateLink()}>候補者用URLをコピー</button><a href="/staff/google-drive">Drive接続設定</a><span className="test-pill">採用担当者専用</span></div>
       </header>
 
       <section className="staff-login">
-        <div><p className="eyebrow">AUTHORIZED RECRUITER ACCESS</p><h1>公式選考レビュー</h1><p>評価本文、文字起こし、録画は認証された採用担当者だけが確認できます。アクセスは監査ログへ記録されます。</p></div>
+        <div><p className="eyebrow">AUTHORIZED RECRUITER ACCESS</p><h1>公式選考レビュー</h1><p>担当者名と共通アクセスキーでログインすると、最近の候補者一覧から記録を選べます。閲覧と保存操作は監査ログへ記録されます。</p></div>
         <div className="staff-login-form">
           <label>担当者名<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="例：採用担当" autoComplete="name" maxLength={40} /></label>
-          <label>面接ID<input value={sessionId} onChange={(event) => setSessionId(event.target.value.toUpperCase())} placeholder="TD-..." autoCapitalize="characters" /></label>
           <label>アクセスキー<input type="password" value={accessKey} onChange={(event) => setAccessKey(event.target.value)} autoComplete="current-password" /></label>
-          <button className="primary-action" onClick={() => void loadReview()} disabled={!reviewer.trim() || !sessionId.trim() || !accessKey || state === "loading"}>{state === "loading" ? "確認中…" : "オンライン一次面接記録を開く"} <span>→</span></button>
+          <button className="primary-action" onClick={() => void loadInterviewList()} disabled={!reviewer.trim() || !accessKey || listLoading}>{listLoading ? "確認中…" : "候補者一覧を表示"} <span>→</span></button>
         </div>
       </section>
 
       {message && <div className="staff-message">{message}</div>}
+
+      {recentInterviews && (
+        <section className="staff-inbox" aria-label="最近のオンライン一次面接">
+          <div className="staff-inbox-heading">
+            <div><p className="eyebrow">INTERVIEW INBOX</p><h2>候補者一覧</h2><span>氏名または店舗で検索し、対象の記録を選択してください。</span></div>
+            <div className="staff-inbox-actions"><button type="button" onClick={() => void loadInterviewList()} disabled={listLoading}>一覧を更新</button><button type="button" onClick={logoutStaff}>ログアウト</button></div>
+          </div>
+          <div className="staff-inbox-tools">
+            <label>候補者を検索<input value={listFilter} onChange={(event) => setListFilter(event.target.value)} placeholder="氏名・店舗・面接ID" /></label>
+            <div className="manual-session-open"><label>面接IDを直接指定<input value={sessionId} onChange={(event) => setSessionId(event.target.value.toUpperCase())} placeholder="TD-..." autoCapitalize="characters" /></label><button type="button" onClick={() => void loadReview()} disabled={!sessionId.trim() || state === "loading"}>開く</button></div>
+          </div>
+          <div className="staff-inbox-list">
+            {filteredInterviews.map((item) => (
+              <button type="button" className={review?.sessionId === item.sessionId ? "active" : ""} key={item.sessionId} onClick={() => void loadReview(item.sessionId)} disabled={state === "loading"}>
+                <span className="staff-inbox-name"><strong>{item.candidateName || "氏名未登録"}</strong><small>{item.employment}・{item.location}</small></span>
+                <span className="staff-inbox-state"><strong>{interviewStatusLabels[item.status] ?? item.status}</strong><small>{recordingStatusLabels[item.recordingStatus] ?? item.recordingStatus}</small></span>
+                <span className="staff-inbox-date"><strong>{formatInterviewDate(item.createdAt)}</strong><small>{item.sessionId}</small></span>
+                <span className={`staff-inbox-drive drive-${item.driveStatus ?? "not-started"}`}>{item.driveStatus === "completed" ? "Drive格納済み" : item.driveStatus === "failed" ? "Drive要確認" : item.driveStatus === "running" ? "Drive格納中" : "Drive未格納"}</span>
+                <span className="staff-inbox-arrow">→</span>
+              </button>
+            ))}
+            {filteredInterviews.length === 0 && <div className="staff-inbox-empty">該当する候補者はありません。</div>}
+          </div>
+        </section>
+      )}
 
       {review && (
         <section className="staff-review">

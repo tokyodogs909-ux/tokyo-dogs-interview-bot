@@ -391,8 +391,8 @@ select, .candidate-name-input { padding: 13px 14px; }
 .staff-shell { min-height: 100vh; background: var(--brand-blue-soft); padding-bottom: 100px; }
 .staff-header { position: static; }
 .staff-header-actions { display: flex; align-items: center; gap: 12px; }
-.staff-header-actions > a { border-bottom: 1px solid var(--brand-navy); color: var(--brand-navy); font-size: 10px; font-weight: 800; text-decoration: none; }
-.staff-login, .staff-review { width: min(1180px, calc(100% - 48px)); margin: 0 auto; }
+.staff-header-actions > a, .staff-header-actions > button { border: 0; border-bottom: 1px solid var(--brand-navy); background: transparent; color: var(--brand-navy); font-size: 10px; font-weight: 800; text-decoration: none; padding: 0 0 2px; }
+.staff-login, .staff-inbox, .staff-review { width: min(1180px, calc(100% - 48px)); margin: 0 auto; }
 .staff-login { padding: 62px 0 34px; display: grid; grid-template-columns: 1fr 440px; align-items: end; gap: 70px; }
 .staff-login h1 { margin: 8px 0 12px; color: var(--brand-navy); font-size: clamp(38px, 5vw, 64px); letter-spacing: -.05em; }
 .staff-login > div:first-child > p:last-child { max-width: 590px; color: var(--muted); line-height: 1.8; }
@@ -403,6 +403,33 @@ select, .candidate-name-input { padding: 13px 14px; }
 .staff-message { width: min(1180px, calc(100% - 48px)); margin: 0 auto 18px; border: 1px solid rgba(7,66,105,.15); background: #fff; color: var(--brand-navy); border-radius: 14px; padding: 15px 18px; }
 .staff-message ul { margin: 10px 0; padding-left: 20px; color: var(--danger); }
 .staff-message p { margin: 8px 0 0; color: var(--muted); line-height: 1.7; }
+.staff-inbox { margin-bottom: 24px; border-radius: 24px; background: #fff; padding: 24px; box-shadow: 0 18px 60px rgba(7,66,105,.08); }
+.staff-inbox-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+.staff-inbox-heading h2 { margin: 4px 0 5px; color: var(--brand-navy); font-size: 28px; letter-spacing: -.035em; }
+.staff-inbox-heading span { color: var(--muted); font-size: 11px; }
+.staff-inbox-actions { display: flex; gap: 8px; }
+.staff-inbox-actions button, .manual-session-open button { border: 1px solid rgba(7,66,105,.18); border-radius: 10px; background: #fff; color: var(--brand-navy); padding: 10px 13px; font-size: 10px; font-weight: 800; white-space: nowrap; }
+.staff-inbox-actions button:hover, .manual-session-open button:hover { border-color: var(--brand-navy); }
+.staff-inbox-tools { display: grid; grid-template-columns: 1fr 1.25fr; gap: 14px; padding: 18px 0; }
+.staff-inbox-tools label { display: grid; gap: 6px; color: var(--brand-navy); font-size: 9px; font-weight: 800; letter-spacing: .08em; }
+.staff-inbox-tools input { width: 100%; border: 1px solid rgba(7,66,105,.16); border-radius: 11px; background: #f8fcff; padding: 11px 12px; color: var(--brand-navy); font: inherit; outline: none; }
+.staff-inbox-tools input:focus { border-color: var(--brand-blue); box-shadow: 0 0 0 3px rgba(72,158,205,.12); }
+.manual-session-open { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 8px; }
+.manual-session-open button { min-height: 42px; }
+.staff-inbox-list { display: grid; gap: 8px; }
+.staff-inbox-list > button { width: 100%; border: 1px solid rgba(7,66,105,.1); border-radius: 14px; background: #f9fcfe; padding: 13px 14px; display: grid; grid-template-columns: minmax(180px, 1.5fr) minmax(100px, .7fr) minmax(130px, .85fr) auto 22px; gap: 14px; align-items: center; color: var(--brand-navy); text-align: left; transition: border-color .18s ease, background .18s ease, transform .18s ease; }
+.staff-inbox-list > button:hover, .staff-inbox-list > button.active { border-color: var(--brand-blue); background: var(--brand-blue-soft); transform: translateY(-1px); }
+.staff-inbox-list > button:disabled { opacity: .6; cursor: wait; }
+.staff-inbox-name, .staff-inbox-state, .staff-inbox-date { min-width: 0; display: grid; gap: 4px; }
+.staff-inbox-name strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.staff-inbox-name small, .staff-inbox-state small, .staff-inbox-date small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 9px; }
+.staff-inbox-state strong, .staff-inbox-date strong { font-size: 10px; }
+.staff-inbox-drive { border-radius: 999px; padding: 6px 9px; background: #edf3f7; color: var(--muted); font-size: 9px; font-weight: 800; white-space: nowrap; }
+.staff-inbox-drive.drive-completed { background: #e7f7ef; color: #16623a; }
+.staff-inbox-drive.drive-failed { background: #fff0ef; color: #8c2d24; }
+.staff-inbox-drive.drive-running, .staff-inbox-drive.drive-pending { background: #e9f5fb; color: var(--brand-navy); }
+.staff-inbox-arrow { color: var(--brand-blue); font-size: 18px; }
+.staff-inbox-empty { border-radius: 14px; background: var(--brand-blue-soft); color: var(--muted); padding: 30px; text-align: center; font-size: 11px; }
 .staff-review { display: grid; gap: 18px; }
 .staff-meta { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; overflow: hidden; border-radius: 18px; background: rgba(7,66,105,.1); }
 .staff-meta > div { background: #fff; padding: 17px 20px; display: grid; gap: 5px; }
@@ -546,6 +573,8 @@ select, .candidate-name-input { padding: 13px 14px; }
   .recommendation { min-height: 150px; }
   .review-columns { grid-template-columns: 1fr; }
   .staff-login { grid-template-columns: 1fr; gap: 26px; padding-top: 38px; }
+  .staff-inbox-list > button { grid-template-columns: minmax(160px, 1.4fr) 1fr auto 22px; }
+  .staff-inbox-date { display: none; }
   .staff-grid { grid-template-columns: 1fr; }
   .human-review-list { grid-template-columns: 1fr; }
   .drive-setup-card { grid-template-columns: 1fr; gap: 30px; padding-top: 40px; }
@@ -555,6 +584,7 @@ select, .candidate-name-input { padding: 13px 14px; }
   .site-header, .intro-layout, .setup-layout, .interview-page, .review-page, .site-footer { width: min(100% - 28px, 1240px); }
   .site-header { height: 78px; gap: 8px; }
   .staff-header-actions > a { display: none; }
+  .staff-header-actions > button { font-size: 8px; }
   .drive-setup-card { width: min(100% - 28px, 520px); padding: 34px 0; }
   .drive-setup-heading h1 { font-size: 46px; }
   .drive-setup-panel { padding: 20px; border-radius: 22px; }
@@ -613,7 +643,15 @@ select, .candidate-name-input { padding: 13px 14px; }
   .review-actions { flex-wrap: wrap; }
   .review-actions > div { width: 100%; }
   .review-actions button { flex: 1; }
-  .staff-login, .staff-review, .staff-message { width: min(100% - 28px, 1180px); }
+  .staff-login, .staff-inbox, .staff-review, .staff-message { width: min(100% - 28px, 1180px); }
+  .staff-inbox { padding: 18px 14px; border-radius: 20px; }
+  .staff-inbox-heading { align-items: flex-start; flex-direction: column; }
+  .staff-inbox-actions { width: 100%; }
+  .staff-inbox-actions button { flex: 1; }
+  .staff-inbox-tools { grid-template-columns: 1fr; }
+  .staff-inbox-list > button { grid-template-columns: 1fr auto 18px; gap: 9px; }
+  .staff-inbox-state { display: none; }
+  .staff-inbox-drive { padding: 5px 7px; font-size: 8px; }
   .staff-meta { grid-template-columns: repeat(2, 1fr); }
   .site-footer { flex-direction: column; justify-content: center; gap: 4px; text-align: center; }
   .mobile-test-intro, .mobile-test-interview, .mobile-test-complete { padding-left: 16px; padding-right: 16px; }
