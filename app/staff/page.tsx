@@ -300,6 +300,20 @@ export default function StaffReviewPage() {
         <div className="staff-header-actions"><button type="button" onClick={() => void copyCandidateLink()}>候補者用URLをコピー</button><a href="/staff/google-drive">Drive接続設定</a><span className="test-pill">採用担当者専用</span></div>
       </header>
 
+      <section className="staff-operation-guide" aria-label="初めての採用担当者向け運用手順">
+        <div>
+          <p className="eyebrow">SIMPLE OPERATION GUIDE</p>
+          <h2>運用は3ステップです</h2>
+          <p>候補者ごとのリンク発行やフォルダ作成は不要です。全員に同じURLを案内すると、面接と保存が候補者別に自動で進みます。</p>
+        </div>
+        <ol>
+          <li><strong>1. 共通URLを案内</strong><span>上の「候補者用URLをコピー」を押し、候補者へ送ります。</span></li>
+          <li><strong>2. 面接完了後に一覧を確認</strong><span>担当者名と共通アクセスキーを入力し、「候補者一覧を表示」を押します。</span></li>
+          <li><strong>3. 3つの完了表示を確認</strong><span>「面接完了」「録画保存済み」「Drive格納済み」がそろった記録を開き、録画と回答根拠を確認します。</span></li>
+        </ol>
+        <p className="staff-operation-alert"><strong>「要確認」がある場合</strong> 候補者を不利に評価せず、記録を開いて技術フラグを確認してください。Driveだけが未完了の場合は「Driveへ再格納」を押します。</p>
+      </section>
+
       <section className="staff-login">
         <div><p className="eyebrow">AUTHORIZED RECRUITER ACCESS</p><h1>公式選考レビュー</h1><p>担当者名と共通アクセスキーでログインすると、最近の候補者一覧から記録を選べます。閲覧と保存操作は監査ログへ記録されます。</p></div>
         <div className="staff-login-form">

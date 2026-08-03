@@ -392,6 +392,14 @@ select, .candidate-name-input { padding: 13px 14px; }
 .staff-header { position: static; }
 .staff-header-actions { display: flex; align-items: center; gap: 12px; }
 .staff-header-actions > a, .staff-header-actions > button { border: 0; border-bottom: 1px solid var(--brand-navy); background: transparent; color: var(--brand-navy); font-size: 10px; font-weight: 800; text-decoration: none; padding: 0 0 2px; }
+.staff-operation-guide { width: min(1180px, calc(100% - 48px)); margin: 34px auto 0; padding: 28px; border: 1px solid rgba(7,66,105,.14); border-radius: 24px; background: rgba(255,255,255,.9); box-shadow: 0 18px 50px rgba(7,66,105,.08); }
+.staff-operation-guide h2 { margin: 6px 0 8px; color: var(--brand-navy); font-size: clamp(24px, 3vw, 36px); letter-spacing: -.035em; }
+.staff-operation-guide > div > p:last-child { margin: 0; max-width: 760px; color: var(--muted); line-height: 1.75; }
+.staff-operation-guide ol { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 22px 0 0; padding: 0; list-style: none; }
+.staff-operation-guide li { display: grid; gap: 7px; min-height: 112px; padding: 18px; border-radius: 16px; background: var(--brand-blue-soft); color: var(--brand-navy); }
+.staff-operation-guide li strong { font-size: 12px; }
+.staff-operation-guide li span { color: var(--muted); font-size: 10px; line-height: 1.7; }
+.staff-operation-alert { margin: 14px 0 0; padding: 13px 16px; border-left: 4px solid var(--warning); background: #fff7ef; color: var(--warning); font-size: 10px; line-height: 1.7; }
 .staff-login, .staff-inbox, .staff-review { width: min(1180px, calc(100% - 48px)); margin: 0 auto; }
 .staff-login { padding: 62px 0 34px; display: grid; grid-template-columns: 1fr 440px; align-items: end; gap: 70px; }
 .staff-login h1 { margin: 8px 0 12px; color: var(--brand-navy); font-size: clamp(38px, 5vw, 64px); letter-spacing: -.05em; }
@@ -573,6 +581,8 @@ select, .candidate-name-input { padding: 13px 14px; }
   .recommendation { min-height: 150px; }
   .review-columns { grid-template-columns: 1fr; }
   .staff-login { grid-template-columns: 1fr; gap: 26px; padding-top: 38px; }
+  .staff-operation-guide ol { grid-template-columns: 1fr; }
+  .staff-operation-guide li { min-height: 0; }
   .staff-inbox-list > button { grid-template-columns: minmax(160px, 1.4fr) 1fr auto 22px; }
   .staff-inbox-date { display: none; }
   .staff-grid { grid-template-columns: 1fr; }
@@ -643,7 +653,7 @@ select, .candidate-name-input { padding: 13px 14px; }
   .review-actions { flex-wrap: wrap; }
   .review-actions > div { width: 100%; }
   .review-actions button { flex: 1; }
-  .staff-login, .staff-inbox, .staff-review, .staff-message { width: min(100% - 28px, 1180px); }
+  .staff-operation-guide, .staff-login, .staff-inbox, .staff-review, .staff-message { width: min(100% - 28px, 1180px); }
   .staff-inbox { padding: 18px 14px; border-radius: 20px; }
   .staff-inbox-heading { align-items: flex-start; flex-direction: column; }
   .staff-inbox-actions { width: 100%; }

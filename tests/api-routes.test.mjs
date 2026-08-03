@@ -2014,6 +2014,63 @@ test("same-origin realtime call authorizes the exact new interview session and p
   }
 });
 
+test("different candidates can hold isolated realtime calls at the same time", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const createCandidate = (candidateName, location) => request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "CF-Connecting-IP": "203.0.113.70" },
+    body: JSON.stringify({ candidateName, employment: "正社員", location, consent: true }),
+  }, env);
+  const [firstSessionResponse, secondSessionResponse] = await Promise.all([
+    createCandidate("並行試験 一郎", "越谷店"),
+    createCandidate("並行試験 二郎", "所沢店"),
+  ]);
+  assert.equal(firstSessionResponse.status, 201);
+  assert.equal(secondSessionResponse.status, 201);
+  const [firstSession, secondSession] = await Promise.all([
+    firstSessionResponse.json(),
+    secondSessionResponse.json(),
+  ]);
+  assert.notEqual(firstSession.sessionId, secondSession.sessionId);
+  assert.notEqual(firstSession.accessToken, secondSession.accessToken);
+
+  const originalFetch = globalThis.fetch;
+  const upstreamSessions = [];
+  let releaseBothCalls;
+  const bothCallsArrived = new Promise((resolve) => { releaseBothCalls = resolve; });
+  try {
+    globalThis.fetch = async (url, init) => {
+      assert.equal(url, "https://api.openai.com/v1/realtime/calls");
+      upstreamSessions.push(JSON.parse(init.body.get("session")));
+      if (upstreamSessions.length === 2) releaseBothCalls();
+      await bothCallsArrived;
+      return new Response("v=0\r\no=parallel-answer\r\n", {
+        status: 200,
+        headers: { "Content-Type": "application/sdp" },
+      });
+    };
+    const call = (session) => request("/api/realtime/call", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/sdp",
+        "X-Interview-Session": session.sessionId,
+      },
+      body: "v=0\r\no=parallel-offer\r\n",
+    }, env);
+    const [firstCall, secondCall] = await Promise.all([call(firstSession), call(secondSession)]);
+    assert.equal(firstCall.status, 200);
+    assert.equal(secondCall.status, 200);
+    assert.equal(upstreamSessions.length, 2);
+    assert.equal(database.sessions.get(firstSession.sessionId).status, "in_progress");
+    assert.equal(database.sessions.get(secondSession.sessionId).status, "in_progress");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 const dimensionNames = [
   "理念・志望動機",
   "素直さ・改善行動",
