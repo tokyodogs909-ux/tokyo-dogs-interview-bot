@@ -100,7 +100,7 @@ export default function GoogleDriveSetupPage() {
     setReadinessChecking(true);
     setMessage("");
     try {
-      const response = await fetch("/api/admin/readiness", {
+      const response = await fetch("/api/admin/google-drive/readiness", {
         credentials: "same-origin",
         cache: "no-store",
         headers: accessKey ? { Authorization: `Bearer ${accessKey}` } : {},
