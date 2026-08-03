@@ -50,6 +50,7 @@ export const CANDIDATE_EVENT_TYPES = [
   "recording_unavailable",
   "connection_failed",
   "candidate_requested_stop",
+  "time_limit_reached",
 ] as const;
 
 export type CandidateEventType = (typeof CANDIDATE_EVENT_TYPES)[number];
@@ -979,7 +980,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     FROM interview_audit_events
     WHERE session_id = ? AND event_type IN (
       'audio_playback_blocked', 'transcription_failed', 'recording_unavailable',
-      'connection_failed', 'candidate_requested_stop'
+      'connection_failed', 'candidate_requested_stop', 'time_limit_reached'
     ) ORDER BY created_at`)
     .bind(sessionId)
     .all<Record<string, unknown>>();
@@ -1035,7 +1036,11 @@ export type InterviewListItem = {
   driveFolderUrl: string | null;
 };
 
-export async function listInterviewSummaries(reviewer: AuthorizedReviewer, limit = 50) {
+export async function listInterviewSummaries(
+  reviewer: AuthorizedReviewer,
+  limit = 50,
+  options: { audit?: boolean } = {},
+) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
@@ -1063,11 +1068,13 @@ export async function listInterviewSummaries(reviewer: AuthorizedReviewer, limit
     driveStatus: typeof row.drive_status === "string" ? row.drive_status : null,
     driveFolderUrl: typeof row.drive_folder_url === "string" ? row.drive_folder_url : null,
   }));
-  await db.prepare(`INSERT INTO interview_staff_audit_events (
-    id, reviewer_name, event_type, detail_json
-  ) VALUES (?, ?, 'interview_list_opened', ?)`)
-    .bind(crypto.randomUUID(), reviewer, JSON.stringify({ resultCount: items.length, limit: safeLimit }))
-    .run();
+  if (options.audit !== false) {
+    await db.prepare(`INSERT INTO interview_staff_audit_events (
+      id, reviewer_name, event_type, detail_json
+    ) VALUES (?, ?, 'interview_list_opened', ?)`)
+      .bind(crypto.randomUUID(), reviewer, JSON.stringify({ resultCount: items.length, limit: safeLimit }))
+      .run();
+  }
   return items;
 }
 

@@ -258,9 +258,9 @@ test("reconnecting to the same interview keeps the transcript and recording capt
 test("app/page.tsx drives the audited turn-taking rules instead of its own copy", async () => {
   const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(source, /from "@\/lib\/interview-turn-taking"/);
-  assert.match(source, /applyTurnTaking\("candidate_speech_stopped"\)/);
+  assert.match(source, /applyTurnTaking\("candidate_speech_stopped"/);
   assert.match(source, /applyTurnTaking\("response_done"/);
-  assert.match(source, /applyTurnTaking\("response_cancel_rejected"\)/);
+  assert.match(source, /applyTurnTaking\("response_cancel_rejected"/);
   assert.match(source, /event\.error\?\.event_id/);
   assert.match(source, /isExpectedResponseCancelError\(/);
   assert.match(source, /supportedRecordingMimeTypes\(/);

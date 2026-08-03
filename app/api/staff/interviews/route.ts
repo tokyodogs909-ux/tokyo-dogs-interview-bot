@@ -10,7 +10,8 @@ export async function GET(request: Request) {
     if (!reviewer) {
       return noStoreJson({ error: "採用担当者の認証を確認できませんでした。" }, { status: 401 });
     }
-    const interviews = await listInterviewSummaries(reviewer);
+    const polling = new URL(request.url).searchParams.get("poll") === "1";
+    const interviews = await listInterviewSummaries(reviewer, 50, { audit: !polling });
     return noStoreJson({ interviews });
   } catch (error) {
     const message = error instanceof Error ? error.message : "";

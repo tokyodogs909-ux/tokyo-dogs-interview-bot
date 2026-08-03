@@ -22,6 +22,12 @@ import {
   reduceTurnTaking,
   supportedRecordingMimeTypes,
 } from "@/lib/interview-turn-taking";
+import {
+  INTERVIEW_MAX_SECONDS,
+  mayDispatchTimedResponse,
+  nextInterviewTimeAction,
+  recordedFallbackQuietState,
+} from "@/lib/interview-time-control";
 
 type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
 /** "checking" while the pre-flight is in flight; every other value mirrors InterviewAccessState. */
@@ -48,6 +54,7 @@ type NetworkAudioState = "idle" | "connecting" | "connected" | "reconnecting" | 
 type RecordingCaptureState = "idle" | "starting" | "recording" | "error";
 type SpeakerTestState = "idle" | "playing" | "passed" | "error";
 type SetupPhase = "idle" | "requesting" | "devices-ready" | "connecting" | "error";
+type TimedInterviewAction = "warning" | "complete";
 type RecordingAudioMix = {
   context: AudioContext;
   destination: MediaStreamAudioDestinationNode;
@@ -233,6 +240,7 @@ export default function Home() {
   const [inviteGate, setInviteGate] = useState<InviteGate>("checking");
   const [recordedQuestionIndex, setRecordedQuestionIndex] = useState(0);
   const [recordedQuestionReady, setRecordedQuestionReady] = useState(false);
+  const [timeControlNotice, setTimeControlNotice] = useState("");
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const preparedAudioRef = useRef<HTMLAudioElement>(null);
@@ -286,6 +294,17 @@ export default function Home() {
   const reportedCandidateEventsRef = useRef(new Set<string>());
   const recordedQuestionTimerRef = useRef<number | null>(null);
   const recordedFallbackActiveRef = useRef(false);
+  const modeRef = useRef<InterviewMode>("voice");
+  const interviewStartedAtRef = useRef<number | null>(null);
+  const microphoneLevelRef = useRef(0);
+  const recordedQuestionReadyRef = useRef(false);
+  const timedWarningDeliveredRef = useRef(false);
+  const timedMaximumRequestedRef = useRef(false);
+  const timedActionRef = useRef<TimedInterviewAction | null>(null);
+  const timedResponseRef = useRef<TimedInterviewAction | null>(null);
+  const timedActionTimerRef = useRef<number | null>(null);
+  const recordedFallbackQuietSinceRef = useRef<number | null>(null);
+  const queueTimedInterviewActionRef = useRef<(action: TimedInterviewAction) => void>(() => undefined);
 
   const candidateTurns = useMemo(
     () => transcript.filter((turn) => turn.speaker === "candidate").length,
@@ -320,10 +339,36 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  useEffect(() => {
+    queueTimedInterviewActionRef.current = queueTimedInterviewAction;
+  });
+
+  useEffect(() => {
     if (stage !== "interview") return;
-    const timer = window.setInterval(() => setElapsed((value) => value + 1), 1000);
+    if (interviewStartedAtRef.current === null) {
+      interviewStartedAtRef.current = Date.now();
+    }
+    const updateElapsed = () => {
+      const startedAt = interviewStartedAtRef.current;
+      if (startedAt !== null) setElapsed(Math.max(0, Math.floor((Date.now() - startedAt) / 1_000)));
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1_000);
     return () => window.clearInterval(timer);
   }, [stage]);
+
+  useEffect(() => {
+    if (stage !== "interview" || mode === "internal-test") return;
+    const action = nextInterviewTimeAction({
+      elapsedSeconds: elapsed,
+      warningDelivered: timedWarningDeliveredRef.current,
+      maximumRequested: timedMaximumRequestedRef.current,
+    });
+    if (action) queueTimedInterviewActionRef.current(action);
+  }, [elapsed, mode, stage]);
 
   useEffect(() => {
     conversationRef.current?.scrollTo({
@@ -363,6 +408,7 @@ export default function Home() {
       if (responseWatchdogRef.current) window.clearTimeout(responseWatchdogRef.current);
       if (candidateResponseDelayTimerRef.current) window.clearTimeout(candidateResponseDelayTimerRef.current);
       if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
+      if (timedActionTimerRef.current) window.clearTimeout(timedActionTimerRef.current);
       if (statsTimerRef.current) window.clearInterval(statsTimerRef.current);
       if (recordedQuestionTimerRef.current) window.clearTimeout(recordedQuestionTimerRef.current);
       playbackRetryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
@@ -399,6 +445,7 @@ export default function Home() {
       // The audio graph can already be disconnected after an iOS audio-session reset.
     }
     microphoneMeterRef.current = null;
+    microphoneLevelRef.current = 0;
     setMicrophoneLevel(0);
   }
 
@@ -429,6 +476,7 @@ export default function Home() {
         }
         const rms = Math.sqrt(sum / samples.length);
         const level = Math.min(100, Math.round(rms * 520));
+        microphoneLevelRef.current = level;
         setMicrophoneLevel((current) => Math.abs(current - level) >= 2 ? level : current);
         if (level >= 4) setCandidateAudioState("detected");
         else if (audioTrack.enabled && !audioTrack.muted) setCandidateAudioState("ready");
@@ -437,6 +485,7 @@ export default function Home() {
       microphoneMeterRef.current = meter;
       update();
     } catch {
+      microphoneLevelRef.current = 0;
       setMicrophoneLevel(0);
     }
   }
@@ -711,7 +760,7 @@ export default function Home() {
   }
 
   function reportCandidateEvent(
-    eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop",
+    eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop" | "time_limit_reached",
     code = "",
   ) {
     const activeSessionId = sessionIdRef.current;
@@ -737,8 +786,172 @@ export default function Home() {
     candidateResponseDelayTimerRef.current = null;
   }
 
+  function clearTimedActionTimer() {
+    if (timedActionTimerRef.current) window.clearTimeout(timedActionTimerRef.current);
+    timedActionTimerRef.current = null;
+  }
+
+  function resetTimedInterviewControl(options: { resetClock?: boolean } = {}) {
+    clearTimedActionTimer();
+    timedWarningDeliveredRef.current = false;
+    timedMaximumRequestedRef.current = false;
+    timedActionRef.current = null;
+    timedResponseRef.current = null;
+    recordedFallbackQuietSinceRef.current = null;
+    recordedQuestionReadyRef.current = false;
+    setTimeControlNotice("");
+    if (options.resetClock !== false) interviewStartedAtRef.current = null;
+  }
+
+  function startInterviewClock() {
+    resetTimedInterviewControl({ resetClock: false });
+    interviewStartedAtRef.current = Date.now();
+    setElapsed(0);
+  }
+
+  function timedResponseInstructions(action: TimedInterviewAction) {
+    if (action === "warning") {
+      return "面接開始から24分が経過しました。応募者の回答を遮らず、残り約3分であることを穏やかに一文で伝えてください。その後、既に得た回答を踏まえ、未確認事項のうち選考上もっとも重要なものを一つだけ短く質問してください。終了案内や完了ツールの呼び出しはまだ行わないでください。";
+    }
+    return "面接時間の上限に達しました。新しい質問はせず、応募者の直前の回答を短く受け止めてください。回答途中で遮らなかったことが自然に伝わるようにし、面接記録を採用担当者が確認する旨とお礼を簡潔に述べて、これでオンライン一次面接を終了すると案内してください。完了ツールは呼び出さないでください。";
+  }
+
+  function finishTimedVoiceResponse(action: TimedInterviewAction) {
+    timedResponseRef.current = null;
+    if (action === "warning") {
+      timedWarningDeliveredRef.current = true;
+      if (timedActionRef.current === "warning") timedActionRef.current = null;
+      setTimeControlNotice("残り時間は約3分です。現在の回答を遮らず、必要な確認を絞って進めています。");
+      if (timedActionRef.current === "complete") scheduleTimedVoiceResponse(800);
+      return;
+    }
+    if (isCandidateSpeaking()) {
+      timedActionRef.current = "complete";
+      return;
+    }
+    timedActionRef.current = null;
+    scheduleInterviewCompletion("max_duration_reached", 1_200);
+  }
+
+  function dispatchTimedVoiceResponse() {
+    timedActionTimerRef.current = null;
+    const action = timedActionRef.current;
+    if (!action || modeRef.current !== "voice") return;
+    if (!mayDispatchTimedResponse({
+      candidateSpeaking: isCandidateSpeaking(),
+      awaitingResponse: isAwaitingResponse(),
+      timedResponseInFlight: Boolean(timedResponseRef.current),
+      ending: endingRef.current,
+    })) return;
+    const channel = channelRef.current;
+    if (!channel || channel.readyState !== "open") {
+      if (action === "complete" && !isCandidateSpeaking()) {
+        timedActionRef.current = null;
+        scheduleInterviewCompletion("max_duration_connection_unavailable", 1_200);
+      }
+      return;
+    }
+    clearCandidateResponseDelay();
+    timedResponseRef.current = action;
+    channel.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        output_modalities: ["audio"],
+        instructions: timedResponseInstructions(action),
+      },
+    }));
+    armResponseWatchdog(true);
+    setConnectionState("ai-speaking");
+  }
+
+  function scheduleTimedVoiceResponse(delay = CANDIDATE_RESPONSE_DELAY_MS) {
+    if (modeRef.current !== "voice" || endingRef.current || timedResponseRef.current) return;
+    clearTimedActionTimer();
+    timedActionTimerRef.current = window.setTimeout(dispatchTimedVoiceResponse, delay);
+  }
+
+  async function completeRecordedFallbackAtTimeLimit(answerAlreadyRecorded = false) {
+    if (endingRef.current || !recordedFallbackActiveRef.current) return;
+    clearTimedActionTimer();
+    recordedQuestionReadyRef.current = false;
+    setRecordedQuestionReady(false);
+    if (!answerAlreadyRecorded) {
+      upsertTurn({
+        id: `recorded-fallback-answer-${recordedQuestionIndex + 1}`,
+        speaker: "candidate",
+        text: `回答${recordedQuestionIndex + 1}の発言内容は録画音声に記録されています。自動文字起こしではないため、採用担当者が録画を確認します。`,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    const closing = "お話の途中では遮らずに確認しました。面接時間の上限となりましたので、オンライン一次面接は以上です。回答と録画は、権限を付与された採用担当者が確認します。ご回答ありがとうございました。";
+    upsertTurn({
+      id: "recorded-fallback-time-limit-closing",
+      speaker: "interviewer",
+      text: closing,
+      createdAt: new Date().toISOString(),
+    });
+    setConnectionState("ai-speaking");
+    await speakRecordedQuestion(closing);
+    await completeInterview("recorded_fallback_max_duration_reached");
+  }
+
+  function monitorRecordedFallbackForSafeClose() {
+    timedActionTimerRef.current = null;
+    if (
+      modeRef.current !== "recorded-fallback" ||
+      !timedMaximumRequestedRef.current ||
+      !recordedFallbackActiveRef.current ||
+      endingRef.current
+    ) return;
+    if (!recordedQuestionReadyRef.current) {
+      timedActionTimerRef.current = window.setTimeout(monitorRecordedFallbackForSafeClose, 250);
+      return;
+    }
+    const quiet = recordedFallbackQuietState({
+      microphoneLevel: microphoneLevelRef.current,
+      quietSince: recordedFallbackQuietSinceRef.current,
+      now: Date.now(),
+    });
+    recordedFallbackQuietSinceRef.current = quiet.quietSince;
+    if (quiet.ready) {
+      void completeRecordedFallbackAtTimeLimit();
+      return;
+    }
+    timedActionTimerRef.current = window.setTimeout(monitorRecordedFallbackForSafeClose, 250);
+  }
+
+  function queueTimedInterviewAction(action: TimedInterviewAction) {
+    if (action === "warning") {
+      if (timedWarningDeliveredRef.current || timedMaximumRequestedRef.current) return;
+      if (!timedActionRef.current) timedActionRef.current = "warning";
+      setTimeControlNotice("開始から24分が経過しました。回答を遮らず、残り約3分で確認をまとめます。");
+      if (modeRef.current === "voice" && !timedActionTimerRef.current && !timedResponseRef.current) {
+        scheduleTimedVoiceResponse();
+      }
+      return;
+    }
+    if (!timedMaximumRequestedRef.current) {
+      timedMaximumRequestedRef.current = true;
+      reportCandidateEvent("time_limit_reached", "MAX_27_MINUTES");
+    }
+    timedActionRef.current = "complete";
+    setTimeControlNotice("面接時間の上限です。現在の回答が終わってから、安全に面接を終了します。");
+    if (modeRef.current === "recorded-fallback") {
+      if (!timedActionTimerRef.current) {
+        recordedFallbackQuietSinceRef.current = null;
+        timedActionTimerRef.current = window.setTimeout(monitorRecordedFallbackForSafeClose, 250);
+      }
+      return;
+    }
+    if (!timedActionTimerRef.current && !timedResponseRef.current) scheduleTimedVoiceResponse();
+  }
+
   function scheduleResponseAfterCandidatePause() {
     clearCandidateResponseDelay();
+    if (timedActionRef.current) {
+      scheduleTimedVoiceResponse();
+      return;
+    }
     if (endingRef.current || isCandidateSpeaking() || isAwaitingResponse()) return;
     setConnectionState("waiting-pause");
     candidateResponseDelayTimerRef.current = window.setTimeout(() => {
@@ -1332,9 +1545,11 @@ export default function Home() {
   function armRecordedAnswerButton() {
     if (!recordedFallbackActiveRef.current) return;
     if (recordedQuestionTimerRef.current) window.clearTimeout(recordedQuestionTimerRef.current);
+    recordedQuestionReadyRef.current = false;
     setRecordedQuestionReady(false);
     recordedQuestionTimerRef.current = window.setTimeout(() => {
       recordedQuestionTimerRef.current = null;
+      recordedQuestionReadyRef.current = true;
       setRecordedQuestionReady(true);
       setConnectionState("candidate-speaking");
     }, 2_800);
@@ -1371,7 +1586,6 @@ export default function Home() {
       }
       stopRealtime({ keepLocalStream: true });
       recordedFallbackActiveRef.current = true;
-      stopMicrophoneMeter();
       const firstQuestion = `TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。音声回線の予備方式で、画面の質問に声で回答し、話し終えたら次の質問へ進んでください。${RECORDED_FALLBACK_QUESTIONS[0]}`;
       const firstTurn: TranscriptTurn = {
         id: "recorded-fallback-question-1",
@@ -1379,9 +1593,10 @@ export default function Home() {
         text: firstQuestion,
         createdAt: new Date().toISOString(),
       };
+      modeRef.current = "recorded-fallback";
       setMode("recorded-fallback");
       setRecordedQuestionIndex(0);
-      setElapsed(0);
+      startInterviewClock();
       setProcessingWarning("");
       transcriptRef.current = [firstTurn];
       setTranscript([firstTurn]);
@@ -1404,6 +1619,7 @@ export default function Home() {
 
   async function advanceRecordedFallback() {
     if (mode !== "recorded-fallback" || !recordedQuestionReady || endingRef.current) return;
+    recordedQuestionReadyRef.current = false;
     setRecordedQuestionReady(false);
     const answerNumber = recordedQuestionIndex + 1;
     upsertTurn({
@@ -1412,6 +1628,10 @@ export default function Home() {
       text: `回答${answerNumber}の発言内容は録画音声に記録されています。自動文字起こしではないため、採用担当者が録画を確認します。`,
       createdAt: new Date().toISOString(),
     });
+    if (timedMaximumRequestedRef.current || elapsed >= INTERVIEW_MAX_SECONDS) {
+      await completeRecordedFallbackAtTimeLimit(true);
+      return;
+    }
     const nextIndex = recordedQuestionIndex + 1;
     if (nextIndex >= RECORDED_FALLBACK_QUESTIONS.length) {
       const closing = "オンライン一次面接は以上です。回答と録画は採用選考の重要な判断資料として、権限を付与された採用担当者が確認します。ご回答ありがとうございました。";
@@ -1426,7 +1646,15 @@ export default function Home() {
       await completeInterview("recorded_fallback_completed");
       return;
     }
-    const nextQuestion = RECORDED_FALLBACK_QUESTIONS[nextIndex];
+    const warningPrefix = timedActionRef.current === "warning"
+      ? "開始から24分が経過しました。残り約3分ですので、必要な確認を絞って進めます。"
+      : "";
+    if (warningPrefix) {
+      timedWarningDeliveredRef.current = true;
+      timedActionRef.current = null;
+      setTimeControlNotice("残り時間は約3分です。現在の回答を遮らず、必要な確認を絞って進めています。");
+    }
+    const nextQuestion = `${warningPrefix}${RECORDED_FALLBACK_QUESTIONS[nextIndex]}`;
     setRecordedQuestionIndex(nextIndex);
     setConnectionState("ai-speaking");
     upsertTurn({
@@ -1557,8 +1785,9 @@ export default function Home() {
       createdAt: new Date().toISOString(),
     };
     setSessionId(id);
+    modeRef.current = "internal-test";
     setMode("internal-test");
-    setElapsed(0);
+    startInterviewClock();
     setErrorMessage("");
     setProcessingWarning("");
     transcriptRef.current = [firstTurn];
@@ -1571,6 +1800,9 @@ export default function Home() {
   function stopRealtime(options: { keepLocalStream?: boolean; keepRecorder?: boolean } = {}) {
     clearResponseWatchdog();
     clearCandidateResponseDelay();
+    clearTimedActionTimer();
+    timedResponseRef.current = null;
+    recordedFallbackQuietSinceRef.current = null;
     turnStateRef.current = { ...turnStateRef.current, awaitingResponse: false, candidateTurnPending: false };
     if (channelOpenTimerRef.current) window.clearTimeout(channelOpenTimerRef.current);
     channelOpenTimerRef.current = null;
@@ -1704,10 +1936,10 @@ export default function Home() {
     void completeInterview(reason);
   }
 
-  function scheduleInterviewCompletion(reason: string) {
+  function scheduleInterviewCompletion(reason: string, delay = 8_000) {
     if (endingRef.current || pendingCompletionReasonRef.current) return;
     pendingCompletionReasonRef.current = reason;
-    pendingCompletionTimerRef.current = window.setTimeout(runPendingCompletion, 8_000);
+    pendingCompletionTimerRef.current = window.setTimeout(runPendingCompletion, delay);
   }
 
   async function completeInterview(reason: string) {
@@ -1780,8 +2012,12 @@ export default function Home() {
       return;
     }
     if (type === "input_audio_buffer.speech_stopped") {
-      const { state } = applyTurnTaking("candidate_speech_stopped");
+      const timedActionPending = Boolean(timedActionRef.current || timedResponseRef.current);
+      const { state } = applyTurnTaking("candidate_speech_stopped", {
+        suppressNextQuestion: timedActionPending,
+      });
       setCandidateAudioState("ready");
+      if (timedActionPending) scheduleTimedVoiceResponse();
       // When a response was still in flight the next question is scheduled by
       // response.done instead, so the candidate is never left waiting silently.
       if (state.candidateTurnPending) setConnectionState("ai-speaking");
@@ -1804,10 +2040,16 @@ export default function Home() {
       return;
     }
     if (type === "response.done") {
+      const timedResponse = timedResponseRef.current;
       const completionPending = Boolean(pendingCompletionReasonRef.current);
       const { scheduledNextQuestion } = applyTurnTaking("response_done", {
-        suppressNextQuestion: completionPending,
+        suppressNextQuestion: completionPending || Boolean(timedResponse) || Boolean(timedActionRef.current),
       });
+      if (timedResponse) {
+        finishTimedVoiceResponse(timedResponse);
+        setNetworkAudioState("connected");
+        return;
+      }
       if (completionPending) {
         if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
         pendingCompletionTimerRef.current = window.setTimeout(runPendingCompletion, 1_200);
@@ -1913,7 +2155,11 @@ export default function Home() {
       );
       if (cancelRace && channelRef.current?.readyState === "open" && !pendingCompletionReasonRef.current) {
         if (cancelEventId) pendingCancelEventsRef.current.delete(cancelEventId);
-        applyTurnTaking("response_cancel_rejected");
+        const timedResponse = timedResponseRef.current;
+        applyTurnTaking("response_cancel_rejected", {
+          suppressNextQuestion: Boolean(timedResponse) || Boolean(timedActionRef.current),
+        });
+        if (timedResponse) finishTimedVoiceResponse(timedResponse);
         setNetworkAudioState("connected");
         return;
       }
@@ -1936,6 +2182,7 @@ export default function Home() {
     // recording already captured before the disconnect (TD-CONN-* recovery paths reuse
     // the same session id). Only a genuinely new session starts from a blank record.
     const isNewInterviewSession = isNewInterviewRecord(recordedInterviewSessionRef.current, activeSessionId);
+    modeRef.current = selectedMode;
     setMode(selectedMode);
     setErrorMessage("");
     setAudioNotice("");
@@ -1945,7 +2192,7 @@ export default function Home() {
     setConnectionStep("voice");
     setStage("interview");
     if (isNewInterviewSession) {
-      setElapsed(0);
+      startInterviewClock();
       transcriptRef.current = [];
       setTranscript([]);
       recordedInterviewSessionRef.current = activeSessionId;
@@ -2196,6 +2443,7 @@ export default function Home() {
 
   function resetInterview() {
     stopRealtime();
+    resetTimedInterviewControl();
     setSessionId("TD-PENDING");
     sessionIdRef.current = "TD-PENDING";
     accessTokenRef.current = "";
@@ -2233,6 +2481,7 @@ export default function Home() {
 
   function restartConnection() {
     stopRealtime();
+    resetTimedInterviewControl();
     accessTokenRef.current = "";
     setSessionId("TD-PENDING");
     sessionIdRef.current = "TD-PENDING";
@@ -2534,6 +2783,12 @@ export default function Home() {
             <div className={`live-state ${connectionState}`}><i />{connectionCopy}</div>
             <div className="interview-time">{formatTime(elapsed)} {mode !== "internal-test" && <span>/ 目安 15–25分</span>}</div>
           </div>
+          {timeControlNotice && mode !== "internal-test" && (
+            <div className={`interview-time-notice ${elapsed >= INTERVIEW_MAX_SECONDS ? "closing" : "warning"}`} role="status" aria-live="polite">
+              <strong>{elapsed >= INTERVIEW_MAX_SECONDS ? "回答後に終了します" : "残り時間のお知らせ"}</strong>
+              <span>{timeControlNotice}</span>
+            </div>
+          )}
           <div className="interview-card">
             <aside className="interview-side">
               <div className="candidate-preview">

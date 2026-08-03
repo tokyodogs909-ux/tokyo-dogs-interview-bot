@@ -1,7 +1,7 @@
 "use client";
 
 /* eslint-disable @next/next/no-img-element */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   VIDEO_REVIEW_DIMENSIONS,
   type InterviewEvaluation,
@@ -65,6 +65,7 @@ const technicalEventLabels: Record<string, string> = {
   recording_unavailable: "録画または双方音声の欠落",
   connection_failed: "音声・通信接続の失敗",
   candidate_requested_stop: "応募者による中止",
+  time_limit_reached: "27分上限後の安全終了",
 };
 
 const recommendationLabels = {
@@ -122,10 +123,26 @@ export default function StaffReviewPage() {
   const [recentInterviews, setRecentInterviews] = useState<InterviewListItem[] | null>(null);
   const [listFilter, setListFilter] = useState("");
   const [listLoading, setListLoading] = useState(false);
+  const [completionNotice, setCompletionNotice] = useState("");
+  const [newCompletedIds, setNewCompletedIds] = useState<Set<string>>(() => new Set());
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unavailable">("unavailable");
+  const knownCompletedIdsRef = useRef(new Set<string>());
+  const completionMonitorInitializedRef = useRef(false);
+  const pollInterviewListRef = useRef<() => Promise<void>>(async () => undefined);
 
   useEffect(() => () => {
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
   }, [recordingUrl]);
+
+  useEffect(() => {
+    pollInterviewListRef.current = async () => loadInterviewList({ silent: true });
+  });
+
+  useEffect(() => {
+    if (!recentInterviews || !reviewer.trim() || !accessKey) return;
+    const timer = window.setInterval(() => void pollInterviewListRef.current(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [accessKey, recentInterviews, reviewer]);
 
   function authHeaders() {
     return {
@@ -137,6 +154,12 @@ export default function StaffReviewPage() {
   async function loadReview(targetSessionId = sessionId) {
     const requestedSessionId = targetSessionId.trim().toUpperCase();
     if (!requestedSessionId) return;
+    setNewCompletedIds((current) => {
+      if (!current.has(requestedSessionId)) return current;
+      const next = new Set(current);
+      next.delete(requestedSessionId);
+      return next;
+    });
     setSessionId(requestedSessionId);
     setState("loading");
     setMessage("");
@@ -174,25 +197,86 @@ export default function StaffReviewPage() {
     }
   }
 
-  async function loadInterviewList() {
-    setListLoading(true);
-    setMessage("");
+  function showBrowserCompletionNotification(items: InterviewListItem[]) {
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    const first = items[0];
+    const body = items.length === 1
+      ? `${first.candidateName || "氏名未登録"}さんの面接が完了しました。担当者画面で保存状態を確認してください。`
+      : `${items.length}件の面接が完了しました。担当者画面で保存状態を確認してください。`;
     try {
-      const response = await fetch("/api/staff/interviews", {
+      const notification = new Notification("TOKYO DOGS｜オンライン一次面接完了", {
+        body,
+        tag: `interview-completed-${items.map((item) => item.sessionId).join("-")}`,
+      });
+      notification.onclick = () => {
+        window.focus();
+        notification.close();
+      };
+    } catch {
+      // The in-page notice remains available when an OS-level notification is blocked.
+    }
+  }
+
+  async function enableCompletionNotifications() {
+    if (typeof Notification === "undefined") {
+      setNotificationPermission("unavailable");
+      setCompletionNotice("このブラウザは端末通知に対応していません。画面内の完了通知は自動で表示します。");
+      return;
+    }
+    try {
+      const permission = await Notification.requestPermission();
+      setNotificationPermission(permission);
+      setCompletionNotice(permission === "granted"
+        ? "端末の完了通知を有効にしました。担当者画面を開いている間、15秒ごとに新しい完了面接を確認します。"
+        : "端末通知は許可されていません。画面内の完了通知は自動で表示します。");
+    } catch {
+      setCompletionNotice("端末通知を開始できませんでした。画面内の完了通知は自動で表示します。");
+    }
+  }
+
+  async function loadInterviewList(options: { silent?: boolean } = {}) {
+    if (!options.silent) {
+      setListLoading(true);
+      setMessage("");
+    }
+    try {
+      const response = await fetch(options.silent ? "/api/staff/interviews?poll=1" : "/api/staff/interviews", {
         headers: authHeaders(),
         cache: "no-store",
       });
       const data = (await response.json()) as { interviews?: InterviewListItem[]; error?: string };
       if (!response.ok || !data.interviews) throw new Error(data.error || "候補者一覧を取得できませんでした。");
+      setNotificationPermission(typeof Notification === "undefined" ? "unavailable" : Notification.permission);
+      const completedItems = data.interviews.filter((item) => item.status === "completed" && item.completedAt);
+      if (!completionMonitorInitializedRef.current) {
+        knownCompletedIdsRef.current = new Set(completedItems.map((item) => item.sessionId));
+        completionMonitorInitializedRef.current = true;
+        setCompletionNotice("完了通知を開始しました。担当者画面を開いている間、15秒ごとに新しい完了面接を確認します。");
+      } else {
+        const newlyCompleted = completedItems.filter((item) => !knownCompletedIdsRef.current.has(item.sessionId));
+        completedItems.forEach((item) => knownCompletedIdsRef.current.add(item.sessionId));
+        if (newlyCompleted.length > 0) {
+          setNewCompletedIds((current) => new Set([...current, ...newlyCompleted.map((item) => item.sessionId)]));
+          const names = newlyCompleted.map((item) => item.candidateName || "氏名未登録").join("、");
+          setCompletionNotice(`新しい面接完了：${names}。録画保存・Drive格納・技術フラグを確認してください。`);
+          showBrowserCompletionNotification(newlyCompleted);
+        }
+      }
       setRecentInterviews(data.interviews);
-      setMessage(data.interviews.length > 0
-        ? `最近のオンライン一次面接を${data.interviews.length}件表示しました。`
-        : "オンライン一次面接の記録はまだありません。");
+      if (!options.silent) {
+        setMessage(data.interviews.length > 0
+          ? `最近のオンライン一次面接を${data.interviews.length}件表示しました。`
+          : "オンライン一次面接の記録はまだありません。");
+      }
     } catch (error) {
-      setRecentInterviews(null);
-      setMessage(error instanceof Error ? error.message : "候補者一覧を取得できませんでした。");
+      if (!options.silent) {
+        setRecentInterviews(null);
+        setMessage(error instanceof Error ? error.message : "候補者一覧を取得できませんでした。");
+      } else {
+        setCompletionNotice("完了通知の自動確認が一時的に止まりました。「一覧を更新」を押してください。");
+      }
     } finally {
-      setListLoading(false);
+      if (!options.silent) setListLoading(false);
     }
   }
 
@@ -204,6 +288,10 @@ export default function StaffReviewPage() {
     setReview(null);
     setRecordingUrl("");
     setRecentInterviews(null);
+    completionMonitorInitializedRef.current = false;
+    knownCompletedIdsRef.current.clear();
+    setNewCompletedIds(new Set());
+    setCompletionNotice("");
     setListFilter("");
     setMessage("運営画面からログアウトしました。");
     setState("idle");
@@ -325,6 +413,15 @@ export default function StaffReviewPage() {
 
       {message && <div className="staff-message">{message}</div>}
 
+      {recentInterviews && completionNotice && (
+        <div className="staff-completion-notice" role="status" aria-live="polite">
+          <div><strong>面接完了通知</strong><span>{completionNotice}</span></div>
+          {notificationPermission !== "granted" && (
+            <button type="button" onClick={() => void enableCompletionNotifications()}>端末通知を有効にする</button>
+          )}
+        </div>
+      )}
+
       {recentInterviews && (
         <section className="staff-inbox" aria-label="最近のオンライン一次面接">
           <div className="staff-inbox-heading">
@@ -337,8 +434,8 @@ export default function StaffReviewPage() {
           </div>
           <div className="staff-inbox-list">
             {filteredInterviews.map((item) => (
-              <button type="button" className={review?.sessionId === item.sessionId ? "active" : ""} key={item.sessionId} onClick={() => void loadReview(item.sessionId)} disabled={state === "loading"}>
-                <span className="staff-inbox-name"><strong>{item.candidateName || "氏名未登録"}</strong><small>{item.employment}・{item.location}</small></span>
+              <button type="button" className={`${review?.sessionId === item.sessionId ? "active" : ""} ${newCompletedIds.has(item.sessionId) ? "new-completion" : ""}`.trim()} key={item.sessionId} onClick={() => void loadReview(item.sessionId)} disabled={state === "loading"}>
+                <span className="staff-inbox-name"><strong>{item.candidateName || "氏名未登録"}{newCompletedIds.has(item.sessionId) && <em>新着完了</em>}</strong><small>{item.employment}・{item.location}</small></span>
                 <span className="staff-inbox-state"><strong>{interviewStatusLabels[item.status] ?? item.status}</strong><small>{recordingStatusLabels[item.recordingStatus] ?? item.recordingStatus}</small></span>
                 <span className="staff-inbox-date"><strong>{formatInterviewDate(item.createdAt)}</strong><small>{item.sessionId}</small></span>
                 <span className={`staff-inbox-drive drive-${item.driveStatus ?? "not-started"}`}>{item.driveStatus === "completed" ? "Drive格納済み" : item.driveStatus === "failed" ? "Drive要確認" : item.driveStatus === "running" ? "Drive格納中" : "Drive未格納"}</span>

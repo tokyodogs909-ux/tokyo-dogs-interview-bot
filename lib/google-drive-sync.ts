@@ -199,6 +199,7 @@ function buildResultJson(source: ArchiveSource) {
       "recording_unavailable",
       "connection_failed",
       "candidate_requested_stop",
+      "time_limit_reached",
     ].includes(event.type)),
     humanDecisionRequired: true,
   }, null, 2);

@@ -412,7 +412,7 @@ class FakeD1Statement {
     if (this.sql.startsWith("SELECT event_type, detail_json, created_at")) {
       const technicalEventTypes = new Set([
         "audio_playback_blocked", "transcription_failed", "recording_unavailable",
-        "connection_failed", "candidate_requested_stop",
+        "connection_failed", "candidate_requested_stop", "time_limit_reached",
       ]);
       return {
         results: this.database.auditEvents.filter((event) =>
@@ -1619,6 +1619,15 @@ test("staff inbox lists recent candidates with one shared login and records list
   assert.equal(database.staffAuditEvents.length, 1);
   assert.equal(database.staffAuditEvents[0].reviewer_name, "採用担当C");
   assert.deepEqual(JSON.parse(database.staffAuditEvents[0].detail_json), { resultCount: 2, limit: 50 });
+
+  const pollingResponse = await request("/api/staff/interviews?poll=1", {
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当C"),
+    },
+  }, env);
+  assert.equal(pollingResponse.status, 200);
+  assert.equal(database.staffAuditEvents.length, 1, "15-second completion polling must not flood the audit table");
 });
 
 test("recording upload survives one transient D1 failure after the R2 object is already stored", async () => {
