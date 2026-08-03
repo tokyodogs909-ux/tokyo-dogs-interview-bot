@@ -24,6 +24,7 @@ type ReviewRecord = {
   transcript: TranscriptTurn[];
   evaluation: InterviewEvaluation | null;
   completedAt: string | null;
+  retentionUntil: string;
   videoReviewRubric: typeof VIDEO_REVIEW_DIMENSIONS;
   humanReviews: Array<{
     reviewerName: string;
@@ -55,6 +56,7 @@ type InterviewListItem = {
   recordingStatus: string;
   createdAt: string;
   completedAt: string | null;
+  retentionUntil: string;
   driveStatus: string | null;
   driveFolderUrl: string | null;
 };
@@ -66,6 +68,7 @@ const technicalEventLabels: Record<string, string> = {
   connection_failed: "音声・通信接続の失敗",
   candidate_requested_stop: "応募者による中止",
   time_limit_reached: "27分上限後の安全終了",
+  reasonable_accommodation_text_selected: "文字入力方式を選択（評価差なし）",
 };
 
 const recommendationLabels = {
@@ -87,6 +90,7 @@ const recordingStatusLabels: Record<string, string> = {
   uploading: "録画保存中",
   stored: "録画保存済み",
   failed: "録画要確認",
+  not_applicable: "文字入力（録画なし）",
 };
 
 function formatInterviewDate(value: string) {
@@ -99,6 +103,21 @@ function formatInterviewDate(value: string) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
+}
+
+function formatRetentionDate(value: string) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "未設定";
+  return new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function isTextInterviewRecord(value: ReviewRecord | null) {
+  return Boolean(value?.technicalEvents.some((event) => event.type === "reasonable_accommodation_text_selected"));
 }
 
 function emptyScores(): VideoScore[] {
@@ -311,6 +330,7 @@ export default function StaffReviewPage() {
   }
 
   const reviewedVideoDimensions = scores.filter((item) => item.score !== null).length;
+  const textInterviewSelected = isTextInterviewRecord(review);
   const normalizedFilter = listFilter.normalize("NFKC").trim().toLowerCase();
   const filteredInterviews = (recentInterviews ?? []).filter((item) => !normalizedFilter || [
     item.candidateName,
@@ -370,7 +390,9 @@ export default function StaffReviewPage() {
       setMessage(data.result.status === "completed"
         ? data.result.recordingIncluded
           ? "Google Driveへの録画・文字起こし・評価・PDFの格納を完了しました。"
-          : "文字起こし・評価・PDFを格納しましたが、録画はまだ格納されていません。録画保存状態を確認してください。"
+          : isTextInterviewRecord(review)
+            ? "文字入力による回答・評価・PDFのGoogle Drive格納を完了しました。"
+            : "文字起こし・評価・PDFを格納しましたが、録画はまだ格納されていません。録画保存状態を確認してください。"
         : "Google Driveへの再格納を予約しました。");
     } catch (error) {
       setState("ready");
@@ -397,7 +419,7 @@ export default function StaffReviewPage() {
         <ol>
           <li><strong>1. 共通URLを案内</strong><span>上の「候補者用URLをコピー」を押し、候補者へ送ります。</span></li>
           <li><strong>2. 面接完了後に一覧を確認</strong><span>担当者名と共通アクセスキーを入力し、「候補者一覧を表示」を押します。</span></li>
-          <li><strong>3. 3つの完了表示を確認</strong><span>「面接完了」「録画保存済み」「Drive格納済み」がそろった記録を開き、録画と回答根拠を確認します。</span></li>
+          <li><strong>3. 保存完了を確認</strong><span>通常面接は「面接完了・録画保存済み・Drive格納済み」、文字入力方式は「面接完了・Drive格納済み」を確認します。</span></li>
         </ol>
         <p className="staff-operation-alert"><strong>「要確認」がある場合</strong> 候補者を不利に評価せず、記録を開いて技術フラグを確認してください。Driveだけが未完了の場合は「Driveへ再格納」を押します。</p>
       </section>
@@ -437,7 +459,7 @@ export default function StaffReviewPage() {
               <button type="button" className={`${review?.sessionId === item.sessionId ? "active" : ""} ${newCompletedIds.has(item.sessionId) ? "new-completion" : ""}`.trim()} key={item.sessionId} onClick={() => void loadReview(item.sessionId)} disabled={state === "loading"}>
                 <span className="staff-inbox-name"><strong>{item.candidateName || "氏名未登録"}{newCompletedIds.has(item.sessionId) && <em>新着完了</em>}</strong><small>{item.employment}・{item.location}</small></span>
                 <span className="staff-inbox-state"><strong>{interviewStatusLabels[item.status] ?? item.status}</strong><small>{recordingStatusLabels[item.recordingStatus] ?? item.recordingStatus}</small></span>
-                <span className="staff-inbox-date"><strong>{formatInterviewDate(item.createdAt)}</strong><small>{item.sessionId}</small></span>
+                <span className="staff-inbox-date"><strong>{formatInterviewDate(item.createdAt)}</strong><small>保存見直し {formatRetentionDate(item.retentionUntil)}</small><small>{item.sessionId}</small></span>
                 <span className={`staff-inbox-drive drive-${item.driveStatus ?? "not-started"}`}>{item.driveStatus === "completed" ? "Drive格納済み" : item.driveStatus === "failed" ? "Drive要確認" : item.driveStatus === "running" ? "Drive格納中" : "Drive未格納"}</span>
                 <span className="staff-inbox-arrow">→</span>
               </button>
@@ -449,14 +471,14 @@ export default function StaffReviewPage() {
 
       {review && (
         <section className="staff-review">
-          <div className="staff-meta"><div><span>氏名</span><strong>{review.candidateName || "旧テスト記録"}</strong></div><div><span>面接ID</span><strong>{review.sessionId}</strong></div><div><span>雇用形態</span><strong>{review.employment}</strong></div><div><span>入職希望対象店舗</span><strong>{review.location}</strong></div><div><span>状態</span><strong>{review.status}</strong></div></div>
+          <div className="staff-meta"><div><span>氏名</span><strong>{review.candidateName || "旧テスト記録"}</strong></div><div><span>面接ID</span><strong>{review.sessionId}</strong></div><div><span>雇用形態</span><strong>{review.employment}</strong></div><div><span>入職希望対象店舗</span><strong>{review.location}</strong></div><div><span>保存見直し</span><strong>{formatRetentionDate(review.retentionUntil)}</strong></div><div><span>状態</span><strong>{review.status}</strong></div></div>
 
           <section className="staff-panel drive-sync-panel">
             <div className="panel-title"><p>GOOGLE DRIVE ARCHIVE</p><h2>面接記録の自動格納</h2></div>
             <p>面接完了後、応募者氏名と面接IDの専用フォルダへ、録画・文字起こし・評価データ・PDFレポート・格納結果を保存します。同じ面接IDで再実行しても既存ファイルを更新します。</p>
             <div className="drive-sync-actions">
               <span className={`drive-sync-status drive-sync-${review.driveSync?.status ?? "not-started"}`}>
-                {review.driveSync?.status === "completed" ? review.driveSync.recordingIncluded ? "録画を含め格納完了" : "録画未格納"
+                {review.driveSync?.status === "completed" ? review.driveSync.recordingIncluded ? "録画を含め格納完了" : textInterviewSelected ? "回答記録を格納完了" : "録画未格納"
                   : review.driveSync?.status === "running" ? "格納中"
                     : review.driveSync?.status === "pending" ? "格納待ち"
                       : review.driveSync?.status === "failed" ? "要再実行"
@@ -468,32 +490,32 @@ export default function StaffReviewPage() {
               </button>
             </div>
             {review.driveSync?.status === "failed" && <p className="guardrail-copy">認証・保存先・通信状態を確認し、再実行してください。応募者の評価状態には影響しません。</p>}
-            {review.driveSync?.status === "completed" && !review.driveSync.recordingIncluded && <p className="guardrail-copy"><strong>録画はDriveへ格納されていません。</strong> 文字起こし・評価・PDFのみ格納済みです。録画状態が「stored」になった後に再格納してください。</p>}
+            {review.driveSync?.status === "completed" && !review.driveSync.recordingIncluded && !textInterviewSelected && <p className="guardrail-copy"><strong>録画はDriveへ格納されていません。</strong> 文字起こし・評価・PDFのみ格納済みです。録画状態が「stored」になった後に再格納してください。</p>}
+            {review.driveSync?.status === "completed" && textInterviewSelected && <p className="guardrail-copy">文字入力方式のため録画はありません。回答記録・評価・PDFをDrive側で再照合済みです。</p>}
             {review.driveSync?.status === "completed" && review.driveSync.recordingIncluded && <p className="guardrail-copy">録画を含む{review.driveSync.archivedArtifactCount}種類の格納結果をDrive側で再照合済みです。</p>}
           </section>
 
-          {review.technicalEvents.length > 0 && <div className="staff-message"><strong>技術・中断フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>これらの事象と映像・音声品質は、応募者の不利益な評価に使用しません。</p></div>}
-          {review.evaluation && <p className="guardrail-copy"><strong>回答評価は応募者端末由来の文字起こしを基にした補助情報です。</strong> 合否判断前に、録画の実際の発言と根拠引用を採用担当者が照合してください。</p>}
+          {review.technicalEvents.length > 0 && <div className="staff-message"><strong>進行・技術フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>参加方法や技術的な事象は、応募者の不利益な評価に使用しません。</p></div>}
+          {review.evaluation && <p className="guardrail-copy"><strong>回答評価は応募者の回答記録を基にした補助情報です。</strong> 合否判断前に、{textInterviewSelected ? "入力された回答" : "録画の実際の発言"}と根拠引用を採用担当者が照合してください。</p>}
 
           <div className="staff-grid">
             <article className="staff-panel recording-panel">
               <div className="panel-title"><p>録画確認</p><h2>接客ロールプレイ</h2></div>
-              {recordingUrl ? <video src={recordingUrl} controls playsInline /> : <div className="recording-empty">録画を取得できないか、録画がまだ保存されていません。</div>}
+              {recordingUrl ? <video src={recordingUrl} controls playsInline /> : <div className="recording-empty">{textInterviewSelected ? "文字入力方式のため録画はありません。回答記録をご確認ください。" : "録画を取得できないか、録画がまだ保存されていません。"}</div>}
               {recordingUrl && recordingAudioCoverage !== "both" && <p className="guardrail-copy"><strong>録画内の双方音声は未確認です。</strong> 応募者音声のみ、または端末側で確認できなかった可能性があります。映像と文字起こしを照合し、技術不具合を不利益に扱わないでください。</p>}
               <p className="guardrail-copy">接客ロールプレイ中の傾聴、理解確認、落ち着いた応対、説明、安全配慮など、職務上観察できる行動だけを確認します。笑顔の有無、顔立ち・容姿、服装、背景、カメラ品質、障害や健康状態の推測は評価しません。</p>
             </article>
 
             <article className="staff-panel">
-              <div className="panel-title"><p>映像確認</p><h2>{reviewer}の確認 / {reviewedVideoDimensions}/{VIDEO_REVIEW_DIMENSIONS.length}項目</h2></div>
-              <div className="validation-box"><strong>判断前の必須確認</strong><p>技術不具合、映像・音声品質、配慮の申出は不利益に扱わず、未確認とします。一部項目だけの平均点や総合点は表示しません。自動評価は合否を決めず、権限を付与された採用担当者が求人要件と根拠を確認します。</p></div>
-              <div className="video-rubric">
+              <div className="panel-title"><p>{textInterviewSelected ? "回答確認" : "映像確認"}</p><h2>{textInterviewSelected ? "文字入力方式" : `${reviewer}の確認 / ${reviewedVideoDimensions}/${VIDEO_REVIEW_DIMENSIONS.length}項目`}</h2></div>
+              <div className="validation-box"><strong>判断前の必須確認</strong><p>{textInterviewSelected ? "文字入力方式では映像評価を行いません。回答内容と求人要件だけを採用担当者が確認してください。" : "技術不具合、映像・音声品質、配慮の申出は不利益に扱わず、未確認とします。一部項目だけの平均点や総合点は表示しません。自動評価は合否を決めず、権限を付与された採用担当者が求人要件と根拠を確認します。"}</p></div>
+              {!textInterviewSelected && <div className="video-rubric">
                 {review.videoReviewRubric.map((dimension) => {
                   const score = scores.find((item) => item.name === dimension.name) ?? { name: dimension.name, score: null, note: "" };
                   return <div className="rubric-item" key={dimension.name}><h3>{dimension.name}{dimension.weight === 2 && <span className="priority-badge">重点項目</span>}</h3><p>{dimension.criterion}</p><div className="score-buttons">{[1, 2, 3, 4, 5].map((value) => <button key={value} className={score.score === value ? "active" : ""} onClick={() => updateScore(dimension.name, { score: value })}>{value}</button>)}<button className={score.score === null ? "active" : ""} onClick={() => updateScore(dimension.name, { score: null, note: "" })}>未確認</button></div><textarea value={score.note} onChange={(event) => updateScore(dimension.name, { note: event.target.value })} placeholder={score.score === null ? "未確認の場合は空欄で構いません" : "点数の根拠となる、映像内の具体的な職務行動を記録（必須）"} rows={2} /></div>;
                 })}
-              </div>
-              <label className="overall-note">総合メモ<textarea value={overallNote} onChange={(event) => setOverallNote(event.target.value)} rows={4} placeholder="追加確認事項。合否はこの画面だけで自動決定しません。" /></label>
-              <button className="primary-action" onClick={() => void saveVideoReview()} disabled={state === "saving"}>{state === "saving" ? "保存中…" : "映像評価を保存"}</button>
+              </div>}
+              {!textInterviewSelected && <><label className="overall-note">総合メモ<textarea value={overallNote} onChange={(event) => setOverallNote(event.target.value)} rows={4} placeholder="追加確認事項。合否はこの画面だけで自動決定しません。" /></label><button className="primary-action" onClick={() => void saveVideoReview()} disabled={state === "saving"}>{state === "saving" ? "保存中…" : "映像評価を保存"}</button></>}
             </article>
           </div>
 

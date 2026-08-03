@@ -94,6 +94,13 @@ export const RECORDED_FALLBACK_QUESTIONS = [
   "最後に、採用担当者へ質問したいことや、選考にあたり伝えておきたいことがあれば教えてください。",
 ] as const;
 
+/**
+ * The reasonable-accommodation path asks the same job-related questions as the
+ * recorded contingency path. Only the input method changes: candidates type
+ * their answers and no camera, microphone, or recording is requested.
+ */
+export const TEXT_INTERVIEW_QUESTIONS = RECORDED_FALLBACK_QUESTIONS;
+
 export type Speaker = "candidate" | "interviewer";
 
 export type TranscriptTurn = {

@@ -43,6 +43,13 @@ export async function generateMetadata(): Promise<Metadata> {
       description,
       images: [new URL("/og-online-first-interview-v3.png", metadataBase).toString()],
     },
+    robots: {
+      index: false,
+      follow: false,
+      noarchive: true,
+      nosnippet: true,
+      noimageindex: true,
+    },
   };
 }
 

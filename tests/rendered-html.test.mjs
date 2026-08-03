@@ -50,11 +50,13 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.match(html, /カメラ・マイクを確認して開始/);
   assert.match(html, /カメラとマイクの「許可」/);
   assert.doesNotMatch(html, /この画面を共有/);
-  assert.match(html, /当社が手動で削除するまで保管します/);
+  assert.match(html, /面接実施日から原則1年間を保存見直し期限として管理します/);
   assert.doesNotMatch(html, /社内確認環境|テスト名/);
   assert.match(html, /笑顔の有無、顔立ち・容姿/);
   assert.match(html, /自動処理だけで合否を決定しません/);
-  assert.match(html, /技術不具合は不利益に扱わず/);
+  assert.match(html, /参加方法や技術不具合は不利益に扱わず/);
+  assert.match(html, /文字入力/);
+  assert.match(html, /カメラ・マイク不要/);
   assert.match(html, /接続確認（選考対象外）/);
   assert.match(html, /interviewer-woman-medium-v2\.png/);
   assert.doesNotMatch(html, /interviewer-dog\.svg/);
@@ -128,6 +130,7 @@ test("voice interview implements bidirectional audio health and recovery guards"
   const gatewaySource = await readFile(new URL("../scripts/mobile-test-gateway.mjs", import.meta.url), "utf8");
   const persistenceSource = await readFile(new URL("../lib/interview-persistence.ts", import.meta.url), "utf8");
   const recordingRouteSource = await readFile(new URL("../app/api/interviews/recording/route.ts", import.meta.url), "utf8");
+  const recordingUploadSource = await readFile(new URL("../lib/recording-upload.js", import.meta.url), "utf8");
   assert.match(source, /あなたの音声/);
   assert.match(source, /茂木の音声/);
   assert.match(source, /resumeRemoteAudio/);
@@ -174,7 +177,9 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /attachRemoteAudioToRecording/);
   assert.match(source, /remoteAnalyser/);
   assert.match(source, /REMOTE_AUDIO_SILENT/);
-  assert.match(source, /X-Interview-Audio-Coverage/);
+  assert.match(recordingUploadSource, /X-Recording-Part-Index/);
+  assert.match(recordingUploadSource, /upload\/start/);
+  assert.match(recordingUploadSource, /upload\/complete/);
   assert.doesNotMatch(source, /Promise\.race\(\[\s*recordingPromiseRef/);
   assert.match(source, /await startRecording\(activeStream, displayStreamRef\.current, remoteStreamRef\.current, \{/);
   assert.match(source, /resume: !isNewInterviewSession/);
@@ -199,7 +204,7 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(staffSource, /evidenceValidationWarnings/);
   assert.match(staffSource, /評価本文の要確認事項/);
   assert.match(staffSource, /録画内の双方音声は未確認です/);
-  assert.match(staffSource, /応募者端末由来の文字起こし/);
+  assert.match(staffSource, /応募者の回答記録を基にした補助情報/);
   const driveSyncSource = await readFile(new URL("../lib/google-drive-sync.ts", import.meta.url), "utf8");
   assert.match(driveSyncSource, /評価本文の要確認事項/);
   assert.match(driveSyncSource, /応募者端末で生成された文字起こし/);

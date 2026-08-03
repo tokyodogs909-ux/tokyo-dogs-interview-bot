@@ -26,13 +26,18 @@ export async function POST(request: Request) {
       employment?: string;
       location?: string;
       consent?: boolean;
+      interviewMode?: "camera" | "text";
       inviteToken?: string;
     };
     const candidateName = payload.candidateName?.normalize("NFKC").replace(/\s+/g, " ").trim() ?? "";
     const employment = payload.employment?.trim() ?? "";
     const location = normalizePreferredLocation(payload.location);
+    const interviewMode = payload.interviewMode ?? "camera";
+    if (interviewMode !== "camera" && interviewMode !== "text") {
+      return noStoreJson({ error: "オンライン一次面接の参加方法を確認してください。" }, { status: 400 });
+    }
     if (payload.consent !== true) {
-      return noStoreJson({ error: "録音・録画と文字起こしへの同意が必要です。" }, { status: 400 });
+      return noStoreJson({ error: interviewMode === "camera" ? "録音・録画と文字起こしへの同意が必要です。" : "回答内容の選考利用への同意が必要です。" }, { status: 400 });
     }
     if (!candidateName || candidateName.length > 60 || /[\u0000-\u001F\u007F]/.test(candidateName)) {
       return noStoreJson({ error: "氏名を60文字以内で入力してください。" }, { status: 400 });
@@ -65,6 +70,7 @@ export async function POST(request: Request) {
       candidateName,
       employment,
       location,
+      interviewMode,
       inviteNonceHash: invite.nonceHash,
     });
     return noStoreJson(session, { status: 201 });

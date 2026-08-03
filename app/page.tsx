@@ -6,6 +6,7 @@ import {
   EMPLOYMENT_OPTIONS,
   INTERNAL_TEST_QUESTIONS,
   RECORDED_FALLBACK_QUESTIONS,
+  TEXT_INTERVIEW_QUESTIONS,
   INTERVIEW_ACCESS_MESSAGES,
   INTERVIEW_ACCESS_STATES,
   INTERVIEW_TOPIC_IDS,
@@ -28,11 +29,13 @@ import {
   nextInterviewTimeAction,
   recordedFallbackQuietState,
 } from "@/lib/interview-time-control";
+import { uploadRecordingResumably } from "@/lib/recording-upload";
 
 type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
 /** "checking" while the pre-flight is in flight; every other value mirrors InterviewAccessState. */
 type InviteGate = "checking" | InterviewAccessState;
 type InterviewMode = "voice" | "text" | "recorded-fallback" | "internal-test";
+type InterviewFormat = "camera" | "text";
 
 // Keep the final single-request upload below the server's 95 MiB limit even on
 // browsers that do not strictly honor the requested MediaRecorder bitrates.
@@ -212,6 +215,7 @@ export default function Home() {
   const [employment, setEmployment] = useState<(typeof EMPLOYMENT_OPTIONS)[number]>("正社員");
   const [location, setLocation] = useState("");
   const [consent, setConsent] = useState(false);
+  const [interviewFormat, setInterviewFormat] = useState<InterviewFormat>("camera");
   const [mode, setMode] = useState<InterviewMode>("voice");
   const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
   const [connectionStep, setConnectionStep] = useState<ConnectionStep>("idle");
@@ -225,6 +229,7 @@ export default function Home() {
   const [sessionStarting, setSessionStarting] = useState(false);
   const [screenCaptureState, setScreenCaptureState] = useState<"idle" | "ready" | "ended" | "unavailable">("idle");
   const [recordingUploadState, setRecordingUploadState] = useState<"idle" | "uploading" | "stored" | "error">("idle");
+  const [recordingUploadProgress, setRecordingUploadProgress] = useState(0);
   const [recordingCaptureState, setRecordingCaptureState] = useState<RecordingCaptureState>("idle");
   const [recordingHasBothAudio, setRecordingHasBothAudio] = useState<boolean | null>(null);
   const [candidateAudioState, setCandidateAudioState] = useState<CandidateAudioState>("idle");
@@ -341,6 +346,16 @@ export default function Home() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  useEffect(() => {
+    if (recordingUploadState !== "uploading" && recordingUploadState !== "error") return;
+    const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeaving);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
+  }, [recordingUploadState]);
 
   useEffect(() => {
     queueTimedInterviewActionRef.current = queueTimedInterviewAction;
@@ -760,15 +775,15 @@ export default function Home() {
   }
 
   function reportCandidateEvent(
-    eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop" | "time_limit_reached",
+    eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop" | "time_limit_reached" | "reasonable_accommodation_text_selected",
     code = "",
   ) {
     const activeSessionId = sessionIdRef.current;
     const accessToken = accessTokenRef.current;
     const dedupeKey = `${eventType}:${code}`;
-    if (!activeSessionId.startsWith("TD-") || activeSessionId === "TD-PENDING" || !accessToken || reportedCandidateEventsRef.current.has(dedupeKey)) return;
+    if (!activeSessionId.startsWith("TD-") || activeSessionId === "TD-PENDING" || !accessToken || reportedCandidateEventsRef.current.has(dedupeKey)) return Promise.resolve();
     reportedCandidateEventsRef.current.add(dedupeKey);
-    void fetch("/api/interviews/event", {
+    return fetch("/api/interviews/event", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -776,7 +791,7 @@ export default function Home() {
       },
       body: JSON.stringify({ sessionId: activeSessionId, eventType, code }),
       keepalive: true,
-    }).catch(() => undefined);
+    }).then(() => undefined).catch(() => undefined);
   }
 
   function clearCandidateResponseDelay() {
@@ -941,6 +956,20 @@ export default function Home() {
         recordedFallbackQuietSinceRef.current = null;
         timedActionTimerRef.current = window.setTimeout(monitorRecordedFallbackForSafeClose, 250);
       }
+      return;
+    }
+    if (modeRef.current === "text") {
+      const pendingText = textDraft.trim();
+      if (pendingText) {
+        upsertTurn({
+          id: `text-time-limit-${Date.now()}`,
+          speaker: "candidate",
+          text: pendingText,
+          createdAt: new Date().toISOString(),
+        });
+        setTextDraft("");
+      }
+      scheduleInterviewCompletion("text_max_duration_reached", 1_200);
       return;
     }
     if (!timedActionTimerRef.current && !timedResponseRef.current) scheduleTimedVoiceResponse();
@@ -1481,6 +1510,7 @@ export default function Home() {
             employment,
             location: preferredLocation,
             consent: true,
+            interviewMode: "camera",
             inviteToken: inviteTokenFromLocation(),
           }),
         });
@@ -1774,6 +1804,77 @@ export default function Home() {
     await connectPreparedInterview();
   }
 
+  async function startTextInterview() {
+    if (!consent || sessionStarting) return;
+    const preferredLocation = normalizePreferredLocation(location);
+    if (!candidateName.trim()) {
+      setErrorMessage("氏名を入力してください。");
+      return;
+    }
+    if (!preferredLocation || preferredLocation.length > PREFERRED_LOCATION_MAX_LENGTH) {
+      setErrorMessage("入職希望対象店舗を120文字以内で入力してください。");
+      return;
+    }
+    setSessionStarting(true);
+    setErrorMessage("");
+    try {
+      const access = inviteGate === "ok" ? "ok" : await checkInterviewAccess();
+      setInviteGate(access);
+      if (access !== "ok") throw new Error(INTERVIEW_ACCESS_MESSAGES[access]);
+      const response = await fetch("/api/interviews/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          candidateName,
+          employment,
+          location: preferredLocation,
+          consent: true,
+          interviewMode: "text",
+          inviteToken: inviteTokenFromLocation(),
+        }),
+      });
+      const data = (await response.json().catch(() => null)) as { sessionId?: string; accessToken?: string; error?: string } | null;
+      if (!response.ok || !data?.sessionId || !data.accessToken) {
+        throw new Error(data?.error || "オンライン一次面接の記録を準備できませんでした。");
+      }
+      accessTokenRef.current = data.accessToken;
+      sessionIdRef.current = data.sessionId;
+      setSessionId(data.sessionId);
+      const started = await fetch("/api/interviews/text/start", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${data.accessToken}`,
+          "X-Interview-Session": data.sessionId,
+        },
+      });
+      if (!started.ok) {
+        const startData = (await started.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(startData?.error || "文字入力によるオンライン一次面接を開始できませんでした。");
+      }
+      const firstTurn: TranscriptTurn = {
+        id: "text-interview-question-1",
+        speaker: "interviewer",
+        text: `TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。カメラとマイクを使用せず、文字入力で進めます。入力方法の違いは評価に使用しません。${TEXT_INTERVIEW_QUESTIONS[0]}`,
+        createdAt: new Date().toISOString(),
+      };
+      modeRef.current = "text";
+      setMode("text");
+      setLocation(preferredLocation);
+      startInterviewClock();
+      transcriptRef.current = [firstTurn];
+      setTranscript([firstTurn]);
+      setConnectionState("ready");
+      setConnectionStep("ready");
+      setProcessingWarning("");
+      setRecordingUploadState("idle");
+      setStage("interview");
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "文字入力によるオンライン一次面接を開始できませんでした。");
+    } finally {
+      setSessionStarting(false);
+    }
+  }
+
   function startInternalTest() {
     stopRealtime();
     const id = `TD-TEST-${Date.now().toString(36).toUpperCase()}`;
@@ -1906,25 +2007,30 @@ export default function Home() {
 
   async function uploadRecording(blob: Blob) {
     setRecordingUploadState("uploading");
-    const response = await fetch("/api/interviews/recording", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessTokenRef.current}`,
-        "X-Interview-Session": sessionId,
-        "X-Interview-Audio-Coverage": recordingHasBothAudioRef.current === true
-          ? "both"
-          : recordingHasBothAudioRef.current === false
-            ? "candidate-only"
-            : "unverified",
-        "Content-Type": blob.type.split(";")[0] || "video/webm",
-      },
-      body: blob,
+    setRecordingUploadProgress(0);
+    await uploadRecordingResumably({
+      blob,
+      sessionId,
+      accessToken: accessTokenRef.current,
+      audioCoverage: recordingHasBothAudioRef.current === true
+        ? "both"
+        : recordingHasBothAudioRef.current === false
+          ? "candidate-only"
+          : "unverified",
+      onProgress: setRecordingUploadProgress,
     });
-    const data = (await response.json()) as { stored?: boolean; error?: string };
-    if (!response.ok || !data.stored) {
-      throw new Error(data.error || "録画を保存できませんでした。");
-    }
     setRecordingUploadState("stored");
+  }
+
+  async function retryRecordingUpload() {
+    const blob = recordingBlobRef.current;
+    if (!blob || recordingUploadState === "uploading") return;
+    try {
+      await uploadRecording(blob);
+      setProcessingWarning("");
+    } catch {
+      setRecordingUploadState("error");
+    }
   }
 
   function runPendingCompletion() {
@@ -1970,11 +2076,11 @@ export default function Home() {
     const recordingBlob = await (
       recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current)
     );
-    if (!recordingBlob) reportCandidateEvent("recording_unavailable", "NO_RECORDING_AT_COMPLETION");
-    if (recordingBlob && recordingHasBothAudioRef.current !== true) {
+    if (mode !== "text" && !recordingBlob) reportCandidateEvent("recording_unavailable", "NO_RECORDING_AT_COMPLETION");
+    if (mode !== "text" && recordingBlob && recordingHasBothAudioRef.current !== true) {
       reportCandidateEvent("recording_unavailable", "REMOTE_AUDIO_UNVERIFIED");
     }
-    const recordingUpload = recordingBlob
+    const recordingUpload = mode !== "text" && recordingBlob
       ? uploadRecording(recordingBlob).catch((error) => {
         setRecordingUploadState("error");
         reportCandidateEvent("recording_unavailable", "UPLOAD_FAILED");
@@ -2412,6 +2518,30 @@ export default function Home() {
       return;
     }
 
+    if (mode === "text") {
+      if (timedMaximumRequestedRef.current || elapsed >= INTERVIEW_MAX_SECONDS) {
+        window.setTimeout(() => void completeInterview("text_max_duration_reached"), 450);
+        return;
+      }
+      const answered = transcriptRef.current.filter((turn) => turn.speaker === "candidate").length;
+      const nextQuestion = TEXT_INTERVIEW_QUESTIONS[answered];
+      setConnectionState("ai-speaking");
+      window.setTimeout(() => {
+        if (nextQuestion) {
+          upsertTurn({
+            id: `text-interview-question-${answered + 1}`,
+            speaker: "interviewer",
+            text: nextQuestion,
+            createdAt: new Date().toISOString(),
+          });
+          setConnectionState("ready");
+        } else {
+          void completeInterview("text_interview_completed");
+        }
+      }, 450);
+      return;
+    }
+
     const channel = channelRef.current;
     if (!channel || channel.readyState !== "open") {
       setConnectionState("error");
@@ -2467,6 +2597,7 @@ export default function Home() {
     recordingBytesRef.current = 0;
     recordingSizeCappedRef.current = false;
     setRecordingUploadState("idle");
+    setRecordingUploadProgress(0);
     setRecordingCaptureState("idle");
     updateRecordingAudioCoverage(null);
     setScreenCaptureState("idle");
@@ -2504,6 +2635,7 @@ export default function Home() {
     recordingResolveRef.current = null;
     setTextDraft("");
     setRecordingUploadState("idle");
+    setRecordingUploadProgress(0);
     setRecordingCaptureState("idle");
     setScreenCaptureState("idle");
     setSetupPhase("idle");
@@ -2646,7 +2778,7 @@ export default function Home() {
             <p className="eyebrow">共に歩む仲間達へ</p>
             <h1>あなたのことを、<br />あなたらしく話してください。</h1>
             <p className="lead">
-              TOKYO DOGSの採用選考におけるオンライン一次面接です。これまでの経験、仕事選びの考え方、働き方の希望について、オンライン採用担当者の茂木が順番にお伺いします。
+              TOKYO DOGSの採用選考におけるオンライン一次面接です。これまでの経験、仕事選びの考え方、働き方の希望について、オンライン採用担当者の茂木が順番にお伺いします。カメラ・音声または文字入力で参加できます。
             </p>
             <div className="intro-interviewer">
               <img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木" />
@@ -2675,15 +2807,21 @@ export default function Home() {
             <input id="location" className="candidate-name-input" type="text" value={location} onChange={(event) => setLocation(event.target.value)} maxLength={PREFERRED_LOCATION_MAX_LENGTH} autoComplete="off" required aria-required="true" aria-describedby="location-help" placeholder="例：越谷店、文京本駒込店（複数記入可）" />
             <p className="field-help" id="location-help">入職を希望する店舗を記入してください。複数ある場合や相談希望の場合も、そのまま記入できます。</p>
             <div className="role-line"><span>募集職種</span><strong>犬の幼稚園スタッフ<br />ドッグトレーナー候補</strong></div>
+            <span className="field-label" id="interview-format-label">参加方法</span>
+            <div className="interview-format-control" role="group" aria-labelledby="interview-format-label">
+              <button type="button" className={interviewFormat === "camera" ? "active" : ""} aria-pressed={interviewFormat === "camera"} onClick={() => { setInterviewFormat("camera"); setConsent(false); }}><strong>カメラ・音声</strong><span>茂木と自然な音声で進行</span></button>
+              <button type="button" className={interviewFormat === "text" ? "active" : ""} aria-pressed={interviewFormat === "text"} onClick={() => { setInterviewFormat("text"); setConsent(false); }}><strong>文字入力</strong><span>カメラ・マイク不要</span></button>
+            </div>
+            {interviewFormat === "text" && <p className="accommodation-note">配慮が必要な理由の入力は不要です。質問内容と採用担当者による確認方法は共通で、入力方法の違いを不利益に扱いません。</p>}
             <label className={`consent-line ${consent ? "checked" : ""}`} htmlFor="selection-consent">
               <input id="selection-consent" type="checkbox" checked={consent} aria-describedby="consent-summary consent-detail-summary" onChange={(event) => setConsent(event.target.checked)} />
               <span className="consent-copy">
-                <strong>録画・文字起こし・選考利用に同意する</strong>
-                <span id="consent-summary">面接の映像・双方の音声・回答内容を、採用選考と記録の照合に使用します。</span>
+                <strong>{interviewFormat === "camera" ? "録画・文字起こし・選考利用に同意する" : "回答内容・選考利用に同意する"}</strong>
+                <span id="consent-summary">{interviewFormat === "camera" ? "面接の映像・双方の音声・回答内容を、採用選考と記録の照合に使用します。" : "文字で入力した回答内容を、採用選考と記録の照合に使用します。カメラ・マイク・録画は使用しません。"}</span>
                 <small>評価は権限を付与された採用担当者だけが確認し、求職者には表示されません。</small>
               </span>
             </label>
-            <details className="consent-details"><summary id="consent-detail-summary">録画とデータの詳しい取り扱い</summary><div><p><strong>利用目的</strong><br />入力した氏名は採用記録の照合と保存管理に使用します。録画はカメラ映像と双方の音声を含み、接客ロールプレイなどの職務関連行動、文字起こしの照合、通信トラブル時の記録確認に使用します。</p><p><strong>処理と閲覧</strong><br />音声と回答は外部の音声・文字処理サービスで処理されます。氏名、録画、文字起こし、評価補助は権限を付与された採用担当者が確認します。自動処理だけで合否を決定しません。</p><p><strong>保管</strong><br />氏名、録画、文字起こし、評価補助は自動削除せず、当社が手動で削除するまで保管します。削除や開示等のご相談は、応募時に利用した連絡経路で採用担当者へご連絡ください。</p><p><strong>公平性とご相談</strong><br />笑顔の有無、顔立ち・容姿、服装、背景、カメラ・音声品質、声質、障害・健康状態の推測は評価しません。技術不具合は不利益に扱わず、情報不足として採用担当者が確認します。機器操作や進行方法に配慮が必要な場合は、応募時に利用した連絡経路で採用担当者へご相談ください。面接中も中止できます。</p></div></details>
+            <details className="consent-details"><summary id="consent-detail-summary">記録とデータの詳しい取り扱い</summary><div><p><strong>利用目的</strong><br />入力した氏名は採用記録の照合と保存管理に使用します。{interviewFormat === "camera" ? "録画はカメラ映像と双方の音声を含み、接客ロールプレイなどの職務関連行動、文字起こしの照合、通信トラブル時の記録確認に使用します。" : "文字入力方式では、入力した回答を職務関連の確認と記録作成に使用し、映像・音声は取得しません。"}</p><p><strong>処理と閲覧</strong><br />{interviewFormat === "camera" ? "音声と回答" : "回答"}は外部の文字処理サービスで処理されます。氏名、{interviewFormat === "camera" ? "録画、文字起こし、" : "回答記録、"}評価補助は権限を付与された採用担当者が確認します。自動処理だけで合否を決定しません。</p><p><strong>保管</strong><br />氏名、{interviewFormat === "camera" ? "録画、文字起こし、" : "回答記録、"}評価補助は、面接実施日から原則1年間を保存見直し期限として管理します。選考継続、法令対応、採用後の労務管理など継続利用が必要な場合を除き、期限後は採用責任者が削除対象を確認します。削除や開示等のご相談は、応募時に利用した連絡経路で採用担当者へご連絡ください。</p><p><strong>公平性とご相談</strong><br />笑顔の有無、顔立ち・容姿、服装、背景、カメラ・音声品質、声質、障害・健康状態の推測は評価しません。参加方法や技術不具合は不利益に扱わず、情報不足として採用担当者が確認します。面接中も中止できます。</p></div></details>
             <p className={`consent-status ${consent && candidateName.trim() && normalizePreferredLocation(location) ? "ready" : ""}`} role="status">
               {!candidateName.trim()
                 ? "氏名を入力してください。"
@@ -2699,14 +2837,14 @@ export default function Home() {
                 <button type="button" onClick={() => void copyPortalLink()}>{copiedPortalLink ? "コピーしました" : "リンクをコピー"}</button>
               </div>
             )}
-            <div className={`speaker-test ${speakerTestState}`}>
+            {interviewFormat === "camera" && <div className={`speaker-test ${speakerTestState}`}>
               <div><strong>端末の音声を確認</strong><span>{speakerTestState === "playing" ? "音声を再生しています" : speakerTestState === "passed" ? "確認音声を再生しました" : speakerTestState === "error" ? "端末の音量設定をご確認ください" : "開始前に茂木の確認音声を聞けます"}</span></div>
               <button type="button" onClick={playSpeakerTest}>{speakerTestState === "idle" ? "音声を確認" : "もう一度聞く"}</button>
-            </div>
+            </div>}
             <ol className="connection-guide">
-              <li><strong>1. 同意欄をチェック</strong><span>録画・文字起こし・選考利用の内容を確認して、同意欄を押します。</span></li>
-              <li><strong>2. 開始ボタンを押す</strong><span>表示される確認画面で、カメラとマイクの「許可」を選びます。</span></li>
-              <li><strong>3. 自動確認後に面接開始</strong><span>映像とマイク入力をこの画面で確認し、そのままオンライン一次面接へ接続します。</span></li>
+              <li><strong>1. 同意欄をチェック</strong><span>{interviewFormat === "camera" ? "録画・文字起こし・選考利用" : "回答内容・選考利用"}を確認して、同意欄を押します。</span></li>
+              <li><strong>2. 開始ボタンを押す</strong><span>{interviewFormat === "camera" ? "表示される確認画面で、カメラとマイクの「許可」を選びます。" : "カメラやマイクの許可画面は表示されません。"}</span></li>
+              <li><strong>3. オンライン一次面接を開始</strong><span>{interviewFormat === "camera" ? "映像とマイク入力を自動確認し、そのまま面接へ接続します。" : "画面の質問を読み、回答欄へ文字で入力します。"}</span></li>
             </ol>
             {inviteGate !== "checking" && inviteGate !== "ok" && (
               <div className="invite-required-notice" role="alert">
@@ -2716,8 +2854,8 @@ export default function Home() {
               </div>
             )}
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
-            <button className="primary-action" aria-label="カメラ・マイクを確認して開始" disabled={inviteGate !== "ok" || !candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting} onClick={() => void prepareInterview()}>
-              {inviteGate === "checking" ? "専用リンクを確認中…" : sessionStarting ? "カメラ・マイクを確認中…" : "カメラ・マイクを確認して開始"} <span>→</span>
+            <button className="primary-action" aria-label={interviewFormat === "camera" ? "カメラ・マイクを確認して開始" : "文字入力で開始"} disabled={inviteGate !== "ok" || !candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting} onClick={() => void (interviewFormat === "camera" ? prepareInterview() : startTextInterview())}>
+              {inviteGate === "checking" ? "専用リンクを確認中…" : sessionStarting ? "オンライン一次面接を準備中…" : interviewFormat === "camera" ? "カメラ・マイクを確認して開始" : "文字入力でオンライン一次面接を開始"} <span>→</span>
             </button>
             <button className="internal-test-button" onClick={startInternalTest}>接続確認（選考対象外）</button>
             <p className="internal-test-note">録画・音声接続・採用評価を行わず、文字入力で面接画面の操作を確認します。</p>
@@ -2779,6 +2917,7 @@ export default function Home() {
         <section className="interview-page">
           {mode === "internal-test" && <div className="internal-test-banner"><strong>接続確認</strong><span>選考対象外・録画・採用評価なし</span></div>}
           {mode === "recorded-fallback" && <div className="recorded-fallback-banner"><strong>オンライン一次面接・予備方式</strong><span>選考対象・録画を採用担当者が確認</span></div>}
+          {mode === "text" && <div className="recorded-fallback-banner"><strong>オンライン一次面接・文字入力方式</strong><span>選考対象・カメラとマイクは使用しません</span></div>}
           <div className="interview-topline">
             <div className={`live-state ${connectionState}`}><i />{connectionCopy}</div>
             <div className="interview-time">{formatTime(elapsed)} {mode !== "internal-test" && <span>/ 目安 15–25分</span>}</div>
@@ -2854,7 +2993,7 @@ export default function Home() {
                 </div>
               ) : (
                 <div className="answer-composer">
-                  <textarea value={textDraft} onChange={(event) => setTextDraft(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") sendTextAnswer(); }} placeholder={mode === "voice" ? "聞き取りにくい時は、ここに入力できます" : "回答を入力してください"} rows={2} />
+                  <textarea value={textDraft} onChange={(event) => setTextDraft(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") sendTextAnswer(); }} placeholder={mode === "voice" ? "聞き取りにくい時は、ここに入力できます" : "回答を入力してください"} rows={mode === "text" ? 6 : 2} maxLength={5000} />
                   <button onClick={sendTextAnswer} disabled={!textDraft.trim() || connectionState === "idle" || connectionState === "connecting" || connectionState === "error"}>送信</button>
                 </div>
               )}
@@ -2874,8 +3013,8 @@ export default function Home() {
           <img src="/tokyo-dogs-logo.jpg" alt="Tokyo Dogs" />
           <div className="evaluation-loader"><i /><i /><i /></div>
           <h1>回答内容を整理しています。</h1>
-          <p>発言根拠を照合し、採用担当者向けの確認資料を作成しています。</p>
-          <div className="evaluation-steps"><span className="done">文字起こし</span><span className="active">根拠を照合</span><span>評価を作成</span></div>
+          <p>{recordingUploadState === "uploading" ? `録画を分割保存しています（${recordingUploadProgress}%）。この画面を閉じずにお待ちください。` : "発言根拠を照合し、採用担当者向けの確認資料を作成しています。"}</p>
+          <div className="evaluation-steps"><span className="done">{mode === "text" ? "回答記録" : "文字起こし"}</span><span className="active">根拠を照合</span><span>評価を作成</span></div>
         </section>
       )}
 
@@ -2893,7 +3032,8 @@ export default function Home() {
           </div>
           {processingWarning && <div className="validation-box"><strong>記録状態を採用担当者が確認します</strong><p>{processingWarning}</p></div>}
           {recordingUploadState === "stored" && <div className="validation-box"><strong>オンライン一次面接の記録を受け付けました</strong><p>録画は面接IDで保管し、採用担当者以外には開示しません。</p></div>}
-          {recordingUploadState === "error" && <div className="validation-box"><strong>記録状態を採用担当者が確認します</strong><p>オンライン一次面接の受け付けは完了しています。受付番号をお控えください。</p></div>}
+          {mode === "text" && <div className="validation-box"><strong>文字入力によるオンライン一次面接を受け付けました</strong><p>カメラ・マイク・録画は使用していません。回答内容は採用担当者が確認します。</p></div>}
+          {recordingUploadState === "error" && <div className="validation-box"><strong>録画の送信を再開できます</strong><p>受信済みの部分は再送せず、未送信部分から再開します。この画面を閉じずに再試行してください。</p><button type="button" className="secondary-action" onClick={() => void retryRecordingUpload()}>録画送信を再試行</button></div>}
           <div className="review-actions"><div><span>{mode === "internal-test" ? "確認時間" : "面接時間"}</span><strong>{formatTime(elapsed)}</strong></div>{mode === "internal-test" && <button className="secondary-action" onClick={resetInterview}>最初から確認</button>}</div>
         </section>
       )}

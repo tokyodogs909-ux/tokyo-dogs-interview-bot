@@ -218,6 +218,9 @@ class FakeD1Statement {
       const session = this.database.sessions.get(id);
       if (session && ["created", "in_progress"].includes(session.status)) {
         session.status = "in_progress";
+        if (this.sql.includes("recording_status = 'not_applicable'")) {
+          session.recording_status = "not_applicable";
+        }
         session.updated_at = updatedAt;
         changes = 1;
       }
@@ -297,6 +300,18 @@ class FakeD1Statement {
         });
         changes = 1;
       }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'reasonable_accommodation_text_selected'")
+    ) {
+      const [, sessionId, detailJson] = this.values;
+      this.database.auditEvents.push({
+        event_type: "reasonable_accommodation_text_selected",
+        detail_json: detailJson,
+        created_at: new Date().toISOString(),
+        session_id: sessionId,
+      });
+      changes = 1;
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("VALUES (?, ?, ?, 'candidate', ?)")
@@ -403,6 +418,7 @@ class FakeD1Statement {
               recording_status: session.recording_status,
               created_at: session.created_at,
               completed_at: session.completed_at ?? null,
+              retention_until: session.retention_until,
               drive_status: sync?.status ?? null,
               drive_folder_url: sync?.folder_url ?? null,
             };
@@ -413,6 +429,7 @@ class FakeD1Statement {
       const technicalEventTypes = new Set([
         "audio_playback_blocked", "transcription_failed", "recording_unavailable",
         "connection_failed", "candidate_requested_stop", "time_limit_reached",
+        "reasonable_accommodation_text_selected",
       ]);
       return {
         results: this.database.auditEvents.filter((event) =>
@@ -566,11 +583,11 @@ test("authenticated production readiness reports missing components without expo
   assert.equal(payload.openAIAuthenticated, false);
   assert.equal(payload.database, false);
   assert.equal(payload.recordingStorage, false);
-  assert.deepEqual(payload.reviewerAuth, { configured: true, dedicated: false });
+  assert.deepEqual(payload.reviewerAuth, { configured: false, dedicated: false });
   assert.ok(payload.missing.includes("OPENAI_AUTHENTICATION"));
   assert.ok(payload.missing.includes("INTERVIEW_DATABASE"));
   assert.ok(payload.missing.includes("RECORDING_STORAGE"));
-  assert.equal(payload.missing.includes("INTERVIEW_STAFF_AUTHENTICATION"), false);
+  assert.equal(payload.missing.includes("INTERVIEW_STAFF_AUTHENTICATION"), true);
   assert.ok(payload.missing.includes("GOOGLE_DRIVE_REFRESH_TOKEN"));
   assert.equal(payload.driveOAuthSetup.configured, false);
   assert.ok(payload.missing.includes("GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET"));
@@ -993,7 +1010,7 @@ test("completed interview archive creates candidate folders and stores recording
     "video/webm",
     recordingBytes.byteLength,
     "test-etag",
-    "manual-deletion-only-policy-pending",
+    "2027-07-29T02:00:00.000Z",
   ]);
   database.externalSyncs.set(session.sessionId, {
     provider: "google_drive",
@@ -1480,6 +1497,39 @@ test("candidate can freely enter one or more preferred work locations and the se
   assert.equal(tooLong.status, 400);
 });
 
+test("text interview starts without camera or recording and is visible as a technical mode event", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const sessionResponse = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "文字面接 テスト",
+      employment: "アルバイト・パート",
+      location: "希望店舗は相談",
+      consent: true,
+      interviewMode: "text",
+    }),
+  }, env);
+  const session = await sessionResponse.json();
+  assert.equal(sessionResponse.status, 201);
+
+  const startResponse = await request("/api/interviews/text/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  assert.equal(startResponse.status, 200, await startResponse.clone().text());
+  assert.deepEqual(await startResponse.json(), { started: true, recordingRequired: false });
+  assert.equal(database.sessions.get(session.sessionId).status, "in_progress");
+  assert.equal(database.sessions.get(session.sessionId).recording_status, "not_applicable");
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId &&
+    event.event_type === "reasonable_accommodation_text_selected"), true);
+});
+
 test("interview session stores the candidate name and protects the recording with a scoped bearer token", async () => {
   process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const database = new FakeD1();
@@ -1502,8 +1552,9 @@ test("interview session stores the candidate name and protects the recording wit
   assert.ok(session.accessToken.length > 20);
   assert.notEqual(database.sessions.get(session.sessionId).access_token_hash, session.accessToken);
   assert.equal(database.sessions.get(session.sessionId).candidate_name, "山田 花子");
-  assert.equal(session.storagePolicy, "manual-deletion-only-policy-pending");
-  assert.equal(database.sessions.get(session.sessionId).retention_until, "manual-deletion-only-policy-pending");
+  assert.equal(session.retentionDays, 365);
+  assert.match(session.retentionUntil, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(database.sessions.get(session.sessionId).retention_until, session.retentionUntil);
   database.sessions.get(session.sessionId).status = "in_progress";
 
   const recordingBody = new TextEncoder().encode("small-webm-fixture");
@@ -1524,7 +1575,7 @@ test("interview session stores the candidate name and protects the recording wit
   assert.equal("objectKey" in upload, false);
   const storedObjectKey = `interviews/${session.sessionId}/recording.webm`;
   assert.equal(recordings.objects.has(storedObjectKey), true);
-  assert.equal(recordings.objects.get(storedObjectKey).options.customMetadata.storagePolicy, "manual-deletion-only-policy-pending");
+  assert.equal(recordings.objects.get(storedObjectKey).options.customMetadata.retentionUntil, session.retentionUntil);
   assert.equal(recordings.objects.get(storedObjectKey).options.customMetadata.audioCoverage, "both");
   assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
 
@@ -1678,6 +1729,84 @@ test("recording upload survives one transient D1 failure after the R2 object is 
   assert.equal(recordings.objects.has(storedObjectKey), true);
   assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
   assert.equal(database.artifacts.some((row) => row[2] === storedObjectKey), true);
+});
+
+test("resumable recording upload stores independent parts and streams the completed recording to staff", async () => {
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const sessionResponse = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "分割送信 テスト",
+      employment: "正社員",
+      location: "越谷店",
+      consent: true,
+      interviewMode: "camera",
+    }),
+  }, env);
+  const session = await sessionResponse.json();
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const partSize = 256 * 1024;
+  const lastSize = 123;
+  const commonHeaders = {
+    Authorization: `Bearer ${session.accessToken}`,
+    "X-Interview-Session": session.sessionId,
+  };
+  const start = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...commonHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize: partSize + lastSize,
+      partSize,
+      totalParts: 2,
+      audioCoverage: "both",
+    }),
+  }, env);
+  assert.equal(start.status, 200, await start.clone().text());
+  assert.deepEqual((await start.json()).uploadedParts, []);
+
+  for (const [index, size, fill] of [[0, partSize, 65], [1, lastSize, 66]]) {
+    const part = await request("/api/interviews/recording/upload/part", {
+      method: "PUT",
+      headers: {
+        ...commonHeaders,
+        "Content-Type": "application/octet-stream",
+        "X-Recording-Part-Index": String(index),
+        "X-Recording-Part-Bytes": String(size),
+      },
+      body: new Uint8Array(size).fill(fill),
+    }, env);
+    assert.equal(part.status, 200, await part.clone().text());
+  }
+
+  const complete = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers: commonHeaders,
+  }, env);
+  const completed = await complete.json();
+  assert.equal(complete.status, 200, JSON.stringify(completed));
+  assert.equal(completed.stored, true);
+  assert.equal(completed.totalParts, 2);
+  assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
+  assert.equal(database.artifacts.some((row) => String(row[2]).endsWith("recording.manifest.json")), true);
+
+  const staffRecording = await request(`/api/staff/recording?sessionId=${session.sessionId}`, {
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当"),
+    },
+  }, env);
+  assert.equal(staffRecording.status, 200);
+  assert.equal(Number(staffRecording.headers.get("content-length")), partSize + lastSize);
+  const recording = new Uint8Array(await staffRecording.arrayBuffer());
+  assert.equal(recording.length, partSize + lastSize);
+  assert.equal(recording[0], 65);
+  assert.equal(recording.at(-1), 66);
 });
 
 test("candidate technical incidents are audited and cross-origin mutations are rejected", async () => {

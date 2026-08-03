@@ -117,6 +117,13 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .segmented-control { display: grid; grid-template-columns: 1fr 1fr; background: var(--brand-blue-soft); padding: 4px; border-radius: 12px; }
 .segmented-control button { border: 0; background: transparent; border-radius: 9px; padding: 11px; color: var(--muted); font-size: 12px; }
 .segmented-control button.active { background: var(--white); color: var(--brand-navy); font-weight: 800; box-shadow: 0 4px 15px rgba(0, 59, 99, .08); }
+.interview-format-control { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 8px 0 12px; }
+.interview-format-control button { min-height: 76px; border: 1px solid #c8dbe7; border-radius: 14px; background: #f6fbfe; color: var(--brand-navy); padding: 13px 14px; text-align: left; display: grid; gap: 4px; cursor: pointer; }
+.interview-format-control button strong { font-size: .95rem; }
+.interview-format-control button span { font-size: .76rem; color: var(--muted); line-height: 1.45; }
+.interview-format-control button.active { background: var(--brand-navy); border-color: var(--brand-navy); color: #fff; box-shadow: 0 8px 20px rgba(1, 71, 111, .16); }
+.interview-format-control button.active span { color: #d9edf7; }
+.accommodation-note { margin: 0 0 12px; border-left: 3px solid var(--brand-green); background: #edf8f6; color: #274d55; padding: 10px 12px; font-size: .78rem; line-height: 1.65; }
 select, textarea, .candidate-name-input { width: 100%; color: var(--ink); background: var(--white); border: 1px solid var(--line); border-radius: 12px; }
 select, .candidate-name-input { padding: 13px 14px; }
 .candidate-name-input:focus { border-color: var(--brand-blue); outline: 3px solid rgba(170,216,241,.55); outline-offset: 1px; }
@@ -601,6 +608,7 @@ select, .candidate-name-input { padding: 13px 14px; }
 }
 
 @media (max-width: 620px) {
+  .interview-format-control { grid-template-columns: 1fr; }
   .site-header, .intro-layout, .setup-layout, .interview-page, .review-page, .site-footer { width: min(100% - 28px, 1240px); }
   .site-header { height: 78px; gap: 8px; }
   .staff-header-actions > a { display: none; }

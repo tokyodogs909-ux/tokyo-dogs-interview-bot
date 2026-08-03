@@ -42,7 +42,14 @@ export type VideoReviewScore = {
 
 export const CONSENT_VERSION = "2026-07-29-v2";
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
-const STORAGE_POLICY = "manual-deletion-only-policy-pending";
+export const INTERVIEW_RETENTION_DAYS = 365;
+export const RECORDING_UPLOAD_PART_BYTES = 4 * 1024 * 1024;
+const MAX_RECORDING_BYTES = 95 * 1024 * 1024;
+const MAX_RECORDING_PARTS = 32;
+
+function retentionUntil(from: Date) {
+  return new Date(from.getTime() + INTERVIEW_RETENTION_DAYS * 24 * 60 * 60 * 1_000).toISOString();
+}
 
 export const CANDIDATE_EVENT_TYPES = [
   "audio_playback_blocked",
@@ -51,6 +58,7 @@ export const CANDIDATE_EVENT_TYPES = [
   "connection_failed",
   "candidate_requested_stop",
   "time_limit_reached",
+  "reasonable_accommodation_text_selected",
 ] as const;
 
 export type CandidateEventType = (typeof CANDIDATE_EVENT_TYPES)[number];
@@ -313,6 +321,7 @@ export async function createInterviewSession(input: {
   candidateName: string;
   employment: string;
   location: string;
+  interviewMode: "camera" | "text";
   inviteNonceHash?: string | null;
 }) {
   const db = database();
@@ -325,6 +334,7 @@ export async function createInterviewSession(input: {
   const accessTokenHash = await sha256(accessToken);
   const nowIso = now.toISOString();
   const expiresAt = new Date(now.getTime() + SESSION_TTL_MS).toISOString();
+  const retentionDate = retentionUntil(now);
   if (input.inviteNonceHash) {
     const results = await db.batch([
       db.prepare(`INSERT INTO interview_sessions (
@@ -343,7 +353,7 @@ export async function createInterviewSession(input: {
         CONSENT_VERSION,
         nowIso,
         expiresAt,
-        STORAGE_POLICY,
+        retentionDate,
         nowIso,
         nowIso,
         input.inviteNonceHash,
@@ -359,7 +369,7 @@ export async function createInterviewSession(input: {
         .bind(
           crypto.randomUUID(),
           sessionId,
-          JSON.stringify({ consentVersion: CONSENT_VERSION }),
+          JSON.stringify({ consentVersion: CONSENT_VERSION, interviewMode: input.interviewMode }),
           sessionId,
         ),
     ]);
@@ -380,14 +390,23 @@ export async function createInterviewSession(input: {
         CONSENT_VERSION,
         nowIso,
         expiresAt,
-        STORAGE_POLICY,
+        retentionDate,
         nowIso,
         nowIso,
       ).run();
-    await audit(db, sessionId, "consent_recorded", { consentVersion: CONSENT_VERSION });
+    await audit(db, sessionId, "consent_recorded", {
+      consentVersion: CONSENT_VERSION,
+      interviewMode: input.interviewMode,
+    });
   }
 
-  return { sessionId, accessToken, expiresAt, storagePolicy: STORAGE_POLICY };
+  return {
+    sessionId,
+    accessToken,
+    expiresAt,
+    retentionUntil: retentionDate,
+    retentionDays: INTERVIEW_RETENTION_DAYS,
+  };
 }
 
 export async function issueInterviewInvite(expiresInHours: number) {
@@ -492,8 +511,6 @@ function reviewerSecret() {
   const candidates = [
     bound.INTERVIEW_STAFF_TOKEN,
     typeof process === "undefined" ? "" : process.env.INTERVIEW_STAFF_TOKEN,
-    bound.INTERVIEW_ADMIN_TOKEN,
-    typeof process === "undefined" ? "" : process.env.INTERVIEW_ADMIN_TOKEN,
   ];
   return candidates.find((candidate) => candidate?.trim())?.trim() ?? "";
 }
@@ -553,6 +570,22 @@ export async function markInterviewStarted(sessionId: string) {
     db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'interview_started', 'candidate', '{}')")
       .bind(crypto.randomUUID(), sessionId),
   ]);
+}
+
+export async function markTextInterviewStarted(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = new Date().toISOString();
+  const result = await db.batch([
+    db.prepare(`UPDATE interview_sessions SET
+      status = 'in_progress', recording_status = 'not_applicable', updated_at = ?
+      WHERE id = ? AND status IN ('created', 'in_progress')`)
+      .bind(now, sessionId),
+    db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'reasonable_accommodation_text_selected', 'candidate', ?)")
+      .bind(crypto.randomUUID(), sessionId, JSON.stringify({ selectionImpact: "none" })),
+  ]);
+  return Number((result[0] as { meta?: { changes?: number } }).meta?.changes ?? 0) === 1;
 }
 
 const REALTIME_CONNECTION_LIMIT_PER_SESSION = 12;
@@ -921,8 +954,9 @@ export async function getInterviewArchiveSource(sessionId: string) {
     FROM interview_artifacts WHERE session_id = ? AND kind = 'recording'
     ORDER BY created_at DESC LIMIT 1`)
     .bind(sessionId).first<{ object_key: string; content_type: string; byte_size: number }>();
-  const storedRecording = artifact && bindings().RECORDINGS
-    ? await bindings().RECORDINGS?.get(artifact.object_key)
+  const recordingBucket = bindings().RECORDINGS;
+  const storedRecording = artifact && recordingBucket
+    ? await loadRecordingObject(recordingBucket, artifact.object_key)
     : null;
   return {
     sessionId,
@@ -967,7 +1001,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
   await ensureSchema(db);
   const session = await db.prepare(`SELECT
     id, candidate_name, employment, preferred_location, status, recording_status,
-    transcript_json, evaluation_json, summary, completed_at, created_at, updated_at
+    transcript_json, evaluation_json, summary, retention_until, completed_at, created_at, updated_at
     FROM interview_sessions WHERE id = ? LIMIT 1`)
     .bind(sessionId)
     .first<Record<string, unknown>>();
@@ -980,7 +1014,8 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     FROM interview_audit_events
     WHERE session_id = ? AND event_type IN (
       'audio_playback_blocked', 'transcription_failed', 'recording_unavailable',
-      'connection_failed', 'candidate_requested_stop', 'time_limit_reached'
+      'connection_failed', 'candidate_requested_stop', 'time_limit_reached',
+      'reasonable_accommodation_text_selected'
     ) ORDER BY created_at`)
     .bind(sessionId)
     .all<Record<string, unknown>>();
@@ -1001,6 +1036,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     transcript: parseJson<TranscriptTurn[]>(session.transcript_json, []),
     evaluation: parseJson<InterviewEvaluation | null>(session.evaluation_json, null),
     completedAt: session.completed_at,
+    retentionUntil: session.retention_until,
     createdAt: session.created_at,
     reviewPolicy: "authorized_staff",
     videoReviewRubric: VIDEO_REVIEW_DIMENSIONS,
@@ -1032,6 +1068,7 @@ export type InterviewListItem = {
   recordingStatus: string;
   createdAt: string;
   completedAt: string | null;
+  retentionUntil: string;
   driveStatus: string | null;
   driveFolderUrl: string | null;
 };
@@ -1047,7 +1084,7 @@ export async function listInterviewSummaries(
   const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
   const rows = await db.prepare(`SELECT
     s.id, s.candidate_name, s.employment, s.preferred_location,
-    s.status, s.recording_status, s.created_at, s.completed_at,
+    s.status, s.recording_status, s.created_at, s.completed_at, s.retention_until,
     d.status AS drive_status, d.folder_url AS drive_folder_url
     FROM interview_sessions AS s
     LEFT JOIN interview_external_syncs AS d
@@ -1065,6 +1102,7 @@ export async function listInterviewSummaries(
     recordingStatus: String(row.recording_status ?? ""),
     createdAt: String(row.created_at ?? ""),
     completedAt: typeof row.completed_at === "string" ? row.completed_at : null,
+    retentionUntil: String(row.retention_until ?? ""),
     driveStatus: typeof row.drive_status === "string" ? row.drive_status : null,
     driveFolderUrl: typeof row.drive_folder_url === "string" ? row.drive_folder_url : null,
   }));
@@ -1132,13 +1170,36 @@ export async function saveInterviewRecording(input: {
     httpMetadata: { contentType: input.contentType },
     customMetadata: {
       sessionId: input.session.id,
-      storagePolicy: STORAGE_POLICY,
+      retentionUntil: input.session.retention_until,
       audioCoverage: input.audioCoverage,
     },
   });
+  await recordRecordingArtifact({
+    db,
+    session: input.session,
+    objectKey,
+    contentType: input.contentType,
+    byteSize: input.byteSize,
+    etag: object.etag,
+    audioCoverage: input.audioCoverage,
+    uploadMode: "single",
+  });
+  return { objectKey, etag: object.etag };
+}
+
+async function recordRecordingArtifact(input: {
+  db: D1Database;
+  session: InterviewSessionRecord;
+  objectKey: string;
+  contentType: string;
+  byteSize: number;
+  etag: string | undefined;
+  audioCoverage: "both" | "candidate-only" | "unverified";
+  uploadMode: "single" | "resumable-parts";
+}) {
   const now = new Date().toISOString();
-  const recordArtifact = () => db.batch([
-    db.prepare(`INSERT INTO interview_artifacts (
+  const recordArtifact = () => input.db.batch([
+    input.db.prepare(`INSERT INTO interview_artifacts (
       id, session_id, kind, object_key, content_type, byte_size, etag, retention_until
     ) VALUES (?, ?, 'recording', ?, ?, ?, ?, ?)
     ON CONFLICT(object_key) DO UPDATE SET
@@ -1149,19 +1210,20 @@ export async function saveInterviewRecording(input: {
       .bind(
         crypto.randomUUID(),
         input.session.id,
-        objectKey,
+        input.objectKey,
         input.contentType,
         input.byteSize,
-        object.etag,
+        input.etag ?? null,
         input.session.retention_until,
       ),
-    db.prepare("UPDATE interview_sessions SET recording_status = 'stored', updated_at = ? WHERE id = ?")
+    input.db.prepare("UPDATE interview_sessions SET recording_status = 'stored', updated_at = ? WHERE id = ?")
       .bind(now, input.session.id),
-    db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'recording_stored', 'system', ?)")
+    input.db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'recording_stored', 'system', ?)")
       .bind(crypto.randomUUID(), input.session.id, JSON.stringify({
         byteSize: input.byteSize,
         contentType: input.contentType,
         audioCoverage: input.audioCoverage,
+        uploadMode: input.uploadMode,
       })),
   ]);
   // The recording is already durably stored in R2 at this point (objectKey is
@@ -1173,13 +1235,269 @@ export async function saveInterviewRecording(input: {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       await recordArtifact();
-      return { objectKey, etag: object.etag };
+      return;
     } catch (error) {
       lastError = error;
       if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
     }
   }
   throw lastError;
+}
+
+type RecordingUploadState = {
+  version: 1;
+  sessionId: string;
+  contentType: string;
+  byteSize: number;
+  partSize: number;
+  totalParts: number;
+  audioCoverage: "both" | "candidate-only" | "unverified";
+  retentionUntil: string;
+  createdAt: string;
+};
+
+type RecordingPartManifest = {
+  version: 1;
+  contentType: string;
+  byteSize: number;
+  audioCoverage: "both" | "candidate-only" | "unverified";
+  parts: Array<{ key: string; byteSize: number }>;
+};
+
+function recordingUploadStateKey(sessionId: string) {
+  return `interviews/${sessionId}/recording-parts/upload.json`;
+}
+
+function recordingPartKey(sessionId: string, index: number) {
+  return `interviews/${sessionId}/recording-parts/part-${String(index).padStart(3, "0")}`;
+}
+
+async function r2ObjectText(object: R2ObjectBody) {
+  return await new Response(object.body).text();
+}
+
+function parseRecordingUploadState(value: string): RecordingUploadState {
+  const parsed = JSON.parse(value) as Partial<RecordingUploadState>;
+  if (
+    parsed.version !== 1 ||
+    typeof parsed.sessionId !== "string" ||
+    typeof parsed.contentType !== "string" ||
+    typeof parsed.byteSize !== "number" ||
+    typeof parsed.partSize !== "number" ||
+    typeof parsed.totalParts !== "number" ||
+    !["both", "candidate-only", "unverified"].includes(parsed.audioCoverage ?? "") ||
+    typeof parsed.retentionUntil !== "string" ||
+    typeof parsed.createdAt !== "string"
+  ) {
+    throw new Error("INTERVIEW_RECORDING_UPLOAD_STATE_INVALID");
+  }
+  return parsed as RecordingUploadState;
+}
+
+export function validateRecordingUploadShape(input: {
+  contentType: string;
+  byteSize: number;
+  partSize: number;
+  totalParts: number;
+  audioCoverage: string;
+}) {
+  const contentType = input.contentType.split(";")[0].toLowerCase();
+  if (!["video/webm", "audio/webm", "video/mp4", "audio/mp4"].includes(contentType)) return null;
+  if (!Number.isInteger(input.byteSize) || input.byteSize <= 0 || input.byteSize > MAX_RECORDING_BYTES) return null;
+  if (!Number.isInteger(input.partSize) || input.partSize < 256 * 1024 || input.partSize > 8 * 1024 * 1024) return null;
+  if (!Number.isInteger(input.totalParts) || input.totalParts <= 0 || input.totalParts > MAX_RECORDING_PARTS) return null;
+  if (Math.ceil(input.byteSize / input.partSize) !== input.totalParts) return null;
+  if (!["both", "candidate-only", "unverified"].includes(input.audioCoverage)) return null;
+  return {
+    contentType,
+    byteSize: input.byteSize,
+    partSize: input.partSize,
+    totalParts: input.totalParts,
+    audioCoverage: input.audioCoverage as RecordingUploadState["audioCoverage"],
+  };
+}
+
+export async function beginResumableInterviewRecording(input: {
+  session: InterviewSessionRecord;
+  contentType: string;
+  byteSize: number;
+  partSize: number;
+  totalParts: number;
+  audioCoverage: RecordingUploadState["audioCoverage"];
+}) {
+  const bucket = bindings().RECORDINGS;
+  if (!bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
+  const stateKey = recordingUploadStateKey(input.session.id);
+  const existingObject = await bucket.get(stateKey);
+  let state: RecordingUploadState;
+  if (existingObject) {
+    state = parseRecordingUploadState(await r2ObjectText(existingObject));
+    if (
+      state.sessionId !== input.session.id ||
+      state.contentType !== input.contentType ||
+      state.byteSize !== input.byteSize ||
+      state.partSize !== input.partSize ||
+      state.totalParts !== input.totalParts ||
+      state.audioCoverage !== input.audioCoverage
+    ) {
+      throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+    }
+  } else {
+    const claimed = await claimInterviewRecordingUpload(input.session.id);
+    if (!claimed) {
+      if (input.session.recording_status === "stored") return { stored: true, uploadedParts: [] as number[] };
+      // A previous start request may have claimed the D1 row and then lost its
+      // response (or failed before the R2 state write). The same candidate token
+      // is allowed to recreate the deterministic state immediately; concurrent
+      // attempts write identical metadata and parts are independently idempotent.
+      if (input.session.recording_status !== "uploading") {
+        throw new Error("INTERVIEW_RECORDING_UPLOAD_BUSY");
+      }
+    }
+    state = {
+      version: 1,
+      sessionId: input.session.id,
+      contentType: input.contentType,
+      byteSize: input.byteSize,
+      partSize: input.partSize,
+      totalParts: input.totalParts,
+      audioCoverage: input.audioCoverage,
+      retentionUntil: input.session.retention_until,
+      createdAt: new Date().toISOString(),
+    };
+    await bucket.put(stateKey, JSON.stringify(state), {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: { sessionId: input.session.id, retentionUntil: input.session.retention_until },
+    });
+  }
+  const uploadedParts: number[] = [];
+  for (let index = 0; index < state.totalParts; index += 1) {
+    const part = await bucket.get(recordingPartKey(state.sessionId, index));
+    if (part?.customMetadata?.byteSize) uploadedParts.push(index);
+  }
+  return { stored: false, uploadedParts };
+}
+
+export async function saveResumableInterviewRecordingPart(input: {
+  sessionId: string;
+  index: number;
+  byteSize: number;
+  body: ReadableStream;
+}) {
+  const bucket = bindings().RECORDINGS;
+  if (!bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
+  const stateObject = await bucket.get(recordingUploadStateKey(input.sessionId));
+  if (!stateObject) throw new Error("INTERVIEW_RECORDING_UPLOAD_NOT_STARTED");
+  const state = parseRecordingUploadState(await r2ObjectText(stateObject));
+  if (!Number.isInteger(input.index) || input.index < 0 || input.index >= state.totalParts) {
+    throw new Error("INTERVIEW_RECORDING_PART_INVALID");
+  }
+  const expectedSize = input.index === state.totalParts - 1
+    ? state.byteSize - state.partSize * (state.totalParts - 1)
+    : state.partSize;
+  if (input.byteSize !== expectedSize) throw new Error("INTERVIEW_RECORDING_PART_SIZE_INVALID");
+  const key = recordingPartKey(input.sessionId, input.index);
+  const existing = await bucket.get(key);
+  if (Number(existing?.customMetadata?.byteSize ?? 0) === input.byteSize) return { stored: true, duplicate: true };
+  await bucket.put(key, input.body, {
+    httpMetadata: { contentType: "application/octet-stream" },
+    customMetadata: {
+      sessionId: input.sessionId,
+      byteSize: String(input.byteSize),
+      retentionUntil: state.retentionUntil,
+    },
+  });
+  return { stored: true, duplicate: false };
+}
+
+export async function completeResumableInterviewRecording(session: InterviewSessionRecord) {
+  const bucket = bindings().RECORDINGS;
+  const db = database();
+  if (!bucket || !db) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
+  const stateObject = await bucket.get(recordingUploadStateKey(session.id));
+  if (!stateObject) throw new Error("INTERVIEW_RECORDING_UPLOAD_NOT_STARTED");
+  const state = parseRecordingUploadState(await r2ObjectText(stateObject));
+  const parts: RecordingPartManifest["parts"] = [];
+  for (let index = 0; index < state.totalParts; index += 1) {
+    const key = recordingPartKey(session.id, index);
+    const part = await bucket.get(key);
+    const byteSize = Number(part?.customMetadata?.byteSize ?? 0);
+    const expectedSize = index === state.totalParts - 1
+      ? state.byteSize - state.partSize * (state.totalParts - 1)
+      : state.partSize;
+    if (!part || byteSize !== expectedSize) throw new Error("INTERVIEW_RECORDING_PART_MISSING");
+    parts.push({ key, byteSize });
+  }
+  if (parts.reduce((total, part) => total + part.byteSize, 0) !== state.byteSize) {
+    throw new Error("INTERVIEW_RECORDING_SIZE_MISMATCH");
+  }
+  const manifest: RecordingPartManifest = {
+    version: 1,
+    contentType: state.contentType,
+    byteSize: state.byteSize,
+    audioCoverage: state.audioCoverage,
+    parts,
+  };
+  const objectKey = `interviews/${session.id}/recording.manifest.json`;
+  const object = await bucket.put(objectKey, JSON.stringify(manifest), {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: {
+      sessionId: session.id,
+      retentionUntil: session.retention_until,
+      audioCoverage: state.audioCoverage,
+      recordingContentType: state.contentType,
+    },
+  });
+  await recordRecordingArtifact({
+    db,
+    session,
+    objectKey,
+    contentType: state.contentType,
+    byteSize: state.byteSize,
+    etag: object.etag,
+    audioCoverage: state.audioCoverage,
+    uploadMode: "resumable-parts",
+  });
+  return { stored: true, byteSize: state.byteSize, totalParts: state.totalParts };
+}
+
+async function loadRecordingObject(bucket: R2Bucket, objectKey: string) {
+  const object = await bucket.get(objectKey);
+  if (!object) return null;
+  if (!objectKey.endsWith(".manifest.json")) {
+    return { body: object.body, etag: object.etag, customMetadata: object.customMetadata ?? {} };
+  }
+  const manifest = JSON.parse(await r2ObjectText(object)) as RecordingPartManifest;
+  if (manifest.version !== 1 || !Array.isArray(manifest.parts) || manifest.parts.length === 0) return null;
+  let partIndex = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      while (partIndex < manifest.parts.length) {
+        if (!reader) {
+          const part = await bucket.get(manifest.parts[partIndex].key);
+          if (!part) {
+            controller.error(new Error("INTERVIEW_RECORDING_PART_MISSING"));
+            return;
+          }
+          reader = part.body.getReader();
+        }
+        const next = await reader.read();
+        if (!next.done) {
+          controller.enqueue(next.value);
+          return;
+        }
+        reader.releaseLock();
+        reader = null;
+        partIndex += 1;
+      }
+      controller.close();
+    },
+    async cancel(reason) {
+      await reader?.cancel(reason);
+    },
+  });
+  return { body, etag: object.etag, customMetadata: object.customMetadata ?? {} };
 }
 
 export async function getInterviewRecording(sessionId: string, reviewer: AuthorizedReviewer) {
@@ -1193,7 +1511,7 @@ export async function getInterviewRecording(sessionId: string, reviewer: Authori
     .bind(sessionId)
     .first<{ object_key: string; content_type: string; byte_size: number }>();
   if (!artifact) return null;
-  const object = await bucket.get(artifact.object_key);
+  const object = await loadRecordingObject(bucket, artifact.object_key);
   if (!object) return null;
   await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'recording_opened', 'recruiter', ?)")
     .bind(crypto.randomUUID(), sessionId, JSON.stringify({ reviewer })).run();
