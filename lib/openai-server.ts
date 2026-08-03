@@ -33,6 +33,26 @@ let openAIHealthCache: OpenAIHealthCache | null = null;
 const OPENAI_HEALTHY_CACHE_MS = 5 * 60 * 1000;
 const OPENAI_UNHEALTHY_CACHE_MS = 30 * 1000;
 
+function diagnosticToken(value: unknown) {
+  if (typeof value !== "string") return null;
+  return /^[a-z0-9._-]{1,80}$/i.test(value) ? value : null;
+}
+
+async function safeOpenAIErrorMetadata(response: Response) {
+  if (response.ok) return { code: null, type: null };
+  try {
+    const payload = await response.clone().json() as {
+      error?: { code?: unknown; type?: unknown };
+    };
+    return {
+      code: diagnosticToken(payload.error?.code),
+      type: diagnosticToken(payload.error?.type),
+    };
+  } catch {
+    return { code: null, type: null };
+  }
+}
+
 /**
  * The candidate readiness endpoint must not report green merely because a string
  * named OPENAI_API_KEY exists. A revoked, mistyped, or billing-disabled key looks
@@ -66,13 +86,14 @@ export async function verifyOpenAIAuthentication() {
       service ? service.fetch(request) : fetch(request)));
     const healthy = responses.every((response) => response.ok);
     if (!healthy) {
-      // Status codes and request IDs are sufficient for operations to distinguish
-      // an invalid key, missing model access, and quota trouble. Never log the
-      // credential, response body, or candidate data here.
+      // Restrict upstream metadata to short machine-readable tokens. Never log
+      // credentials, human-readable messages, response bodies, or candidate data.
+      const errors = await Promise.all(responses.map(safeOpenAIErrorMetadata));
       console.warn("OPENAI_AUTHENTICATION_CHECK_FAILED", {
         models: [REALTIME_MODEL, EVALUATION_MODEL],
         statuses: responses.map((response) => response.status),
         requestIds: responses.map((response) => response.headers.get("x-request-id") ?? "unavailable"),
+        errors,
       });
     }
     openAIHealthCache = { apiKeyHash, checkedAt: now, healthy };

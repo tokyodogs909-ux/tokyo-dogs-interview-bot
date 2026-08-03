@@ -513,18 +513,33 @@ test("health endpoint verifies server authentication without returning the key",
 
 test("health endpoint fails closed when the configured OpenAI key is rejected", async () => {
   process.env.OPENAI_API_KEY = "rejected-test-key-never-returned";
-  const response = await request("/api/health", {}, {
-    ...workerEnv,
-    OPENAI_API_KEY: "rejected-test-key-never-returned",
-    OPENAI_API: { fetch: async () => Response.json(
-      { error: { type: "invalid_request_error" } },
-      { status: 401 },
-    ) },
-  });
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  let response;
+  try {
+    response = await request("/api/health", {}, {
+      ...workerEnv,
+      OPENAI_API_KEY: "rejected-test-key-never-returned",
+      OPENAI_API: { fetch: async () => Response.json(
+        { error: {
+          code: "invalid_api_key",
+          type: "invalid_request_error",
+          message: "rejected-test-key-never-returned",
+        } },
+        { status: 401 },
+      ) },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
   const responseText = await response.clone().text();
   assert.equal(response.status, 503);
   assert.deepEqual(await response.json(), { configured: false });
   assert.equal(responseText.includes("rejected-test-key-never-returned"), false);
+  assert.equal(JSON.stringify(warnings).includes("rejected-test-key-never-returned"), false);
+  assert.match(JSON.stringify(warnings), /invalid_api_key/);
+  assert.match(JSON.stringify(warnings), /invalid_request_error/);
 });
 
 test("authenticated production readiness reports missing components without exposing secrets", async () => {
