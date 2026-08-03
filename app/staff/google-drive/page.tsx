@@ -72,22 +72,26 @@ export default function GoogleDriveSetupPage() {
     }
   }
 
-  async function confirmApprovedFolder() {
+  async function confirmApprovedFolder(accessKeyOverride = "") {
     setPhase("selecting");
     setMessage("");
     const response = await fetch("/api/admin/google-drive/root", {
       method: "POST",
       credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(accessKeyOverride ? { Authorization: `Bearer ${accessKeyOverride}` } : {}),
+      },
       body: JSON.stringify({}),
     });
     const payload = await response.json() as { saved?: boolean; root?: DriveRoot; error?: string };
     if (!response.ok || !payload.saved || !payload.root) {
-      setPhase("connected");
+      setPhase(accessKeyOverride ? "idle" : "connected");
       setMessage(payload.error || "承認済み保存先を確認できませんでした。");
       return;
     }
     setRoot(payload.root);
+    setAccessKey("");
     setPhase("ready");
     setMessage("承認済み保存先を確認し、自動格納の設定を完了しました。");
   }
@@ -152,6 +156,10 @@ export default function GoogleDriveSetupPage() {
               <button className="primary-action" onClick={() => void beginConnection()} disabled={!accessKey || phase === "connecting"}>
                 {phase === "connecting" ? "接続中…" : "Google Driveと接続"} <span>→</span>
               </button>
+              <button className="secondary-action" type="button" onClick={() => void confirmApprovedFolder(accessKey)} disabled={!accessKey || phase === "connecting"}>
+                保存済み接続を確認
+              </button>
+              <small>Google同意済みの場合は「保存済み接続を確認」を押すだけで、再同意せず設定を再開できます。</small>
             </label>
           ) : (
             <div className="drive-folder-action">

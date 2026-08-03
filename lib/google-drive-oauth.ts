@@ -59,7 +59,7 @@ export function clearGoogleDriveOAuthCookies(request: Request) {
 }
 
 export function googleDriveAdminSessionCookie(request: Request, name: string, value: string, maxAge: number) {
-  return cookie(request, name, value, maxAge, "/api/admin/google-drive");
+  return cookie(request, name, value, maxAge, "/api/admin");
 }
 
 async function constantTimeStringEqual(left: string, right: string) {
