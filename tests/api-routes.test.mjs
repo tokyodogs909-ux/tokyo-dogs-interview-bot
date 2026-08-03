@@ -1667,6 +1667,13 @@ test("staff inbox lists recent candidates with one shared login and records list
   const archived = payload.interviews.find((item) => item.sessionId === second.sessionId);
   assert.equal(archived.driveStatus, "completed");
   assert.equal(archived.driveFolderUrl, "https://drive.google.com/drive/folders/test");
+  assert.deepEqual(payload.archiveHealth, {
+    completedInterviews: 1,
+    stored: 1,
+    processing: 0,
+    attention: 0,
+    autoRecoveryScheduled: 0,
+  });
   assert.equal(database.staffAuditEvents.length, 1);
   assert.equal(database.staffAuditEvents[0].reviewer_name, "採用担当C");
   assert.deepEqual(JSON.parse(database.staffAuditEvents[0].detail_json), { resultCount: 2, limit: 50 });

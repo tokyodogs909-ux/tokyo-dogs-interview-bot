@@ -1071,6 +1071,7 @@ export type InterviewListItem = {
   retentionUntil: string;
   driveStatus: string | null;
   driveFolderUrl: string | null;
+  driveUpdatedAt: string | null;
 };
 
 export async function listInterviewSummaries(
@@ -1085,7 +1086,7 @@ export async function listInterviewSummaries(
   const rows = await db.prepare(`SELECT
     s.id, s.candidate_name, s.employment, s.preferred_location,
     s.status, s.recording_status, s.created_at, s.completed_at, s.retention_until,
-    d.status AS drive_status, d.folder_url AS drive_folder_url
+    d.status AS drive_status, d.folder_url AS drive_folder_url, d.updated_at AS drive_updated_at
     FROM interview_sessions AS s
     LEFT JOIN interview_external_syncs AS d
       ON d.session_id = s.id AND d.provider = 'google_drive'
@@ -1105,6 +1106,7 @@ export async function listInterviewSummaries(
     retentionUntil: String(row.retention_until ?? ""),
     driveStatus: typeof row.drive_status === "string" ? row.drive_status : null,
     driveFolderUrl: typeof row.drive_folder_url === "string" ? row.drive_folder_url : null,
+    driveUpdatedAt: typeof row.drive_updated_at === "string" ? row.drive_updated_at : null,
   }));
   if (options.audit !== false) {
     await db.prepare(`INSERT INTO interview_staff_audit_events (

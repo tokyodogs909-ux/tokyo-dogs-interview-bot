@@ -433,6 +433,11 @@ select, .candidate-name-input { padding: 13px 14px; }
 .staff-inbox-actions { display: flex; gap: 8px; }
 .staff-inbox-actions button, .manual-session-open button { border: 1px solid rgba(7,66,105,.18); border-radius: 10px; background: #fff; color: var(--brand-navy); padding: 10px 13px; font-size: 10px; font-weight: 800; white-space: nowrap; }
 .staff-inbox-actions button:hover, .manual-session-open button:hover { border-color: var(--brand-navy); }
+.archive-health { margin-top: 16px; border: 1px solid #8cc7aa; border-radius: 14px; padding: 13px 15px; background: #edf9f3; color: #16623a; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.archive-health > div { display: grid; gap: 3px; }
+.archive-health strong { font-size: 11px; }
+.archive-health span, .archive-health small { font-size: 9px; line-height: 1.55; }
+.archive-health.attention { border-color: #e2bd84; background: #fff8ed; color: #7a4c12; }
 .staff-inbox-tools { display: grid; grid-template-columns: 1fr 1.25fr; gap: 14px; padding: 18px 0; }
 .staff-inbox-tools label { display: grid; gap: 6px; color: var(--brand-navy); font-size: 9px; font-weight: 800; letter-spacing: .08em; }
 .staff-inbox-tools input { width: 100%; border: 1px solid rgba(7,66,105,.16); border-radius: 11px; background: #f8fcff; padding: 11px 12px; color: var(--brand-navy); font: inherit; outline: none; }
@@ -677,6 +682,7 @@ select, .candidate-name-input { padding: 13px 14px; }
   .staff-completion-notice button { width: 100%; }
   .staff-inbox { padding: 18px 14px; border-radius: 20px; }
   .staff-inbox-heading { align-items: flex-start; flex-direction: column; }
+  .archive-health { align-items: flex-start; flex-direction: column; }
   .staff-inbox-actions { width: 100%; }
   .staff-inbox-actions button { flex: 1; }
   .staff-inbox-tools { grid-template-columns: 1fr; }

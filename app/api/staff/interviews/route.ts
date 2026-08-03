@@ -2,6 +2,8 @@ import {
   authorizeReviewerRequest,
   listInterviewSummaries,
 } from "@/lib/interview-persistence";
+import { planDriveRecovery, summarizeDriveArchives } from "@/lib/drive-recovery.js";
+import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
 import { noStoreJson } from "@/lib/openai-server";
 
 export async function GET(request: Request) {
@@ -12,7 +14,12 @@ export async function GET(request: Request) {
     }
     const polling = new URL(request.url).searchParams.get("poll") === "1";
     const interviews = await listInterviewSummaries(reviewer, 50, { audit: !polling });
-    return noStoreJson({ interviews });
+    const recoverySessionIds = planDriveRecovery(interviews) as string[];
+    recoverySessionIds.forEach((sessionId) => scheduleGoogleDriveSync(sessionId));
+    return noStoreJson({
+      interviews,
+      archiveHealth: summarizeDriveArchives(interviews, recoverySessionIds),
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     const status = message === "INTERVIEW_REVIEW_AUTH_UNCONFIGURED" ||

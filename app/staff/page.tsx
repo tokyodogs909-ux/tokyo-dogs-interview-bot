@@ -59,6 +59,15 @@ type InterviewListItem = {
   retentionUntil: string;
   driveStatus: string | null;
   driveFolderUrl: string | null;
+  driveUpdatedAt: string | null;
+};
+
+type ArchiveHealth = {
+  completedInterviews: number;
+  stored: number;
+  processing: number;
+  attention: number;
+  autoRecoveryScheduled: number;
 };
 
 const technicalEventLabels: Record<string, string> = {
@@ -140,6 +149,7 @@ export default function StaffReviewPage() {
   const [state, setState] = useState<"idle" | "loading" | "ready" | "saving" | "syncing">("idle");
   const [message, setMessage] = useState("");
   const [recentInterviews, setRecentInterviews] = useState<InterviewListItem[] | null>(null);
+  const [archiveHealth, setArchiveHealth] = useState<ArchiveHealth | null>(null);
   const [listFilter, setListFilter] = useState("");
   const [listLoading, setListLoading] = useState(false);
   const [completionNotice, setCompletionNotice] = useState("");
@@ -263,8 +273,9 @@ export default function StaffReviewPage() {
         headers: authHeaders(),
         cache: "no-store",
       });
-      const data = (await response.json()) as { interviews?: InterviewListItem[]; error?: string };
+      const data = (await response.json()) as { interviews?: InterviewListItem[]; archiveHealth?: ArchiveHealth; error?: string };
       if (!response.ok || !data.interviews) throw new Error(data.error || "候補者一覧を取得できませんでした。");
+      setArchiveHealth(data.archiveHealth ?? null);
       setNotificationPermission(typeof Notification === "undefined" ? "unavailable" : Notification.permission);
       const completedItems = data.interviews.filter((item) => item.status === "completed" && item.completedAt);
       if (!completionMonitorInitializedRef.current) {
@@ -290,6 +301,7 @@ export default function StaffReviewPage() {
     } catch (error) {
       if (!options.silent) {
         setRecentInterviews(null);
+        setArchiveHealth(null);
         setMessage(error instanceof Error ? error.message : "候補者一覧を取得できませんでした。");
       } else {
         setCompletionNotice("完了通知の自動確認が一時的に止まりました。「一覧を更新」を押してください。");
@@ -307,6 +319,7 @@ export default function StaffReviewPage() {
     setReview(null);
     setRecordingUrl("");
     setRecentInterviews(null);
+    setArchiveHealth(null);
     completionMonitorInitializedRef.current = false;
     knownCompletedIdsRef.current.clear();
     setNewCompletedIds(new Set());
@@ -450,6 +463,17 @@ export default function StaffReviewPage() {
             <div><p className="eyebrow">INTERVIEW INBOX</p><h2>候補者一覧</h2><span>氏名または店舗で検索し、対象の記録を選択してください。</span></div>
             <div className="staff-inbox-actions"><button type="button" onClick={() => void loadInterviewList()} disabled={listLoading}>一覧を更新</button><button type="button" onClick={logoutStaff}>ログアウト</button></div>
           </div>
+          {archiveHealth && archiveHealth.completedInterviews > 0 && (
+            <div className={`archive-health ${archiveHealth.attention > 0 ? "attention" : "healthy"}`} role="status" aria-live="polite">
+              <div>
+                <strong>{archiveHealth.attention > 0 ? "保存の自動復旧を確認中" : "自動格納は正常です"}</strong>
+                <span>面接完了 {archiveHealth.completedInterviews}件・Drive格納済み {archiveHealth.stored}件{archiveHealth.processing > 0 ? `・処理中 ${archiveHealth.processing}件` : ""}</span>
+              </div>
+              {archiveHealth.attention > 0 && (
+                <small>{archiveHealth.autoRecoveryScheduled > 0 ? `${archiveHealth.autoRecoveryScheduled}件を自動再実行しました。` : `${archiveHealth.attention}件を一定時間後に自動再実行します。`} 通常は手動操作不要です。</small>
+              )}
+            </div>
+          )}
           <div className="staff-inbox-tools">
             <label>候補者を検索<input value={listFilter} onChange={(event) => setListFilter(event.target.value)} placeholder="氏名・店舗・面接ID" /></label>
             <div className="manual-session-open"><label>面接IDを直接指定<input value={sessionId} onChange={(event) => setSessionId(event.target.value.toUpperCase())} placeholder="TD-..." autoCapitalize="characters" /></label><button type="button" onClick={() => void loadReview()} disabled={!sessionId.trim() || state === "loading"}>開く</button></div>
