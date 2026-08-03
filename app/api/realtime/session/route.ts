@@ -84,6 +84,10 @@ export async function POST(request: Request) {
     });
 
     if (!response.ok) {
+      console.warn("OPENAI_REALTIME_SESSION_REJECTED", {
+        status: response.status,
+        requestId: response.headers.get("x-request-id") ?? "unavailable",
+      });
       return noStoreJson(
         { error: await readOpenAIError(response) },
         { status: response.status === 429 ? 429 : 502 },

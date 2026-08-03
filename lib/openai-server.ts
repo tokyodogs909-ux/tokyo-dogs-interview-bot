@@ -65,6 +65,16 @@ export async function verifyOpenAIAuthentication() {
     const responses = await Promise.all(requests.map((request) =>
       service ? service.fetch(request) : fetch(request)));
     const healthy = responses.every((response) => response.ok);
+    if (!healthy) {
+      // Status codes and request IDs are sufficient for operations to distinguish
+      // an invalid key, missing model access, and quota trouble. Never log the
+      // credential, response body, or candidate data here.
+      console.warn("OPENAI_AUTHENTICATION_CHECK_FAILED", {
+        models: [REALTIME_MODEL, EVALUATION_MODEL],
+        statuses: responses.map((response) => response.status),
+        requestIds: responses.map((response) => response.headers.get("x-request-id") ?? "unavailable"),
+      });
+    }
     openAIHealthCache = { apiKeyHash, checkedAt: now, healthy };
     return healthy;
   } catch {
