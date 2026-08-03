@@ -14,6 +14,7 @@ type GoogleDriveBindings = {
   GOOGLE_DRIVE_REFRESH_TOKEN?: string;
   GOOGLE_DRIVE_ROOT_FOLDER_ID?: string;
   GOOGLE_DRIVE_EXPECTED_ROOT_NAME?: string;
+  GOOGLE_DRIVE_EXPECTED_ACCOUNT_EMAIL?: string;
 };
 
 type DriveFolderMetadata = {
@@ -25,6 +26,12 @@ type DriveFolderMetadata = {
   webViewLink?: string;
   capabilities?: {
     canAddChildren?: boolean;
+  };
+};
+
+type DriveAbout = {
+  user?: {
+    emailAddress?: string;
   };
 };
 
@@ -52,6 +59,10 @@ export function configuredGoogleDriveRootId() {
   return setting("GOOGLE_DRIVE_ROOT_FOLDER_ID");
 }
 
+export function expectedGoogleDriveAccountEmail() {
+  return setting("GOOGLE_DRIVE_EXPECTED_ACCOUNT_EMAIL") || "tokyodogs909@gmail.com";
+}
+
 async function resolvedDriveConfiguration() {
   const staticRefreshToken = setting("GOOGLE_DRIVE_REFRESH_TOKEN");
   const staticRootFolderId = setting("GOOGLE_DRIVE_ROOT_FOLDER_ID");
@@ -63,12 +74,11 @@ async function resolvedDriveConfiguration() {
     clientId: setting("GOOGLE_DRIVE_CLIENT_ID"),
     clientSecret: setting("GOOGLE_DRIVE_CLIENT_SECRET"),
     refreshToken: hasCompleteStaticConfiguration ? staticRefreshToken : stored?.refreshToken || "",
-    // The approved destination is intentionally managed as a Sites setting even
-    // when OAuth stores the refresh token in D1. Requiring Picker to write the
-    // same ID into D1 created an avoidable second setup step and left a valid
-    // OAuth connection unusable on mobile.
-    rootFolderId: staticRootFolderId || stored?.rootFolderId || "",
-    expectedRootName: expectedGoogleDriveRootName(),
+    // An OAuth-created, app-managed destination is stored in D1 and takes
+    // precedence over the legacy Sites setting. This keeps the non-sensitive
+    // drive.file scope while avoiding a Google Picker dependency on mobile.
+    rootFolderId: stored?.rootFolderId || staticRootFolderId || "",
+    expectedRootName: stored?.rootFolderName || expectedGoogleDriveRootName(),
   };
 }
 
@@ -115,6 +125,16 @@ async function readJson(response: Response) {
   } catch {
     return {};
   }
+}
+
+export async function fetchGoogleDriveAccountEmail(accessToken: string) {
+  const response = await fetch(`${DRIVE_API_ENDPOINT}/about?fields=user(emailAddress)`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const about = await readJson(response) as DriveAbout;
+  const email = about.user?.emailAddress?.trim().toLowerCase() ?? "";
+  if (!response.ok || !email) throw new Error("GOOGLE_DRIVE_ACCOUNT_LOOKUP_FAILED");
+  return email;
 }
 
 export async function fetchGoogleDriveAccessToken() {
@@ -179,4 +199,75 @@ export async function validateGoogleDriveFolderSelection(
     locationType: folder.driveId ? "shared_drive" : "my_drive",
     webViewLink: typeof folder.webViewLink === "string" ? folder.webViewLink : null,
   };
+}
+
+const MANAGED_ROOT_PROPERTY = "online-first-interview-v1";
+
+function managedRootName() {
+  return `${expectedGoogleDriveRootName()}_システム管理`;
+}
+
+function safeRootFromMetadata(folder: DriveFolderMetadata, expectedName: string): SafeDriveRootMetadata {
+  if (
+    !folder.id ||
+    folder.name !== expectedName ||
+    folder.mimeType !== FOLDER_MIME_TYPE ||
+    folder.trashed === true
+  ) {
+    throw new Error("GOOGLE_DRIVE_ROOT_MISMATCH");
+  }
+  if (folder.capabilities?.canAddChildren !== true) {
+    throw new Error("GOOGLE_DRIVE_ROOT_NOT_WRITABLE");
+  }
+  return {
+    id: folder.id,
+    name: folder.name,
+    canAddChildren: true,
+    locationType: folder.driveId ? "shared_drive" : "my_drive",
+    webViewLink: typeof folder.webViewLink === "string" ? folder.webViewLink : null,
+  };
+}
+
+/**
+ * drive.file cannot see an arbitrary pre-existing Drive folder unless it was
+ * opened with this app through Google Picker. For the one-time production
+ * setup we therefore create a narrowly scoped app-owned destination and store
+ * its ID in D1. Repeated calls find the tagged folder instead of creating a
+ * duplicate.
+ */
+export async function ensureGoogleDriveManagedRoot(accessToken: string): Promise<SafeDriveRootMetadata> {
+  const name = managedRootName();
+  const fields = "files(id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren))";
+  const query = new URLSearchParams({
+    q: `trashed = false and mimeType = '${FOLDER_MIME_TYPE}' and appProperties has { key='tokyoDogsManagedRoot' and value='${MANAGED_ROOT_PROPERTY}' }`,
+    pageSize: "10",
+    spaces: "drive",
+    fields,
+  });
+  const lookupResponse = await fetch(`${DRIVE_API_ENDPOINT}/files?${query}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const lookup = await readJson(lookupResponse) as { files?: DriveFolderMetadata[] };
+  if (!lookupResponse.ok) throw new Error("GOOGLE_DRIVE_MANAGED_ROOT_LOOKUP_FAILED");
+  const existing = lookup.files?.find((folder) => folder.name === name);
+  if (existing) return safeRootFromMetadata(existing, name);
+
+  const createResponse = await fetch(
+    `${DRIVE_API_ENDPOINT}/files?fields=${encodeURIComponent("id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren)")}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name,
+        mimeType: FOLDER_MIME_TYPE,
+        appProperties: { tokyoDogsManagedRoot: MANAGED_ROOT_PROPERTY },
+      }),
+    },
+  );
+  const created = await readJson(createResponse) as DriveFolderMetadata;
+  if (!createResponse.ok) throw new Error("GOOGLE_DRIVE_MANAGED_ROOT_CREATE_FAILED");
+  return safeRootFromMetadata(created, name);
 }

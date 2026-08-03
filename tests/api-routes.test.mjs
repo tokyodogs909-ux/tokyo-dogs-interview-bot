@@ -774,6 +774,10 @@ test("Google Drive OAuth callback encrypts the refresh token and the approved fo
         assert.equal(body.get("refresh_token"), "stored-google-refresh-token-never-returned");
         return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
       }
+      if (href.includes("/drive/v3/about?")) {
+        assert.equal(init.headers.Authorization, "Bearer temporary-google-access-token");
+        return Response.json({ user: { emailAddress: "tokyodogs909@gmail.com" } });
+      }
       if (href.includes(`/drive/v3/files/${rootFolderId}`)) {
         assert.equal(init.headers.Authorization, "Bearer temporary-google-access-token");
         return Response.json({
@@ -813,6 +817,127 @@ test("Google Drive OAuth callback encrypts the refresh token and the approved fo
     assert.equal(database.driveConnection.root_folder_id, rootFolderId);
     assert.equal(database.driveConnection.root_folder_name, "オンライン一次面接_自動格納");
     assert.equal(JSON.stringify(rootPayload).includes("temporary-google-access-token"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Google Drive setup creates and reuses an app-managed root when drive.file cannot see the old empty folder", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const oldRootFolderId = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
+  const managedRootFolderId = "managedRootFolder987654321";
+  const env = {
+    ...workerEnv,
+    DB: database,
+    INTERVIEW_ADMIN_TOKEN: "drive-admin-secret",
+    GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+    GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+    GOOGLE_DRIVE_OAUTH_REDIRECT_URI: "http://localhost/api/admin/google-drive/oauth/callback",
+    GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: "test-only-encryption-material-over-32-characters",
+    GOOGLE_DRIVE_ROOT_FOLDER_ID: oldRootFolderId,
+    GOOGLE_DRIVE_EXPECTED_ROOT_NAME: "オンライン一次面接_自動格納",
+  };
+  let createCalls = 0;
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        const body = new URLSearchParams(String(init.body));
+        if (body.get("grant_type") === "authorization_code") {
+          return Response.json({
+            refresh_token: "stored-google-refresh-token-never-returned",
+            scope: "https://www.googleapis.com/auth/drive.file",
+          });
+        }
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      if (href.includes("/drive/v3/about?")) {
+        return Response.json({ user: { emailAddress: "tokyodogs909@gmail.com" } });
+      }
+      if (href.includes(`/drive/v3/files/${oldRootFolderId}?`)) {
+        return Response.json({ error: { code: 404 } }, { status: 404 });
+      }
+      if (href.includes("appProperties+has") && init.method !== "POST") {
+        return Response.json({ files: createCalls ? [{
+          id: managedRootFolderId,
+          name: "オンライン一次面接_自動格納_システム管理",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+          webViewLink: `https://drive.google.com/drive/folders/${managedRootFolderId}`,
+        }] : [] });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method === "POST") {
+        createCalls += 1;
+        const metadata = JSON.parse(String(init.body));
+        assert.equal(metadata.name, "オンライン一次面接_自動格納_システム管理");
+        return Response.json({
+          id: managedRootFolderId,
+          name: metadata.name,
+          mimeType: metadata.mimeType,
+          trashed: false,
+          capabilities: { canAddChildren: true },
+          webViewLink: `https://drive.google.com/drive/folders/${managedRootFolderId}`,
+        });
+      }
+      if (href.includes(`/drive/v3/files/${managedRootFolderId}?`)) {
+        return Response.json({
+          id: managedRootFolderId,
+          name: "オンライン一次面接_自動格納_システム管理",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+          webViewLink: `https://drive.google.com/drive/folders/${managedRootFolderId}`,
+        });
+      }
+      throw new Error(`Unexpected Google request: ${href}`);
+    };
+
+    const start = await request("/api/admin/google-drive/oauth/start", {
+      method: "POST",
+      headers: { Authorization: "Bearer drive-admin-secret", Origin: "http://localhost" },
+    }, env);
+    const startPayload = await start.json();
+    const authorizationUrl = new URL(startPayload.authorizationUrl);
+    const state = authorizationUrl.searchParams.get("state");
+    const cookieHeader = start.headers.getSetCookie().map((value) => value.split(";", 1)[0]).join("; ");
+    const setupCookie = cookieHeader.split("; ").find((value) => value.startsWith("td_drive_admin_setup="));
+    assert.ok(state);
+    assert.ok(setupCookie);
+    const callback = await request(`/api/admin/google-drive/oauth/callback?code=authorization-code-from-google&state=${encodeURIComponent(state)}`, {
+      headers: { Cookie: cookieHeader },
+    }, env);
+    assert.equal(callback.status, 303);
+
+    const firstResponse = await request("/api/admin/google-drive/root", {
+      method: "POST",
+      headers: {
+        Cookie: setupCookie,
+        Origin: "http://localhost",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({}),
+    }, env);
+    const firstPayload = await firstResponse.json();
+    assert.equal(firstResponse.status, 200, JSON.stringify(firstPayload));
+    assert.equal(firstPayload.saved, true);
+    assert.equal(firstPayload.root.id, managedRootFolderId);
+    assert.equal(firstPayload.accountEmail, "tokyodogs909@gmail.com");
+    assert.equal(database.driveConnection.root_folder_id, managedRootFolderId);
+    assert.equal(createCalls, 1);
+
+    const secondResponse = await request("/api/admin/google-drive/root", {
+      method: "POST",
+      headers: {
+        Cookie: setupCookie,
+        Origin: "http://localhost",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({}),
+    }, env);
+    assert.equal(secondResponse.status, 200);
+    assert.equal(createCalls, 1, "the tagged app-managed root must not be duplicated");
   } finally {
     globalThis.fetch = originalFetch;
   }
