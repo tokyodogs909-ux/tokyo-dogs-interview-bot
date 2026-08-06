@@ -697,3 +697,17 @@ select, .candidate-name-input { padding: 13px 14px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
 }
+
+/* Interviewer image stage */
+.interviewer-stage { position: relative; width: calc(100% - 48px); aspect-ratio: 16 / 9; overflow: hidden; margin: 0 24px 4px; border-radius: 16px; background: var(--brand-navy); box-shadow: 0 12px 30px rgba(7,66,105,.16); }
+.interviewer-stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity .9s ease; }
+.interviewer-stage img.on { opacity: 1; }
+.interviewer-stage-badge { position: absolute; top: 12px; left: 12px; display: flex; align-items: center; gap: 6px; padding: 6px 11px; border-radius: 999px; background: rgba(11,58,91,.58); color: #fff; font-size: 10px; font-weight: 700; letter-spacing: .04em; backdrop-filter: blur(5px); }
+.interviewer-stage-badge i { width: 7px; height: 7px; border-radius: 50%; background: var(--brand-blue); }
+.interviewer-stage.speaking .interviewer-stage-badge i { background: #ff5d5d; animation: statePulse 1.2s infinite; }
+.interviewer-stage-name { position: absolute; right: 14px; bottom: 12px; left: 14px; color: #fff; font-size: 12px; font-weight: 700; text-align: right; text-shadow: 0 1px 6px rgba(0,0,0,.55); }
+
+@media (max-width: 720px) {
+  .interviewer-stage { width: calc(100% - 32px); margin: 0 16px 4px; }
+  .interviewer-stage-name { font-size: 10px; }
+}

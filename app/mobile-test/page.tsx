@@ -60,7 +60,7 @@ export default function MobileTestPage() {
       {!started && (
         <section className="mobile-test-intro">
           <div className="mobile-test-visual">
-            <img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木" />
+            <img src="/interviewer-mogi.jpg" alt="TOKYO DOGS オンライン採用担当者 茂木" />
             <span>オンライン一次面接ポータル確認</span>
           </div>
           <p className="eyebrow">TOKYO DOGS / PORTAL PREVIEW</p>
@@ -90,7 +90,7 @@ export default function MobileTestPage() {
 
           <div className="mobile-test-conversation" aria-live="polite">
             <div className="mobile-test-guide">
-              <img src="/interviewer-woman-medium-v2.png" alt="" />
+              <img src="/interviewer-mogi.jpg" alt="" />
               <div><span>ONLINE RECRUITER</span><strong>オンライン採用担当者 茂木</strong></div>
             </div>
 
@@ -127,7 +127,7 @@ export default function MobileTestPage() {
 
       {finished && (
         <section className="mobile-test-complete">
-          <img src="/interviewer-woman-medium-v2.png" alt="" />
+          <img src="/interviewer-mogi.jpg" alt="" />
           <p className="eyebrow">PORTAL CHECK COMPLETE</p>
           <h1>画面確認が<br />完了しました。</h1>
           <p>{answers.length}問すべてに回答できました。入力内容は保存・送信されていません。</p>

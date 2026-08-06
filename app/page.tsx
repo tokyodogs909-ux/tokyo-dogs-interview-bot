@@ -30,6 +30,7 @@ import {
   recordedFallbackQuietState,
 } from "@/lib/interview-time-control";
 import { uploadRecordingResumably } from "@/lib/recording-upload";
+import { InterviewerStage } from "./interviewer-stage";
 
 type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
 /** "checking" while the pre-flight is in flight; every other value mirrors InterviewAccessState. */
@@ -2781,7 +2782,7 @@ export default function Home() {
               TOKYO DOGSの採用選考におけるオンライン一次面接です。これまでの経験、仕事選びの考え方、働き方の希望について、オンライン採用担当者の茂木が順番にお伺いします。カメラ・音声または文字入力で参加できます。
             </p>
             <div className="intro-interviewer">
-              <img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木" />
+              <img src="/interviewer-mogi.jpg" alt="TOKYO DOGS オンライン採用担当者 茂木" />
               <div><span>ONLINE RECRUITER</span><strong>オンライン採用担当者 茂木</strong></div>
             </div>
             <div className="feature-row">
@@ -2949,11 +2950,14 @@ export default function Home() {
             <div className="conversation-area">
               <div className="conversation-heading">
                 <div className={`interviewer-profile ${connectionState}`}>
-                  <div className="interviewer-avatar"><img src="/interviewer-woman-medium-v2.png" alt="TOKYO DOGS オンライン採用担当者 茂木" /></div>
+                  <div className="interviewer-avatar"><img src="/interviewer-mogi.jpg" alt="TOKYO DOGS オンライン採用担当者 茂木" /></div>
                   <div><span>ONLINE RECRUITER</span><h2>オンライン採用担当者 茂木</h2></div>
                 </div>
                 <span>{candidateTurns} 回答</span>
               </div>
+              {mode !== "internal-test" && (
+                <InterviewerStage speaking={connectionState === "ai-speaking"} />
+              )}
               {mode === "voice" && (
                 <div className="audio-health" aria-label="双方向音声の接続状態">
                   <div className={candidateAudioState}><i /><span>あなたの音声</span><strong>{candidateAudioCopy}</strong></div>
@@ -2978,7 +2982,7 @@ export default function Home() {
               )}
               <div className="conversation-log" ref={conversationRef} aria-live="polite">
                 {transcript.length === 0 ? (
-                  <div className="waiting-message"><div className={`waiting-avatar ${connectionState}`}><img src="/interviewer-woman-medium-v2.png" alt="" /></div><div className="wave"><i /><i /><i /><i /></div><strong>{connectionState === "error" ? "接続できませんでした" : "オンライン一次面接を準備しています"}</strong><p>{connectionState === "error" ? errorMessage : connectionStepCopy || "まもなく茂木から最初の質問が始まります。"}</p></div>
+                  <div className="waiting-message"><div className={`waiting-avatar ${connectionState}`}><img src="/interviewer-mogi.jpg" alt="" /></div><div className="wave"><i /><i /><i /><i /></div><strong>{connectionState === "error" ? "接続できませんでした" : "オンライン一次面接を準備しています"}</strong><p>{connectionState === "error" ? errorMessage : connectionStepCopy || "まもなく茂木から最初の質問が始まります。"}</p></div>
                 ) : transcript.map((turn) => (
                   <article className={`message ${turn.speaker}`} key={turn.id}>
                     <span>{turn.speaker === "interviewer" ? "茂木" : "あなた"}</span>

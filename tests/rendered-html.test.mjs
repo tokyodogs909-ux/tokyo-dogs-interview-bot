@@ -58,7 +58,7 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.match(html, /文字入力/);
   assert.match(html, /カメラ・マイク不要/);
   assert.match(html, /接続確認（選考対象外）/);
-  assert.match(html, /interviewer-woman-medium-v2\.png/);
+  assert.match(html, /interviewer-mogi\.jpg/);
   assert.doesNotMatch(html, /interviewer-dog\.svg/);
   assert.match(html, /双方の音声/);
   assert.match(html, /茂木の音声/);
@@ -131,6 +131,7 @@ test("voice interview implements bidirectional audio health and recovery guards"
   const persistenceSource = await readFile(new URL("../lib/interview-persistence.ts", import.meta.url), "utf8");
   const recordingRouteSource = await readFile(new URL("../app/api/interviews/recording/route.ts", import.meta.url), "utf8");
   const recordingUploadSource = await readFile(new URL("../lib/recording-upload.js", import.meta.url), "utf8");
+  const interviewerStageSource = await readFile(new URL("../app/interviewer-stage.tsx", import.meta.url), "utf8");
   assert.match(source, /あなたの音声/);
   assert.match(source, /茂木の音声/);
   assert.match(source, /resumeRemoteAudio/);
@@ -221,7 +222,17 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /画面共有を追加（任意）/);
   assert.match(source, /output_modalities: \["audio"\]/);
   assert.match(source, /自分の名前には敬称を付けず/);
+  assert.match(source, /<InterviewerStage speaking=/);
+  assert.match(interviewerStageSource, /音声案内中/);
+  assert.match(interviewerStageSource, /回答を確認中/);
+  assert.match(interviewerStageSource, /案内イメージ/);
+  assert.match(interviewerStageSource, /prefers-reduced-motion: reduce/);
+  for (let cut = 1; cut <= 10; cut += 1) {
+    const image = await stat(new URL(`../public/interviewer-mogi-${cut}.jpg`, import.meta.url));
+    assert.ok(image.size > 50_000, `interviewer-mogi-${cut}.jpg is unexpectedly small`);
+  }
   assert.match(styles, /\.remote-audio-player/);
+  assert.match(styles, /\.interviewer-stage/);
   assert.doesNotMatch(styles, /audio\s*\{\s*display:\s*none/);
   assert.doesNotMatch(source, /モテギ/);
   assert.doesNotMatch(source, /茂木さん/);
@@ -320,7 +331,7 @@ test("server-renders the selection-excluded portal check", async () => {
   assert.match(html, /この確認内容は保存しません/);
   assert.match(html, /録画・音声接続・採用評価は行いません/);
   assert.match(html, /接続確認をはじめる/);
-  assert.match(html, /interviewer-woman-medium-v2\.png/);
+  assert.match(html, /interviewer-mogi\.jpg/);
   assert.doesNotMatch(html, /スマートフォン|スマホ|ONLINE INTERVIEW/);
   assert.doesNotMatch(html, /求職者面談|公式面談|面談担当|INTERVIEW_STAFF_TOKEN|OpenAI API/);
 });
