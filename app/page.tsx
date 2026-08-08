@@ -10,6 +10,7 @@ import {
   INTERVIEW_ACCESS_MESSAGES,
   INTERVIEW_ACCESS_STATES,
   INTERVIEW_TOPIC_IDS,
+  LIGHT_OPENING_QUESTION,
   PREFERRED_LOCATION_MAX_LENGTH,
   normalizePreferredLocation,
   type InterviewAccessState,
@@ -2434,7 +2435,7 @@ export default function Home() {
           type: "response.create",
           response: {
             output_modalities: ["audio"],
-            instructions: "「TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。この面接は音声システムで進行します」と音声で開始してください。自分の名前には敬称を付けず、茂木または私と表現してください。15〜25分の面接であることと、回答が採用選考の重要な判断資料になることを短く説明し、話しやすい自己紹介から一問だけ質問してください。実在する人間がライブで参加しているとは説明しないでください。",
+            instructions: `「TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。この面接は音声システムで進行します」と音声で開始してください。自分の名前には敬称を付けず、茂木または私と表現してください。15〜25分の面接であることと、回答が採用選考の重要な判断資料になることを短く説明してください。案内の直後は、追加の前置きや複数の確認を入れず「${LIGHT_OPENING_QUESTION}」だけを質問してください。実在する人間がライブで参加しているとは説明しないでください。`,
           },
         }));
         if (remoteStreamRef.current) queueRemoteAudioRecovery();

@@ -129,6 +129,7 @@ test("voice interview implements bidirectional audio health and recovery guards"
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const gatewaySource = await readFile(new URL("../scripts/mobile-test-gateway.mjs", import.meta.url), "utf8");
   const persistenceSource = await readFile(new URL("../lib/interview-persistence.ts", import.meta.url), "utf8");
+  const interviewSource = await readFile(new URL("../lib/interview.ts", import.meta.url), "utf8");
   const recordingRouteSource = await readFile(new URL("../app/api/interviews/recording/route.ts", import.meta.url), "utf8");
   const recordingUploadSource = await readFile(new URL("../lib/recording-upload.js", import.meta.url), "utf8");
   const interviewerStageSource = await readFile(new URL("../app/interviewer-stage.tsx", import.meta.url), "utf8");
@@ -221,6 +222,8 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /回答本文の自動文字起こしと自動評価は行わず/);
   assert.match(source, /画面共有を追加（任意）/);
   assert.match(source, /output_modalities: \["audio"\]/);
+  assert.match(source, /LIGHT_OPENING_QUESTION/);
+  assert.match(interviewSource, /まず、今のお仕事や学校について、簡単に教えてください。/);
   assert.match(source, /自分の名前には敬称を付けず/);
   assert.match(source, /<InterviewerStage speaking=/);
   assert.match(interviewerStageSource, /音声案内中/);

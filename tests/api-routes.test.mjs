@@ -1968,6 +1968,8 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
     assert.equal(capturedBody.session.audio.input.turn_detection.create_response, false);
     assert.equal(capturedBody.session.audio.input.turn_detection.interrupt_response, false);
     assert.equal(capturedBody.session.max_output_tokens, 1400);
+    assert.match(capturedBody.session.instructions, /まず、今のお仕事や学校について、簡単に教えてください。/);
+    assert.match(capturedBody.session.instructions, /自己紹介や詳しい経歴を一度に求めず/);
     assert.match(capturedBody.session.instructions, /退職・転職を考えた理由/);
     assert.match(capturedBody.session.instructions, /なぜそれをやろうと思ったのですか/);
     assert.match(capturedBody.session.instructions, /決め手は何でしたか/);
