@@ -30,6 +30,10 @@ import {
   nextInterviewTimeAction,
   recordedFallbackQuietState,
 } from "@/lib/interview-time-control";
+import {
+  isExactRecordedCompletionReplay,
+  splitRecordedAnswerUpload,
+} from "@/lib/recorded-answer-upload";
 import { uploadRecordingResumably } from "@/lib/recording-upload";
 import { InterviewerStage } from "./interviewer-stage";
 
@@ -38,6 +42,15 @@ type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
 type InviteGate = "checking" | InterviewAccessState;
 type InterviewMode = "voice" | "text" | "recorded-fallback" | "internal-test";
 type InterviewFormat = "camera" | "text";
+type InterviewCredentials = { sessionId: string; accessToken: string };
+type RecordedAnswerReceipt = {
+  state: "completed" | "pending";
+  retryAfterSeconds: number;
+};
+type RecordedAnswerUploadPromises = {
+  registration: Promise<void>;
+  completion: Promise<void>;
+};
 
 // Keep the final single-request upload below the server's 95 MiB limit even on
 // browsers that do not strictly honor the requested MediaRecorder bitrates.
@@ -274,11 +287,20 @@ export default function Home() {
   const recordedAnswerRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedAnswerChunksRef = useRef<Blob[]>([]);
   const recordedAnswerStartedAtRef = useRef<number | null>(null);
-  const recordedAnswerUploadsRef = useRef(new Map<number, Promise<void>>());
+  // Registration proves that D1 has the exact answer index and R2 has the
+  // corresponding audio bytes. Transcription may legitimately remain pending
+  // after that receipt, so it has a separate promise and must not delay the
+  // lightweight answer-count seal or the full recording upload.
+  const recordedAnswerRegistrationPromisesRef = useRef(new Map<number, Promise<void>>());
+  const recordedAnswerCompletionPromisesRef = useRef(new Map<number, Promise<void>>());
+  const recordedAnswerRegisteredRef = useRef(new Set<number>());
+  const recordedAnswerTranscribedRef = useRef(new Set<number>());
+  const recordedAnswerCredentialsRef = useRef(new Map<number, InterviewCredentials>());
   const recordedAnswerBlobsRef = useRef(new Map<number, Blob>());
   const recordingAudioContextRef = useRef<AudioContext | null>(null);
   const recordingAudioMixRef = useRef<RecordingAudioMix | null>(null);
   const recordingHasBothAudioRef = useRef<boolean | null>(null);
+  const retryRecordedAnswersOnFinalizationRef = useRef(false);
   const playbackAudioContextRef = useRef<AudioContext | null>(null);
   const remotePlaybackGraphRef = useRef<RemotePlaybackGraph | null>(null);
   const microphoneMeterRef = useRef<MicrophoneMeter | null>(null);
@@ -918,8 +940,7 @@ export default function Home() {
     setRecordedQuestionReady(false);
     if (!answerAlreadyRecorded) {
       const answerNumber = recordedQuestionIndex + 1;
-      const answerUpload = finishRecordedAnswerCapture(answerNumber);
-      recordedAnswerUploadsRef.current.set(answerNumber, answerUpload);
+      finishRecordedAnswerCapture(answerNumber);
       upsertTurn({
         id: `recorded-fallback-answer-${answerNumber}`,
         speaker: "candidate",
@@ -1687,8 +1708,8 @@ export default function Home() {
   async function uploadRecordedAnswer(
     answerIndex: number,
     blob: Blob,
-    credentials = { sessionId: sessionIdRef.current, accessToken: accessTokenRef.current },
-  ) {
+    credentials: InterviewCredentials,
+  ): Promise<RecordedAnswerReceipt> {
     const response = await fetch("/api/interviews/recorded/answer", {
       method: "POST",
       headers: {
@@ -1701,16 +1722,27 @@ export default function Home() {
       body: blob,
     });
     const data = (await response.json().catch(() => null)) as {
+      stored?: boolean;
       transcribed?: boolean;
       pending?: boolean;
+      answerIndex?: number;
       retryAfterSeconds?: number;
       error?: string;
     } | null;
-    if (response.ok && data?.transcribed === true) return;
-    if (response.status === 202 && data?.pending) {
-      const retrySeconds = Math.max(1, Math.min(15, Number(data.retryAfterSeconds) || 5));
-      await new Promise((resolve) => window.setTimeout(resolve, retrySeconds * 1_000));
-      return await retryRecordedAnswerTranscription(answerIndex, 3, credentials);
+    const exactReceipt = data?.stored === true && data.answerIndex === answerIndex;
+    if (response.status === 200 && exactReceipt && data?.transcribed === true) {
+      return { state: "completed", retryAfterSeconds: 0 };
+    }
+    if (
+      response.status === 202 &&
+      exactReceipt &&
+      data?.transcribed === false &&
+      data.pending === true
+    ) {
+      return {
+        state: "pending",
+        retryAfterSeconds: Math.max(1, Math.min(15, Number(data.retryAfterSeconds) || 5)),
+      };
     }
     throw new Error(data?.error || "回答音声の文字起こしを完了できませんでした。");
   }
@@ -1732,39 +1764,135 @@ export default function Home() {
       },
     });
     const data = (await response.json().catch(() => null)) as {
+      stored?: boolean;
       transcribed?: boolean;
       pending?: boolean;
+      answerIndex?: number;
       retryAfterSeconds?: number;
       error?: string;
     } | null;
-    if (response.ok && data?.transcribed === true) return;
-    if (response.status === 202 && data?.pending) {
+    const exactReceipt = data?.stored === true && data.answerIndex === answerIndex;
+    if (response.status === 200 && exactReceipt && data?.transcribed === true) return;
+    if (response.status === 202 && exactReceipt && data?.transcribed === false && data.pending === true) {
       const retrySeconds = Math.max(1, Math.min(15, Number(data.retryAfterSeconds) || 5));
       await new Promise((resolve) => window.setTimeout(resolve, retrySeconds * 1_000));
       return await retryRecordedAnswerTranscription(answerIndex, attemptsRemaining - 1, credentials);
     }
+    if (response.status === 409) {
+      // Staff recovery may have transcribed every durable answer and completed
+      // the interview while this candidate retry was in flight. This status is
+      // only a signal to verify the separate completion receipt, never success.
+      throw new Error("RECORDED_ANSWER_SESSION_STATE_CONFLICT");
+    }
     throw new Error(data?.error || "回答音声の文字起こしを完了できませんでした。");
   }
 
-  function finishRecordedAnswerCapture(answerIndex: number) {
+  function recordedAnswerCredentials(answerIndex: number, proposed?: InterviewCredentials) {
+    const existing = recordedAnswerCredentialsRef.current.get(answerIndex);
+    if (existing) return existing;
+    const snapshot = proposed
+      ? { sessionId: proposed.sessionId, accessToken: proposed.accessToken }
+      : { sessionId: sessionIdRef.current, accessToken: accessTokenRef.current };
+    recordedAnswerCredentialsRef.current.set(answerIndex, snapshot);
+    return snapshot;
+  }
+
+  function trackRecordedAnswerUpload(
+    answerIndex: number,
+    register: () => Promise<RecordedAnswerReceipt>,
+    proposedCredentials?: InterviewCredentials,
+  ): RecordedAnswerUploadPromises {
+    const credentials = recordedAnswerCredentials(answerIndex, proposedCredentials);
+    const promises = splitRecordedAnswerUpload({
+      register,
+      afterRegistration: () => {
+        // A stopped request from an abandoned/restarted interview must not mark
+        // the same numeric answer index in the new session as registered.
+        if (recordedAnswerCredentialsRef.current.get(answerIndex) === credentials) {
+          recordedAnswerRegisteredRef.current.add(answerIndex);
+        }
+      },
+      complete: async (receipt) => {
+        if (receipt.state === "pending") {
+          await new Promise((resolve) => window.setTimeout(resolve, receipt.retryAfterSeconds * 1_000));
+          await retryRecordedAnswerTranscription(answerIndex, 3, credentials);
+        }
+        if (recordedAnswerCredentialsRef.current.get(answerIndex) === credentials) {
+          recordedAnswerTranscribedRef.current.add(answerIndex);
+        }
+      },
+    });
+    recordedAnswerRegistrationPromisesRef.current.set(answerIndex, promises.registration);
+    recordedAnswerCompletionPromisesRef.current.set(answerIndex, promises.completion);
+    // The completion branch intentionally runs while registration, sealing and
+    // recording upload proceed. Attach a handler now so a rejected background
+    // retry is not reported as an unhandled promise before finalization awaits it.
+    void promises.registration.catch(() => undefined);
+    void promises.completion.catch(() => undefined);
+    return promises;
+  }
+
+  function restartRecordedAnswerTranscription(answerIndex: number) {
+    if (!recordedAnswerRegisteredRef.current.has(answerIndex)) {
+      throw new Error("RECORDED_ANSWER_REGISTRATION_MISSING");
+    }
+    if (recordedAnswerTranscribedRef.current.has(answerIndex)) return Promise.resolve();
+    const credentials = recordedAnswerCredentialsRef.current.get(answerIndex);
+    if (!credentials) throw new Error("RECORDED_ANSWER_CREDENTIALS_MISSING");
+    const completion = retryRecordedAnswerTranscription(answerIndex, 3, credentials).then(() => {
+      if (recordedAnswerCredentialsRef.current.get(answerIndex) === credentials) {
+        recordedAnswerTranscribedRef.current.add(answerIndex);
+      }
+    });
+    recordedAnswerCompletionPromisesRef.current.set(answerIndex, completion);
+    void completion.catch(() => undefined);
+    return completion;
+  }
+
+  function resendRecordedAnswerRegistration(answerIndex: number) {
+    const blob = recordedAnswerBlobsRef.current.get(answerIndex);
+    const credentials = recordedAnswerCredentialsRef.current.get(answerIndex);
+    if (!blob || !credentials) throw new Error("RECORDED_ANSWER_UPLOAD_MISSING");
+    return trackRecordedAnswerUpload(
+      answerIndex,
+      () => uploadRecordedAnswer(answerIndex, blob, credentials),
+      credentials,
+    );
+  }
+
+  function finishRecordedAnswerCapture(answerIndex: number): RecordedAnswerUploadPromises {
+    const credentials = recordedAnswerCredentials(answerIndex);
     const recorder = recordedAnswerRecorderRef.current;
-    if (!recorder || recorder.state === "inactive") return Promise.reject(new Error("RECORDED_ANSWER_AUDIO_MISSING"));
+    if (!recorder || recorder.state === "inactive") {
+      return trackRecordedAnswerUpload(
+        answerIndex,
+        () => Promise.reject(new Error("RECORDED_ANSWER_AUDIO_MISSING")),
+        credentials,
+      );
+    }
     recordedAnswerRecorderRef.current = null;
     const chunks = recordedAnswerChunksRef.current;
     const startedAt = recordedAnswerStartedAtRef.current;
     recordedAnswerChunksRef.current = [];
     recordedAnswerStartedAtRef.current = null;
-    return new Promise<void>((resolve, reject) => {
+    let resolveReceipt: (receipt: RecordedAnswerReceipt) => void = () => undefined;
+    let rejectReceipt: (error: unknown) => void = () => undefined;
+    const receipt = new Promise<RecordedAnswerReceipt>((resolve, reject) => {
+      resolveReceipt = resolve;
+      rejectReceipt = reject;
+    });
+    const promises = trackRecordedAnswerUpload(answerIndex, () => receipt, credentials);
+    {
       let settled = false;
-      const finishResolve = () => {
+      const finishResolve = (value: RecordedAnswerReceipt) => {
         if (settled) return;
         settled = true;
-        resolve();
+        resolveReceipt(value);
       };
       const finishReject = (error: unknown) => {
         if (settled) return;
         settled = true;
-        reject(error);
+        rejectReceipt(error);
       };
       recorder.onerror = () => finishReject(new Error("RECORDED_ANSWER_AUDIO_FAILED"));
       recorder.onstop = () => {
@@ -1774,7 +1902,7 @@ export default function Home() {
           return;
         }
         recordedAnswerBlobsRef.current.set(answerIndex, blob);
-        uploadRecordedAnswer(answerIndex, blob).then(finishResolve, finishReject);
+        uploadRecordedAnswer(answerIndex, blob, credentials).then(finishResolve, finishReject);
       };
       try {
         recorder.requestData();
@@ -1782,7 +1910,8 @@ export default function Home() {
       } catch (error) {
         finishReject(error);
       }
-    });
+    }
+    return promises;
   }
 
   function discardRecordedAnswerCapture() {
@@ -1800,8 +1929,13 @@ export default function Home() {
     }
     recordedAnswerChunksRef.current = [];
     recordedAnswerStartedAtRef.current = null;
-    recordedAnswerUploadsRef.current.clear();
+    recordedAnswerRegistrationPromisesRef.current.clear();
+    recordedAnswerCompletionPromisesRef.current.clear();
+    recordedAnswerRegisteredRef.current.clear();
+    recordedAnswerTranscribedRef.current.clear();
+    recordedAnswerCredentialsRef.current.clear();
     recordedAnswerBlobsRef.current.clear();
+    retryRecordedAnswersOnFinalizationRef.current = false;
   }
 
   async function startRecordedFallback(options: { continueCurrentAttempt?: boolean } = {}) {
@@ -1851,7 +1985,11 @@ export default function Home() {
       setTranscript([firstTurn]);
       recordedInterviewSessionRef.current = activeSessionId;
       if (!options.continueCurrentAttempt) {
-        recordedAnswerUploadsRef.current.clear();
+        recordedAnswerRegistrationPromisesRef.current.clear();
+        recordedAnswerCompletionPromisesRef.current.clear();
+        recordedAnswerRegisteredRef.current.clear();
+        recordedAnswerTranscribedRef.current.clear();
+        recordedAnswerCredentialsRef.current.clear();
         recordedAnswerBlobsRef.current.clear();
       }
       setConnectionState("ai-speaking");
@@ -1880,8 +2018,7 @@ export default function Home() {
     recordedQuestionReadyRef.current = false;
     setRecordedQuestionReady(false);
     const answerNumber = recordedQuestionIndex + 1;
-    const answerUpload = finishRecordedAnswerCapture(answerNumber);
-    recordedAnswerUploadsRef.current.set(answerNumber, answerUpload);
+    finishRecordedAnswerCapture(answerNumber);
     upsertTurn({
       id: `recorded-fallback-answer-${answerNumber}`,
       speaker: "candidate",
@@ -2233,27 +2370,134 @@ export default function Home() {
     }
   }
 
-  async function completeRecordedFallback() {
-    const answerIndexes = [...recordedAnswerBlobsRef.current.keys()].sort((left, right) => left - right);
-    const questionCount = answerIndexes.length;
-    if (questionCount < 1 || answerIndexes.some((answerIndex, index) => answerIndex !== index + 1)) {
+  function recordedAnswerIndexes() {
+    // A capture is expected as soon as its split promises are installed. The
+    // final MediaRecorder stop may still be producing its Blob, so using the
+    // Blob map here would reintroduce a race before the registration promise.
+    const answerIndexes = [...recordedAnswerRegistrationPromisesRef.current.keys()]
+      .sort((left, right) => left - right);
+    if (
+      answerIndexes.length < 1 ||
+      answerIndexes.length > RECORDED_FALLBACK_QUESTIONS.length ||
+      answerIndexes.some((answerIndex, index) => answerIndex !== index + 1)
+    ) {
       throw new Error("回答音声を保存できていません。面接記録の保存を再試行してください。");
     }
-    try {
-      const existingUploads = answerIndexes.map((answerIndex) => recordedAnswerUploadsRef.current.get(answerIndex));
-      if (existingUploads.some((upload) => !upload)) throw new Error("RECORDED_ANSWER_UPLOAD_MISSING");
-      await Promise.all(existingUploads);
-    } catch {
-      // Each audio blob is retained locally until the final receipt. Replaying an
-      // identical blob is idempotent server-side and recovers transport failures.
-      const answerUploads = answerIndexes.map((answerIndex) => {
-        const blob = recordedAnswerBlobsRef.current.get(answerIndex)!;
-        const upload = uploadRecordedAnswer(answerIndex, blob);
-        recordedAnswerUploadsRef.current.set(answerIndex, upload);
-        return upload;
-      });
-      await Promise.all(answerUploads);
+    return answerIndexes;
+  }
+
+  async function ensureRecordedAnswerRegistrations(retryMissing: boolean) {
+    const answerIndexes = recordedAnswerIndexes();
+    const registrations = answerIndexes.map((answerIndex) => {
+      if (recordedAnswerRegisteredRef.current.has(answerIndex)) return Promise.resolve();
+      const existing = recordedAnswerRegistrationPromisesRef.current.get(answerIndex);
+      if (!retryMissing) {
+        if (!existing) throw new Error("RECORDED_ANSWER_REGISTRATION_MISSING");
+        return existing;
+      }
+      // This path is reached only from a visible retry action. If the first
+      // request never received an exact D1/R2 receipt, replay the retained blob;
+      // the server accepts only an identical SHA for the same answer index.
+      return existing
+        ? existing.catch(() => resendRecordedAnswerRegistration(answerIndex).registration)
+        : resendRecordedAnswerRegistration(answerIndex).registration;
+    });
+    await Promise.all(registrations);
+    if (answerIndexes.some((answerIndex) => !recordedAnswerRegisteredRef.current.has(answerIndex))) {
+      throw new Error("RECORDED_ANSWER_REGISTRATION_MISSING");
     }
+    return answerIndexes;
+  }
+
+  function exactRecordedAnswerCredentials(answerIndexes: number[]) {
+    const first = recordedAnswerCredentialsRef.current.get(answerIndexes[0]);
+    if (
+      !first ||
+      first.sessionId !== sessionIdRef.current ||
+      first.accessToken !== accessTokenRef.current ||
+      answerIndexes.some((answerIndex, offset) => {
+        const credentials = recordedAnswerCredentialsRef.current.get(answerIndex);
+        return answerIndex !== offset + 1 ||
+          !credentials ||
+          credentials.sessionId !== first.sessionId ||
+          credentials.accessToken !== first.accessToken;
+      })
+    ) {
+      throw new Error("RECORDED_ANSWER_CREDENTIALS_MISMATCH");
+    }
+    return first;
+  }
+
+  async function verifyConcurrentRecordedFallbackCompletion(answerIndexes: number[]) {
+    // The local index collection is the one sealed earlier in this interview.
+    // Recheck contiguous 1..N indexes and a single credential snapshot before
+    // asking the completion endpoint for an idempotent receipt.
+    const credentials = exactRecordedAnswerCredentials(answerIndexes);
+    const response = await fetch("/api/interviews/recorded/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${credentials.accessToken}`,
+      },
+      body: JSON.stringify({
+        sessionId: credentials.sessionId,
+        questionCount: answerIndexes.length,
+      }),
+    });
+    const data = await response.json().catch(() => null) as unknown;
+    if (!isExactRecordedCompletionReplay(response.status, data)) {
+      throw new Error("RECORDED_ANSWER_COMPLETION_REPLAY_UNVERIFIED");
+    }
+    for (const answerIndex of answerIndexes) {
+      const current = recordedAnswerCredentialsRef.current.get(answerIndex);
+      if (
+        current?.sessionId !== credentials.sessionId ||
+        current.accessToken !== credentials.accessToken
+      ) {
+        throw new Error("RECORDED_ANSWER_CREDENTIALS_MISMATCH");
+      }
+      recordedAnswerTranscribedRef.current.add(answerIndex);
+    }
+  }
+
+  async function awaitRecordedAnswerTranscriptions(retryIncomplete: boolean) {
+    const answerIndexes = await ensureRecordedAnswerRegistrations(retryIncomplete);
+    const completions = answerIndexes.map((answerIndex) => {
+      if (recordedAnswerTranscribedRef.current.has(answerIndex)) return Promise.resolve();
+      const existing = recordedAnswerCompletionPromisesRef.current.get(answerIndex);
+      if (!retryIncomplete) {
+        if (!existing) throw new Error("RECORDED_ANSWER_TRANSCRIPTION_MISSING");
+        return existing;
+      }
+      // Once registration is receipted, retries must be bodyless. R2 is the
+      // durable source and resending candidate bytes would only increase risk.
+      return existing
+        ? existing.catch(() => restartRecordedAnswerTranscription(answerIndex))
+        : restartRecordedAnswerTranscription(answerIndex);
+    });
+    const settled = await Promise.allSettled(completions);
+    const failures = settled.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failures.length > 0) {
+      const staffCompletionConflict = failures.some((failure) =>
+        failure.reason instanceof Error &&
+        failure.reason.message === "RECORDED_ANSWER_SESSION_STATE_CONFLICT"
+      );
+      if (!staffCompletionConflict) throw failures[0].reason;
+      // A 409 on an individual answer remains failure unless this separate,
+      // authenticated replay proves the exact session/count is already complete.
+      await verifyConcurrentRecordedFallbackCompletion(answerIndexes);
+      return { answerIndexes, completionAlreadyStored: true };
+    }
+    if (answerIndexes.some((answerIndex) => !recordedAnswerTranscribedRef.current.has(answerIndex))) {
+      throw new Error("RECORDED_ANSWER_TRANSCRIPTION_MISSING");
+    }
+    return { answerIndexes, completionAlreadyStored: false };
+  }
+
+  async function completeRecordedFallback(retryIncomplete = false) {
+    const { answerIndexes, completionAlreadyStored } = await awaitRecordedAnswerTranscriptions(retryIncomplete);
+    if (completionAlreadyStored) return;
+    const questionCount = answerIndexes.length;
     const response = await fetch("/api/interviews/recorded/complete", {
       method: "POST",
       headers: {
@@ -2265,17 +2509,19 @@ export default function Home() {
         questionCount,
       }),
     });
-    const data = (await response.json().catch(() => null)) as { stored?: boolean; error?: string } | null;
-    if (!response.ok || !data?.stored) {
+    const data = (await response.json().catch(() => null)) as {
+      stored?: boolean;
+      humanReviewRequired?: boolean;
+      error?: string;
+    } | null;
+    if (response.status !== 200 || data?.stored !== true || data.humanReviewRequired !== true) {
       throw new Error(data?.error || "録画式面接の受付を完了できませんでした。");
     }
   }
 
-  async function sealRecordedFallbackCompletion() {
-    const expectedAnswerCount = recordedAnswerUploadsRef.current.size;
-    if (expectedAnswerCount < 1 || expectedAnswerCount > RECORDED_FALLBACK_QUESTIONS.length) {
-      throw new Error("回答音声を完了情報として保存できませんでした。");
-    }
+  async function sealRecordedFallbackCompletion(retryMissingRegistration = false) {
+    const answerIndexes = await ensureRecordedAnswerRegistrations(retryMissingRegistration);
+    const expectedAnswerCount = answerIndexes.length;
     const response = await fetch("/api/interviews/recorded/seal", {
       method: "POST",
       headers: {
@@ -2399,7 +2645,7 @@ export default function Home() {
     }
     if (mode === "voice") await sealVoiceTranscriptCompletion();
     if (mode === "recorded-fallback") {
-      await completeRecordedFallback();
+      await completeRecordedFallback(retryRecordedAnswersOnFinalizationRef.current);
     } else {
       await requestEvaluation();
     }
@@ -2425,7 +2671,7 @@ export default function Home() {
     setStage("evaluating");
     try {
       if (mode === "voice") await sealVoiceTranscriptCompletion();
-      if (mode === "recorded-fallback") await sealRecordedFallbackCompletion();
+      if (mode === "recorded-fallback") await sealRecordedFallbackCompletion(true);
       await uploadRecording(blob);
     } catch {
       setRecordingUploadState("error");
@@ -2435,6 +2681,7 @@ export default function Home() {
       return;
     }
     try {
+      retryRecordedAnswersOnFinalizationRef.current = true;
       await storeInterviewFinalization();
       await syncInterviewArchive();
       setArchiveCompletionMessage();
@@ -2444,6 +2691,7 @@ export default function Home() {
       // failure must not falsely return the recording itself to the error state.
       setProcessingWarning("面接記録の最終保存を完了できませんでした。下のボタンから再試行してください。");
     } finally {
+      retryRecordedAnswersOnFinalizationRef.current = false;
       setStage("review");
     }
   }
@@ -2459,6 +2707,8 @@ export default function Home() {
     setStage("evaluating");
     try {
       if (mode === "voice") await sealVoiceTranscriptCompletion();
+      if (mode === "recorded-fallback") await sealRecordedFallbackCompletion(true);
+      retryRecordedAnswersOnFinalizationRef.current = true;
       await storeInterviewFinalization();
       await syncInterviewArchive();
       setArchiveCompletionMessage();
@@ -2466,6 +2716,7 @@ export default function Home() {
     } catch {
       setProcessingWarning("面接記録の最終保存を完了できませんでした。下のボタンから再試行してください。");
     } finally {
+      retryRecordedAnswersOnFinalizationRef.current = false;
       setStage("review");
     }
   }
@@ -2511,8 +2762,7 @@ export default function Home() {
     setConnectionState("idle");
     if (mode === "recorded-fallback" && recordedAnswerRecorderRef.current) {
       const answerNumber = recordedQuestionIndex + 1;
-      const answerUpload = finishRecordedAnswerCapture(answerNumber);
-      recordedAnswerUploadsRef.current.set(answerNumber, answerUpload);
+      finishRecordedAnswerCapture(answerNumber);
       upsertTurn({
         id: `recorded-fallback-answer-${answerNumber}`,
         speaker: "candidate",

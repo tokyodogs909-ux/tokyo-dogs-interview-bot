@@ -123,10 +123,10 @@ export async function getInterviewSessionState(sessionId: string) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
-  return await db.prepare(`SELECT id, status, recording_status
+  return await db.prepare(`SELECT id, status, recording_status, transcript_json
     FROM interview_sessions WHERE id = ? LIMIT 1`)
     .bind(sessionId)
-    .first<{ id: string; status: string; recording_status: string }>();
+    .first<{ id: string; status: string; recording_status: string; transcript_json: string | null }>();
 }
 
 async function ensureSchema(db: D1Database) {
@@ -1516,7 +1516,12 @@ export async function getInterviewRecordingChunk(input: {
   const manifestObject = await bucket.get(artifact.object_key);
   if (!manifestObject || !("body" in manifestObject)) throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
   const manifest = JSON.parse(await r2ObjectText(manifestObject)) as RecordingPartManifest;
-  if (manifest.version !== 1 || !Array.isArray(manifest.parts) || manifest.parts.length === 0) {
+  if (
+    ![1, 2].includes(manifest.version) ||
+    !Array.isArray(manifest.parts) ||
+    manifest.parts.length === 0 ||
+    (manifest.version === 2 && manifest.parts.some((part) => !/^[a-f0-9]{64}$/.test(part.sha256 ?? "")))
+  ) {
     throw new Error("INTERVIEW_RECORDING_MANIFEST_INVALID");
   }
   const result = new Uint8Array(input.length);
@@ -1834,7 +1839,9 @@ async function recordRecordingArtifact(input: {
 }
 
 type RecordingUploadState = {
-  version: 1;
+  // Version 2 requires a SHA-256 receipt for every new part. Version 1 remains
+  // readable so already-uploaded production interviews can still be recovered.
+  version: 1 | 2;
   sessionId: string;
   contentType: string;
   byteSize: number;
@@ -1846,11 +1853,11 @@ type RecordingUploadState = {
 };
 
 type RecordingPartManifest = {
-  version: 1;
+  version: 1 | 2;
   contentType: string;
   byteSize: number;
   audioCoverage: "both" | "candidate-only" | "unverified";
-  parts: Array<{ key: string; byteSize: number }>;
+  parts: Array<{ key: string; byteSize: number; sha256?: string }>;
 };
 
 function recordingUploadStateKey(sessionId: string) {
@@ -1861,6 +1868,45 @@ function recordingPartKey(sessionId: string, index: number) {
   return `interviews/${sessionId}/recording-parts/part-${String(index).padStart(3, "0")}`;
 }
 
+function bufferHex(value: ArrayBuffer | ArrayBufferView | undefined) {
+  if (!value) return "";
+  const bytes = ArrayBuffer.isView(value)
+    ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+    : new Uint8Array(value);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function verifiedRecordingPartSha256(part: R2Object, expected: string) {
+  return part.customMetadata?.sha256 === expected && bufferHex(part.checksums?.sha256) === expected;
+}
+
+function verifiedRecordingPartForCompletion(state: RecordingUploadState, part: R2Object) {
+  const sha256 = part.customMetadata?.sha256 ?? "";
+  // Only an object that genuinely predates the checksum rollout may omit its
+  // digest. Every part accepted by the current server, including a Version 1
+  // old-tab upload, is hashed server-side and must pass the same R2 readback.
+  if (!sha256) return state.version === 1;
+  return /^[a-f0-9]{64}$/.test(sha256) && verifiedRecordingPartSha256(part, sha256);
+}
+
+async function legacyRecordingPartBodyMatches(input: {
+  bucket: R2Bucket;
+  key: string;
+  byteSize: number;
+  sha256: string;
+}) {
+  const object = await input.bucket.get(input.key);
+  if (
+    !object ||
+    object.size !== input.byteSize ||
+    Number(object.customMetadata?.byteSize ?? 0) !== input.byteSize
+  ) return false;
+  const bytes = new Uint8Array(await object.arrayBuffer());
+  if (bytes.byteLength !== input.byteSize) return false;
+  const exact = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  return bufferHex(await crypto.subtle.digest("SHA-256", exact)) === input.sha256;
+}
+
 async function r2ObjectText(object: R2ObjectBody) {
   return await new Response(object.body).text();
 }
@@ -1868,7 +1914,7 @@ async function r2ObjectText(object: R2ObjectBody) {
 function parseRecordingUploadState(value: string): RecordingUploadState {
   const parsed = JSON.parse(value) as Partial<RecordingUploadState>;
   if (
-    parsed.version !== 1 ||
+    ![1, 2].includes(parsed.version ?? 0) ||
     typeof parsed.sessionId !== "string" ||
     typeof parsed.contentType !== "string" ||
     typeof parsed.byteSize !== "number" ||
@@ -1908,6 +1954,7 @@ export function validateRecordingUploadShape(input: {
 
 export async function beginResumableInterviewRecording(input: {
   session: InterviewSessionRecord;
+  uploadVersion: 1 | 2;
   contentType: string;
   byteSize: number;
   partSize: number;
@@ -1922,6 +1969,7 @@ export async function beginResumableInterviewRecording(input: {
   if (existingObject) {
     state = parseRecordingUploadState(await r2ObjectText(existingObject));
     if (
+      state.version !== input.uploadVersion ||
       state.sessionId !== input.session.id ||
       state.contentType !== input.contentType ||
       state.byteSize !== input.byteSize ||
@@ -1943,8 +1991,8 @@ export async function beginResumableInterviewRecording(input: {
         throw new Error("INTERVIEW_RECORDING_UPLOAD_BUSY");
       }
     }
-    state = {
-      version: 1,
+    const proposedState: RecordingUploadState = {
+      version: input.uploadVersion,
       sessionId: input.session.id,
       contentType: input.contentType,
       byteSize: input.byteSize,
@@ -1954,12 +2002,36 @@ export async function beginResumableInterviewRecording(input: {
       retentionUntil: input.session.retention_until,
       createdAt: new Date().toISOString(),
     };
-    await bucket.put(stateKey, JSON.stringify(state), {
+    const created = await bucket.put(stateKey, JSON.stringify(proposedState), {
+      onlyIf: { etagDoesNotMatch: "*" },
       httpMetadata: { contentType: "application/json" },
       customMetadata: { sessionId: input.session.id, retentionUntil: input.session.retention_until },
     });
+    if (created) {
+      state = proposedState;
+    } else {
+      // Another authenticated start won the create-only race after our first
+      // read. Re-read its immutable protocol/shape and join only if every field
+      // matches; never let an old and new tab clobber each other's state.
+      const concurrentObject = await bucket.get(stateKey);
+      if (!concurrentObject) throw new Error("INTERVIEW_RECORDING_UPLOAD_BUSY");
+      const concurrent = parseRecordingUploadState(await r2ObjectText(concurrentObject));
+      if (
+        concurrent.version !== proposedState.version ||
+        concurrent.sessionId !== proposedState.sessionId ||
+        concurrent.contentType !== proposedState.contentType ||
+        concurrent.byteSize !== proposedState.byteSize ||
+        concurrent.partSize !== proposedState.partSize ||
+        concurrent.totalParts !== proposedState.totalParts ||
+        concurrent.audioCoverage !== proposedState.audioCoverage
+      ) {
+        throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+      }
+      state = concurrent;
+    }
   }
   const uploadedParts: number[] = [];
+  const uploadedPartReceipts: Array<{ index: number; sha256: string }> = [];
   for (let index = 0; index < state.totalParts; index += 1) {
     // Resume needs metadata only. Opening every stored part body here recreates
     // the same Worker connection exhaustion that previously broke finalization.
@@ -1969,17 +2041,46 @@ export async function beginResumableInterviewRecording(input: {
       : state.partSize;
     if (
       part?.size === expectedSize &&
-      Number(part.customMetadata?.byteSize ?? 0) === expectedSize
-    ) uploadedParts.push(index);
+      Number(part.customMetadata?.byteSize ?? 0) === expectedSize &&
+      // A pre-rollout Version 1 object may have no checksum. Do not tell a
+      // candidate client to skip it: force an exact replay so the PUT path can
+      // hash the stored body and prove that the browser still has the same
+      // bytes. Staff completion retains the size-only legacy recovery below.
+      /^[a-f0-9]{64}$/.test(part.customMetadata?.sha256 ?? "") &&
+      verifiedRecordingPartSha256(part, part.customMetadata?.sha256 ?? "")
+    ) {
+      uploadedParts.push(index);
+      if (state.version === 2) {
+        uploadedPartReceipts.push({ index, sha256: part.customMetadata?.sha256 ?? "" });
+      }
+    }
   }
-  return { stored: false, uploadedParts };
+  // The authorization snapshot was read before the R2 metadata walk. Staff
+  // recovery may finalize the same upload during that walk, so refresh the D1
+  // status at the end instead of returning a stale `stored: false` receipt.
+  const latestSession = input.session.recording_status === "stored"
+    ? input.session
+    : await getInterviewSessionState(input.session.id);
+  return {
+    stored: latestSession?.recording_status === "stored",
+    uploadVersion: state.version,
+    uploadedParts,
+    uploadedPartReceipts,
+    contentType: state.contentType,
+    byteSize: state.byteSize,
+    partSize: state.partSize,
+    totalParts: state.totalParts,
+    audioCoverage: state.audioCoverage,
+  };
 }
 
 export async function saveResumableInterviewRecordingPart(input: {
   sessionId: string;
   index: number;
   byteSize: number;
-  body: ReadableStream;
+  sha256?: string;
+  digestDeclared?: boolean;
+  body: ReadableStream | Uint8Array;
 }) {
   const bucket = bindings().RECORDINGS;
   if (!bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
@@ -1993,22 +2094,88 @@ export async function saveResumableInterviewRecordingPart(input: {
     ? state.byteSize - state.partSize * (state.totalParts - 1)
     : state.partSize;
   if (input.byteSize !== expectedSize) throw new Error("INTERVIEW_RECORDING_PART_SIZE_INVALID");
+  if (state.version === 2 && !/^[a-f0-9]{64}$/.test(input.sha256 ?? "")) {
+    throw new Error("INTERVIEW_RECORDING_PART_DIGEST_INVALID");
+  }
+  if (input.sha256 !== undefined && !/^[a-f0-9]{64}$/.test(input.sha256)) {
+    throw new Error("INTERVIEW_RECORDING_PART_DIGEST_INVALID");
+  }
   const key = recordingPartKey(input.sessionId, input.index);
-  // A duplicate retry is decided entirely from metadata; never open its body.
+  // New objects are verified from R2 checksum metadata. A genuinely
+  // pre-rollout Version 1 object has no checksum, so that one compatibility
+  // case consumes and hashes its bounded (<=8 MiB) body before acknowledging.
   const existing = await bucket.head(key);
+  const legacyExistingMatches = Boolean(
+    existing?.size === input.byteSize &&
+    Number(existing.customMetadata?.byteSize ?? 0) === input.byteSize &&
+    state.version === 1 &&
+    !existing.customMetadata?.sha256 &&
+    input.digestDeclared === false &&
+    input.sha256 &&
+    await legacyRecordingPartBodyMatches({
+      bucket,
+      key,
+      byteSize: input.byteSize,
+      sha256: input.sha256,
+    })
+  );
   if (
     existing?.size === input.byteSize &&
-    Number(existing.customMetadata?.byteSize ?? 0) === input.byteSize
+    Number(existing.customMetadata?.byteSize ?? 0) === input.byteSize &&
+    (
+      (input.sha256 && verifiedRecordingPartSha256(existing, input.sha256)) ||
+      // Only an object actually created before the checksum rollout may use
+      // the legacy size-only receipt. New requests always carry the SHA that
+      // the server computed from their exact buffered body.
+      legacyExistingMatches
+    )
   ) return { stored: true, duplicate: true };
+  // A deterministic part key is immutable once present. Replacing an existing
+  // object would let a delayed retry silently change a finalized recording.
+  if (existing) throw new Error("INTERVIEW_RECORDING_PART_DIGEST_CONFLICT");
   const stored = await bucket.put(key, input.body, {
+    // Make the deterministic part key create-only. This closes the race where
+    // two different same-size requests both observed an absent object.
+    onlyIf: { etagDoesNotMatch: "*" },
     httpMetadata: { contentType: "application/octet-stream" },
     customMetadata: {
       sessionId: input.sessionId,
       byteSize: String(input.byteSize),
+      ...(input.sha256 ? { sha256: input.sha256 } : {}),
       retentionUntil: state.retentionUntil,
     },
+    ...(input.sha256 ? { sha256: input.sha256 } : {}),
   });
-  if (stored.size !== input.byteSize) {
+  if (!stored) {
+    const concurrent = await bucket.head(key);
+    const legacyConcurrentMatches = Boolean(
+      concurrent?.size === input.byteSize &&
+      Number(concurrent.customMetadata?.byteSize ?? 0) === input.byteSize &&
+      state.version === 1 &&
+      !concurrent.customMetadata?.sha256 &&
+      input.digestDeclared === false &&
+      input.sha256 &&
+      await legacyRecordingPartBodyMatches({
+        bucket,
+        key,
+        byteSize: input.byteSize,
+        sha256: input.sha256,
+      })
+    );
+    if (
+      concurrent?.size === input.byteSize &&
+      Number(concurrent.customMetadata?.byteSize ?? 0) === input.byteSize &&
+      (
+        (input.sha256 && verifiedRecordingPartSha256(concurrent, input.sha256)) ||
+        legacyConcurrentMatches
+      )
+    ) return { stored: true, duplicate: true };
+    throw new Error("INTERVIEW_RECORDING_PART_DIGEST_CONFLICT");
+  }
+  if (
+    stored.size !== input.byteSize ||
+    (input.sha256 && !verifiedRecordingPartSha256(stored, input.sha256))
+  ) {
     throw new Error("INTERVIEW_RECORDING_PART_SIZE_INVALID");
   }
   return { stored: true, duplicate: false };
@@ -2029,19 +2196,25 @@ export async function completeResumableInterviewRecording(session: InterviewSess
     // slots and made Android recordings hang until the request was cancelled.
     const part = await bucket.head(key);
     const byteSize = Number(part?.customMetadata?.byteSize ?? 0);
+    const sha256 = part?.customMetadata?.sha256 ?? "";
     const expectedSize = index === state.totalParts - 1
       ? state.byteSize - state.partSize * (state.totalParts - 1)
       : state.partSize;
-    if (!part || part.size !== expectedSize || byteSize !== expectedSize) {
+    if (
+      !part ||
+      part.size !== expectedSize ||
+      byteSize !== expectedSize ||
+      !verifiedRecordingPartForCompletion(state, part)
+    ) {
       throw new Error("INTERVIEW_RECORDING_PART_MISSING");
     }
-    parts.push({ key, byteSize });
+    parts.push({ key, byteSize, ...(sha256 ? { sha256 } : {}) });
   }
   if (parts.reduce((total, part) => total + part.byteSize, 0) !== state.byteSize) {
     throw new Error("INTERVIEW_RECORDING_SIZE_MISMATCH");
   }
   const manifest: RecordingPartManifest = {
-    version: 1,
+    version: state.version,
     contentType: state.contentType,
     byteSize: state.byteSize,
     audioCoverage: state.audioCoverage,
@@ -2186,7 +2359,12 @@ async function loadRecordingObject(bucket: R2Bucket, objectKey: string) {
     return { body: object.body, etag: object.etag, customMetadata: object.customMetadata ?? {} };
   }
   const manifest = JSON.parse(await r2ObjectText(object)) as RecordingPartManifest;
-  if (manifest.version !== 1 || !Array.isArray(manifest.parts) || manifest.parts.length === 0) return null;
+  if (
+    ![1, 2].includes(manifest.version) ||
+    !Array.isArray(manifest.parts) ||
+    manifest.parts.length === 0 ||
+    (manifest.version === 2 && manifest.parts.some((part) => !/^[a-f0-9]{64}$/.test(part.sha256 ?? "")))
+  ) return null;
   let partIndex = 0;
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   const body = new ReadableStream<Uint8Array>({

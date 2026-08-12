@@ -186,6 +186,8 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /remoteAnalyser/);
   assert.match(source, /REMOTE_AUDIO_SILENT/);
   assert.match(recordingUploadSource, /X-Recording-Part-Index/);
+  assert.match(recordingUploadSource, /X-Recording-Part-Sha256/);
+  assert.match(recordingUploadSource, /crypto\.subtle\.digest\("SHA-256"/);
   assert.match(recordingUploadSource, /upload\/start/);
   assert.match(recordingUploadSource, /upload\/complete/);
   assert.doesNotMatch(source, /Promise\.race\(\[\s*recordingPromiseRef/);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 // vinext evaluates the worker module at import time. Set a non-secret fixture
@@ -20,6 +21,10 @@ const workerContext = {
 
 function request(path, init, env = workerEnv) {
   return worker.fetch(new Request(`http://localhost${path}`, init), env, workerContext);
+}
+
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 async function captureConsoleWarnings(callback) {
@@ -789,7 +794,12 @@ class FakeD1Statement {
     }
     if (this.sql.startsWith("SELECT id, status, recording_status")) {
       const session = this.database.sessions.get(this.values[0]);
-      return session ? { id: session.id, status: session.status, recording_status: session.recording_status } : null;
+      return session ? {
+        id: session.id,
+        status: session.status,
+        recording_status: session.recording_status,
+        transcript_json: session.transcript_json ?? null,
+      } : null;
     }
     if (this.sql.startsWith("SELECT id, candidate_name, employment, preferred_location")) {
       return this.database.sessions.get(this.values[0]) ?? null;
@@ -961,17 +971,28 @@ class FakeR2 {
 
   async put(key, body, options) {
     this.putCount += 1;
+    if (options?.onlyIf?.etagDoesNotMatch === "*" && this.objects.has(key)) return null;
     const bytes = body instanceof ReadableStream
       ? new Uint8Array(await new Response(body).arrayBuffer())
       : body instanceof Uint8Array
         ? Uint8Array.from(body)
         : body instanceof ArrayBuffer
           ? new Uint8Array(body.slice(0))
-          : typeof body === "string"
-            ? new TextEncoder().encode(body)
-            : new Uint8Array(await new Response(body).arrayBuffer());
+            : typeof body === "string"
+              ? new TextEncoder().encode(body)
+              : new Uint8Array(await new Response(body).arrayBuffer());
+    if (options?.sha256 && sha256Hex(bytes) !== options.sha256) {
+      throw new Error("R2_SHA256_MISMATCH");
+    }
     this.objects.set(key, { body: bytes, options });
-    return { etag: "test-etag", size: bytes.byteLength };
+    return {
+      etag: "test-etag",
+      size: bytes.byteLength,
+      customMetadata: options?.customMetadata ?? {},
+      checksums: options?.sha256
+        ? { sha256: Uint8Array.from(Buffer.from(options.sha256, "hex")).buffer }
+        : {},
+    };
   }
 
   async get(key, options = {}) {
@@ -1002,6 +1023,9 @@ class FakeR2 {
       etag: "test-etag",
       size: object.body.byteLength,
       customMetadata: object.options?.customMetadata ?? {},
+      checksums: object.options?.sha256
+        ? { sha256: Uint8Array.from(Buffer.from(object.options.sha256, "hex")).buffer }
+        : {},
     };
   }
 
@@ -2470,12 +2494,14 @@ test("resumable recording upload resumes 14 parts without opening stored body st
       partSize,
       totalParts,
       audioCoverage: "both",
+      uploadVersion: 2,
     }),
   }, env);
   assert.equal(start.status, 200, await start.clone().text());
   assert.deepEqual((await start.json()).uploadedParts, []);
 
   const uploadPart = async (index, size, fill) => {
+    const body = new Uint8Array(size).fill(fill);
     const part = await request("/api/interviews/recording/upload/part", {
       method: "PUT",
       headers: {
@@ -2483,19 +2509,83 @@ test("resumable recording upload resumes 14 parts without opening stored body st
         "Content-Type": "application/octet-stream",
         "X-Recording-Part-Index": String(index),
         "X-Recording-Part-Bytes": String(size),
+        "X-Recording-Part-Sha256": sha256Hex(body),
       },
-      body: new Uint8Array(size).fill(fill),
+      body,
     }, env);
     assert.equal(part.status, 200, await part.clone().text());
     return await part.json();
   };
 
+  const digestRequiredBody = new Uint8Array(partSize).fill(65);
+  const serverDigested = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(partSize),
+    },
+    body: digestRequiredBody,
+  }, env);
+  assert.equal(serverDigested.status, 200, await serverDigested.clone().text());
+  const malformedDigest = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "1",
+      "X-Recording-Part-Bytes": String(partSize),
+      "X-Recording-Part-Sha256": "not-a-sha256",
+    },
+    body: new Uint8Array(partSize).fill(66),
+  }, env);
+  assert.equal(malformedDigest.status, 400, "a malformed declared digest must fail");
+  assert.equal(recordings.objects.has(`interviews/${session.sessionId}/recording-parts/part-000`), true);
+  assert.equal(recordings.objects.has(`interviews/${session.sessionId}/recording-parts/part-001`), false);
+
   for (let index = 0; index < 7; index += 1) {
     await uploadPart(index, partSize, 65 + index);
   }
 
+  const firstPartObject = recordings.objects.get(`interviews/${session.sessionId}/recording-parts/part-000`);
+  const firstPartDigest = sha256Hex(new Uint8Array(partSize).fill(65));
+  assert.equal(firstPartObject.options.sha256, firstPartDigest, "R2 must validate the supplied checksum while storing");
+  assert.equal(firstPartObject.options.customMetadata.sha256, firstPartDigest, "resume metadata must retain the checksum");
+  const firstPartHead = await recordings.head(`interviews/${session.sessionId}/recording-parts/part-000`);
+  assert.equal(Buffer.from(firstPartHead.checksums.sha256).toString("hex"), firstPartDigest);
+
   const duplicate = await uploadPart(0, partSize, 65);
   assert.equal(duplicate.duplicate, true);
+  const conflictingBody = new Uint8Array(partSize).fill(66);
+  const conflictingDuplicate = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(partSize),
+      "X-Recording-Part-Sha256": sha256Hex(conflictingBody),
+    },
+    body: conflictingBody,
+  }, env);
+  assert.equal(conflictingDuplicate.status, 409, "same-size replacement bytes must never be accepted as a duplicate");
+  assert.equal(recordings.objects.get(`interviews/${session.sessionId}/recording-parts/part-000`).body[0], 65);
+  const forgedBody = new Uint8Array(partSize).fill(72);
+  const forgedDigest = sha256Hex(new Uint8Array(partSize).fill(73));
+  const forgedUpload = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "7",
+      "X-Recording-Part-Bytes": String(partSize),
+      "X-Recording-Part-Sha256": forgedDigest,
+    },
+    body: forgedBody,
+  }, env);
+  assert.equal(forgedUpload.status, 400, "the server must reject a forged body/digest pair before R2 storage");
+  assert.equal(recordings.objects.has(`interviews/${session.sessionId}/recording-parts/part-007`), false);
   const getCountBeforeResume = recordings.getCount;
   const headCountBeforeResume = recordings.headCount;
   const resume = await request("/api/interviews/recording/upload/start", {
@@ -2508,6 +2598,7 @@ test("resumable recording upload resumes 14 parts without opening stored body st
       partSize,
       totalParts,
       audioCoverage: "both",
+      uploadVersion: 2,
     }),
   }, env);
   const resumed = await resume.json();
@@ -2538,6 +2629,11 @@ test("resumable recording upload resumes 14 parts without opening stored body st
   assert.equal(recordings.headCount, headCountBeforeComplete + totalParts);
   assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
   assert.equal(database.artifacts.some((row) => String(row[2]).endsWith("recording.manifest.json")), true);
+  const manifestObject = recordings.objects.get(`interviews/${session.sessionId}/recording.manifest.json`);
+  const manifest = JSON.parse(new TextDecoder().decode(manifestObject.body));
+  assert.equal(manifest.version, 2);
+  assert.equal(manifest.parts.length, totalParts);
+  assert.equal(manifest.parts.every((part) => /^[a-f0-9]{64}$/.test(part.sha256)), true);
 
   const staffRecording = await request(`/api/staff/recording?sessionId=${session.sessionId}`, {
     headers: {
@@ -2558,7 +2654,10 @@ test("voice transcript seal is authenticated, fail-closed, and exactly idempoten
   const env = { ...workerEnv, DB: database };
   const session = await createTestInterviewSession(env);
   const stored = database.sessions.get(session.sessionId);
+  // Realtime call coverage separately proves that only a successful upstream
+  // voice connection moves a production session into this state.
   stored.status = "in_progress";
+  assert.equal(stored.status, "in_progress");
   const transcript = [
     { id: "voice-question-1", speaker: "interviewer", text: "志望理由を教えてください。", createdAt: "2026-08-12T10:00:00.000Z" },
     { id: "voice-answer-1", speaker: "candidate", text: " 犬とご家族に誠実に向き合います。 ", createdAt: "2026-08-12T10:00:10.000Z" },
@@ -3021,6 +3120,262 @@ test("recorded answer keeps durable audio pending across OpenAI quota failure an
   assert.equal(completedPayload.alreadyCompleted, true);
   assert.equal(upstreamCalls, 2, "a completed body-less replay must not call OpenAI again");
   assert.equal(recordings.putCount, 1, "a completed body-less replay must not re-upload audio");
+});
+
+test("forced 202 flow stores every recording part before a bodyless answer retry and completes", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  let upstreamCalls = 0;
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    OPENAI_API_KEY: "test-key-never-returned",
+    OPENAI_API: {
+      fetch: async () => {
+        upstreamCalls += 1;
+        if (upstreamCalls === 1) {
+          return Response.json(
+            { error: { code: "rate_limit_exceeded" } },
+            { status: 429, headers: { "Retry-After": "2" } },
+          );
+        }
+        return Response.json({ text: "録画確定後の再試行で復旧した実回答" });
+      },
+    },
+  };
+  const session = await createTestInterviewSession(env);
+  const authorization = `Bearer ${session.accessToken}`;
+  const candidateHeaders = {
+    Authorization: authorization,
+    "X-Interview-Session": session.sessionId,
+  };
+  const recordedStart = await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: candidateHeaders,
+  }, env);
+  assert.equal(recordedStart.status, 200, await recordedStart.clone().text());
+
+  const answerBytes = new TextEncoder().encode("forced-202-answer-stored-before-recording");
+  const capturedInitial = await captureConsoleWarnings(() => request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: {
+      ...candidateHeaders,
+      "Content-Type": "audio/webm",
+      "X-Recorded-Answer-Index": "1",
+      "X-Recorded-Answer-Bytes": String(answerBytes.byteLength),
+    },
+    body: answerBytes,
+  }, env));
+  const initialAnswer = capturedInitial.value;
+  const initialAnswerPayload = await initialAnswer.json();
+  assert.equal(initialAnswer.status, 202, JSON.stringify(initialAnswerPayload));
+  assert.deepEqual(initialAnswerPayload, {
+    stored: true,
+    transcribed: false,
+    pending: true,
+    answerIndex: 1,
+    retryAfterSeconds: 2,
+  });
+  assert.equal(Number.isInteger(initialAnswerPayload.retryAfterSeconds), true);
+  assert.ok(initialAnswerPayload.retryAfterSeconds > 0);
+  assert.equal(initialAnswer.headers.get("Retry-After"), String(initialAnswerPayload.retryAfterSeconds));
+  assert.equal(recordings.putCount, 1, "the initial answer audio must be durable before the 202 receipt");
+
+  await sealRecordedCompletion(env, session, 1);
+
+  const partSize = 256 * 1024;
+  const recordingByteSize = partSize + 17;
+  const totalParts = 2;
+  const startPayload = {
+    sessionId: session.sessionId,
+    contentType: "video/webm",
+    byteSize: recordingByteSize,
+    partSize,
+    totalParts,
+    audioCoverage: "both",
+    uploadVersion: 2,
+  };
+  const uploadStart = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...candidateHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify(startPayload),
+  }, env);
+  const uploadStartPayload = await uploadStart.json();
+  assert.equal(uploadStart.status, 200, JSON.stringify(uploadStartPayload));
+  assert.deepEqual(uploadStartPayload, {
+    stored: false,
+    uploadVersion: 2,
+    uploadedParts: [],
+    uploadedPartReceipts: [],
+    contentType: "video/webm",
+    byteSize: recordingByteSize,
+    partSize,
+    totalParts,
+    audioCoverage: "both",
+  });
+
+  const unauthenticatedPart = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      "X-Interview-Session": session.sessionId,
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(partSize),
+      "Content-Type": "application/octet-stream",
+    },
+    body: new Uint8Array(partSize).fill(3),
+  }, env);
+  assert.equal(unauthenticatedPart.status, 401);
+  assert.equal((await unauthenticatedPart.json()).index, undefined, "unauthenticated responses must not echo an index");
+
+  const uploadPart = async (index, byteSize) => {
+    const body = new Uint8Array(byteSize).fill(index + 11);
+    const response = await request("/api/interviews/recording/upload/part", {
+      method: "PUT",
+      headers: {
+        ...candidateHeaders,
+        "X-Recording-Part-Index": String(index),
+        "X-Recording-Part-Bytes": String(byteSize),
+        "X-Recording-Part-Sha256": sha256Hex(body),
+        "Content-Type": "application/octet-stream",
+      },
+      body,
+    }, env);
+    const payload = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(payload));
+    assert.deepEqual(payload, { stored: true, duplicate: false, index });
+  };
+  await uploadPart(0, partSize);
+  await uploadPart(1, 17);
+  const duplicatePart = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...candidateHeaders,
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(partSize),
+      "X-Recording-Part-Sha256": sha256Hex(new Uint8Array(partSize).fill(11)),
+      "Content-Type": "application/octet-stream",
+    },
+    body: new Uint8Array(partSize).fill(11),
+  }, env);
+  const duplicatePartPayload = await duplicatePart.json();
+  assert.equal(duplicatePart.status, 200, JSON.stringify(duplicatePartPayload));
+  assert.deepEqual(duplicatePartPayload, { stored: true, duplicate: true, index: 0 });
+
+  const resume = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...candidateHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify(startPayload),
+  }, env);
+  const resumePayload = await resume.json();
+  assert.equal(resume.status, 200, JSON.stringify(resumePayload));
+  assert.deepEqual(resumePayload.uploadedParts, [0, 1]);
+  assert.equal(resumePayload.byteSize, recordingByteSize);
+  assert.equal(resumePayload.partSize, partSize);
+  assert.equal(resumePayload.totalParts, totalParts);
+
+  const finalize = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers: candidateHeaders,
+  }, env);
+  const finalizePayload = await finalize.json();
+  assert.equal(finalize.status, 200, JSON.stringify(finalizePayload));
+  assert.deepEqual(finalizePayload, { stored: true, byteSize: recordingByteSize, totalParts });
+
+  const pendingCompletion = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: { ...candidateHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 1 }),
+  }, env);
+  const pendingCompletionPayload = await pendingCompletion.json();
+  assert.equal(pendingCompletion.status, 409, JSON.stringify(pendingCompletionPayload));
+  assert.equal(pendingCompletionPayload.stored, false);
+  assert.equal(pendingCompletionPayload.transcriptionPending, true);
+  assert.equal(pendingCompletionPayload.completedAnswerCount, 0);
+  assert.deepEqual(pendingCompletionPayload.missingAnswerIndexes, [1]);
+
+  const finalizeReplay = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers: candidateHeaders,
+  }, env);
+  assert.equal(finalizeReplay.status, 200, await finalizeReplay.clone().text());
+  assert.deepEqual(await finalizeReplay.json(), { stored: true, alreadyStored: true });
+  const storedReadback = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...candidateHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify(startPayload),
+  }, env);
+  const storedReadbackPayload = await storedReadback.json();
+  assert.equal(storedReadback.status, 200, JSON.stringify(storedReadbackPayload));
+  assert.deepEqual(storedReadbackPayload, {
+    stored: true,
+    uploadVersion: 2,
+    uploadedParts: [0, 1],
+    uploadedPartReceipts: [
+      { index: 0, sha256: sha256Hex(new Uint8Array(partSize).fill(11)) },
+      { index: 1, sha256: sha256Hex(new Uint8Array(17).fill(12)) },
+    ],
+    contentType: "video/webm",
+    byteSize: recordingByteSize,
+    partSize,
+    totalParts,
+    audioCoverage: "both",
+  });
+
+  database.recordedAnswers.get(`${session.sessionId}:1`).next_retry_at = new Date(0).toISOString();
+  const r2PutCountBeforeRetry = recordings.putCount;
+  const capturedRetry = await captureConsoleWarnings(() => request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: {
+      ...candidateHeaders,
+      "X-Recorded-Answer-Index": "1",
+    },
+  }, env));
+  const retriedAnswer = capturedRetry.value;
+  const retriedAnswerPayload = await retriedAnswer.json();
+  assert.equal(retriedAnswer.status, 200, JSON.stringify(retriedAnswerPayload));
+  assert.deepEqual(retriedAnswerPayload, {
+    stored: true,
+    transcribed: true,
+    answerIndex: 1,
+    alreadyCompleted: false,
+  });
+  assert.equal(recordings.putCount, r2PutCountBeforeRetry, "bodyless retry must not upload any replacement object");
+  assert.equal(upstreamCalls, 2);
+
+  const completion = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: { ...candidateHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 1 }),
+  }, env);
+  const completionPayload = await completion.json();
+  assert.equal(completion.status, 200, JSON.stringify(completionPayload));
+  assert.deepEqual(completionPayload, { stored: true, humanReviewRequired: true });
+  const transcript = JSON.parse(database.sessions.get(session.sessionId).transcript_json);
+  assert.equal(transcript.find((turn) => turn.speaker === "candidate").text, "録画確定後の再試行で復旧した実回答");
+
+  // This is the exact race contract used by the production E2E when staff
+  // recovery completes the session before the candidate's bodyless retry.
+  const answerAfterCompletion = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: {
+      ...candidateHeaders,
+      "X-Recorded-Answer-Index": "1",
+    },
+  }, env);
+  assert.equal(answerAfterCompletion.status, 409);
+  const completionReplay = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: { ...candidateHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 1 }),
+  }, env);
+  const completionReplayPayload = await completionReplay.json();
+  assert.equal(completionReplay.status, 200, JSON.stringify(completionReplayPayload));
+  assert.deepEqual(completionReplayPayload, {
+    stored: true,
+    humanReviewRequired: true,
+    alreadyCompleted: true,
+  });
 });
 
 test("recorded transcription retry diagnostics sanitize upstream, timeout, and transport failures", async (t) => {
@@ -3745,6 +4100,7 @@ test("staff polling finalizes all uploaded recording parts after a sealed candid
       partSize: 256 * 1024,
       totalParts: 1,
       audioCoverage: "both",
+      uploadVersion: 2,
     }),
   }, env);
   assert.equal(startUpload.status, 200);
@@ -3755,6 +4111,7 @@ test("staff polling finalizes all uploaded recording parts after a sealed candid
       "X-Interview-Session": session.sessionId,
       "X-Recording-Part-Index": "0",
       "X-Recording-Part-Bytes": String(recordingBytes.byteLength),
+      "X-Recording-Part-Sha256": sha256Hex(recordingBytes),
       "Content-Type": "application/octet-stream",
     },
     body: recordingBytes,
@@ -3813,6 +4170,7 @@ test("staff polling finalizes normal voice recording parts only behind the durab
       partSize: 256 * 1024,
       totalParts: 1,
       audioCoverage: "both",
+      uploadVersion: 2,
     }),
   }, env);
   assert.equal(start.status, 200);
@@ -3823,6 +4181,7 @@ test("staff polling finalizes normal voice recording parts only behind the durab
       "X-Interview-Session": session.sessionId,
       "X-Recording-Part-Index": "0",
       "X-Recording-Part-Bytes": String(recordingBytes.byteLength),
+      "X-Recording-Part-Sha256": sha256Hex(recordingBytes),
       "Content-Type": "application/octet-stream",
     },
     body: recordingBytes,
@@ -3881,6 +4240,7 @@ test("staff voice recovery leaves an upload with any missing part non-stored", a
       partSize,
       totalParts: 2,
       audioCoverage: "both",
+      uploadVersion: 2,
     }),
   }, env);
   assert.equal(start.status, 200);
@@ -3891,6 +4251,7 @@ test("staff voice recovery leaves an upload with any missing part non-stored", a
       "X-Interview-Session": session.sessionId,
       "X-Recording-Part-Index": "0",
       "X-Recording-Part-Bytes": String(partSize),
+      "X-Recording-Part-Sha256": sha256Hex(new Uint8Array(partSize).fill(31)),
       "Content-Type": "application/octet-stream",
     },
     body: new Uint8Array(partSize).fill(31),
@@ -3932,6 +4293,7 @@ test("recording parts compare R2 actual size and never trust only the declared m
       partSize: declaredBytes,
       totalParts: 1,
       audioCoverage: "both",
+      uploadVersion: 2,
     }),
   }, env);
   assert.equal(start.status, 200);
@@ -3943,11 +4305,32 @@ test("recording parts compare R2 actual size and never trust only the declared m
       "X-Interview-Session": session.sessionId,
       "X-Recording-Part-Index": "0",
       "X-Recording-Part-Bytes": String(declaredBytes),
+      "X-Recording-Part-Sha256": sha256Hex(new Uint8Array([1])),
       "Content-Type": "application/octet-stream",
     },
     body: new Uint8Array([1]),
   }, env);
   assert.equal(truncated.status, 400);
+  assert.equal(
+    recordings.objects.has(`interviews/${session.sessionId}/recording-parts/part-000`),
+    false,
+    "a short request body must be rejected before creating its immutable R2 key",
+  );
+
+  const completeBody = new Uint8Array(declaredBytes).fill(2);
+  const recoveredPart = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(declaredBytes),
+      "X-Recording-Part-Sha256": sha256Hex(completeBody),
+      "Content-Type": "application/octet-stream",
+    },
+    body: completeBody,
+  }, env);
+  assert.equal(recoveredPart.status, 200, await recoveredPart.clone().text());
 
   const resume = await request("/api/interviews/recording/upload/start", {
     method: "POST",
@@ -3959,10 +4342,11 @@ test("recording parts compare R2 actual size and never trust only the declared m
       partSize: declaredBytes,
       totalParts: 1,
       audioCoverage: "both",
+      uploadVersion: 2,
     }),
   }, env);
   assert.equal(resume.status, 200);
-  assert.deepEqual((await resume.json()).uploadedParts, [], "truncated R2 data must be re-uploaded, never acknowledged");
+  assert.deepEqual((await resume.json()).uploadedParts, [0], "the exact retry must be acknowledged after the short body is rejected");
 
   const complete = await request("/api/interviews/recording/upload/complete", {
     method: "POST",
@@ -3971,9 +4355,243 @@ test("recording parts compare R2 actual size and never trust only the declared m
       "X-Interview-Session": session.sessionId,
     },
   }, env);
-  assert.equal(complete.status, 409);
-  assert.notEqual(database.sessions.get(session.sessionId).recording_status, "stored");
-  assert.equal(database.artifacts.some((artifact) => artifact[1] === session.sessionId), false);
+  assert.equal(complete.status, 200, await complete.clone().text());
+  assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
+  assert.equal(database.artifacts.some((artifact) => artifact[1] === session.sessionId), true);
+});
+
+test("a pre-deploy tab that starts uploading after deployment can finish as Version 1", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const session = await createTestInterviewSession(env);
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const recordingBytes = new Uint8Array(1_024).fill(91);
+  const commonHeaders = {
+    Authorization: `Bearer ${session.accessToken}`,
+    "X-Interview-Session": session.sessionId,
+  };
+  const start = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...commonHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize: recordingBytes.byteLength,
+      partSize: 256 * 1024,
+      totalParts: 1,
+      audioCoverage: "both",
+    }),
+  }, env);
+  assert.equal(start.status, 200);
+
+  // The old client has no uploadVersion field. Even when this start request
+  // reaches the new server after a long interview, it must create Version 1 so
+  // the legacy client can send its locally held parts without SHA headers.
+  const stateKey = `interviews/${session.sessionId}/recording-parts/upload.json`;
+  const stateObject = recordings.objects.get(stateKey);
+  const state = JSON.parse(new TextDecoder().decode(stateObject.body));
+  assert.equal(state.version, 1);
+
+  const part = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(recordingBytes.byteLength),
+    },
+    body: recordingBytes,
+  }, env);
+  assert.equal(part.status, 200, await part.clone().text());
+  assert.deepEqual(await part.json(), { stored: true, duplicate: false, index: 0 });
+  const partKey = `interviews/${session.sessionId}/recording-parts/part-000`;
+  const storedPart = recordings.objects.get(partKey);
+  const expectedDigest = sha256Hex(recordingBytes);
+  assert.equal(storedPart.options.customMetadata.sha256, expectedDigest);
+  assert.equal(storedPart.options.sha256, expectedDigest, "the server must checksum an old-tab upload even without a digest header");
+
+  const conflictingRetry = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(recordingBytes.byteLength),
+    },
+    body: new Uint8Array(recordingBytes.byteLength).fill(92),
+  }, env);
+  assert.equal(conflictingRetry.status, 409, "omitting the version and digest must not downgrade same-size content checks");
+
+  const exactRetry = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(recordingBytes.byteLength),
+    },
+    body: recordingBytes,
+  }, env);
+  assert.equal(exactRetry.status, 200, await exactRetry.clone().text());
+  assert.deepEqual(await exactRetry.json(), { stored: true, duplicate: true, index: 0 });
+  const complete = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers: commonHeaders,
+  }, env);
+  assert.equal(complete.status, 200, await complete.clone().text());
+  assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
+});
+
+test("concurrent old and new upload starts cannot overwrite each other's protocol state", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const session = await createTestInterviewSession(env);
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const stateKey = `interviews/${session.sessionId}/recording-parts/upload.json`;
+  const originalPut = recordings.put.bind(recordings);
+  let firstStatePutReached;
+  let releaseFirstStatePut;
+  const reached = new Promise((resolve) => { firstStatePutReached = resolve; });
+  const release = new Promise((resolve) => { releaseFirstStatePut = resolve; });
+  let blockFirstStatePut = true;
+  recordings.put = async (key, body, options) => {
+    if (key === stateKey && blockFirstStatePut) {
+      blockFirstStatePut = false;
+      firstStatePutReached();
+      await release;
+    }
+    return await originalPut(key, body, options);
+  };
+  const common = {
+    sessionId: session.sessionId,
+    contentType: "video/webm",
+    byteSize: 1_024,
+    partSize: 256 * 1024,
+    totalParts: 1,
+    audioCoverage: "both",
+  };
+  const headers = { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" };
+  const newClient = request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...common, uploadVersion: 2 }),
+  }, env);
+  await reached;
+  const oldClient = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(common),
+  }, env);
+  releaseFirstStatePut();
+  const newClientResponse = await newClient;
+  assert.equal(oldClient.status, 200, await oldClient.clone().text());
+  assert.equal(newClientResponse.status, 409, await newClientResponse.clone().text());
+  const persisted = JSON.parse(new TextDecoder().decode(recordings.objects.get(stateKey).body));
+  assert.equal(persisted.version, 1, "the create-only winner must remain immutable");
+});
+
+test("a checksum-less pre-rollout Version 1 part is re-acknowledged only for the exact stored bytes", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const session = await createTestInterviewSession(env);
+  const storedSession = database.sessions.get(session.sessionId);
+  storedSession.status = "in_progress";
+  const originalBytes = new Uint8Array(1_024).fill(71);
+  const stateKey = `interviews/${session.sessionId}/recording-parts/upload.json`;
+  const partKey = `interviews/${session.sessionId}/recording-parts/part-000`;
+  const headers = {
+    Authorization: `Bearer ${session.accessToken}`,
+    "X-Interview-Session": session.sessionId,
+  };
+  const shape = {
+    sessionId: session.sessionId,
+    contentType: "video/webm",
+    byteSize: originalBytes.byteLength,
+    partSize: 256 * 1024,
+    totalParts: 1,
+    audioCoverage: "both",
+  };
+  const initialStart = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify(shape),
+  }, env);
+  assert.equal(initialStart.status, 200);
+  assert.equal(JSON.parse(new TextDecoder().decode(recordings.objects.get(stateKey).body)).version, 1);
+
+  // Reproduce an object accepted before checksum metadata was introduced.
+  await recordings.put(partKey, originalBytes, {
+    httpMetadata: { contentType: "application/octet-stream" },
+    customMetadata: {
+      sessionId: session.sessionId,
+      byteSize: String(originalBytes.byteLength),
+      retentionUntil: storedSession.retention_until,
+    },
+  });
+  const resume = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify(shape),
+  }, env);
+  assert.equal(resume.status, 200);
+  assert.deepEqual((await resume.json()).uploadedParts, [], "an unverified legacy part must be replayed, not skipped");
+
+  const conflicting = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...headers,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(originalBytes.byteLength),
+    },
+    body: new Uint8Array(originalBytes.byteLength).fill(72),
+  }, env);
+  assert.equal(conflicting.status, 409, "same-size replacement bytes cannot inherit the old receipt");
+  assert.deepEqual(recordings.objects.get(partKey).body, originalBytes, "the legacy object must remain immutable");
+
+  const exact = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...headers,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(originalBytes.byteLength),
+    },
+    body: originalBytes,
+  }, env);
+  assert.equal(exact.status, 200, await exact.clone().text());
+  assert.deepEqual(await exact.json(), { stored: true, duplicate: true, index: 0 });
+  const complete = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers,
+  }, env);
+  assert.equal(complete.status, 200, await complete.clone().text());
+  assert.equal(storedSession.recording_status, "stored");
+});
+
+test("a completed non-recorded interview cannot forge the recorded completion replay receipt", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "completed";
+  stored.recording_status = "stored";
+  stored.transcript_json = JSON.stringify([{
+    id: "voice-answer-1",
+    speaker: "candidate",
+    text: "通常音声面接の回答です。",
+    createdAt: new Date().toISOString(),
+  }]);
+  const replay = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 1 }),
+  }, env);
+  assert.equal(replay.status, 409, await replay.clone().text());
+  assert.equal((await replay.json()).stored, undefined);
 });
 
 test("recorded answer rejects cross-origin, oversize, and conflicting replacement audio", async () => {

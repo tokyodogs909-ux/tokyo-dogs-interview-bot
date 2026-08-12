@@ -23,6 +23,7 @@ export async function POST(request: Request) {
       partSize?: number;
       totalParts?: number;
       audioCoverage?: string;
+      uploadVersion?: number;
     };
     const sessionId = payload.sessionId?.trim() ?? "";
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
@@ -43,7 +44,19 @@ export async function POST(request: Request) {
       audioCoverage: payload.audioCoverage ?? "",
     });
     if (!shape) return noStoreJson({ error: "録画の分割情報を確認できません。" }, { status: 400 });
-    const result = await beginResumableInterviewRecording({ session: authorized.session, ...shape });
+    // Tabs opened before the SHA-256 rollout do not send uploadVersion. Keep
+    // those in Version 1 so a 15-27 minute interview that spans deployment can
+    // still upload its locally held recording. Only the new client explicitly
+    // opts into the stricter Version 2 part-digest contract.
+    const uploadVersion = payload.uploadVersion === undefined ? 1 : payload.uploadVersion;
+    if (uploadVersion !== 1 && uploadVersion !== 2) {
+      return noStoreJson({ error: "録画の分割情報を確認できません。" }, { status: 400 });
+    }
+    const result = await beginResumableInterviewRecording({
+      session: authorized.session,
+      ...shape,
+      uploadVersion,
+    });
     return noStoreJson(result);
   } catch (error) {
     const code = error instanceof Error ? error.message : "";
