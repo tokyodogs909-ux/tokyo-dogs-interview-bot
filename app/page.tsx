@@ -3068,6 +3068,8 @@ export default function Home() {
           {processingWarning && <div className="validation-box"><strong>記録状態を採用担当者が確認します</strong><p>{processingWarning}</p></div>}
           {recordingUploadState === "stored" && <div className="validation-box"><strong>オンライン一次面接の記録を受け付けました</strong><p>録画は面接IDで保管し、採用担当者以外には開示しません。</p></div>}
           {archiveSyncState === "stored" && <div className="validation-box"><strong>社内Driveへの格納まで完了しました</strong><p>録画・文字起こし・評価資料の格納結果をサーバーで再確認済みです。</p></div>}
+          {archiveSyncState === "syncing" && <div className="validation-box"><strong>社内Driveへの格納を確認中です</strong><p>録画を含む全資料の実読取が終わるまで、この画面を閉じずにお待ちください。</p></div>}
+          {archiveSyncState === "error" && <div className="validation-box"><strong>社内Driveへの格納を再確認できます</strong><p>録画本体は面接IDで保存済みです。この画面を閉じずに再確認してください。</p><button type="button" className="secondary-action" onClick={() => void syncInterviewArchive()}>Drive格納を再確認</button></div>}
           {mode === "text" && <div className="validation-box"><strong>文字入力によるオンライン一次面接を受け付けました</strong><p>カメラ・マイク・録画は使用していません。回答内容は採用担当者が確認します。</p></div>}
           {recordingUploadState === "error" && <div className="validation-box"><strong>録画の送信を再開できます</strong><p>受信済みの部分は再送せず、未送信部分から再開します。この画面を閉じずに再試行してください。</p><button type="button" className="secondary-action" onClick={() => void retryRecordingUpload()}>録画送信を再試行</button></div>}
           <div className="review-actions"><div><span>{mode === "internal-test" ? "確認時間" : "面接時間"}</span><strong>{formatTime(elapsed)}</strong></div>{mode === "internal-test" && <button className="secondary-action" onClick={resetInterview}>最初から確認</button>}</div>

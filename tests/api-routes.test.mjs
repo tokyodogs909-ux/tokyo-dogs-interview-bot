@@ -1184,11 +1184,13 @@ test("candidate foreground archive waits for Drive readback and stores all six a
       },
       body: JSON.stringify({ sessionId: session.sessionId }),
     }, env);
+    const responseHeadersElapsed = Date.now() - archiveStartedAt;
     const payload = await response.json();
     assert.equal(response.status, 200, JSON.stringify({ payload, sync: database.externalSyncs.get(session.sessionId), uploadedNames, createdFolders }));
     assert.equal(payload.stored, true);
     assert.equal(payload.recordingIncluded, true);
     assert.equal(recordingUploadFinished, true, "the API must not respond before the recording upload finishes");
+    assert.ok(responseHeadersElapsed < 70, "streaming headers must arrive before the simulated Drive upload completes");
     assert.deepEqual(recordingUploadRanges, [
       `bytes 0-8388607/${recordingBytes.byteLength}`,
       `bytes 0-8388607/${recordingBytes.byteLength}`,

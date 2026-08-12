@@ -1,6 +1,6 @@
 import { syncInterviewToGoogleDrive } from "@/lib/google-drive-sync";
 import { authorizeInterviewRequest } from "@/lib/interview-persistence";
-import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { hasTrustedRequestOrigin, noStoreJson, noStoreJsonStream } from "@/lib/openai-server";
 
 /**
  * Completes the applicant's own Drive archive in the foreground. Cloudflare
@@ -24,12 +24,27 @@ export async function POST(request: Request) {
     if (!authorized?.session) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
     }
-    const result = await syncInterviewToGoogleDrive(sessionId);
-    return noStoreJson({ stored: result.status === "completed", recordingIncluded: result.recordingIncluded });
+    return noStoreJsonStream(async () => {
+      try {
+        const result = await syncInterviewToGoogleDrive(sessionId);
+        return { stored: result.status === "completed", recordingIncluded: result.recordingIncluded };
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "";
+        const safeCode = /^[A-Z0-9_:-]{3,120}$/.test(code) ? code : "INTERVIEW_ARCHIVE_FAILED";
+        console.error("interview_archive_failed", { code: safeCode });
+        const archiveNotReady = code === "INTERVIEW_NOT_READY_FOR_DRIVE_SYNC" ||
+          code === "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC" ||
+          code === "INTERVIEW_RECORDING_ARTIFACT_MISSING";
+        return {
+          stored: false,
+          error: archiveNotReady
+            ? "録画と面接記録の保存完了後に社内格納できます。"
+            : "面接記録の社内格納を完了できませんでした。採用担当者が保存状態を確認します。",
+        };
+      }
+    });
   } catch (error) {
     const code = error instanceof Error ? error.message : "";
-    const safeCode = /^[A-Z0-9_:-]{3,120}$/.test(code) ? code : "INTERVIEW_ARCHIVE_FAILED";
-    console.error("interview_archive_failed", { code: safeCode });
     const archiveNotReady = code === "INTERVIEW_NOT_READY_FOR_DRIVE_SYNC" ||
       code === "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC" ||
       code === "INTERVIEW_RECORDING_ARTIFACT_MISSING";

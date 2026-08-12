@@ -137,6 +137,61 @@ export function noStoreJson(payload: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(payload), { ...init, headers });
 }
 
+/**
+ * Starts an application/json response immediately and emits legal JSON
+ * whitespace while a long foreground operation is still running. Sites' public
+ * dispatch path canceled an otherwise-connected archive request after about 167
+ * seconds when no response headers or body had been produced. A streamed body
+ * also keeps the Worker invocation alive under Cloudflare's documented HTTP
+ * execution model, while the final JSON remains compatible with response.json().
+ */
+export function noStoreJsonStream(task: () => Promise<unknown>) {
+  const encoder = new TextEncoder();
+  let stopped = false;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const write = (value: string) => {
+        if (stopped) return;
+        try {
+          controller.enqueue(encoder.encode(value));
+        } catch {
+          stopped = true;
+        }
+      };
+      // Leading whitespace is valid JSON and forces headers through every proxy
+      // before the Drive work starts waiting on R2 or Google.
+      write(" \n");
+      heartbeat = setInterval(() => write(" \n"), 10_000);
+      void task().then((payload) => {
+        write(JSON.stringify(payload));
+      }).catch(() => {
+        write(JSON.stringify({
+          stored: false,
+          error: "面接記録の社内格納を完了できませんでした。採用担当者が保存状態を確認します。",
+        }));
+      }).finally(() => {
+        if (heartbeat) clearInterval(heartbeat);
+        heartbeat = null;
+        if (!stopped) controller.close();
+        stopped = true;
+      });
+    },
+    cancel() {
+      stopped = true;
+      if (heartbeat) clearInterval(heartbeat);
+      heartbeat = null;
+    },
+  });
+  return new Response(body, {
+    headers: {
+      "Cache-Control": "no-store, no-transform",
+      "Content-Type": "application/json; charset=utf-8",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
 export function safeOpenAIError(status: number, code?: string) {
   if (code === "insufficient_quota") {
     return "オンライン一次面接の接続設定が完了していません。採用担当者へご連絡ください。";
