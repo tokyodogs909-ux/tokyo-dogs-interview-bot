@@ -183,6 +183,10 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(recordingUploadSource, /upload\/start/);
   assert.match(recordingUploadSource, /upload\/complete/);
   assert.doesNotMatch(source, /Promise\.race\(\[\s*recordingPromiseRef/);
+  assert.ok(
+    source.indexOf("await recordingUpload;") < source.indexOf("await completeRecordedFallback();"),
+    "recording storage must finish before fallback completion can start the Drive archive",
+  );
   assert.match(source, /await startRecording\(activeStream, displayStreamRef\.current, remoteStreamRef\.current, \{/);
   assert.match(source, /resume: !isNewInterviewSession/);
   assert.match(source, /recordedInterviewSessionRef/);

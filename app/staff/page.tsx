@@ -60,6 +60,7 @@ type InterviewListItem = {
   driveStatus: string | null;
   driveFolderUrl: string | null;
   driveUpdatedAt: string | null;
+  driveRecordingIncluded: boolean | null;
 };
 
 type ArchiveHealth = {
@@ -123,6 +124,26 @@ function formatRetentionDate(value: string) {
     month: "2-digit",
     day: "2-digit",
   }).format(date);
+}
+
+function driveArchiveLabel(item: InterviewListItem) {
+  if (item.driveStatus === "failed") return "Drive要確認";
+  if (item.driveStatus === "running") return "Drive格納中";
+  if (item.driveStatus === "pending") return "Drive格納待ち";
+  if (item.driveStatus !== "completed") return "Drive未格納";
+  if (item.recordingStatus === "not_applicable") return "Drive格納済み";
+  return item.recordingStatus === "stored" && item.driveRecordingIncluded === true
+    ? "動画含め格納済み"
+    : "動画を自動復旧中";
+}
+
+function driveArchiveClass(item: InterviewListItem) {
+  if (
+    item.driveStatus === "completed" &&
+    item.recordingStatus !== "not_applicable" &&
+    !(item.recordingStatus === "stored" && item.driveRecordingIncluded === true)
+  ) return "attention";
+  return item.driveStatus ?? "not-started";
 }
 
 function isTextInterviewRecord(value: ReviewRecord | null) {
@@ -484,7 +505,7 @@ export default function StaffReviewPage() {
                 <span className="staff-inbox-name"><strong>{item.candidateName || "氏名未登録"}{newCompletedIds.has(item.sessionId) && <em>新着完了</em>}</strong><small>{item.employment}・{item.location}</small></span>
                 <span className="staff-inbox-state"><strong>{interviewStatusLabels[item.status] ?? item.status}</strong><small>{recordingStatusLabels[item.recordingStatus] ?? item.recordingStatus}</small></span>
                 <span className="staff-inbox-date"><strong>{formatInterviewDate(item.createdAt)}</strong><small>保存見直し {formatRetentionDate(item.retentionUntil)}</small><small>{item.sessionId}</small></span>
-                <span className={`staff-inbox-drive drive-${item.driveStatus ?? "not-started"}`}>{item.driveStatus === "completed" ? "Drive格納済み" : item.driveStatus === "failed" ? "Drive要確認" : item.driveStatus === "running" ? "Drive格納中" : "Drive未格納"}</span>
+                <span className={`staff-inbox-drive drive-${driveArchiveClass(item)}`}>{driveArchiveLabel(item)}</span>
                 <span className="staff-inbox-arrow">→</span>
               </button>
             ))}

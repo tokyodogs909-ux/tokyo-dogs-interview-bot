@@ -2,8 +2,9 @@ import {
   authorizeReviewerRequest,
   listInterviewSummaries,
 } from "@/lib/interview-persistence";
-import { planDriveRecovery, summarizeDriveArchives } from "@/lib/drive-recovery.js";
+import { planDriveRecovery, planRecordingRecovery, summarizeDriveArchives } from "@/lib/drive-recovery.js";
 import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
+import { scheduleInterruptedInterviewRecovery } from "@/lib/interview-recovery";
 import { noStoreJson } from "@/lib/openai-server";
 
 export async function GET(request: Request) {
@@ -14,11 +15,16 @@ export async function GET(request: Request) {
     }
     const polling = new URL(request.url).searchParams.get("poll") === "1";
     const interviews = await listInterviewSummaries(reviewer, 50, { audit: !polling });
+    const recordingRecoverySessionIds = planRecordingRecovery(interviews) as string[];
+    recordingRecoverySessionIds.forEach((sessionId) => scheduleInterruptedInterviewRecovery(sessionId));
     const recoverySessionIds = planDriveRecovery(interviews) as string[];
     recoverySessionIds.forEach((sessionId) => scheduleGoogleDriveSync(sessionId));
     return noStoreJson({
       interviews,
-      archiveHealth: summarizeDriveArchives(interviews, recoverySessionIds),
+      archiveHealth: summarizeDriveArchives(interviews, [
+        ...recordingRecoverySessionIds,
+        ...recoverySessionIds,
+      ]),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "";

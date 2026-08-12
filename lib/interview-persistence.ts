@@ -1072,6 +1072,7 @@ export type InterviewListItem = {
   driveStatus: string | null;
   driveFolderUrl: string | null;
   driveUpdatedAt: string | null;
+  driveRecordingIncluded: boolean | null;
 };
 
 export async function listInterviewSummaries(
@@ -1086,7 +1087,8 @@ export async function listInterviewSummaries(
   const rows = await db.prepare(`SELECT
     s.id, s.candidate_name, s.employment, s.preferred_location,
     s.status, s.recording_status, s.created_at, s.completed_at, s.retention_until,
-    d.status AS drive_status, d.folder_url AS drive_folder_url, d.updated_at AS drive_updated_at
+    d.status AS drive_status, d.folder_url AS drive_folder_url, d.updated_at AS drive_updated_at,
+    d.manifest_json AS drive_manifest_json
     FROM interview_sessions AS s
     LEFT JOIN interview_external_syncs AS d
       ON d.session_id = s.id AND d.provider = 'google_drive'
@@ -1094,20 +1096,24 @@ export async function listInterviewSummaries(
     LIMIT ?`)
     .bind(safeLimit)
     .all<Record<string, unknown>>();
-  const items: InterviewListItem[] = (rows.results ?? []).map((row) => ({
-    sessionId: String(row.id ?? ""),
-    candidateName: String(row.candidate_name ?? ""),
-    employment: String(row.employment ?? ""),
-    location: String(row.preferred_location ?? ""),
-    status: String(row.status ?? ""),
-    recordingStatus: String(row.recording_status ?? ""),
-    createdAt: String(row.created_at ?? ""),
-    completedAt: typeof row.completed_at === "string" ? row.completed_at : null,
-    retentionUntil: String(row.retention_until ?? ""),
-    driveStatus: typeof row.drive_status === "string" ? row.drive_status : null,
-    driveFolderUrl: typeof row.drive_folder_url === "string" ? row.drive_folder_url : null,
-    driveUpdatedAt: typeof row.drive_updated_at === "string" ? row.drive_updated_at : null,
-  }));
+  const items: InterviewListItem[] = (rows.results ?? []).map((row) => {
+    const driveManifest = parseJson<Record<string, unknown> | null>(row.drive_manifest_json, null);
+    return {
+      sessionId: String(row.id ?? ""),
+      candidateName: String(row.candidate_name ?? ""),
+      employment: String(row.employment ?? ""),
+      location: String(row.preferred_location ?? ""),
+      status: String(row.status ?? ""),
+      recordingStatus: String(row.recording_status ?? ""),
+      createdAt: String(row.created_at ?? ""),
+      completedAt: typeof row.completed_at === "string" ? row.completed_at : null,
+      retentionUntil: String(row.retention_until ?? ""),
+      driveStatus: typeof row.drive_status === "string" ? row.drive_status : null,
+      driveFolderUrl: typeof row.drive_folder_url === "string" ? row.drive_folder_url : null,
+      driveUpdatedAt: typeof row.drive_updated_at === "string" ? row.drive_updated_at : null,
+      driveRecordingIncluded: driveManifest ? driveManifest.recordingIncluded === true : null,
+    };
+  });
   if (options.audit !== false) {
     await db.prepare(`INSERT INTO interview_staff_audit_events (
       id, reviewer_name, event_type, detail_json
@@ -1422,7 +1428,10 @@ export async function completeResumableInterviewRecording(session: InterviewSess
   const parts: RecordingPartManifest["parts"] = [];
   for (let index = 0; index < state.totalParts; index += 1) {
     const key = recordingPartKey(session.id, index);
-    const part = await bucket.get(key);
+    // Completion only needs object metadata. R2 `get()` also opens a body stream;
+    // leaving many of those streams unread exhausts the Worker's subrequest/body
+    // slots and made Android recordings hang until the request was cancelled.
+    const part = await bucket.head(key);
     const byteSize = Number(part?.customMetadata?.byteSize ?? 0);
     const expectedSize = index === state.totalParts - 1
       ? state.byteSize - state.partSize * (state.totalParts - 1)
@@ -1461,6 +1470,28 @@ export async function completeResumableInterviewRecording(session: InterviewSess
     uploadMode: "resumable-parts",
   });
   return { stored: true, byteSize: state.byteSize, totalParts: state.totalParts };
+}
+
+/**
+ * Finalizes a completed interview whose candidate uploaded every recording part
+ * but whose original completion request was interrupted. This is intentionally
+ * server-side and idempotent so the recruiter recovery loop never needs the
+ * candidate's expired access token.
+ */
+export async function recoverResumableInterviewRecording(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const session = await db.prepare(
+    "SELECT id, access_token_hash, candidate_name, employment, preferred_location, status, recording_status, expires_at, retention_until FROM interview_sessions WHERE id = ? LIMIT 1",
+  ).bind(sessionId).first<InterviewSessionRecord>();
+  if (!session) throw new Error("INTERVIEW_NOT_FOUND");
+  if (session.status !== "completed") throw new Error("INTERVIEW_RECORDING_RECOVERY_NOT_READY");
+  if (session.recording_status === "stored") return { stored: true, alreadyStored: true };
+  if (!["uploading", "failed"].includes(session.recording_status)) {
+    throw new Error("INTERVIEW_RECORDING_RECOVERY_NOT_AVAILABLE");
+  }
+  return await completeResumableInterviewRecording(session);
 }
 
 async function loadRecordingObject(bucket: R2Bucket, objectKey: string) {

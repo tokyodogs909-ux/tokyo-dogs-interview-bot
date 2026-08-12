@@ -2090,6 +2090,10 @@ export default function Home() {
       })
       : Promise.resolve();
 
+    // Do not let evaluation completion start the Drive archive before the
+    // recording artifact is durable. Both operations were awaited eventually,
+    // but running them concurrently allowed a permanent video-less archive.
+    await recordingUpload;
     try {
       if (transcriptRef.current.length === 0) {
         throw new Error("評価に必要な回答記録がありません。オンライン一次面接を最初からお試しください。");
@@ -2104,7 +2108,6 @@ export default function Home() {
       setProcessingWarning("回答記録の自動整理を完了できませんでした。採用担当者が記録状態を確認します。");
       void error;
     } finally {
-      await recordingUpload;
       setStage("review");
       endingRef.current = false;
       void reason;

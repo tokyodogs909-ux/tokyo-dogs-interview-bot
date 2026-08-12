@@ -421,6 +421,8 @@ class FakeD1Statement {
               retention_until: session.retention_until,
               drive_status: sync?.status ?? null,
               drive_folder_url: sync?.folder_url ?? null,
+              drive_updated_at: sync?.updated_at ?? null,
+              drive_manifest_json: sync?.manifest_json ?? null,
             };
           }),
       };
@@ -467,6 +469,8 @@ class FakeR2 {
   constructor() {
     this.objects = new Map();
     this.putCount = 0;
+    this.getCount = 0;
+    this.headCount = 0;
   }
 
   async put(key, body, options) {
@@ -476,10 +480,21 @@ class FakeR2 {
   }
 
   async get(key) {
+    this.getCount += 1;
     const object = this.objects.get(key);
     if (!object) return null;
     return {
       body: object.body,
+      etag: "test-etag",
+      customMetadata: object.options?.customMetadata ?? {},
+    };
+  }
+
+  async head(key) {
+    this.headCount += 1;
+    const object = this.objects.get(key);
+    if (!object) return null;
+    return {
       etag: "test-etag",
       customMetadata: object.options?.customMetadata ?? {},
     };
@@ -979,6 +994,7 @@ test("completed interview archive creates candidate folders and stores recording
   const session = await createTestInterviewSession(env, "正社員", "越谷店・相談可");
   const stored = database.sessions.get(session.sessionId);
   stored.status = "completed";
+  stored.recording_status = "stored";
   stored.completed_at = "2026-07-29T03:00:00.000Z";
   stored.transcript_json = JSON.stringify([
     { id: "turn-1", speaker: "interviewer", text: "自己紹介をお願いします。", createdAt: "2026-07-29T02:50:00.000Z" },
@@ -1647,9 +1663,11 @@ test("staff inbox lists recent candidates with one shared login and records list
   database.sessions.get(first.sessionId).candidate_name = "山田 花子";
   database.sessions.get(second.sessionId).candidate_name = "佐藤 太郎";
   database.sessions.get(second.sessionId).status = "completed";
+  database.sessions.get(second.sessionId).recording_status = "not_applicable";
   database.externalSyncs.set(second.sessionId, {
     status: "completed",
     folder_url: "https://drive.google.com/drive/folders/test",
+    manifest_json: JSON.stringify({ recordingIncluded: false }),
   });
 
   const unauthorized = await request("/api/staff/interviews", {}, env);
@@ -1799,6 +1817,10 @@ test("resumable recording upload stores independent parts and streams the comple
   assert.equal(complete.status, 200, JSON.stringify(completed));
   assert.equal(completed.stored, true);
   assert.equal(completed.totalParts, 2);
+  // Finalization must inspect metadata without opening unread R2 body streams.
+  // Opening one body per part exhausts Worker connections on real 15-27 minute
+  // Android recordings and leaves the completion request hanging.
+  assert.equal(recordings.headCount, 2);
   assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
   assert.equal(database.artifacts.some((row) => String(row[2]).endsWith("recording.manifest.json")), true);
 
@@ -2525,6 +2547,10 @@ async function seedCompletedInterview(env, database) {
   const session = await createTestInterviewSession(env, "正社員", "越谷店");
   const stored = database.sessions.get(session.sessionId);
   stored.status = "completed";
+  // These claim-fencing tests do not exercise a recording upload. Model them as
+  // the supported text interview path so Drive readiness is unrelated to the
+  // concurrency behavior under test.
+  stored.recording_status = "not_applicable";
   stored.completed_at = "2026-07-29T03:00:00.000Z";
   stored.transcript_json = JSON.stringify([
     { id: "turn-1", speaker: "candidate", text: "接客経験があります。", createdAt: "2026-07-29T02:50:10.000Z" },
@@ -2551,6 +2577,30 @@ function requestAdminSync(sessionId, env) {
     body: JSON.stringify({ sessionId }),
   }, env);
 }
+
+test("Drive archive waits for a camera interview recording instead of completing without video", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  database.sessions.get(session.sessionId).recording_status = "uploading";
+  let driveCalls = 0;
+  try {
+    globalThis.fetch = async () => {
+      driveCalls += 1;
+      throw new Error("Drive must not be touched before the recording is durable");
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    assert.equal(response.status, 409);
+    assert.equal(driveCalls, 0);
+    assert.equal(
+      database.externalSyncs.get(session.sessionId).error_code,
+      "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("a Google Drive archive still reporting progress is never restarted underneath itself", async () => {
   // Two workers archiving the same interview both create the candidate folder and

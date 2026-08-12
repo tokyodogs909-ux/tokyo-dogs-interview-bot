@@ -488,6 +488,16 @@ async function performDriveSync(
   if (source.status !== "completed" || !source.evaluation) {
     throw new Error("INTERVIEW_NOT_READY_FOR_DRIVE_SYNC");
   }
+  // A camera/microphone interview is not archive-ready until its recording
+  // artifact is durable. Previously evaluation completion raced recording
+  // finalization, permanently marking a five-file, video-less Drive archive as
+  // completed before the final recording part had been committed.
+  if (source.recordingStatus !== "stored" && source.recordingStatus !== "not_applicable") {
+    throw new Error("INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC");
+  }
+  if (source.recordingStatus === "stored" && !source.recording) {
+    throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
+  }
   await reportProgress();
   const accessToken = await fetchGoogleDriveAccessToken();
   const root = await validateGoogleDriveRoot(accessToken);

@@ -457,6 +457,7 @@ select, .candidate-name-input { padding: 13px 14px; }
 .staff-inbox-drive { border-radius: 999px; padding: 6px 9px; background: #edf3f7; color: var(--muted); font-size: 9px; font-weight: 800; white-space: nowrap; }
 .staff-inbox-drive.drive-completed { background: #e7f7ef; color: #16623a; }
 .staff-inbox-drive.drive-failed { background: #fff0ef; color: #8c2d24; }
+.staff-inbox-drive.drive-attention { background: #fff5df; color: #7a4b00; }
 .staff-inbox-drive.drive-running, .staff-inbox-drive.drive-pending { background: #e9f5fb; color: var(--brand-navy); }
 .staff-inbox-arrow { color: var(--brand-blue); font-size: 18px; }
 .staff-inbox-empty { border-radius: 14px; background: var(--brand-blue-soft); color: var(--muted); padding: 30px; text-align: center; font-size: 11px; }
