@@ -22,6 +22,17 @@ function request(path, init, env = workerEnv) {
   return worker.fetch(new Request(`http://localhost${path}`, init), env, workerContext);
 }
 
+async function captureConsoleWarnings(callback) {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    return { value: await callback(), warnings };
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
 class FakeD1Statement {
   constructor(database, sql) {
     this.database = database;
@@ -2908,8 +2919,12 @@ test("recorded answer keeps durable audio pending across OpenAI quota failure an
         upstreamCalls += 1;
         if (upstreamCalls === 1) {
           return Response.json(
-            { error: { code: "insufficient_quota", type: "insufficient_quota" } },
-            { status: 429, headers: { "Retry-After": "2" } },
+            { error: {
+              code: "insufficient_quota",
+              type: "insufficient_quota",
+              message: "test-key-never-returned one-independent-valid-webm-answer テスト 応募者",
+            } },
+            { status: 429, headers: { "Retry-After": "2", "x-request-id": "req_abc123def456" } },
           );
         }
         return Response.json({ text: "再試行で復旧した実回答" });
@@ -2930,15 +2945,16 @@ test("recorded answer keeps durable audio pending across OpenAI quota failure an
     "X-Interview-Session": session.sessionId,
     "X-Recorded-Answer-Index": "1",
   };
-  const first = await request("/api/interviews/recorded/answer", {
-    method: "POST",
-    headers: {
-      ...headers,
-      "Content-Type": "audio/webm",
-      "X-Recorded-Answer-Bytes": String(bytes.byteLength),
-    },
-    body: bytes,
-  }, env);
+  const capturedFirst = await captureConsoleWarnings(() => request("/api/interviews/recorded/answer", {
+      method: "POST",
+      headers: {
+        ...headers,
+        "Content-Type": "audio/webm",
+        "X-Recorded-Answer-Bytes": String(bytes.byteLength),
+      },
+      body: bytes,
+    }, env));
+  const first = capturedFirst.value;
   const firstPayload = await first.json();
   assert.equal(first.status, 202);
   assert.equal(firstPayload.stored, true);
@@ -2950,6 +2966,23 @@ test("recorded answer keeps durable audio pending across OpenAI quota failure an
   assert.equal(recordings.putCount, 1);
   assert.equal(database.auditEvents.filter((event) => event.event_type === "transcription_failed").length, 1);
   assert.doesNotMatch(database.auditEvents.at(-1).detail_json, /one-independent-valid-webm-answer/);
+  assert.equal(capturedFirst.warnings.length, 1);
+  assert.equal(capturedFirst.warnings[0][0], "RECORDED_ANSWER_TRANSCRIPTION_RETRYABLE_FAILURE");
+  assert.deepEqual(capturedFirst.warnings[0][1], {
+    status: 429,
+    code: "insufficient_quota",
+    requestId: "req_abc123def456",
+    sessionIdHash: capturedFirst.warnings[0][1].sessionIdHash,
+    answerIndex: 1,
+    retryAfterSeconds: 2,
+    attempt: 1,
+  });
+  assert.match(capturedFirst.warnings[0][1].sessionIdHash, /^[a-f0-9]{32}$/);
+  const safeLog = JSON.stringify(capturedFirst.warnings);
+  assert.equal(safeLog.includes(session.sessionId), false);
+  assert.equal(safeLog.includes("test-key-never-returned"), false);
+  assert.equal(safeLog.includes("one-independent-valid-webm-answer"), false);
+  assert.equal(safeLog.includes("テスト 応募者"), false);
 
   const tooEarly = await request("/api/interviews/recorded/answer", {
     method: "POST",
@@ -2964,16 +2997,18 @@ test("recorded answer keeps durable audio pending across OpenAI quota failure an
   // Cloudflare/Vinext may normalize an omitted POST body to a truthy, empty
   // ReadableStream. This is still the body-less retry contract because no
   // X-Recorded-Answer-Bytes upload declaration is present.
-  const retried = await request("/api/interviews/recorded/answer", {
-    method: "POST",
-    headers,
-    body: new Uint8Array(0),
-  }, env);
+  const capturedSuccess = await captureConsoleWarnings(() => request("/api/interviews/recorded/answer", {
+      method: "POST",
+      headers,
+      body: new Uint8Array(0),
+    }, env));
+  const retried = capturedSuccess.value;
   assert.equal(retried.status, 200, JSON.stringify(await retried.clone().json()));
   assert.equal((await retried.json()).transcribed, true);
   assert.equal(upstreamCalls, 2);
   assert.equal(recordings.putCount, 1, "body-less retry must reuse the exact durable R2 object");
   assert.equal(database.recordedAnswers.get(`${session.sessionId}:1`).transcript_text, "再試行で復旧した実回答");
+  assert.deepEqual(capturedSuccess.warnings, [], "successful transcription must not emit a warning");
 
   const completedReplay = await request("/api/interviews/recorded/answer", {
     method: "POST",
@@ -2986,6 +3021,230 @@ test("recorded answer keeps durable audio pending across OpenAI quota failure an
   assert.equal(completedPayload.alreadyCompleted, true);
   assert.equal(upstreamCalls, 2, "a completed body-less replay must not call OpenAI again");
   assert.equal(recordings.putCount, 1, "a completed body-less replay must not re-upload audio");
+});
+
+test("recorded transcription retry diagnostics sanitize upstream, timeout, and transport failures", async (t) => {
+  class CorruptRecordedAnswerR2 extends FakeR2 {
+    constructor(corruption) {
+      super();
+      this.corruption = corruption;
+    }
+
+    async get(key, options) {
+      const object = await super.get(key, options);
+      if (!object || !key.includes("/recorded-answers/")) return object;
+      const originalArrayBuffer = object.arrayBuffer;
+      return {
+        ...object,
+        arrayBuffer: async () => {
+          const original = new Uint8Array(await originalArrayBuffer());
+          if (this.corruption === "size") {
+            const oversized = new Uint8Array(original.byteLength + 1);
+            oversized.set(original);
+            return oversized.buffer;
+          }
+          const changed = Uint8Array.from(original);
+          changed[0] ^= 0xff;
+          return changed.buffer;
+        },
+      };
+    }
+  }
+
+  const cases = [
+    {
+      name: "retryable upstream response",
+      fetch: async () => Response.json({
+        error: {
+          code: "unsafe/code/test-key-never-returned",
+          message: "diagnostic-secret-audio-body テスト 応募者",
+        },
+      }, {
+        status: 503,
+        headers: { "x-request-id": "unsafe/request/test-key-never-returned" },
+      }),
+      expected: { status: 503, code: "http_503", requestId: "unavailable" },
+    },
+    {
+      name: "timeout",
+      fetch: async () => {
+        const error = new Error("test-key-never-returned diagnostic-secret-audio-body テスト 応募者");
+        error.name = "AbortError";
+        throw error;
+      },
+      expected: { status: 0, code: "transcription_timeout", requestId: "unavailable" },
+    },
+    {
+      name: "transport error",
+      fetch: async () => {
+        throw new Error("test-key-never-returned diagnostic-secret-audio-body テスト 応募者");
+      },
+      expected: { status: 0, code: "transcription_transport_error", requestId: "unavailable" },
+    },
+    {
+      name: "stored audio size mismatch",
+      recordings: () => new CorruptRecordedAnswerR2("size"),
+      fetch: async () => { throw new Error("upstream must not run"); },
+      expected: { status: 0, code: "recorded_answer_audio_size_mismatch", requestId: "unavailable" },
+    },
+    {
+      name: "stored audio digest mismatch",
+      recordings: () => new CorruptRecordedAnswerR2("digest"),
+      fetch: async () => { throw new Error("upstream must not run"); },
+      expected: { status: 0, code: "recorded_answer_audio_digest_mismatch", requestId: "unavailable" },
+    },
+    {
+      name: "OpenAI key unconfigured",
+      withoutApiKey: true,
+      fetch: async () => { throw new Error("upstream must not run"); },
+      expected: { status: 0, code: "openai_api_key_unconfigured", requestId: "unavailable" },
+    },
+  ];
+
+  for (const diagnosticCase of cases) {
+    await t.test(diagnosticCase.name, async () => {
+      const database = new FakeD1();
+      const recordings = diagnosticCase.recordings?.() ?? new FakeR2();
+      const env = {
+        ...workerEnv,
+        DB: database,
+        RECORDINGS: recordings,
+        ...(diagnosticCase.withoutApiKey ? {} : { OPENAI_API_KEY: "test-key-never-returned" }),
+        OPENAI_API: { fetch: diagnosticCase.fetch },
+      };
+      const session = await createTestInterviewSession(env);
+      await request("/api/interviews/recorded/start", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "X-Interview-Session": session.sessionId,
+        },
+      }, env);
+      const audioText = `diagnostic-secret-audio-body-${diagnosticCase.name}`;
+      const bytes = new TextEncoder().encode(audioText);
+      const previousApiKey = process.env.OPENAI_API_KEY;
+      if (diagnosticCase.withoutApiKey) delete process.env.OPENAI_API_KEY;
+      let captured;
+      try {
+        captured = await captureConsoleWarnings(() => request("/api/interviews/recorded/answer", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session.accessToken}`,
+            "X-Interview-Session": session.sessionId,
+            "X-Recorded-Answer-Index": "1",
+            "X-Recorded-Answer-Bytes": String(bytes.byteLength),
+            "Content-Type": "audio/webm",
+          },
+          body: bytes,
+        }, env));
+      } finally {
+        if (diagnosticCase.withoutApiKey) {
+          if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
+          else process.env.OPENAI_API_KEY = previousApiKey;
+        }
+      }
+      assert.equal(captured.value.status, 202, await captured.value.clone().text());
+      assert.equal(captured.warnings.length, 1);
+      const [eventName, detail] = captured.warnings[0];
+      assert.equal(eventName, "RECORDED_ANSWER_TRANSCRIPTION_RETRYABLE_FAILURE");
+      assert.equal(detail.status, diagnosticCase.expected.status);
+      assert.equal(detail.code, diagnosticCase.expected.code);
+      assert.equal(detail.requestId, diagnosticCase.expected.requestId);
+      assert.match(detail.sessionIdHash, /^[a-f0-9]{32}$/);
+      assert.equal(detail.answerIndex, 1);
+      assert.equal(detail.retryAfterSeconds, 15);
+      assert.equal(detail.attempt, 1);
+      assert.equal(database.recordedAnswers.get(`${session.sessionId}:1`).last_error_code, diagnosticCase.expected.code);
+      const serialized = JSON.stringify(captured.warnings);
+      for (const forbidden of [
+        session.sessionId,
+        session.accessToken,
+        "test-key-never-returned",
+        audioText,
+        "diagnostic-secret-audio-body",
+        "テスト 応募者",
+        "unsafe/request",
+      ]) {
+        assert.equal(serialized.includes(forbidden), false, `diagnostic log leaked: ${forbidden}`);
+      }
+    });
+  }
+
+  await t.test("durable R2 audio object missing", async () => {
+    const database = new FakeD1();
+    const recordings = new FakeR2();
+    let upstreamCalls = 0;
+    const env = {
+      ...workerEnv,
+      DB: database,
+      RECORDINGS: recordings,
+      OPENAI_API_KEY: "test-key-never-returned",
+      OPENAI_API: {
+        fetch: async () => {
+          upstreamCalls += 1;
+          return Response.json(
+            { error: { code: "rate_limit_exceeded" } },
+            { status: 429, headers: { "Retry-After": "1" } },
+          );
+        },
+      },
+    };
+    const session = await createTestInterviewSession(env);
+    await request("/api/interviews/recorded/start", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-Interview-Session": session.sessionId,
+      },
+    }, env);
+    const audioText = "audio-object-missing-secret-body";
+    const bytes = new TextEncoder().encode(audioText);
+    await captureConsoleWarnings(() => request("/api/interviews/recorded/answer", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-Interview-Session": session.sessionId,
+        "X-Recorded-Answer-Index": "1",
+        "X-Recorded-Answer-Bytes": String(bytes.byteLength),
+        "Content-Type": "audio/webm",
+      },
+      body: bytes,
+    }, env));
+    const row = database.recordedAnswers.get(`${session.sessionId}:1`);
+    row.next_retry_at = new Date(0).toISOString();
+    recordings.objects.delete(row.object_key);
+
+    const captured = await captureConsoleWarnings(() => request("/api/interviews/recorded/answer", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-Interview-Session": session.sessionId,
+        "X-Recorded-Answer-Index": "1",
+      },
+      body: new Uint8Array(0),
+    }, env));
+    const payload = await captured.value.json();
+    assert.equal(captured.value.status, 202, JSON.stringify(payload));
+    assert.equal(payload.retryAfterSeconds, 30);
+    assert.equal(upstreamCalls, 1, "a missing R2 object must not call OpenAI");
+    assert.equal(captured.warnings.length, 1);
+    const [eventName, detail] = captured.warnings[0];
+    assert.equal(eventName, "RECORDED_ANSWER_TRANSCRIPTION_RETRYABLE_FAILURE");
+    assert.deepEqual(detail, {
+      status: 0,
+      code: "audio_object_missing",
+      requestId: "unavailable",
+      sessionIdHash: detail.sessionIdHash,
+      answerIndex: 1,
+      retryAfterSeconds: 30,
+      attempt: 2,
+    });
+    assert.match(detail.sessionIdHash, /^[a-f0-9]{32}$/);
+    const serialized = JSON.stringify(captured.warnings);
+    for (const forbidden of [session.sessionId, session.accessToken, row.object_key, audioText, "test-key-never-returned"]) {
+      assert.equal(serialized.includes(forbidden), false, `missing-object log leaked: ${forbidden}`);
+    }
+  });
 });
 
 test("staff polling completes a durable pending transcription after the candidate closes the browser", async () => {

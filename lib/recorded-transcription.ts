@@ -43,6 +43,12 @@ export const RECORDED_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 const TRANSCRIPTION_CLAIM_STALE_MS = 3 * 60 * 1000;
 const TRANSCRIPTION_TIMEOUT_MS = 75 * 1000;
 const MAX_TRANSCRIPT_CHARS = 50_000;
+const RECORDED_TRANSCRIPTION_RETRY_EVENT = "RECORDED_ANSWER_TRANSCRIPTION_RETRYABLE_FAILURE";
+const SAFE_CAUGHT_TRANSCRIPTION_CODES = new Map<string, string>([
+  ["RECORDED_ANSWER_AUDIO_SIZE_MISMATCH", "recorded_answer_audio_size_mismatch"],
+  ["RECORDED_ANSWER_AUDIO_DIGEST_MISMATCH", "recorded_answer_audio_digest_mismatch"],
+  ["OPENAI_API_KEY is not configured on the server", "openai_api_key_unconfigured"],
+]);
 
 function bindings() {
   return (globalThis as typeof globalThis & {
@@ -208,6 +214,60 @@ function sanitizedOpenAIError(payload: unknown) {
   return typeof value === "string" && /^[a-z0-9._-]{1,80}$/i.test(value) ? value : null;
 }
 
+function safeDiagnosticCode(value: unknown) {
+  return typeof value === "string" && /^[a-z][a-z0-9._-]{0,79}$/i.test(value)
+    ? value
+    : "unknown_error";
+}
+
+function safeOpenAIRequestId(value: unknown) {
+  // OpenAI request IDs are opaque machine identifiers. Accept only their short
+  // request-token shape so a malformed/reflected header cannot inject a secret,
+  // candidate text, control characters, or unbounded data into production logs.
+  return typeof value === "string" && /^req[_-][a-z0-9_-]{1,72}$/i.test(value)
+    ? value
+    : "unavailable";
+}
+
+function safeDiagnosticInteger(value: unknown, minimum: number, maximum: number, fallback: number) {
+  return typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum
+    ? value
+    : fallback;
+}
+
+function warnRecordedTranscriptionRetry(input: {
+  status: number;
+  code: string;
+  requestId: string | null;
+  sessionIdHash: string;
+  answerIndex: number;
+  retryAfterSeconds: number;
+  attempt: number;
+}) {
+  // This intentionally has no candidate identity, object key, audio bytes,
+  // transcript, upstream response body/message, request body, or credential.
+  console.warn(RECORDED_TRANSCRIPTION_RETRY_EVENT, {
+    status: safeDiagnosticInteger(input.status, 100, 599, 0),
+    code: safeDiagnosticCode(input.code),
+    requestId: safeOpenAIRequestId(input.requestId),
+    sessionIdHash: /^[a-f0-9]{32}$/.test(input.sessionIdHash) ? input.sessionIdHash : "unavailable",
+    answerIndex: safeDiagnosticInteger(input.answerIndex, 1, RECORDED_ANSWER_COUNT, 0),
+    retryAfterSeconds: safeDiagnosticInteger(input.retryAfterSeconds, 1, 300, 300),
+    attempt: safeDiagnosticInteger(input.attempt, 1, 10_000, 10_000),
+  });
+}
+
+function safeCaughtTranscriptionCode(error: unknown) {
+  if (error instanceof Error && error.name === "AbortError") return "transcription_timeout";
+  if (error instanceof Error) {
+    const knownCode = SAFE_CAUGHT_TRANSCRIPTION_CODES.get(error.message);
+    if (knownCode) return knownCode;
+  }
+  // Never reflect an unknown Error.message. Transport implementations can put
+  // URLs, credentials, request bodies, or other uncontrolled text in it.
+  return "transcription_transport_error";
+}
+
 function retrySeconds(response: Response | null, attemptCount: number) {
   const retryAfter = Number(response?.headers.get("retry-after") ?? "");
   if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(300, Math.ceil(retryAfter));
@@ -315,8 +375,18 @@ async function transcribeRegisteredAnswer(
     claimed_at: claimedAt,
     attempt_count: row.attempt_count + 1,
   };
+  const sessionIdHash = await privacySafeIdentifier(row.session_id);
   const object = await bucket.get(row.object_key);
   if (!object) {
+    warnRecordedTranscriptionRetry({
+      status: 0,
+      code: "audio_object_missing",
+      requestId: null,
+      sessionIdHash,
+      answerIndex: row.answer_index,
+      retryAfterSeconds: 30,
+      attempt: claimedRow.attempt_count,
+    });
     await markPending({ db, row: claimedRow, claimId, code: "audio_object_missing", retryAfterSeconds: 30 });
     return { state: "pending", answerIndex: row.answer_index, retryAfterSeconds: 30, reason: "upstream_unavailable" };
   }
@@ -342,7 +412,7 @@ async function transcribeRegisteredAnswer(
       method: "POST",
       headers: {
         Authorization: `Bearer ${requireOpenAIApiKey()}`,
-        "OpenAI-Safety-Identifier": await privacySafeIdentifier(row.session_id),
+        "OpenAI-Safety-Identifier": sessionIdHash,
       },
       body: form,
       signal: controller.signal,
@@ -358,6 +428,15 @@ async function transcribeRegisteredAnswer(
         const seconds = [401, 403].includes(upstreamResponse.status)
           ? 300
           : retrySeconds(upstreamResponse, claimedRow.attempt_count);
+        warnRecordedTranscriptionRetry({
+          status: upstreamResponse.status,
+          code: errorCode,
+          requestId: upstreamResponse.headers.get("x-request-id"),
+          sessionIdHash,
+          answerIndex: row.answer_index,
+          retryAfterSeconds: seconds,
+          attempt: claimedRow.attempt_count,
+        });
         await markPending({ db, row: claimedRow, claimId, code: errorCode, retryAfterSeconds: seconds });
         return { state: "pending", answerIndex: row.answer_index, retryAfterSeconds: seconds, reason: "upstream_unavailable" };
       }
@@ -381,10 +460,17 @@ async function transcribeRegisteredAnswer(
     }
     return { state: "completed", answerIndex: row.answer_index, text, alreadyCompleted: false };
   } catch (error) {
-    const code = error instanceof Error && error.name === "AbortError"
-      ? "transcription_timeout"
-      : "transcription_transport_error";
+    const code = safeCaughtTranscriptionCode(error);
     const seconds = retrySeconds(upstreamResponse, claimedRow.attempt_count);
+    warnRecordedTranscriptionRetry({
+      status: upstreamResponse?.status ?? 0,
+      code,
+      requestId: upstreamResponse?.headers.get("x-request-id") ?? null,
+      sessionIdHash,
+      answerIndex: row.answer_index,
+      retryAfterSeconds: seconds,
+      attempt: claimedRow.attempt_count,
+    });
     await markPending({ db, row: claimedRow, claimId, code, retryAfterSeconds: seconds });
     return { state: "pending", answerIndex: row.answer_index, retryAfterSeconds: seconds, reason: "upstream_unavailable" };
   } finally {
