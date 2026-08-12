@@ -232,6 +232,7 @@ export default function Home() {
   const [screenCaptureState, setScreenCaptureState] = useState<"idle" | "ready" | "ended" | "unavailable">("idle");
   const [recordingUploadState, setRecordingUploadState] = useState<"idle" | "uploading" | "stored" | "error">("idle");
   const [recordingUploadProgress, setRecordingUploadProgress] = useState(0);
+  const [archiveSyncState, setArchiveSyncState] = useState<"idle" | "syncing" | "stored" | "error">("idle");
   const [recordingCaptureState, setRecordingCaptureState] = useState<RecordingCaptureState>("idle");
   const [recordingHasBothAudio, setRecordingHasBothAudio] = useState<boolean | null>(null);
   const [candidateAudioState, setCandidateAudioState] = useState<CandidateAudioState>("idle");
@@ -2007,6 +2008,29 @@ export default function Home() {
     }
   }
 
+  async function syncInterviewArchive() {
+    setArchiveSyncState("syncing");
+    const response = await fetch("/api/interviews/archive", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessTokenRef.current}`,
+      },
+      body: JSON.stringify({ sessionId }),
+    });
+    const data = (await response.json().catch(() => null)) as {
+      stored?: boolean;
+      recordingIncluded?: boolean;
+      error?: string;
+    } | null;
+    const needsRecording = mode !== "text";
+    if (!response.ok || !data?.stored || (needsRecording && data.recordingIncluded !== true)) {
+      setArchiveSyncState("error");
+      throw new Error(data?.error || "面接記録の社内格納を完了できませんでした。");
+    }
+    setArchiveSyncState("stored");
+  }
+
   async function uploadRecording(blob: Blob) {
     setRecordingUploadState("uploading");
     setRecordingUploadProgress(0);
@@ -2029,6 +2053,7 @@ export default function Home() {
     if (!blob || recordingUploadState === "uploading") return;
     try {
       await uploadRecording(blob);
+      await syncInterviewArchive();
       setProcessingWarning("");
     } catch {
       setRecordingUploadState("error");
@@ -2100,9 +2125,11 @@ export default function Home() {
       }
       if (mode === "recorded-fallback") {
         await completeRecordedFallback();
+        await syncInterviewArchive();
         setProcessingWarning("回答本文の自動文字起こしと自動評価は行わず、採用担当者が録画を確認します。");
       } else {
         await requestEvaluation();
+        await syncInterviewArchive();
       }
     } catch (error) {
       setProcessingWarning("回答記録の自動整理を完了できませんでした。採用担当者が記録状態を確認します。");
@@ -3021,7 +3048,7 @@ export default function Home() {
           <img src="/tokyo-dogs-logo.jpg" alt="Tokyo Dogs" />
           <div className="evaluation-loader"><i /><i /><i /></div>
           <h1>回答内容を整理しています。</h1>
-          <p>{recordingUploadState === "uploading" ? `録画を分割保存しています（${recordingUploadProgress}%）。この画面を閉じずにお待ちください。` : "発言根拠を照合し、採用担当者向けの確認資料を作成しています。"}</p>
+          <p>{recordingUploadState === "uploading" ? `録画を分割保存しています（${recordingUploadProgress}%）。この画面を閉じずにお待ちください。` : archiveSyncState === "syncing" ? "録画・文字起こし・評価資料を社内Driveへ格納しています。この画面を閉じずにお待ちください。" : "発言根拠を照合し、採用担当者向けの確認資料を作成しています。"}</p>
           <div className="evaluation-steps"><span className="done">{mode === "text" ? "回答記録" : "文字起こし"}</span><span className="active">根拠を照合</span><span>評価を作成</span></div>
         </section>
       )}
@@ -3040,6 +3067,7 @@ export default function Home() {
           </div>
           {processingWarning && <div className="validation-box"><strong>記録状態を採用担当者が確認します</strong><p>{processingWarning}</p></div>}
           {recordingUploadState === "stored" && <div className="validation-box"><strong>オンライン一次面接の記録を受け付けました</strong><p>録画は面接IDで保管し、採用担当者以外には開示しません。</p></div>}
+          {archiveSyncState === "stored" && <div className="validation-box"><strong>社内Driveへの格納まで完了しました</strong><p>録画・文字起こし・評価資料の格納結果をサーバーで再確認済みです。</p></div>}
           {mode === "text" && <div className="validation-box"><strong>文字入力によるオンライン一次面接を受け付けました</strong><p>カメラ・マイク・録画は使用していません。回答内容は採用担当者が確認します。</p></div>}
           {recordingUploadState === "error" && <div className="validation-box"><strong>録画の送信を再開できます</strong><p>受信済みの部分は再送せず、未送信部分から再開します。この画面を閉じずに再試行してください。</p><button type="button" className="secondary-action" onClick={() => void retryRecordingUpload()}>録画送信を再試行</button></div>}
           <div className="review-actions"><div><span>{mode === "internal-test" ? "確認時間" : "面接時間"}</span><strong>{formatTime(elapsed)}</strong></div>{mode === "internal-test" && <button className="secondary-action" onClick={resetInterview}>最初から確認</button>}</div>

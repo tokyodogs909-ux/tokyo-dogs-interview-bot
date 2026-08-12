@@ -131,6 +131,9 @@ test("voice interview implements bidirectional audio health and recovery guards"
   const persistenceSource = await readFile(new URL("../lib/interview-persistence.ts", import.meta.url), "utf8");
   const interviewSource = await readFile(new URL("../lib/interview.ts", import.meta.url), "utf8");
   const recordingRouteSource = await readFile(new URL("../app/api/interviews/recording/route.ts", import.meta.url), "utf8");
+  const archiveRouteSource = await readFile(new URL("../app/api/interviews/archive/route.ts", import.meta.url), "utf8");
+  const evaluationRouteSource = await readFile(new URL("../app/api/evaluate/route.ts", import.meta.url), "utf8");
+  const recordedCompleteRouteSource = await readFile(new URL("../app/api/interviews/recorded/complete/route.ts", import.meta.url), "utf8");
   const recordingUploadSource = await readFile(new URL("../lib/recording-upload.js", import.meta.url), "utf8");
   const interviewerStageSource = await readFile(new URL("../app/interviewer-stage.tsx", import.meta.url), "utf8");
   assert.match(source, /あなたの音声/);
@@ -187,6 +190,10 @@ test("voice interview implements bidirectional audio health and recovery guards"
     source.indexOf("await recordingUpload;") < source.indexOf("await completeRecordedFallback();"),
     "recording storage must finish before fallback completion can start the Drive archive",
   );
+  assert.match(source, /await syncInterviewArchive\(\);/);
+  assert.match(archiveRouteSource, /await syncInterviewToGoogleDrive\(sessionId\)/);
+  assert.doesNotMatch(evaluationRouteSource, /scheduleGoogleDriveSync/);
+  assert.doesNotMatch(recordedCompleteRouteSource, /scheduleGoogleDriveSync/);
   assert.match(source, /await startRecording\(activeStream, displayStreamRef\.current, remoteStreamRef\.current, \{/);
   assert.match(source, /resume: !isNewInterviewSession/);
   assert.match(source, /recordedInterviewSessionRef/);

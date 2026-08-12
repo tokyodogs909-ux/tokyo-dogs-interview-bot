@@ -179,6 +179,7 @@ export default function StaffReviewPage() {
   const knownCompletedIdsRef = useRef(new Set<string>());
   const completionMonitorInitializedRef = useRef(false);
   const pollInterviewListRef = useRef<() => Promise<void>>(async () => undefined);
+  const driveRecoveryInFlightRef = useRef(new Set<string>());
 
   useEffect(() => () => {
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
@@ -284,6 +285,27 @@ export default function StaffReviewPage() {
     }
   }
 
+  async function recoverDriveArchives(sessionIds: string[]) {
+    for (const targetSessionId of sessionIds.slice(0, 2)) {
+      if (driveRecoveryInFlightRef.current.has(targetSessionId)) continue;
+      driveRecoveryInFlightRef.current.add(targetSessionId);
+      try {
+        const response = await fetch("/api/staff/google-drive/sync", {
+          method: "POST",
+          headers: { ...authHeaders(), "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: targetSessionId }),
+        });
+        if (!response.ok) {
+          setCompletionNotice("Drive自動復旧を完了できない記録があります。「Driveへ再格納」で再確認してください。");
+        }
+      } catch {
+        setCompletionNotice("Drive自動復旧を完了できない記録があります。「Driveへ再格納」で再確認してください。");
+      } finally {
+        driveRecoveryInFlightRef.current.delete(targetSessionId);
+      }
+    }
+  }
+
   async function loadInterviewList(options: { silent?: boolean } = {}) {
     if (!options.silent) {
       setListLoading(true);
@@ -294,7 +316,12 @@ export default function StaffReviewPage() {
         headers: authHeaders(),
         cache: "no-store",
       });
-      const data = (await response.json()) as { interviews?: InterviewListItem[]; archiveHealth?: ArchiveHealth; error?: string };
+      const data = (await response.json()) as {
+        interviews?: InterviewListItem[];
+        driveRecoverySessionIds?: string[];
+        archiveHealth?: ArchiveHealth;
+        error?: string;
+      };
       if (!response.ok || !data.interviews) throw new Error(data.error || "候補者一覧を取得できませんでした。");
       setArchiveHealth(data.archiveHealth ?? null);
       setNotificationPermission(typeof Notification === "undefined" ? "unavailable" : Notification.permission);
@@ -314,6 +341,7 @@ export default function StaffReviewPage() {
         }
       }
       setRecentInterviews(data.interviews);
+      if (data.driveRecoverySessionIds?.length) void recoverDriveArchives(data.driveRecoverySessionIds);
       if (!options.silent) {
         setMessage(data.interviews.length > 0
           ? `最近のオンライン一次面接を${data.interviews.length}件表示しました。`

@@ -826,6 +826,27 @@ export async function requestExternalSync(sessionId: string) {
   return now;
 }
 
+/** Releases a confirmed-interrupted Drive worker so bounded maintenance can retry it. */
+export async function releaseInterruptedExternalSync(sessionId: string, idleForMs = 30_000) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = new Date().toISOString();
+  const idleBefore = new Date(Date.now() - Math.max(30_000, idleForMs)).toISOString();
+  const result = await db.prepare(`UPDATE interview_external_syncs SET
+    status = 'pending', started_at = NULL, completed_at = NULL,
+    error_code = NULL, updated_at = ?
+    WHERE session_id = ? AND provider = 'google_drive' AND status = 'running'
+      AND updated_at <= ?`)
+    .bind(now, sessionId, idleBefore).run();
+  if (Number(result.meta?.changes ?? 0) === 1) {
+    await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'google_drive_sync_interrupted_released', 'system', ?)")
+      .bind(crypto.randomUUID(), sessionId, JSON.stringify({ idleBefore })).run();
+    return true;
+  }
+  return false;
+}
+
 /**
  * Reports that the worker holding `startedAt` is still making progress, and
  * reports back whether it still owns the claim. A worker whose claim was

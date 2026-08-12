@@ -23,7 +23,6 @@ import {
   failInterviewEvaluation,
   saveInterviewEvaluation,
 } from "@/lib/interview-persistence";
-import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
 
 function cleanTurns(value: unknown): TranscriptTurn[] {
   if (!Array.isArray(value)) return [];
@@ -172,7 +171,6 @@ ${SOURCE_GROUNDED_EVALUATION_GUIDE}`,
       if (!saved) {
         return noStoreJson({ error: "このオンライン一次面接の評価受付は完了しています。" }, { status: 409 });
       }
-      scheduleGoogleDriveSync(sessionId);
       return noStoreJson({
         stored: true,
         humanReviewRequired: true,

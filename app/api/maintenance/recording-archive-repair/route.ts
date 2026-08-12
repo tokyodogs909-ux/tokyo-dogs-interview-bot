@@ -1,9 +1,14 @@
-import { scheduleInterruptedInterviewRecovery } from "@/lib/interview-recovery";
+import { syncInterviewToGoogleDrive } from "@/lib/google-drive-sync";
+import {
+  recoverResumableInterviewRecording,
+  releaseInterruptedExternalSync,
+} from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 const MAINTENANCE_ID = "2026-08-12-recording-archive-repair";
 const REPAIR_BATCHES = [
-  ["TD-MSO85H0W-XLIY5NA", "TD-MSOGPXBI-ND4OCDC"],
+  ["TD-MSO85H0W-XLIY5NA"],
+  ["TD-MSOGPXBI-ND4OCDC"],
   ["TD-MSPHPNBC-Z7QFNFU"],
 ] as const;
 
@@ -31,9 +36,17 @@ export async function POST(request: Request) {
     return noStoreJson({ error: "復旧対象を確認できません。" }, { status: 400 });
   }
   const targets = REPAIR_BATCHES[batch - 1];
-  const scheduled = targets.filter((sessionId) => scheduleInterruptedInterviewRecovery(sessionId)).length;
-  if (scheduled !== targets.length) {
-    return noStoreJson({ error: "復旧処理を開始できません。" }, { status: 503 });
+  try {
+    for (const sessionId of targets) {
+      await recoverResumableInterviewRecording(sessionId);
+      await releaseInterruptedExternalSync(sessionId);
+      const result = await syncInterviewToGoogleDrive(sessionId);
+      if (result.status !== "completed" || result.recordingIncluded !== true) {
+        throw new Error("INTERVIEW_ARCHIVE_REPAIR_READBACK_FAILED");
+      }
+    }
+  } catch {
+    return noStoreJson({ error: "復旧処理を完了できませんでした。" }, { status: 502 });
   }
-  return noStoreJson({ accepted: true, scheduled }, { status: 202 });
+  return noStoreJson({ completed: true, repaired: targets.length });
 }

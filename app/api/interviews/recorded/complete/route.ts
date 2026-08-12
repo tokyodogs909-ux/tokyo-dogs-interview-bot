@@ -11,7 +11,6 @@ import {
   failInterviewEvaluation,
   saveInterviewEvaluation,
 } from "@/lib/interview-persistence";
-import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 function canonicalRecordedTranscript(): TranscriptTurn[] {
@@ -94,7 +93,6 @@ export async function POST(request: Request) {
     if (!saved) {
       return noStoreJson({ error: "録画式面接の受付を完了できませんでした。" }, { status: 409 });
     }
-    scheduleGoogleDriveSync(sessionId);
     return noStoreJson({ stored: true, humanReviewRequired: true });
   } catch {
     if (claimId && sessionId) await failInterviewEvaluation(sessionId, claimId);

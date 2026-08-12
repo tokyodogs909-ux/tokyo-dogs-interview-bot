@@ -3,7 +3,6 @@ import {
   listInterviewSummaries,
 } from "@/lib/interview-persistence";
 import { planDriveRecovery, planRecordingRecovery, summarizeDriveArchives } from "@/lib/drive-recovery.js";
-import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
 import { scheduleInterruptedInterviewRecovery } from "@/lib/interview-recovery";
 import { noStoreJson } from "@/lib/openai-server";
 
@@ -18,9 +17,11 @@ export async function GET(request: Request) {
     const recordingRecoverySessionIds = planRecordingRecovery(interviews) as string[];
     recordingRecoverySessionIds.forEach((sessionId) => scheduleInterruptedInterviewRecovery(sessionId));
     const recoverySessionIds = planDriveRecovery(interviews) as string[];
-    recoverySessionIds.forEach((sessionId) => scheduleGoogleDriveSync(sessionId));
     return noStoreJson({
       interviews,
+      // The authenticated staff browser runs these in foreground requests.
+      // A full recording can exceed Cloudflare's 30-second waitUntil window.
+      driveRecoverySessionIds: recoverySessionIds,
       archiveHealth: summarizeDriveArchives(interviews, [
         ...recordingRecoverySessionIds,
         ...recoverySessionIds,
