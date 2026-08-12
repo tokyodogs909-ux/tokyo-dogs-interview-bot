@@ -1049,6 +1049,7 @@ test("candidate foreground archive waits for Drive readback and stores all six a
   const recordingUploadRanges = [];
   let recordingMetadata = null;
   let injectFirstRecordingChunkFailure = true;
+  let replacedRecordingUploadLocation = false;
   try {
     globalThis.fetch = async (url, init = {}) => {
       const href = String(url);
@@ -1110,8 +1111,9 @@ test("candidate foreground archive waits for Drive readback and stores all six a
           headers: { Location: "https://upload.example.test/recording-session" },
         });
       }
-      if (href === "https://upload.example.test/recording-session") {
+      if (href === "https://upload.example.test/recording-session" || href === "https://upload.example.test/recording-session-2") {
         assert.equal(init.method, "PUT");
+        assert.equal(init.redirect, "manual");
         const contentRange = init.headers["Content-Range"];
         if (contentRange === `bytes */${recordingBytes.byteLength}`) {
           return new Response(null, { status: 308 });
@@ -1127,7 +1129,12 @@ test("candidate foreground archive waits for Drive readback and stores all six a
           return new Response(null, { status: 503 });
         }
         if (end + 1 < total) {
-          return new Response(null, { status: 308, headers: { Range: `bytes=0-${end}` } });
+          const headers = { Range: `bytes=0-${end}` };
+          if (!replacedRecordingUploadLocation) {
+            replacedRecordingUploadLocation = true;
+            headers.Location = "https://upload.example.test/recording-session-2";
+          }
+          return new Response(null, { status: 308, headers });
         }
         await new Promise((resolve) => setTimeout(resolve, 75));
         recordingUploadFinished = true;

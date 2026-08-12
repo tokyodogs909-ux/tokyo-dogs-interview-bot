@@ -376,12 +376,17 @@ async function uploadRecording(input: {
     },
     body: JSON.stringify(metadata),
   });
-  const location = initResponse.headers.get("Location");
-  if (!initResponse.ok || !location) throw new Error(`GOOGLE_DRIVE_RESUMABLE_INIT_${initResponse.status}`);
+  let uploadLocation = initResponse.headers.get("Location");
+  if (!initResponse.ok || !uploadLocation) throw new Error(`GOOGLE_DRIVE_RESUMABLE_INIT_${initResponse.status}`);
 
   async function queryCommittedBytes() {
-    const response = await fetch(location as string, {
+    const response = await fetch(uploadLocation as string, {
       method: "PUT",
+      // Drive uses HTTP 308 as an application-level "Resume Incomplete"
+      // response and can supply a replacement upload URI. Automatic redirect
+      // handling would replay the same PUT instead of returning control to this
+      // resumable-upload state machine.
+      redirect: "manual",
       headers: {
         "Content-Length": "0",
         "Content-Range": `bytes */${input.byteSize}`,
@@ -389,7 +394,9 @@ async function uploadRecording(input: {
     });
     if (response.ok) return { complete: true as const, file: await response.json() as DriveFile };
     if (response.status !== 308) throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${response.status}`);
+    uploadLocation = response.headers.get("Location") || uploadLocation;
     const range = response.headers.get("Range")?.match(/^bytes=0-(\d+)$/);
+    await response.body?.cancel();
     return { complete: false as const, committedBytes: range ? Number(range[1]) + 1 : 0 };
   }
 
@@ -400,8 +407,9 @@ async function uploadRecording(input: {
     for (let attempt = 0; attempt < DRIVE_RECORDING_CHUNK_ATTEMPTS; attempt += 1) {
       try {
         const remaining = bytes.subarray(nextOffset - start);
-        const response = await fetch(location as string, {
+        const response = await fetch(uploadLocation as string, {
           method: "PUT",
+          redirect: "manual",
           headers: {
             "Content-Type": input.contentType,
             "Content-Length": String(remaining.byteLength),
@@ -412,7 +420,9 @@ async function uploadRecording(input: {
         lastStatus = response.status;
         if (response.ok) return { complete: true as const, file: await response.json() as DriveFile };
         if (response.status === 308) {
+          uploadLocation = response.headers.get("Location") || uploadLocation;
           const range = response.headers.get("Range")?.match(/^bytes=0-(\d+)$/);
+          await response.body?.cancel();
           const committedBytes = range ? Number(range[1]) + 1 : 0;
           if (committedBytes >= end + 1) return { complete: false as const };
           if (committedBytes < nextOffset || committedBytes > end) {
@@ -424,6 +434,7 @@ async function uploadRecording(input: {
         if (![429, 500, 502, 503, 504].includes(response.status)) {
           throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${response.status}`);
         }
+        await response.body?.cancel();
       } catch (error) {
         const code = error instanceof Error ? error.message : "";
         if (code === "GOOGLE_DRIVE_RESUMABLE_RANGE_MISMATCH" || /^GOOGLE_DRIVE_RESUMABLE_UPLOAD_(?!429|500|502|503|504)/.test(code)) {
