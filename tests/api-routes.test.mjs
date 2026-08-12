@@ -1192,10 +1192,13 @@ test("candidate foreground archive waits for Drive readback and stores all six a
     assert.equal(recordingUploadFinished, true, "the API must not respond before the recording upload finishes");
     assert.ok(responseHeadersElapsed < 70, "streaming headers must arrive before the simulated Drive upload completes");
     assert.deepEqual(recordingUploadRanges, [
-      `bytes 0-8388607/${recordingBytes.byteLength}`,
-      `bytes 0-8388607/${recordingBytes.byteLength}`,
-      `bytes 8388608-16777215/${recordingBytes.byteLength}`,
-      `bytes 16777216-${recordingBytes.byteLength - 1}/${recordingBytes.byteLength}`,
+      `bytes 0-4194303/${recordingBytes.byteLength}`,
+      `bytes 0-4194303/${recordingBytes.byteLength}`,
+      `bytes 4194304-8388607/${recordingBytes.byteLength}`,
+      `bytes 8388608-12582911/${recordingBytes.byteLength}`,
+      `bytes 12582912-16777215/${recordingBytes.byteLength}`,
+      `bytes 16777216-20971519/${recordingBytes.byteLength}`,
+      `bytes 20971520-${recordingBytes.byteLength - 1}/${recordingBytes.byteLength}`,
     ]);
     assert.ok(Date.now() - archiveStartedAt >= 70, "the foreground archive response must await Drive readback");
     assert.match(database.externalSyncs.get(session.sessionId).folder_url, /^https:\/\/drive\.google\.com\/drive\/folders\/folder-/);

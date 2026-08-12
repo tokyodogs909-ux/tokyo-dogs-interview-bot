@@ -22,8 +22,9 @@ const TRANSIENT_DRIVE_RETRY_DELAY_MS = 600;
 // Google Drive resumable uploads require every non-final chunk to be a
 // multiple of 256 KiB. Keeping each request bounded avoids the two-minute
 // upstream timeout observed when a 71 MB R2 stream was sent in one PUT.
-const DRIVE_RECORDING_CHUNK_BYTES = 8 * 1024 * 1024;
-const DRIVE_RECORDING_CHUNK_ATTEMPTS = 3;
+const DRIVE_RECORDING_CHUNK_BYTES = 4 * 1024 * 1024;
+const DRIVE_RECORDING_CHUNK_ATTEMPTS = 4;
+const DRIVE_RECORDING_REQUEST_TIMEOUT_MS = 25_000;
 
 type DriveFile = {
   id: string;
@@ -65,6 +66,16 @@ function isTransientDriveError(error: unknown) {
 
 function wait(milliseconds: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function driveQueryValue(value: string) {
@@ -366,7 +377,7 @@ async function uploadRecording(input: {
   const initUrl = existing
     ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(existing.id)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`
     : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`;
-  const initResponse = await fetch(initUrl, {
+  const initResponse = await fetchWithTimeout(initUrl, {
     method: existing ? "PATCH" : "POST",
     headers: {
       Authorization: `Bearer ${input.accessToken}`,
@@ -375,12 +386,12 @@ async function uploadRecording(input: {
       "X-Upload-Content-Length": String(input.byteSize),
     },
     body: JSON.stringify(metadata),
-  });
+  }, DRIVE_RECORDING_REQUEST_TIMEOUT_MS);
   let uploadLocation = initResponse.headers.get("Location");
   if (!initResponse.ok || !uploadLocation) throw new Error(`GOOGLE_DRIVE_RESUMABLE_INIT_${initResponse.status}`);
 
   async function queryCommittedBytes() {
-    const response = await fetch(uploadLocation as string, {
+    const response = await fetchWithTimeout(uploadLocation as string, {
       method: "PUT",
       // Drive uses HTTP 308 as an application-level "Resume Incomplete"
       // response and can supply a replacement upload URI. Automatic redirect
@@ -391,7 +402,7 @@ async function uploadRecording(input: {
         "Content-Length": "0",
         "Content-Range": `bytes */${input.byteSize}`,
       },
-    });
+    }, DRIVE_RECORDING_REQUEST_TIMEOUT_MS);
     if (response.ok) return { complete: true as const, file: await response.json() as DriveFile };
     if (response.status !== 308) throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${response.status}`);
     uploadLocation = response.headers.get("Location") || uploadLocation;
@@ -407,7 +418,7 @@ async function uploadRecording(input: {
     for (let attempt = 0; attempt < DRIVE_RECORDING_CHUNK_ATTEMPTS; attempt += 1) {
       try {
         const remaining = bytes.subarray(nextOffset - start);
-        const response = await fetch(uploadLocation as string, {
+        const response = await fetchWithTimeout(uploadLocation as string, {
           method: "PUT",
           redirect: "manual",
           headers: {
@@ -416,7 +427,7 @@ async function uploadRecording(input: {
             "Content-Range": `bytes ${nextOffset}-${end}/${input.byteSize}`,
           },
           body: Uint8Array.from(remaining).buffer,
-        });
+        }, DRIVE_RECORDING_REQUEST_TIMEOUT_MS);
         lastStatus = response.status;
         if (response.ok) return { complete: true as const, file: await response.json() as DriveFile };
         if (response.status === 308) {
