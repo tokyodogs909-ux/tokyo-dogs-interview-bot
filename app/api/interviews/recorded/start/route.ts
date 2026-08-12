@@ -1,6 +1,6 @@
 import {
   authorizeInterviewRequest,
-  markInterviewStarted,
+  markRecordedFallbackStarted,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
@@ -20,7 +20,7 @@ export async function POST(request: Request) {
     if (!["created", "in_progress"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接は開始できません。" }, { status: 409 });
     }
-    await markInterviewStarted(sessionId);
+    await markRecordedFallbackStarted(sessionId);
     return noStoreJson({ started: true });
   } catch {
     return noStoreJson({ error: "録画式のオンライン一次面接を開始できませんでした。" }, { status: 500 });

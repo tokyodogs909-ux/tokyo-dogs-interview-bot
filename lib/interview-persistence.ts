@@ -3,6 +3,7 @@ import {
   type InterviewEvaluation,
   type TranscriptTurn,
 } from "@/lib/interview";
+import { hasVerifiedCandidateTranscript } from "@/lib/interview-transcript-verification";
 import {
   assertSignedInviteConfigured,
   createInterviewInviteToken,
@@ -118,6 +119,16 @@ export function hasRecordingStorage() {
   return Boolean(bindings().RECORDINGS);
 }
 
+export async function getInterviewSessionState(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  return await db.prepare(`SELECT id, status, recording_status
+    FROM interview_sessions WHERE id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<{ id: string; status: string; recording_status: string }>();
+}
+
 async function ensureSchema(db: D1Database) {
   await db.batch([
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_sessions (
@@ -132,8 +143,6 @@ async function ensureSchema(db: D1Database) {
       recording_status TEXT DEFAULT 'not_started' NOT NULL,
       transcript_json TEXT,
       evaluation_json TEXT,
-      evaluation_claim_id TEXT,
-      evaluation_started_at TEXT,
       summary TEXT,
       expires_at TEXT NOT NULL,
       retention_until TEXT NOT NULL,
@@ -143,6 +152,14 @@ async function ensureSchema(db: D1Database) {
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_sessions_status_idx ON interview_sessions (status)"),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_sessions_retention_idx ON interview_sessions (retention_until)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_evaluation_claims (
+      session_id TEXT PRIMARY KEY NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+      claim_id TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_evaluation_claims_started_idx ON interview_evaluation_claims (started_at)"),
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_artifacts (
       id TEXT PRIMARY KEY NOT NULL,
       session_id TEXT NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
@@ -215,6 +232,26 @@ async function ensureSchema(db: D1Database) {
       UNIQUE(session_id, provider)
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_external_syncs_status_idx ON interview_external_syncs (status)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_drive_upload_steps (
+      session_id TEXT PRIMARY KEY NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+      started_at TEXT NOT NULL,
+      phase TEXT DEFAULT 'uploading' NOT NULL,
+      upload_url_ciphertext TEXT NOT NULL,
+      upload_url_iv TEXT NOT NULL,
+      committed_offset INTEGER DEFAULT 0 NOT NULL,
+      total_bytes INTEGER NOT NULL,
+      content_type TEXT NOT NULL,
+      recording_name TEXT NOT NULL,
+      folder_id TEXT NOT NULL,
+      folder_url TEXT NOT NULL,
+      context_json TEXT NOT NULL,
+      recording_file_json TEXT,
+      lease_token TEXT,
+      lease_expires_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_drive_upload_steps_lease_idx ON interview_drive_upload_steps (lease_expires_at)"),
   ]);
   const sessionColumns = await db.prepare("PRAGMA table_info(interview_sessions)")
     .all<{ name: string }>();
@@ -236,14 +273,6 @@ async function ensureSchema(db: D1Database) {
   await addColumnIfMissing(
     "candidate_name",
     "ALTER TABLE interview_sessions ADD COLUMN candidate_name TEXT DEFAULT '' NOT NULL",
-  );
-  await addColumnIfMissing(
-    "evaluation_claim_id",
-    "ALTER TABLE interview_sessions ADD COLUMN evaluation_claim_id TEXT",
-  );
-  await addColumnIfMissing(
-    "evaluation_started_at",
-    "ALTER TABLE interview_sessions ADD COLUMN evaluation_started_at TEXT",
   );
 }
 
@@ -480,6 +509,93 @@ export async function authorizeInterviewRequest(request: Request, sessionId: str
   return { session };
 }
 
+/**
+ * Durably fences a cleanly completed realtime voice transcript before the
+ * browser begins the much larger recording upload. The audit event is the
+ * explicit seal; transcript_json remains the single transcript source used by
+ * evaluation and Drive export.
+ */
+export async function sealVoiceInterviewTranscript(input: {
+  sessionId: string;
+  transcript: TranscriptTurn[];
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  if (
+    input.transcript.length < 1 ||
+    input.transcript.length > 300 ||
+    !input.transcript.some((turn) =>
+      turn.speaker === "candidate" && typeof turn.text === "string" && turn.text.trim().length > 0
+    )
+  ) {
+    throw new Error("VOICE_TRANSCRIPT_SEAL_NOT_READY");
+  }
+  await ensureSchema(db);
+  const transcriptJson = JSON.stringify(input.transcript);
+  const transcriptSha256 = await sha256(transcriptJson);
+  const now = new Date().toISOString();
+  const results = await db.batch([
+    db.prepare(`UPDATE interview_sessions SET transcript_json = ?, updated_at = ?
+      WHERE id = ?
+        AND status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+        AND (transcript_json IS NULL OR transcript_json = ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events
+          WHERE session_id = ? AND event_type = 'recorded_fallback_started'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events
+          WHERE session_id = ? AND event_type = 'voice_transcript_sealed'
+        )`)
+      .bind(transcriptJson, now, input.sessionId, transcriptJson, input.sessionId, input.sessionId),
+    db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json
+      )
+      SELECT ?, s.id, 'voice_transcript_sealed', 'candidate', ?
+      FROM interview_sessions s
+      WHERE s.id = ?
+        AND s.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+        AND s.transcript_json = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events
+          WHERE session_id = s.id AND event_type = 'recorded_fallback_started'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events
+          WHERE session_id = s.id AND event_type = 'voice_transcript_sealed'
+        )`)
+      .bind(
+        crypto.randomUUID(),
+        JSON.stringify({
+          transcriptSha256,
+          turnCount: input.transcript.length,
+          candidateTurnCount: input.transcript.filter((turn) => turn.speaker === "candidate").length,
+        }),
+        input.sessionId,
+        transcriptJson,
+      ),
+  ]);
+  const state = await db.prepare(`SELECT s.status, s.transcript_json,
+      EXISTS (
+        SELECT 1 FROM interview_audit_events
+        WHERE session_id = s.id AND event_type = 'voice_transcript_sealed'
+      ) AS voice_transcript_sealed
+    FROM interview_sessions s WHERE s.id = ? LIMIT 1`)
+    .bind(input.sessionId)
+    .first<{ status: string; transcript_json: string | null; voice_transcript_sealed: number }>();
+  if (Number(state?.voice_transcript_sealed ?? 0) === 1) {
+    if (state?.transcript_json !== transcriptJson) throw new Error("VOICE_TRANSCRIPT_SEAL_CONFLICT");
+    return {
+      alreadySealed: Number(results[1]?.meta?.changes ?? 0) !== 1,
+      turnCount: input.transcript.length,
+    };
+  }
+  if (state?.transcript_json && state.transcript_json !== transcriptJson) {
+    throw new Error("VOICE_TRANSCRIPT_SEAL_CONFLICT");
+  }
+  throw new Error("VOICE_TRANSCRIPT_SEAL_NOT_READY");
+}
+
 export async function claimInterviewRecordingUpload(sessionId: string) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
@@ -501,7 +617,7 @@ export async function failInterviewRecordingUpload(sessionId: string) {
   if (!db) return;
   await db.prepare(`UPDATE interview_sessions SET
     recording_status = 'failed', updated_at = ?
-    WHERE id = ? AND recording_status = 'uploading'`)
+    WHERE id = ? AND recording_status IN ('uploading', 'failed')`)
     .bind(new Date().toISOString(), sessionId)
     .run();
 }
@@ -572,6 +688,33 @@ export async function markInterviewStarted(sessionId: string) {
   ]);
 }
 
+export async function markRecordedFallbackStarted(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = new Date().toISOString();
+  await db.batch([
+    db.prepare("UPDATE interview_sessions SET status = 'in_progress', updated_at = ? WHERE id = ? AND status IN ('created', 'in_progress')")
+      .bind(now, sessionId),
+    db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json
+      )
+      SELECT ?, ?, 'interview_started', 'candidate', '{}'
+      WHERE EXISTS (SELECT 1 FROM interview_sessions WHERE id = ?)`)
+      .bind(crypto.randomUUID(), sessionId, sessionId),
+    db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json
+      )
+      SELECT ?, ?, 'recorded_fallback_started', 'candidate', '{}'
+      WHERE EXISTS (SELECT 1 FROM interview_sessions WHERE id = ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events
+          WHERE session_id = ? AND event_type = 'recorded_fallback_started'
+        )`)
+      .bind(crypto.randomUUID(), sessionId, sessionId, sessionId),
+  ]);
+}
+
 export async function markTextInterviewStarted(sessionId: string) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
@@ -618,6 +761,83 @@ export async function reserveInterviewRealtimeConnection(sessionId: string) {
 const EVALUATION_CLAIM_STALE_AFTER_MS = 10 * 60 * 1_000;
 
 /**
+ * Returns one durable, stale or released evaluation for the staff recovery loop.
+ *
+ * The JSON predicate is deliberately part of the query: an empty, malformed,
+ * or interviewer-only transcript must never be converted into a completed
+ * interview merely because its Worker claim became stale. A released
+ * evaluation_pending row is also recoverable after the same delay when the
+ * candidate left after a persistence exception. The caller still validates the
+ * decoded value and the technical audit trail before the atomic claim below.
+ */
+export async function findNextStaleInterviewEvaluation() {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const staleBefore = new Date(Date.now() - EVALUATION_CLAIM_STALE_AFTER_MS).toISOString();
+  const target = await db.prepare(`SELECT s.id, s.transcript_json
+    FROM interview_sessions s
+    LEFT JOIN interview_evaluation_claims c ON c.session_id = s.id
+    WHERE (
+        (s.status = 'evaluation_processing' AND (
+          (c.started_at IS NOT NULL AND c.started_at <= ?)
+          OR (c.session_id IS NULL AND s.updated_at <= ?)
+        ))
+        OR (s.status = 'evaluation_pending' AND c.session_id IS NULL AND s.updated_at <= ?)
+        OR (
+          s.status = 'in_progress'
+          AND s.recording_status = 'stored'
+          AND c.session_id IS NULL
+          AND EXISTS (SELECT 1 FROM interview_audit_events seal
+            WHERE seal.session_id = s.id AND seal.event_type = 'voice_transcript_sealed')
+        )
+      )
+      AND s.transcript_json IS NOT NULL
+      AND json_valid(s.transcript_json)
+      AND EXISTS (
+        SELECT 1 FROM json_each(s.transcript_json)
+        WHERE json_extract(value, '$.speaker') = 'candidate'
+          AND length(trim(coalesce(json_extract(value, '$.text'), ''))) > 0
+      )
+    ORDER BY coalesce(c.started_at, s.updated_at), s.id
+    LIMIT 1`)
+    .bind(staleBefore, staleBefore, staleBefore)
+    .first<{ id: string; transcript_json: string }>();
+  if (!target) return null;
+
+  const transcript = parseJson<unknown>(target.transcript_json, null);
+  if (!Array.isArray(transcript)) return null;
+  const validTurns = transcript.slice(0, 300).flatMap((value): TranscriptTurn[] => {
+    if (!value || typeof value !== "object") return [];
+    const turn = value as Partial<TranscriptTurn>;
+    if (
+      typeof turn.id !== "string" ||
+      (turn.speaker !== "candidate" && turn.speaker !== "interviewer") ||
+      typeof turn.text !== "string"
+    ) return [];
+    const text = turn.text.replace(/\0/g, "").trim().slice(0, 5_000);
+    if (!text) return [];
+    return [{
+      id: turn.id.slice(0, 120),
+      speaker: turn.speaker,
+      text,
+      createdAt: typeof turn.createdAt === "string" ? turn.createdAt.slice(0, 40) : "",
+    }];
+  });
+  const failures = await db.prepare(`SELECT event_type, detail_json
+    FROM interview_audit_events
+    WHERE session_id = ? AND event_type = 'transcription_failed'`)
+    .bind(target.id)
+    .all<{ event_type: string; detail_json: string | null }>();
+  const auditEvents = (failures.results ?? []).map((event) => ({
+    type: event.event_type,
+    detail: parseJson<Record<string, unknown>>(event.detail_json, {}),
+  }));
+  if (!hasVerifiedCandidateTranscript(validTurns, auditEvents)) return null;
+  return { sessionId: target.id, transcript: validTurns };
+}
+
+/**
  * Claims the one paid evaluation call for a session before contacting the model.
  * A Worker that died after claiming can be recovered after ten minutes, while a
  * concurrent or replayed request is rejected before incurring another model call.
@@ -631,17 +851,53 @@ export async function claimInterviewEvaluation(input: {
   const now = new Date().toISOString();
   const claimId = crypto.randomUUID();
   const staleBefore = new Date(Date.now() - EVALUATION_CLAIM_STALE_AFTER_MS).toISOString();
-  const result = await db.prepare(`UPDATE interview_sessions SET
-    status = 'evaluation_processing', transcript_json = ?, evaluation_claim_id = ?,
-    evaluation_started_at = ?, updated_at = ?
-    WHERE id = ? AND (
-      status IN ('in_progress', 'evaluation_pending') OR
-      (status = 'evaluation_processing' AND
-        (evaluation_started_at IS NULL OR evaluation_started_at < ?))
-    )`)
-    .bind(JSON.stringify(input.transcript), claimId, now, now, input.sessionId, staleBefore)
+  const claim = await db.prepare(`INSERT INTO interview_evaluation_claims (
+    session_id, claim_id, started_at, created_at, updated_at
+  ) SELECT s.id, ?, ?, ?, ?
+    FROM interview_sessions s
+    LEFT JOIN interview_evaluation_claims current ON current.session_id = s.id
+    WHERE s.id = ? AND (
+      s.status IN ('in_progress', 'evaluation_pending') OR
+      (s.status = 'evaluation_processing' AND (
+        (current.started_at IS NOT NULL AND current.started_at <= ?)
+        OR (current.session_id IS NULL AND s.updated_at <= ?)
+      ))
+    )
+    ON CONFLICT(session_id) DO UPDATE SET
+      claim_id = excluded.claim_id,
+      started_at = excluded.started_at,
+      updated_at = excluded.updated_at
+    WHERE interview_evaluation_claims.started_at <= ?`)
+    .bind(claimId, now, now, now, input.sessionId, staleBefore, staleBefore, staleBefore)
     .run();
-  if (Number(result.meta?.changes ?? 0) !== 1) return null;
+  if (Number(claim.meta?.changes ?? 0) !== 1) return null;
+  const session = await db.prepare(`UPDATE interview_sessions SET
+    status = 'evaluation_processing', transcript_json = ?, updated_at = ?
+    WHERE id = ?
+      AND status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+      AND EXISTS (SELECT 1 FROM interview_evaluation_claims
+        WHERE session_id = ? AND claim_id = ?)
+      AND (
+        NOT EXISTS (SELECT 1 FROM interview_audit_events
+          WHERE session_id = ? AND event_type = 'voice_transcript_sealed')
+        OR transcript_json = ?
+      )`)
+    .bind(
+      JSON.stringify(input.transcript),
+      now,
+      input.sessionId,
+      input.sessionId,
+      claimId,
+      input.sessionId,
+      JSON.stringify(input.transcript),
+    )
+    .run();
+  if (Number(session.meta?.changes ?? 0) !== 1) {
+    await db.prepare("DELETE FROM interview_evaluation_claims WHERE session_id = ? AND claim_id = ?")
+      .bind(input.sessionId, claimId)
+      .run();
+    return null;
+  }
   await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'evaluation_started', 'system', ?)")
     .bind(crypto.randomUUID(), input.sessionId, JSON.stringify({ turnCount: input.transcript.length }))
     .run();
@@ -651,11 +907,17 @@ export async function claimInterviewEvaluation(input: {
 export async function failInterviewEvaluation(sessionId: string, claimId: string) {
   const db = database();
   if (!db) return;
+  const released = await db.prepare(
+    "DELETE FROM interview_evaluation_claims WHERE session_id = ? AND claim_id = ?",
+  )
+    .bind(sessionId, claimId)
+    .run();
+  if (Number(released.meta?.changes ?? 0) !== 1) return;
   await db.prepare(`UPDATE interview_sessions SET
-    status = 'evaluation_pending', evaluation_claim_id = NULL,
-    evaluation_started_at = NULL, updated_at = ?
-    WHERE id = ? AND status = 'evaluation_processing' AND evaluation_claim_id = ?`)
-    .bind(new Date().toISOString(), sessionId, claimId)
+    status = 'evaluation_pending', updated_at = ?
+    WHERE id = ? AND status = 'evaluation_processing'
+      AND NOT EXISTS (SELECT 1 FROM interview_evaluation_claims WHERE session_id = ?)`)
+    .bind(new Date().toISOString(), sessionId, sessionId)
     .run();
 }
 
@@ -678,9 +940,15 @@ export async function saveInterviewEvaluation(input: {
   const results = await db.batch([
     db.prepare(`UPDATE interview_sessions SET
       status = 'completed', transcript_json = ?, evaluation_json = ?, summary = ?,
-      evaluation_claim_id = NULL, evaluation_started_at = NULL,
       completed_at = ?, updated_at = ? WHERE id = ?
-      AND status = 'evaluation_processing' AND evaluation_claim_id = ?`)
+      AND status = 'evaluation_processing'
+      AND EXISTS (SELECT 1 FROM interview_evaluation_claims
+        WHERE session_id = ? AND claim_id = ?)
+      AND (
+        NOT EXISTS (SELECT 1 FROM interview_audit_events
+          WHERE session_id = ? AND event_type = 'voice_transcript_sealed')
+        OR transcript_json = ?
+      )`)
       .bind(
         JSON.stringify(input.transcript),
         JSON.stringify(input.evaluation),
@@ -688,7 +956,10 @@ export async function saveInterviewEvaluation(input: {
         now,
         now,
         input.sessionId,
+        input.sessionId,
         input.claimId,
+        input.sessionId,
+        JSON.stringify(input.transcript),
       ),
     db.prepare(`INSERT INTO interview_audit_events (
       id, session_id, event_type, actor_type, detail_json
@@ -701,6 +972,11 @@ export async function saveInterviewEvaluation(input: {
         input.sessionId,
         now,
       ),
+    db.prepare(`DELETE FROM interview_evaluation_claims
+      WHERE session_id = ? AND claim_id = ?
+        AND EXISTS (SELECT 1 FROM interview_sessions
+          WHERE id = ? AND completed_at = ?)`)
+      .bind(input.sessionId, input.claimId, input.sessionId, now),
   ]);
   return Number((results[0] as { meta?: { changes?: number } }).meta?.changes ?? 0) === 1;
 }
@@ -933,6 +1209,213 @@ export async function failExternalSync(input: {
   ]);
 }
 
+export type DriveUploadStepState = {
+  sessionId: string;
+  startedAt: string;
+  phase: "uploading" | "finalizing";
+  uploadUrlCiphertext: string;
+  uploadUrlIv: string;
+  committedOffset: number;
+  totalBytes: number;
+  contentType: string;
+  recordingName: string;
+  folderId: string;
+  folderUrl: string;
+  context: Record<string, unknown>;
+  recordingFile: Record<string, unknown> | null;
+  leaseToken: string | null;
+  leaseExpiresAt: string | null;
+};
+
+type DriveUploadStepRow = {
+  session_id: string;
+  started_at: string;
+  phase: string;
+  upload_url_ciphertext: string;
+  upload_url_iv: string;
+  committed_offset: number;
+  total_bytes: number;
+  content_type: string;
+  recording_name: string;
+  folder_id: string;
+  folder_url: string;
+  context_json: string;
+  recording_file_json: string | null;
+  lease_token: string | null;
+  lease_expires_at: string | null;
+};
+
+function safeDriveUploadStep(row: DriveUploadStepRow | null): DriveUploadStepState | null {
+  if (!row || (row.phase !== "uploading" && row.phase !== "finalizing")) return null;
+  return {
+    sessionId: row.session_id,
+    startedAt: row.started_at,
+    phase: row.phase,
+    uploadUrlCiphertext: row.upload_url_ciphertext,
+    uploadUrlIv: row.upload_url_iv,
+    committedOffset: Number(row.committed_offset),
+    totalBytes: Number(row.total_bytes),
+    contentType: row.content_type,
+    recordingName: row.recording_name,
+    folderId: row.folder_id,
+    folderUrl: row.folder_url,
+    context: parseJson<Record<string, unknown>>(row.context_json, {}),
+    recordingFile: parseJson<Record<string, unknown> | null>(row.recording_file_json, null),
+    leaseToken: row.lease_token,
+    leaseExpiresAt: row.lease_expires_at,
+  };
+}
+
+export async function getDriveUploadStep(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const row = await db.prepare(`SELECT session_id, started_at, phase,
+    upload_url_ciphertext, upload_url_iv, committed_offset, total_bytes,
+    content_type, recording_name, folder_id, folder_url, context_json,
+    recording_file_json, lease_token, lease_expires_at
+    FROM interview_drive_upload_steps WHERE session_id = ? LIMIT 1`)
+    .bind(sessionId).first<DriveUploadStepRow>();
+  return safeDriveUploadStep(row);
+}
+
+export async function initializeDriveUploadStep(input: {
+  sessionId: string;
+  startedAt: string;
+  uploadUrlCiphertext: string;
+  uploadUrlIv: string;
+  totalBytes: number;
+  contentType: string;
+  recordingName: string;
+  folderId: string;
+  folderUrl: string;
+  context: Record<string, unknown>;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = new Date().toISOString();
+  await db.prepare(`INSERT INTO interview_drive_upload_steps (
+    session_id, started_at, phase, upload_url_ciphertext, upload_url_iv,
+    committed_offset, total_bytes, content_type, recording_name, folder_id,
+    folder_url, context_json, recording_file_json, lease_token,
+    lease_expires_at, created_at, updated_at
+  ) VALUES (?, ?, 'uploading', ?, ?, 0, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+  ON CONFLICT(session_id) DO UPDATE SET
+    started_at = excluded.started_at,
+    phase = 'uploading',
+    upload_url_ciphertext = excluded.upload_url_ciphertext,
+    upload_url_iv = excluded.upload_url_iv,
+    committed_offset = 0,
+    total_bytes = excluded.total_bytes,
+    content_type = excluded.content_type,
+    recording_name = excluded.recording_name,
+    folder_id = excluded.folder_id,
+    folder_url = excluded.folder_url,
+    context_json = excluded.context_json,
+    recording_file_json = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL,
+    updated_at = excluded.updated_at`)
+    .bind(
+      input.sessionId,
+      input.startedAt,
+      input.uploadUrlCiphertext,
+      input.uploadUrlIv,
+      input.totalBytes,
+      input.contentType,
+      input.recordingName,
+      input.folderId,
+      input.folderUrl,
+      JSON.stringify(input.context),
+      now,
+      now,
+    ).run();
+  const stored = await getDriveUploadStep(input.sessionId);
+  if (!stored || stored.startedAt !== input.startedAt || stored.totalBytes !== input.totalBytes) {
+    throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_READBACK_MISMATCH");
+  }
+  return stored;
+}
+
+const DRIVE_UPLOAD_STEP_LEASE_MS = 90_000;
+
+export async function acquireDriveUploadStepLease(sessionId: string, startedAt: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date();
+  const leaseToken = crypto.randomUUID();
+  const nowIso = now.toISOString();
+  const leaseExpiresAt = new Date(now.getTime() + DRIVE_UPLOAD_STEP_LEASE_MS).toISOString();
+  const result = await db.prepare(`UPDATE interview_drive_upload_steps SET
+    lease_token = ?, lease_expires_at = ?, updated_at = ?
+    WHERE session_id = ? AND started_at = ?
+      AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)`)
+    .bind(leaseToken, leaseExpiresAt, nowIso, sessionId, startedAt, nowIso).run();
+  return Number(result.meta?.changes ?? 0) === 1 ? leaseToken : null;
+}
+
+export async function updateDriveUploadStep(input: {
+  sessionId: string;
+  startedAt: string;
+  leaseToken: string;
+  committedOffset: number;
+  phase?: "uploading" | "finalizing";
+  recordingFile?: Record<string, unknown> | null;
+  uploadUrlCiphertext?: string;
+  uploadUrlIv?: string;
+  releaseLease?: boolean;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
+  const result = await db.prepare(`UPDATE interview_drive_upload_steps SET
+    committed_offset = ?,
+    phase = COALESCE(?, phase),
+    recording_file_json = CASE WHEN ? IS NULL THEN recording_file_json ELSE ? END,
+    upload_url_ciphertext = COALESCE(?, upload_url_ciphertext),
+    upload_url_iv = COALESCE(?, upload_url_iv),
+    lease_token = CASE WHEN ? = 1 THEN NULL ELSE lease_token END,
+    lease_expires_at = CASE WHEN ? = 1 THEN NULL ELSE lease_expires_at END,
+    updated_at = ?
+    WHERE session_id = ? AND started_at = ? AND lease_token = ?`)
+    .bind(
+      input.committedOffset,
+      input.phase ?? null,
+      input.recordingFile === undefined ? null : "replace",
+      input.recordingFile === undefined ? null : JSON.stringify(input.recordingFile),
+      input.uploadUrlCiphertext ?? null,
+      input.uploadUrlIv ?? null,
+      input.releaseLease === true ? 1 : 0,
+      input.releaseLease === true ? 1 : 0,
+      now,
+      input.sessionId,
+      input.startedAt,
+      input.leaseToken,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST");
+}
+
+export async function releaseDriveUploadStepLease(input: {
+  sessionId: string;
+  startedAt: string;
+  leaseToken: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await db.prepare(`UPDATE interview_drive_upload_steps SET
+    lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+    WHERE session_id = ? AND started_at = ? AND lease_token = ?`)
+    .bind(new Date().toISOString(), input.sessionId, input.startedAt, input.leaseToken).run();
+}
+
+export async function deleteDriveUploadStep(sessionId: string, startedAt: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await db.prepare("DELETE FROM interview_drive_upload_steps WHERE session_id = ? AND started_at = ?")
+    .bind(sessionId, startedAt).run();
+}
+
 export async function getInterviewArchiveSource(sessionId: string) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
@@ -995,6 +1478,71 @@ export async function getInterviewArchiveSource(sessionId: string) {
   };
 }
 
+export async function getInterviewRecordingChunk(input: {
+  sessionId: string;
+  offset: number;
+  length: number;
+}) {
+  const db = database();
+  const bucket = bindings().RECORDINGS;
+  if (!db || !bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
+  await ensureSchema(db);
+  const artifact = await db.prepare(`SELECT object_key, content_type, byte_size
+    FROM interview_artifacts WHERE session_id = ? AND kind = 'recording'
+    ORDER BY created_at DESC LIMIT 1`)
+    .bind(input.sessionId)
+    .first<{ object_key: string; content_type: string; byte_size: number }>();
+  if (!artifact) return null;
+  if (
+    !Number.isInteger(input.offset) ||
+    !Number.isInteger(input.length) ||
+    input.offset < 0 ||
+    input.length < 1 ||
+    input.offset + input.length > artifact.byte_size
+  ) {
+    throw new Error("INTERVIEW_RECORDING_RANGE_INVALID");
+  }
+
+  if (!artifact.object_key.endsWith(".manifest.json")) {
+    const object = await bucket.get(artifact.object_key, {
+      range: { offset: input.offset, length: input.length },
+    });
+    if (!object || !("body" in object)) throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    if (bytes.byteLength !== input.length) throw new Error("INTERVIEW_RECORDING_RANGE_MISMATCH");
+    return { bytes, contentType: artifact.content_type, byteSize: artifact.byte_size };
+  }
+
+  const manifestObject = await bucket.get(artifact.object_key);
+  if (!manifestObject || !("body" in manifestObject)) throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
+  const manifest = JSON.parse(await r2ObjectText(manifestObject)) as RecordingPartManifest;
+  if (manifest.version !== 1 || !Array.isArray(manifest.parts) || manifest.parts.length === 0) {
+    throw new Error("INTERVIEW_RECORDING_MANIFEST_INVALID");
+  }
+  const result = new Uint8Array(input.length);
+  let outputOffset = 0;
+  let objectOffset = 0;
+  for (const part of manifest.parts) {
+    const partStart = objectOffset;
+    const partEnd = partStart + part.byteSize;
+    objectOffset = partEnd;
+    const overlapStart = Math.max(input.offset, partStart);
+    const overlapEnd = Math.min(input.offset + input.length, partEnd);
+    if (overlapStart >= overlapEnd) continue;
+    const length = overlapEnd - overlapStart;
+    const object = await bucket.get(part.key, {
+      range: { offset: overlapStart - partStart, length },
+    });
+    if (!object || !("body" in object)) throw new Error("INTERVIEW_RECORDING_PART_MISSING");
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    if (bytes.byteLength !== length) throw new Error("INTERVIEW_RECORDING_RANGE_MISMATCH");
+    result.set(bytes, outputOffset);
+    outputOffset += bytes.byteLength;
+  }
+  if (outputOffset !== input.length) throw new Error("INTERVIEW_RECORDING_RANGE_MISMATCH");
+  return { bytes: result, contentType: artifact.content_type, byteSize: artifact.byte_size };
+}
+
 export async function getInterviewReview(sessionId: string, reviewer: AuthorizedReviewer) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
@@ -1019,6 +1567,16 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     ) ORDER BY created_at`)
     .bind(sessionId)
     .all<Record<string, unknown>>();
+  const parsedTranscript = parseJson<TranscriptTurn[]>(session.transcript_json, []);
+  const parsedTechnicalEvents = (technicalEvents.results ?? []).map((event) => ({
+    type: String(event.event_type ?? ""),
+    detail: parseJson<Record<string, unknown>>(event.detail_json, {}),
+    createdAt: String(event.created_at ?? ""),
+  }));
+  const sourceTranscriptVerified = hasVerifiedCandidateTranscript(
+    parsedTranscript,
+    parsedTechnicalEvents,
+  );
   const driveSync = await getExternalSyncStatus(sessionId);
   const manifestFiles = driveSync?.manifest?.files;
   const archivedArtifactCount = manifestFiles && typeof manifestFiles === "object" && !Array.isArray(manifestFiles)
@@ -1033,7 +1591,8 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     location: session.preferred_location,
     status: session.status,
     recordingStatus: session.recording_status,
-    transcript: parseJson<TranscriptTurn[]>(session.transcript_json, []),
+    transcript: parsedTranscript,
+    sourceTranscriptVerified,
     evaluation: parseJson<InterviewEvaluation | null>(session.evaluation_json, null),
     completedAt: session.completed_at,
     retentionUntil: session.retention_until,
@@ -1046,14 +1605,14 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
       overallNote: typeof review.overall_note === "string" ? review.overall_note : "",
       updatedAt: review.updated_at,
     })),
-    technicalEvents: (technicalEvents.results ?? []).map((event) => ({
-      type: event.event_type,
-      detail: parseJson<Record<string, unknown>>(event.detail_json, {}),
-      createdAt: event.created_at,
-    })),
+    technicalEvents: parsedTechnicalEvents,
     driveSync: driveSync ? {
       ...driveSync,
       recordingIncluded: driveSync.manifest?.recordingIncluded === true,
+      transcriptAvailable: driveSync.manifest?.transcriptAvailable === true,
+      transcriptKind: typeof driveSync.manifest?.transcriptKind === "string"
+        ? driveSync.manifest.transcriptKind
+        : "unknown",
       archivedArtifactCount,
     } : null,
   };
@@ -1073,6 +1632,9 @@ export type InterviewListItem = {
   driveFolderUrl: string | null;
   driveUpdatedAt: string | null;
   driveRecordingIncluded: boolean | null;
+  driveTranscriptAvailable: boolean | null;
+  driveTranscriptKind: string | null;
+  sourceTranscriptVerified: boolean;
 };
 
 export async function listInterviewSummaries(
@@ -1086,7 +1648,14 @@ export async function listInterviewSummaries(
   const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
   const rows = await db.prepare(`SELECT
     s.id, s.candidate_name, s.employment, s.preferred_location,
-    s.status, s.recording_status, s.created_at, s.completed_at, s.retention_until,
+    s.status, s.recording_status, s.transcript_json, s.created_at, s.completed_at, s.retention_until,
+    EXISTS (
+      SELECT 1 FROM interview_audit_events AS ta
+      WHERE ta.session_id = s.id
+        AND ta.event_type = 'transcription_failed'
+        AND CASE WHEN json_valid(ta.detail_json)
+          THEN json_extract(ta.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+    ) AS candidate_transcription_failed,
     d.status AS drive_status, d.folder_url AS drive_folder_url, d.updated_at AS drive_updated_at,
     d.manifest_json AS drive_manifest_json
     FROM interview_sessions AS s
@@ -1098,6 +1667,13 @@ export async function listInterviewSummaries(
     .all<Record<string, unknown>>();
   const items: InterviewListItem[] = (rows.results ?? []).map((row) => {
     const driveManifest = parseJson<Record<string, unknown> | null>(row.drive_manifest_json, null);
+    const sourceTranscript = parseJson<TranscriptTurn[]>(row.transcript_json, []);
+    const sourceTranscriptVerified = hasVerifiedCandidateTranscript(
+      sourceTranscript,
+      Number(row.candidate_transcription_failed ?? 0) === 1
+        ? [{ type: "transcription_failed", detail: { code: "TRANSCRIPTION_FAILED" } }]
+        : [],
+    );
     return {
       sessionId: String(row.id ?? ""),
       candidateName: String(row.candidate_name ?? ""),
@@ -1112,6 +1688,11 @@ export async function listInterviewSummaries(
       driveFolderUrl: typeof row.drive_folder_url === "string" ? row.drive_folder_url : null,
       driveUpdatedAt: typeof row.drive_updated_at === "string" ? row.drive_updated_at : null,
       driveRecordingIncluded: driveManifest ? driveManifest.recordingIncluded === true : null,
+      driveTranscriptAvailable: driveManifest ? driveManifest.transcriptAvailable === true : null,
+      driveTranscriptKind: driveManifest && typeof driveManifest.transcriptKind === "string"
+        ? driveManifest.transcriptKind
+        : null,
+      sourceTranscriptVerified,
     };
   });
   if (options.audit !== false) {
@@ -1383,7 +1964,13 @@ export async function beginResumableInterviewRecording(input: {
     // Resume needs metadata only. Opening every stored part body here recreates
     // the same Worker connection exhaustion that previously broke finalization.
     const part = await bucket.head(recordingPartKey(state.sessionId, index));
-    if (part?.customMetadata?.byteSize) uploadedParts.push(index);
+    const expectedSize = index === state.totalParts - 1
+      ? state.byteSize - state.partSize * (state.totalParts - 1)
+      : state.partSize;
+    if (
+      part?.size === expectedSize &&
+      Number(part.customMetadata?.byteSize ?? 0) === expectedSize
+    ) uploadedParts.push(index);
   }
   return { stored: false, uploadedParts };
 }
@@ -1409,8 +1996,11 @@ export async function saveResumableInterviewRecordingPart(input: {
   const key = recordingPartKey(input.sessionId, input.index);
   // A duplicate retry is decided entirely from metadata; never open its body.
   const existing = await bucket.head(key);
-  if (Number(existing?.customMetadata?.byteSize ?? 0) === input.byteSize) return { stored: true, duplicate: true };
-  await bucket.put(key, input.body, {
+  if (
+    existing?.size === input.byteSize &&
+    Number(existing.customMetadata?.byteSize ?? 0) === input.byteSize
+  ) return { stored: true, duplicate: true };
+  const stored = await bucket.put(key, input.body, {
     httpMetadata: { contentType: "application/octet-stream" },
     customMetadata: {
       sessionId: input.sessionId,
@@ -1418,6 +2008,9 @@ export async function saveResumableInterviewRecordingPart(input: {
       retentionUntil: state.retentionUntil,
     },
   });
+  if (stored.size !== input.byteSize) {
+    throw new Error("INTERVIEW_RECORDING_PART_SIZE_INVALID");
+  }
   return { stored: true, duplicate: false };
 }
 
@@ -1439,7 +2032,9 @@ export async function completeResumableInterviewRecording(session: InterviewSess
     const expectedSize = index === state.totalParts - 1
       ? state.byteSize - state.partSize * (state.totalParts - 1)
       : state.partSize;
-    if (!part || byteSize !== expectedSize) throw new Error("INTERVIEW_RECORDING_PART_MISSING");
+    if (!part || part.size !== expectedSize || byteSize !== expectedSize) {
+      throw new Error("INTERVIEW_RECORDING_PART_MISSING");
+    }
     parts.push({ key, byteSize });
   }
   if (parts.reduce((total, part) => total + part.byteSize, 0) !== state.byteSize) {
@@ -1489,12 +2084,99 @@ export async function recoverResumableInterviewRecording(sessionId: string) {
     "SELECT id, access_token_hash, candidate_name, employment, preferred_location, status, recording_status, expires_at, retention_until FROM interview_sessions WHERE id = ? LIMIT 1",
   ).bind(sessionId).first<InterviewSessionRecord>();
   if (!session) throw new Error("INTERVIEW_NOT_FOUND");
-  if (session.status !== "completed") throw new Error("INTERVIEW_RECORDING_RECOVERY_NOT_READY");
+  if (session.status !== "completed") {
+    const seal = await db.prepare(`SELECT
+        EXISTS (
+          SELECT 1 FROM recorded_interview_completions
+          WHERE session_id = s.id
+        ) AS recorded_fallback_sealed,
+        (
+          EXISTS (
+            SELECT 1 FROM interview_audit_events
+            WHERE session_id = s.id AND event_type = 'voice_transcript_sealed'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM interview_audit_events
+            WHERE session_id = s.id AND event_type = 'recorded_fallback_started'
+          )
+          AND s.transcript_json IS NOT NULL
+          AND json_valid(s.transcript_json)
+          AND EXISTS (
+            SELECT 1 FROM json_each(s.transcript_json) AS turn
+            WHERE json_extract(turn.value, '$.speaker') = 'candidate'
+              AND length(trim(COALESCE(json_extract(turn.value, '$.text'), ''))) > 0
+          )
+        ) AS voice_transcript_sealed
+      FROM interview_sessions s WHERE s.id = ? LIMIT 1`)
+      .bind(sessionId)
+      .first<{ recorded_fallback_sealed: number; voice_transcript_sealed: number }>();
+    const hasRecoverySeal = Number(seal?.recorded_fallback_sealed ?? 0) === 1 ||
+      Number(seal?.voice_transcript_sealed ?? 0) === 1;
+    if (!hasRecoverySeal || !["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status)) {
+      throw new Error("INTERVIEW_RECORDING_RECOVERY_NOT_READY");
+    }
+  }
   if (session.recording_status === "stored") return { stored: true, alreadyStored: true };
   if (!["uploading", "failed"].includes(session.recording_status)) {
     throw new Error("INTERVIEW_RECORDING_RECOVERY_NOT_AVAILABLE");
   }
   return await completeResumableInterviewRecording(session);
+}
+
+export async function recoverNextSealedResumableInterviewRecording() {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const staleBefore = new Date(Date.now() - 60 * 1_000).toISOString();
+  const target = await db.prepare(`SELECT s.id
+    FROM interview_sessions s
+    WHERE s.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+      AND s.recording_status IN ('uploading', 'failed')
+      AND s.updated_at <= ?
+      AND (
+        EXISTS (
+          SELECT 1 FROM recorded_interview_completions c
+          WHERE c.session_id = s.id
+        )
+        OR (
+          EXISTS (
+            SELECT 1 FROM interview_audit_events
+            WHERE session_id = s.id AND event_type = 'voice_transcript_sealed'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM interview_audit_events
+            WHERE session_id = s.id AND event_type = 'recorded_fallback_started'
+          )
+          AND s.transcript_json IS NOT NULL
+          AND json_valid(s.transcript_json)
+          AND EXISTS (
+            SELECT 1 FROM json_each(s.transcript_json) AS turn
+            WHERE json_extract(turn.value, '$.speaker') = 'candidate'
+              AND length(trim(COALESCE(json_extract(turn.value, '$.text'), ''))) > 0
+          )
+        )
+      )
+    ORDER BY COALESCE(
+      (SELECT c.requested_at FROM recorded_interview_completions c WHERE c.session_id = s.id),
+      (SELECT MIN(a.created_at) FROM interview_audit_events a
+        WHERE a.session_id = s.id AND a.event_type = 'voice_transcript_sealed')
+    ) ASC, s.id ASC
+    LIMIT 1`)
+    .bind(staleBefore)
+    .first<{ id: string }>();
+  if (!target) return { state: "none" } as const;
+  try {
+    const result = await recoverResumableInterviewRecording(target.id);
+    return { state: "stored", sessionId: target.id, result } as const;
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "INTERVIEW_RECORDING_RECOVERY_FAILED";
+    await failInterviewRecordingUpload(target.id);
+    return {
+      state: code.includes("PART_MISSING") ? "incomplete" : "failed",
+      sessionId: target.id,
+      errorCode: code.slice(0, 120),
+    } as const;
+  }
 }
 
 async function loadRecordingObject(bucket: R2Bucket, objectKey: string) {

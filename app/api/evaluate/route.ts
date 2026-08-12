@@ -14,7 +14,6 @@ import {
   noStoreJson,
   hasTrustedRequestOrigin,
   privacySafeIdentifier,
-  readOpenAIError,
   requireOpenAIApiKey,
 } from "@/lib/openai-server";
 import {
@@ -23,6 +22,7 @@ import {
   failInterviewEvaluation,
   saveInterviewEvaluation,
 } from "@/lib/interview-persistence";
+import { buildDeferredHumanEvaluation } from "@/lib/interview-evaluation-fallback";
 
 function cleanTurns(value: unknown): TranscriptTurn[] {
   if (!Array.isArray(value)) return [];
@@ -65,7 +65,10 @@ export async function POST(request: Request) {
     const sessionId = payload.sessionId?.trim() ?? "";
     const location = normalizePreferredLocation(payload.location);
     const transcript = cleanTurns(payload.transcript);
-    if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId) || transcript.length === 0) {
+    const hasCandidateAnswer = transcript.some(
+      (turn) => turn.speaker === "candidate" && turn.text.trim().length > 0,
+    );
+    if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId) || !hasCandidateAnswer) {
       return noStoreJson({ error: "評価に必要なオンライン一次面接記録がありません。" }, { status: 400 });
     }
     const authorized = await authorizeInterviewRequest(request, sessionId);
@@ -75,9 +78,6 @@ export async function POST(request: Request) {
         { status: 401 },
       );
     }
-    if (!["in_progress", "evaluation_pending", "evaluation_processing"].includes(authorized.session.status)) {
-      return noStoreJson({ error: "このオンライン一次面接の評価受付は完了しています。" }, { status: 409 });
-    }
     if (
       authorized.session &&
       (authorized.session.employment !== payload.employment ||
@@ -85,12 +85,22 @@ export async function POST(request: Request) {
     ) {
       return noStoreJson({ error: "応募条件とオンライン一次面接の接続情報が一致しません。" }, { status: 409 });
     }
+    // The model result may have been committed even if the browser never received
+    // the HTTP response. Return the durable receipt without paying for or writing
+    // a second evaluation so the candidate can safely resume final archiving.
+    if (authorized.session.status === "completed") {
+      return noStoreJson({ stored: true, alreadyStored: true });
+    }
+    if (!["in_progress", "evaluation_pending", "evaluation_processing"].includes(authorized.session.status)) {
+      return noStoreJson({ error: "このオンライン一次面接の評価受付は完了しています。" }, { status: 409 });
+    }
 
     const evaluationClaimId = await claimInterviewEvaluation({ sessionId, transcript });
     if (!evaluationClaimId) {
       return noStoreJson({ error: "このオンライン一次面接の評価処理は進行中、または完了しています。" }, { status: 409 });
     }
 
+    let evaluation: InterviewEvaluation | null = null;
     try {
       const apiKey = requireOpenAIApiKey();
       const safetyIdentifier = await privacySafeIdentifier(sessionId);
@@ -143,29 +153,30 @@ ${SOURCE_GROUNDED_EVALUATION_GUIDE}`,
       }),
       });
 
-      if (!response.ok) {
-        await failInterviewEvaluation(sessionId, evaluationClaimId);
-        return noStoreJson(
-          { error: await readOpenAIError(response) },
-          { status: response.status === 429 ? 429 : 502 },
-        );
+      if (response.ok) {
+        const responseBody = await response.json();
+        const outputText = extractResponseText(responseBody);
+        if (outputText) {
+          const parsed = JSON.parse(outputText) as Omit<
+            InterviewEvaluation,
+            "transcriptProvenance" | "evidenceValidationWarnings" | "humanReviewRequired"
+          >;
+          evaluation = validateEvaluation(parsed, transcript);
+        }
       }
+    } catch {
+      // OpenAI configuration, transport, response parsing and schema failures all
+      // degrade to an explicit human-review record. The upstream response is not
+      // returned to the candidate and cannot block the durable archive pipeline.
+      evaluation = null;
+    }
 
-      const responseBody = await response.json();
-      const outputText = extractResponseText(responseBody);
-      if (!outputText) {
-        await failInterviewEvaluation(sessionId, evaluationClaimId);
-        return noStoreJson({ error: "評価結果を読み取れませんでした。" }, { status: 502 });
-      }
-      const parsed = JSON.parse(outputText) as Omit<
-        InterviewEvaluation,
-        "transcriptProvenance" | "evidenceValidationWarnings" | "humanReviewRequired"
-      >;
-      const evaluation = validateEvaluation(parsed, transcript);
+    try {
+      const automaticEvaluationDeferred = evaluation === null;
       const saved = await saveInterviewEvaluation({
         sessionId,
         transcript,
-        evaluation,
+        evaluation: evaluation ?? buildDeferredHumanEvaluation("service_unavailable"),
         claimId: evaluationClaimId,
       });
       if (!saved) {
@@ -174,6 +185,7 @@ ${SOURCE_GROUNDED_EVALUATION_GUIDE}`,
       return noStoreJson({
         stored: true,
         humanReviewRequired: true,
+        ...(automaticEvaluationDeferred ? { automaticEvaluationDeferred: true } : {}),
       });
     } catch (error) {
       await failInterviewEvaluation(sessionId, evaluationClaimId);

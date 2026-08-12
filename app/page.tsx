@@ -233,6 +233,7 @@ export default function Home() {
   const [recordingUploadState, setRecordingUploadState] = useState<"idle" | "uploading" | "stored" | "error">("idle");
   const [recordingUploadProgress, setRecordingUploadProgress] = useState(0);
   const [archiveSyncState, setArchiveSyncState] = useState<"idle" | "syncing" | "stored" | "error">("idle");
+  const [completionSavePending, setCompletionSavePending] = useState(false);
   const [recordingCaptureState, setRecordingCaptureState] = useState<RecordingCaptureState>("idle");
   const [recordingHasBothAudio, setRecordingHasBothAudio] = useState<boolean | null>(null);
   const [candidateAudioState, setCandidateAudioState] = useState<CandidateAudioState>("idle");
@@ -263,9 +264,18 @@ export default function Home() {
   const chunksRef = useRef<Blob[]>([]);
   const recordingBytesRef = useRef(0);
   const recordingSizeCappedRef = useRef(false);
+  // This is true only after MediaRecorder reaches a normal, error-free stop.
+  // A Blob may still exist after a size cap or recorder error, but that Blob is
+  // partial evidence and must never be uploaded or unlock a candidate receipt.
+  const recordingCompleteRef = useRef(false);
   const recordingBlobRef = useRef<Blob | null>(null);
   const recordingPromiseRef = useRef<Promise<Blob | null> | null>(null);
   const recordingResolveRef = useRef<((blob: Blob | null) => void) | null>(null);
+  const recordedAnswerRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedAnswerChunksRef = useRef<Blob[]>([]);
+  const recordedAnswerStartedAtRef = useRef<number | null>(null);
+  const recordedAnswerUploadsRef = useRef(new Map<number, Promise<void>>());
+  const recordedAnswerBlobsRef = useRef(new Map<number, Blob>());
   const recordingAudioContextRef = useRef<AudioContext | null>(null);
   const recordingAudioMixRef = useRef<RecordingAudioMix | null>(null);
   const recordingHasBothAudioRef = useRef<boolean | null>(null);
@@ -299,6 +309,7 @@ export default function Home() {
   const currentAssistantAudioItemRef = useRef("");
   const assistantAudioStartedAtRef = useRef<number | null>(null);
   const recordingGenerationRef = useRef(0);
+  const recordingFinalStopRequestedRef = useRef(false);
   const reportedCandidateEventsRef = useRef(new Set<string>());
   const recordedQuestionTimerRef = useRef<number | null>(null);
   const recordedFallbackActiveRef = useRef(false);
@@ -312,6 +323,12 @@ export default function Home() {
   const timedResponseRef = useRef<TimedInterviewAction | null>(null);
   const timedActionTimerRef = useRef<number | null>(null);
   const recordedFallbackQuietSinceRef = useRef<number | null>(null);
+  const interviewFinalizationStoredRef = useRef(false);
+  // One failed realtime input transcription means the server transcript is
+  // incomplete. Keep the interview unreceipted instead of archiving a partial
+  // set of answers as though it were a complete voice transcript.
+  const voiceTranscriptionCompleteRef = useRef(true);
+  const voiceTranscriptSealedRef = useRef(false);
   const queueTimedInterviewActionRef = useRef<(action: TimedInterviewAction) => void>(() => undefined);
 
   const candidateTurns = useMemo(
@@ -351,14 +368,20 @@ export default function Home() {
   }, [mode]);
 
   useEffect(() => {
-    if (recordingUploadState !== "uploading" && recordingUploadState !== "error") return;
+    const activeInterviewCanLoseUnsentMedia = stage === "interview" && mode !== "internal-test";
+    if (
+      !activeInterviewCanLoseUnsentMedia &&
+      !completionSavePending &&
+      recordingUploadState !== "uploading" &&
+      recordingUploadState !== "error"
+    ) return;
     const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", warnBeforeLeaving);
     return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
-  }, [recordingUploadState]);
+  }, [completionSavePending, mode, recordingUploadState, stage]);
 
   useEffect(() => {
     queueTimedInterviewActionRef.current = queueTimedInterviewAction;
@@ -894,10 +917,13 @@ export default function Home() {
     recordedQuestionReadyRef.current = false;
     setRecordedQuestionReady(false);
     if (!answerAlreadyRecorded) {
+      const answerNumber = recordedQuestionIndex + 1;
+      const answerUpload = finishRecordedAnswerCapture(answerNumber);
+      recordedAnswerUploadsRef.current.set(answerNumber, answerUpload);
       upsertTurn({
-        id: `recorded-fallback-answer-${recordedQuestionIndex + 1}`,
+        id: `recorded-fallback-answer-${answerNumber}`,
         speaker: "candidate",
-        text: `回答${recordedQuestionIndex + 1}の発言内容は録画音声に記録されています。自動文字起こしではないため、採用担当者が録画を確認します。`,
+        text: `回答${answerNumber}の発言内容は録画音声に記録されています。自動文字起こし完了後、採用担当者が録画と照合します。`,
         createdAt: new Date().toISOString(),
       });
     }
@@ -1230,6 +1256,7 @@ export default function Home() {
     options: { resume?: boolean } = {},
   ) {
     if (!activeStream || typeof MediaRecorder === "undefined") {
+      recordingCompleteRef.current = false;
       setRecordingCaptureState("error");
       recordingPromiseRef.current = Promise.resolve(null);
       return;
@@ -1244,6 +1271,7 @@ export default function Home() {
       return;
     }
     if (options.resume && recordingSizeCappedRef.current) {
+      recordingCompleteRef.current = false;
       setRecordingCaptureState("error");
       return;
     }
@@ -1256,6 +1284,7 @@ export default function Home() {
       chunksRef.current = [];
       recordingBytesRef.current = 0;
       recordingSizeCappedRef.current = false;
+      recordingCompleteRef.current = false;
     }
     // Each recorder belongs to one generation. A previous recorder's stop event
     // can still be queued when a reconnect starts a new one; without this guard
@@ -1264,6 +1293,8 @@ export default function Home() {
     const generation = recordingGenerationRef.current + 1;
     recordingGenerationRef.current = generation;
     const ownsRecording = () => recordingGenerationRef.current === generation;
+    recordingCompleteRef.current = false;
+    recordingFinalStopRequestedRef.current = false;
     recordingBlobRef.current = null;
     recordingPromiseRef.current = new Promise((resolve) => {
       recordingResolveRef.current = resolve;
@@ -1370,6 +1401,7 @@ export default function Home() {
       (mimeType) => MediaRecorder.isTypeSupported(mimeType),
     );
     let selectedRecorder: MediaRecorder | null = null;
+    let recordingCaptureFailed = false;
     for (const mimeType of candidates) {
       try {
         const recorder = new MediaRecorder(recordingStream, {
@@ -1381,7 +1413,9 @@ export default function Home() {
           if (event.data.size <= 0 || recordingSizeCappedRef.current) return;
           const nextSize = recordingBytesRef.current + event.data.size;
           if (nextSize > MAX_CLIENT_RECORDING_BYTES) {
+            recordingCaptureFailed = true;
             recordingSizeCappedRef.current = true;
+            recordingCompleteRef.current = false;
             reportCandidateEvent("recording_unavailable", "CLIENT_RECORDING_SIZE_LIMIT");
             setRecordingCaptureState("error");
             setAudioNotice("録画容量が安全上限に達したため、ここまでの録画を保護しました。面接は継続し、採用担当者が記録状態を確認します。");
@@ -1400,9 +1434,11 @@ export default function Home() {
         };
         recorder.onerror = () => {
           if (!ownsRecording()) return;
+          recordingCaptureFailed = true;
+          recordingCompleteRef.current = false;
           setRecordingCaptureState("error");
           reportCandidateEvent("recording_unavailable", "RECORDER_ERROR");
-          setAudioNotice("録画を継続できませんでした。面接は受け付け、採用担当者が記録状態を確認します。");
+          setAudioNotice("録画を継続できませんでした。面接記録の保存はまだ完了していません。採用担当者が記録状態を確認します。");
           if (recorder.state !== "inactive") {
             try {
               recorder.stop();
@@ -1418,6 +1454,7 @@ export default function Home() {
           if (recorderRef.current === recorder) recorderRef.current = null;
           if (!ownsRecording()) return;
           if (!chunksRef.current.length) {
+            recordingCompleteRef.current = false;
             setRecordingCaptureState("error");
             recordingResolveRef.current?.(null);
             recordingResolveRef.current = null;
@@ -1426,7 +1463,20 @@ export default function Home() {
           const blob = new Blob(chunksRef.current, {
             type: recorder.mimeType || (hasVideo ? "video/webm" : "audio/webm"),
           });
+          // Retain partial bytes locally as incident evidence, but resolve the
+          // upload promise with null unless the recorder stopped cleanly.
           recordingBlobRef.current = blob;
+          if (
+            recordingCaptureFailed ||
+            recordingSizeCappedRef.current ||
+            !recordingFinalStopRequestedRef.current
+          ) {
+            recordingCompleteRef.current = false;
+            recordingResolveRef.current?.(null);
+            recordingResolveRef.current = null;
+            return;
+          }
+          recordingCompleteRef.current = true;
           recordingResolveRef.current?.(blob);
           recordingResolveRef.current = null;
         };
@@ -1440,6 +1490,7 @@ export default function Home() {
       }
     }
     if (!selectedRecorder) {
+      recordingCompleteRef.current = false;
       stopComposite?.();
       cleanupRecordingAudioMix();
       setRecordingCaptureState("error");
@@ -1582,10 +1633,175 @@ export default function Home() {
     setRecordedQuestionReady(false);
     recordedQuestionTimerRef.current = window.setTimeout(() => {
       recordedQuestionTimerRef.current = null;
+      if (!startRecordedAnswerCapture()) {
+        recordedQuestionReadyRef.current = false;
+        setRecordedQuestionReady(false);
+        setConnectionState("error");
+        return;
+      }
       recordedQuestionReadyRef.current = true;
       setRecordedQuestionReady(true);
       setConnectionState("candidate-speaking");
     }, 2_800);
+  }
+
+  function startRecordedAnswerCapture() {
+    const microphoneTrack = streamRef.current?.getAudioTracks().find((track) => track.readyState === "live");
+    if (!microphoneTrack || typeof MediaRecorder === "undefined" || recordedAnswerRecorderRef.current) {
+      setProcessingWarning("回答音声の保存を開始できませんでした。同じ質問のまま接続を確認してください。");
+      return false;
+    }
+    const candidates = supportedRecordingMimeTypes(false, (mimeType) => MediaRecorder.isTypeSupported(mimeType));
+    for (const mimeType of candidates) {
+      try {
+        const recorder = new MediaRecorder(new MediaStream([microphoneTrack]), {
+          mimeType,
+          audioBitsPerSecond: 48_000,
+        });
+        const chunks: Blob[] = [];
+        const startedAt = Date.now();
+        recordedAnswerChunksRef.current = chunks;
+        recordedAnswerStartedAtRef.current = startedAt;
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) chunks.push(event.data);
+        };
+        recorder.onerror = () => {
+          if (recordedAnswerRecorderRef.current === recorder) {
+            recordedAnswerRecorderRef.current = null;
+            recordedAnswerChunksRef.current = [];
+            recordedAnswerStartedAtRef.current = null;
+          }
+          setProcessingWarning("回答音声の文字起こし用保存を継続できませんでした。面接は受領完了にせず、保存状態を確認します。");
+        };
+        recorder.start(1_000);
+        recordedAnswerRecorderRef.current = recorder;
+        return true;
+      } catch {
+        // Try the next independently playable audio container.
+      }
+    }
+    setProcessingWarning("この端末で回答音声を文字起こし用に保存できません。面接は受領完了にせず、保存状態を確認します。");
+    return false;
+  }
+
+  async function uploadRecordedAnswer(
+    answerIndex: number,
+    blob: Blob,
+    credentials = { sessionId: sessionIdRef.current, accessToken: accessTokenRef.current },
+  ) {
+    const response = await fetch("/api/interviews/recorded/answer", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${credentials.accessToken}`,
+        "X-Interview-Session": credentials.sessionId,
+        "X-Recorded-Answer-Index": String(answerIndex),
+        "X-Recorded-Answer-Bytes": String(blob.size),
+        "Content-Type": blob.type.split(";")[0] || "audio/webm",
+      },
+      body: blob,
+    });
+    const data = (await response.json().catch(() => null)) as {
+      transcribed?: boolean;
+      pending?: boolean;
+      retryAfterSeconds?: number;
+      error?: string;
+    } | null;
+    if (response.ok && data?.transcribed === true) return;
+    if (response.status === 202 && data?.pending) {
+      const retrySeconds = Math.max(1, Math.min(15, Number(data.retryAfterSeconds) || 5));
+      await new Promise((resolve) => window.setTimeout(resolve, retrySeconds * 1_000));
+      return await retryRecordedAnswerTranscription(answerIndex, 3, credentials);
+    }
+    throw new Error(data?.error || "回答音声の文字起こしを完了できませんでした。");
+  }
+
+  async function retryRecordedAnswerTranscription(
+    answerIndex: number,
+    attemptsRemaining: number,
+    credentials: { sessionId: string; accessToken: string },
+  ): Promise<void> {
+    if (attemptsRemaining <= 0) {
+      throw new Error("回答音声の文字起こしが保留中です。しばらくしてから保存を再試行してください。");
+    }
+    const response = await fetch("/api/interviews/recorded/answer", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${credentials.accessToken}`,
+        "X-Interview-Session": credentials.sessionId,
+        "X-Recorded-Answer-Index": String(answerIndex),
+      },
+    });
+    const data = (await response.json().catch(() => null)) as {
+      transcribed?: boolean;
+      pending?: boolean;
+      retryAfterSeconds?: number;
+      error?: string;
+    } | null;
+    if (response.ok && data?.transcribed === true) return;
+    if (response.status === 202 && data?.pending) {
+      const retrySeconds = Math.max(1, Math.min(15, Number(data.retryAfterSeconds) || 5));
+      await new Promise((resolve) => window.setTimeout(resolve, retrySeconds * 1_000));
+      return await retryRecordedAnswerTranscription(answerIndex, attemptsRemaining - 1, credentials);
+    }
+    throw new Error(data?.error || "回答音声の文字起こしを完了できませんでした。");
+  }
+
+  function finishRecordedAnswerCapture(answerIndex: number) {
+    const recorder = recordedAnswerRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") return Promise.reject(new Error("RECORDED_ANSWER_AUDIO_MISSING"));
+    recordedAnswerRecorderRef.current = null;
+    const chunks = recordedAnswerChunksRef.current;
+    const startedAt = recordedAnswerStartedAtRef.current;
+    recordedAnswerChunksRef.current = [];
+    recordedAnswerStartedAtRef.current = null;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finishResolve = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const finishReject = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+      recorder.onerror = () => finishReject(new Error("RECORDED_ANSWER_AUDIO_FAILED"));
+      recorder.onstop = () => {
+        const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+        if (!startedAt || Date.now() - startedAt < 500 || blob.size <= 0) {
+          finishReject(new Error("RECORDED_ANSWER_AUDIO_MISSING"));
+          return;
+        }
+        recordedAnswerBlobsRef.current.set(answerIndex, blob);
+        uploadRecordedAnswer(answerIndex, blob).then(finishResolve, finishReject);
+      };
+      try {
+        recorder.requestData();
+        recorder.stop();
+      } catch (error) {
+        finishReject(error);
+      }
+    });
+  }
+
+  function discardRecordedAnswerCapture() {
+    const recorder = recordedAnswerRecorderRef.current;
+    recordedAnswerRecorderRef.current = null;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      recorder.onerror = null;
+      try {
+        recorder.stop();
+      } catch {
+        // The recorder may already be stopping during a connection reset.
+      }
+    }
+    recordedAnswerChunksRef.current = [];
+    recordedAnswerStartedAtRef.current = null;
+    recordedAnswerUploadsRef.current.clear();
+    recordedAnswerBlobsRef.current.clear();
   }
 
   async function startRecordedFallback(options: { continueCurrentAttempt?: boolean } = {}) {
@@ -1634,6 +1850,10 @@ export default function Home() {
       transcriptRef.current = [firstTurn];
       setTranscript([firstTurn]);
       recordedInterviewSessionRef.current = activeSessionId;
+      if (!options.continueCurrentAttempt) {
+        recordedAnswerUploadsRef.current.clear();
+        recordedAnswerBlobsRef.current.clear();
+      }
       setConnectionState("ai-speaking");
       setConnectionStep("ready");
       setNetworkAudioState("idle");
@@ -1651,14 +1871,21 @@ export default function Home() {
   }
 
   async function advanceRecordedFallback() {
-    if (mode !== "recorded-fallback" || !recordedQuestionReady || endingRef.current) return;
+    if (
+      mode !== "recorded-fallback" ||
+      !recordedQuestionReady ||
+      !recordedQuestionReadyRef.current ||
+      endingRef.current
+    ) return;
     recordedQuestionReadyRef.current = false;
     setRecordedQuestionReady(false);
     const answerNumber = recordedQuestionIndex + 1;
+    const answerUpload = finishRecordedAnswerCapture(answerNumber);
+    recordedAnswerUploadsRef.current.set(answerNumber, answerUpload);
     upsertTurn({
       id: `recorded-fallback-answer-${answerNumber}`,
       speaker: "candidate",
-      text: `回答${answerNumber}の発言内容は録画音声に記録されています。自動文字起こしではないため、採用担当者が録画を確認します。`,
+      text: `回答${answerNumber}の発言内容は録画音声に記録されています。自動文字起こし完了後、採用担当者が録画と照合します。`,
       createdAt: new Date().toISOString(),
     });
     if (timedMaximumRequestedRef.current || elapsed >= INTERVIEW_MAX_SECONDS) {
@@ -1843,6 +2070,7 @@ export default function Home() {
       accessTokenRef.current = data.accessToken;
       sessionIdRef.current = data.sessionId;
       setSessionId(data.sessionId);
+      voiceTranscriptionCompleteRef.current = true;
       const started = await fetch("/api/interviews/text/start", {
         method: "POST",
         headers: {
@@ -1870,6 +2098,10 @@ export default function Home() {
       setConnectionStep("ready");
       setProcessingWarning("");
       setRecordingUploadState("idle");
+      setArchiveSyncState("idle");
+      setCompletionSavePending(false);
+      interviewFinalizationStoredRef.current = false;
+      voiceTranscriptSealedRef.current = false;
       setStage("interview");
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "文字入力によるオンライン一次面接を開始できませんでした。");
@@ -1882,6 +2114,7 @@ export default function Home() {
     stopRealtime();
     const id = `TD-TEST-${Date.now().toString(36).toUpperCase()}`;
     sessionIdRef.current = id;
+    voiceTranscriptionCompleteRef.current = true;
     const firstTurn: TranscriptTurn = {
       id: "internal-test-question-1",
       speaker: "interviewer",
@@ -1894,6 +2127,10 @@ export default function Home() {
     startInterviewClock();
     setErrorMessage("");
     setProcessingWarning("");
+    setArchiveSyncState("idle");
+    setCompletionSavePending(false);
+    interviewFinalizationStoredRef.current = false;
+    voiceTranscriptSealedRef.current = false;
     transcriptRef.current = [firstTurn];
     setTranscript([firstTurn]);
     setConnectionState("ready");
@@ -1941,8 +2178,14 @@ export default function Home() {
         // The recorder can already be stopping.
       }
       try {
+        // Only completeInterview sets endingRef before requesting stop. A
+        // browser/OS track interruption can otherwise emit a clean onstop with
+        // only the early part of the interview; never receipt that as complete.
+        recordingFinalStopRequestedRef.current = endingRef.current;
         activeRecorder.stop();
       } catch {
+        recordingFinalStopRequestedRef.current = false;
+        recordingCompleteRef.current = false;
         recordingResolveRef.current?.(null);
         recordingResolveRef.current = null;
         cleanupRecordingAudioMix();
@@ -1991,6 +2234,26 @@ export default function Home() {
   }
 
   async function completeRecordedFallback() {
+    const answerIndexes = [...recordedAnswerBlobsRef.current.keys()].sort((left, right) => left - right);
+    const questionCount = answerIndexes.length;
+    if (questionCount < 1 || answerIndexes.some((answerIndex, index) => answerIndex !== index + 1)) {
+      throw new Error("回答音声を保存できていません。面接記録の保存を再試行してください。");
+    }
+    try {
+      const existingUploads = answerIndexes.map((answerIndex) => recordedAnswerUploadsRef.current.get(answerIndex));
+      if (existingUploads.some((upload) => !upload)) throw new Error("RECORDED_ANSWER_UPLOAD_MISSING");
+      await Promise.all(existingUploads);
+    } catch {
+      // Each audio blob is retained locally until the final receipt. Replaying an
+      // identical blob is idempotent server-side and recovers transport failures.
+      const answerUploads = answerIndexes.map((answerIndex) => {
+        const blob = recordedAnswerBlobsRef.current.get(answerIndex)!;
+        const upload = uploadRecordedAnswer(answerIndex, blob);
+        recordedAnswerUploadsRef.current.set(answerIndex, upload);
+        return upload;
+      });
+      await Promise.all(answerUploads);
+    }
     const response = await fetch("/api/interviews/recorded/complete", {
       method: "POST",
       headers: {
@@ -1999,7 +2262,7 @@ export default function Home() {
       },
       body: JSON.stringify({
         sessionId,
-        questionCount: RECORDED_FALLBACK_QUESTIONS.length,
+        questionCount,
       }),
     });
     const data = (await response.json().catch(() => null)) as { stored?: boolean; error?: string } | null;
@@ -2008,30 +2271,108 @@ export default function Home() {
     }
   }
 
-  async function syncInterviewArchive() {
-    setArchiveSyncState("syncing");
-    const response = await fetch("/api/interviews/archive", {
+  async function sealRecordedFallbackCompletion() {
+    const expectedAnswerCount = recordedAnswerUploadsRef.current.size;
+    if (expectedAnswerCount < 1 || expectedAnswerCount > RECORDED_FALLBACK_QUESTIONS.length) {
+      throw new Error("回答音声を完了情報として保存できませんでした。");
+    }
+    const response = await fetch("/api/interviews/recorded/seal", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessTokenRef.current}`,
       },
-      body: JSON.stringify({ sessionId }),
+      body: JSON.stringify({ sessionId, expectedAnswerCount }),
     });
-    const data = (await response.json().catch(() => null)) as {
-      stored?: boolean;
-      recordingIncluded?: boolean;
-      error?: string;
-    } | null;
-    const needsRecording = mode !== "text";
-    if (!response.ok || !data?.stored || (needsRecording && data.recordingIncluded !== true)) {
-      setArchiveSyncState("error");
-      throw new Error(data?.error || "面接記録の社内格納を完了できませんでした。");
+    const data = (await response.json().catch(() => null)) as { sealed?: boolean; error?: string } | null;
+    if (!response.ok || data?.sealed !== true) {
+      throw new Error(data?.error || "回答数の完了情報を保存できませんでした。");
     }
-    setArchiveSyncState("stored");
+  }
+
+  async function sealVoiceTranscriptCompletion() {
+    if (voiceTranscriptSealedRef.current) return;
+    if (!voiceTranscriptionCompleteRef.current) {
+      throw new Error("回答音声の文字起こしに未完了の箇所があるため、面接記録の保存は完了していません。");
+    }
+    if (!transcriptRef.current.some((turn) =>
+      turn.speaker === "candidate" && turn.text.trim().length > 0
+    )) {
+      throw new Error("確定できる回答の文字起こしがありません。");
+    }
+    const response = await fetch("/api/interviews/voice/transcript/seal", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessTokenRef.current}`,
+      },
+      body: JSON.stringify({
+        sessionId,
+        transcript: transcriptRef.current,
+        transcriptionComplete: true,
+      }),
+    });
+    const data = (await response.json().catch(() => null)) as { sealed?: boolean; error?: string } | null;
+    if (!response.ok || data?.sealed !== true) {
+      throw new Error(data?.error || "回答の文字起こしを確定できませんでした。");
+    }
+    voiceTranscriptSealedRef.current = true;
+  }
+
+  async function syncInterviewArchive(attempt = 0): Promise<void> {
+    if (mode !== "text" && !recordingCompleteRef.current) {
+      setArchiveSyncState("error");
+      throw new Error("完全な録画を確認できないため、社内Drive格納を完了できません。");
+    }
+    if (attempt >= 120) {
+      setArchiveSyncState("error");
+      throw new Error("社内Driveへの格納確認が時間内に完了しませんでした。保存を再試行してください。");
+    }
+    setArchiveSyncState("syncing");
+    try {
+      const response = await fetch("/api/interviews/archive", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessTokenRef.current}`,
+        },
+        body: JSON.stringify({ sessionId }),
+      });
+      const data = (await response.json().catch(() => null)) as {
+        stored?: boolean;
+        recordingIncluded?: boolean;
+        transcriptAvailable?: boolean;
+        transcriptKind?: string;
+        pending?: boolean;
+        retryAfterMs?: number;
+        error?: string;
+      } | null;
+      if (response.ok && data?.pending === true) {
+        const retryAfterMs = Math.max(100, Math.min(5_000, Number(data.retryAfterMs) || 250));
+        await new Promise((resolve) => window.setTimeout(resolve, retryAfterMs));
+        return await syncInterviewArchive(attempt + 1);
+      }
+      const needsRecording = mode !== "text";
+      if (
+        !response.ok ||
+        !data?.stored ||
+        data.transcriptAvailable !== true ||
+        data.transcriptKind !== "actual_transcript" ||
+        (needsRecording && data.recordingIncluded !== true)
+      ) {
+        throw new Error(data?.error || "面接記録の社内格納を完了できませんでした。");
+      }
+      setArchiveSyncState("stored");
+    } catch (error) {
+      setArchiveSyncState("error");
+      throw error;
+    }
   }
 
   async function uploadRecording(blob: Blob) {
+    if (!recordingCompleteRef.current) {
+      throw new Error("途中までの録画は送信できません。");
+    }
     setRecordingUploadState("uploading");
     setRecordingUploadProgress(0);
     await uploadRecordingResumably({
@@ -2048,15 +2389,84 @@ export default function Home() {
     setRecordingUploadState("stored");
   }
 
+  async function storeInterviewFinalization() {
+    if (interviewFinalizationStoredRef.current) return;
+    if (mode === "voice" && !voiceTranscriptionCompleteRef.current) {
+      throw new Error("回答音声の文字起こしに未完了の箇所があるため、面接記録の保存は完了していません。");
+    }
+    if (!transcriptRef.current.some((turn) => turn.speaker === "candidate" && turn.text.trim().length > 0)) {
+      throw new Error("評価に必要な回答記録がありません。オンライン一次面接を最初からお試しください。");
+    }
+    if (mode === "voice") await sealVoiceTranscriptCompletion();
+    if (mode === "recorded-fallback") {
+      await completeRecordedFallback();
+    } else {
+      await requestEvaluation();
+    }
+    interviewFinalizationStoredRef.current = true;
+  }
+
+  function setArchiveCompletionMessage() {
+    setProcessingWarning(
+      mode === "recorded-fallback"
+        ? "回答音声の自動文字起こしは完了しています。自動評価は行わず、採用担当者が録画と照合します。"
+        : "",
+    );
+  }
+
   async function retryRecordingUpload() {
     const blob = recordingBlobRef.current;
     if (!blob || recordingUploadState === "uploading") return;
+    if (!recordingCompleteRef.current) {
+      setProcessingWarning("録画が途中で終了したため、この録画を完了データとして送信できません。採用担当者へ受付番号をお知らせください。");
+      setStage("review");
+      return;
+    }
+    setStage("evaluating");
     try {
+      if (mode === "voice") await sealVoiceTranscriptCompletion();
+      if (mode === "recorded-fallback") await sealRecordedFallbackCompletion();
       await uploadRecording(blob);
-      await syncInterviewArchive();
-      setProcessingWarning("");
     } catch {
       setRecordingUploadState("error");
+      setProcessingWarning("録画の送信を完了できませんでした。下のボタンから再試行してください。");
+      reportCandidateEvent("recording_unavailable", "UPLOAD_FAILED");
+      setStage("review");
+      return;
+    }
+    try {
+      await storeInterviewFinalization();
+      await syncInterviewArchive();
+      setArchiveCompletionMessage();
+      setCompletionSavePending(false);
+    } catch {
+      // The recording is already durable at this point. An evaluation or Drive
+      // failure must not falsely return the recording itself to the error state.
+      setProcessingWarning("面接記録の最終保存を完了できませんでした。下のボタンから再試行してください。");
+    } finally {
+      setStage("review");
+    }
+  }
+
+  async function retryInterviewFinalization() {
+    if (archiveSyncState === "syncing") return;
+    if (mode !== "text" && !recordingCompleteRef.current) {
+      setArchiveSyncState("error");
+      setProcessingWarning("完全な録画を確認できないため、面接記録の最終保存は完了していません。採用担当者へ受付番号をお知らせください。");
+      setStage("review");
+      return;
+    }
+    setStage("evaluating");
+    try {
+      if (mode === "voice") await sealVoiceTranscriptCompletion();
+      await storeInterviewFinalization();
+      await syncInterviewArchive();
+      setArchiveCompletionMessage();
+      setCompletionSavePending(false);
+    } catch {
+      setProcessingWarning("面接記録の最終保存を完了できませんでした。下のボタンから再試行してください。");
+    } finally {
+      setStage("review");
     }
   }
 
@@ -2085,6 +2495,7 @@ export default function Home() {
         createdAt: new Date().toISOString(),
       });
       setConnectionState("idle");
+      setCompletionSavePending(false);
       setStage("review");
       void reason;
       return;
@@ -2093,8 +2504,22 @@ export default function Home() {
     pendingCompletionTimerRef.current = null;
     pendingCompletionReasonRef.current = null;
     endingRef.current = true;
+    // From this point until the verified Drive receipt, leaving the page can
+    // abandon bytes or finalization requests that no server has received yet.
+    setCompletionSavePending(true);
     setStage("evaluating");
     setConnectionState("idle");
+    if (mode === "recorded-fallback" && recordedAnswerRecorderRef.current) {
+      const answerNumber = recordedQuestionIndex + 1;
+      const answerUpload = finishRecordedAnswerCapture(answerNumber);
+      recordedAnswerUploadsRef.current.set(answerNumber, answerUpload);
+      upsertTurn({
+        id: `recorded-fallback-answer-${answerNumber}`,
+        speaker: "candidate",
+        text: `回答${answerNumber}の発言内容は録画音声に記録されています。自動文字起こし完了後、採用担当者が録画と照合します。`,
+        createdAt: new Date().toISOString(),
+      });
+    }
     stopRealtime();
     // MediaRecorder.stop() finalizes its container asynchronously. Do not race it
     // against a short timer: a large iPhone MP4 can legitimately need more than six
@@ -2103,39 +2528,76 @@ export default function Home() {
     const recordingBlob = await (
       recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current)
     );
-    if (mode !== "text" && !recordingBlob) reportCandidateEvent("recording_unavailable", "NO_RECORDING_AT_COMPLETION");
-    if (mode !== "text" && recordingBlob && recordingHasBothAudioRef.current !== true) {
+    const recordingComplete = mode === "text" || recordingCompleteRef.current;
+    if (mode !== "text" && (!recordingBlob || !recordingComplete)) reportCandidateEvent("recording_unavailable", "NO_RECORDING_AT_COMPLETION");
+    if (mode !== "text" && recordingBlob && recordingComplete && recordingHasBothAudioRef.current !== true) {
       reportCandidateEvent("recording_unavailable", "REMOTE_AUDIO_UNVERIFIED");
     }
-    const recordingUpload = mode !== "text" && recordingBlob
-      ? uploadRecording(recordingBlob).catch((error) => {
+    if (mode !== "text" && (!recordingBlob || !recordingComplete)) {
+      setRecordingUploadState("error");
+      setProcessingWarning("完全な録画データを端末で生成できなかったため、面接記録の保存は完了していません。採用担当者へ受付番号をお知らせください。");
+      setStage("review");
+      endingRef.current = false;
+      return;
+    }
+    if (mode === "recorded-fallback") {
+      try {
+        // Seal the candidate's intended answer count before the large recording
+        // upload. Staff recovery may only complete exactly this many answers.
+        await sealRecordedFallbackCompletion();
+      } catch {
         setRecordingUploadState("error");
-        reportCandidateEvent("recording_unavailable", "UPLOAD_FAILED");
-        void error;
-      })
-      : Promise.resolve();
-
+        setProcessingWarning("回答数の完了情報を保存できませんでした。下のボタンから再試行してください。");
+        setStage("review");
+        endingRef.current = false;
+        return;
+      }
+    } else if (mode === "voice") {
+      try {
+        // Persist the actual transcript before the large recording upload. If
+        // the browser closes after the final part, staff recovery can now prove
+        // that this was a cleanly completed voice interview before receipting it.
+        await sealVoiceTranscriptCompletion();
+      } catch {
+        setRecordingUploadState("error");
+        setProcessingWarning("回答の文字起こしを確定できませんでした。下のボタンから再試行してください。");
+        setStage("review");
+        endingRef.current = false;
+        return;
+      }
+    }
     // Do not let evaluation completion start the Drive archive before the
     // recording artifact is durable. Both operations were awaited eventually,
     // but running them concurrently allowed a permanent video-less archive.
-    await recordingUpload;
+    let completionPhase: "recording" | "evaluation" | "archive" = "recording";
+    let recordingStored = mode === "text";
     try {
-      if (transcriptRef.current.length === 0) {
-        throw new Error("評価に必要な回答記録がありません。オンライン一次面接を最初からお試しください。");
+      if (mode !== "text" && recordingBlob) {
+        await uploadRecording(recordingBlob);
+        recordingStored = true;
       }
-      if (mode === "recorded-fallback") {
-        await completeRecordedFallback();
-        await syncInterviewArchive();
-        setProcessingWarning("回答本文の自動文字起こしと自動評価は行わず、採用担当者が録画を確認します。");
-      } else {
-        await requestEvaluation();
-        await syncInterviewArchive();
-      }
+      completionPhase = "evaluation";
+      await storeInterviewFinalization();
+      completionPhase = "archive";
+      await syncInterviewArchive();
+      setArchiveCompletionMessage();
+      setCompletionSavePending(false);
+      setStage("review");
     } catch (error) {
-      setProcessingWarning("回答記録の自動整理を完了できませんでした。採用担当者が記録状態を確認します。");
+      if (completionPhase === "recording" && !recordingStored && mode !== "text") {
+        setRecordingUploadState("error");
+        reportCandidateEvent("recording_unavailable", "UPLOAD_FAILED");
+      }
+      setProcessingWarning(
+        completionPhase === "recording"
+          ? "録画の送信を完了できませんでした。下のボタンから再試行してください。"
+          : completionPhase === "evaluation"
+            ? "回答記録の整理を完了できませんでした。下のボタンから再試行してください。"
+            : "社内Driveへの最終格納を完了できませんでした。下のボタンから再試行してください。",
+      );
+      setStage("review");
       void error;
     } finally {
-      setStage("review");
       endingRef.current = false;
       void reason;
     }
@@ -2212,6 +2674,7 @@ export default function Home() {
       return;
     }
     if (type === "conversation.item.input_audio_transcription.failed") {
+      voiceTranscriptionCompleteRef.current = false;
       setCandidateAudioState("ready");
       reportCandidateEvent("transcription_failed", "TRANSCRIPTION_FAILED");
       setAudioNotice("回答音声の文字起こしを一部確認できませんでした。内容が画面に表示されない場合は、下の入力欄から補足できます。");
@@ -2330,7 +2793,13 @@ export default function Home() {
     setConnectionStep("voice");
     setStage("interview");
     if (isNewInterviewSession) {
+      recordingCompleteRef.current = false;
+      voiceTranscriptionCompleteRef.current = true;
       startInterviewClock();
+      setArchiveSyncState("idle");
+      setCompletionSavePending(false);
+      interviewFinalizationStoredRef.current = false;
+      voiceTranscriptSealedRef.current = false;
       transcriptRef.current = [];
       setTranscript([]);
       recordedInterviewSessionRef.current = activeSessionId;
@@ -2604,6 +3073,7 @@ export default function Home() {
   }
 
   function resetInterview() {
+    discardRecordedAnswerCapture();
     stopRealtime();
     resetTimedInterviewControl();
     setSessionId("TD-PENDING");
@@ -2628,8 +3098,16 @@ export default function Home() {
     recordingResolveRef.current = null;
     recordingBytesRef.current = 0;
     recordingSizeCappedRef.current = false;
+    recordingCompleteRef.current = false;
+    recordingFinalStopRequestedRef.current = false;
+    voiceTranscriptionCompleteRef.current = true;
+    recordingGenerationRef.current += 1;
     setRecordingUploadState("idle");
     setRecordingUploadProgress(0);
+    setArchiveSyncState("idle");
+    setCompletionSavePending(false);
+    interviewFinalizationStoredRef.current = false;
+    voiceTranscriptSealedRef.current = false;
     setRecordingCaptureState("idle");
     updateRecordingAudioCoverage(null);
     setScreenCaptureState("idle");
@@ -2643,6 +3121,7 @@ export default function Home() {
   }
 
   function restartConnection() {
+    discardRecordedAnswerCapture();
     stopRealtime();
     resetTimedInterviewControl();
     accessTokenRef.current = "";
@@ -2662,12 +3141,20 @@ export default function Home() {
     chunksRef.current = [];
     recordingBytesRef.current = 0;
     recordingSizeCappedRef.current = false;
+    recordingCompleteRef.current = false;
+    recordingFinalStopRequestedRef.current = false;
+    voiceTranscriptionCompleteRef.current = true;
+    recordingGenerationRef.current += 1;
     recordingBlobRef.current = null;
     recordingPromiseRef.current = null;
     recordingResolveRef.current = null;
     setTextDraft("");
     setRecordingUploadState("idle");
     setRecordingUploadProgress(0);
+    setArchiveSyncState("idle");
+    setCompletionSavePending(false);
+    interviewFinalizationStoredRef.current = false;
+    voiceTranscriptSealedRef.current = false;
     setRecordingCaptureState("idle");
     setScreenCaptureState("idle");
     setSetupPhase("idle");
@@ -3048,7 +3535,7 @@ export default function Home() {
           <img src="/tokyo-dogs-logo.jpg" alt="Tokyo Dogs" />
           <div className="evaluation-loader"><i /><i /><i /></div>
           <h1>回答内容を整理しています。</h1>
-          <p>{recordingUploadState === "uploading" ? `録画を分割保存しています（${recordingUploadProgress}%）。この画面を閉じずにお待ちください。` : archiveSyncState === "syncing" ? "録画・文字起こし・評価資料を社内Driveへ格納しています。この画面を閉じずにお待ちください。" : "発言根拠を照合し、採用担当者向けの確認資料を作成しています。"}</p>
+          <p>{recordingUploadState === "uploading" ? `録画を分割保存しています（${recordingUploadProgress}%）。この画面を閉じずにお待ちください。` : archiveSyncState === "syncing" ? mode === "recorded-fallback" ? "録画と回答文字起こしを社内Driveへ格納しています。この画面を閉じずにお待ちください。" : mode === "text" ? "回答記録と評価資料を社内Driveへ格納しています。この画面を閉じずにお待ちください。" : "録画・文字起こし・評価資料を社内Driveへ格納しています。この画面を閉じずにお待ちください。" : "発言根拠を照合し、採用担当者向けの確認資料を作成しています。"}</p>
           <div className="evaluation-steps"><span className="done">{mode === "text" ? "回答記録" : "文字起こし"}</span><span className="active">根拠を照合</span><span>評価を作成</span></div>
         </section>
       )}
@@ -3056,22 +3543,25 @@ export default function Home() {
       {stage === "review" && (
         <section className="review-page">
           <div className="review-heading">
-            <div><p className="eyebrow">{mode === "internal-test" ? "PORTAL CHECK COMPLETE" : "ONLINE FIRST INTERVIEW RECEIVED"}</p><h1>{mode === "internal-test" ? "接続確認が完了しました。" : "オンライン一次面接を受け付けました。"}</h1><p>{mode === "internal-test" ? "録画・音声接続・採用評価は行っていません。この内容は採用判断には使用しません。" : "ご回答ありがとうございました。面接記録は権限を付与された採用担当者が確認し、採用選考の判断資料として使用します。"}</p></div>
+            <div><p className="eyebrow">{mode === "internal-test" ? "PORTAL CHECK COMPLETE" : archiveSyncState === "stored" ? "ONLINE FIRST INTERVIEW RECEIVED" : "INTERVIEW SAVE NOT YET VERIFIED"}</p><h1>{mode === "internal-test" ? "接続確認が完了しました。" : archiveSyncState === "stored" ? "オンライン一次面接を受け付けました。" : "面接記録の保存はまだ完了していません。"}</h1><p>{mode === "internal-test" ? "録画・音声接続・採用評価は行っていません。この内容は採用判断には使用しません。" : archiveSyncState === "stored" ? "ご回答ありがとうございました。面接記録は権限を付与された採用担当者が確認し、採用選考の判断資料として使用します。" : "この画面を閉じずに、下の保存状態と案内をご確認ください。"}</p></div>
             <div className="recommendation human_review"><span>受付番号</span><strong>{mode === "internal-test" ? "TEST COMPLETE" : sessionId}</strong><small>{mode === "internal-test" ? "採用判断には使用しません" : "採用担当者のみ閲覧可能"}</small></div>
           </div>
           <div className="summary-card">
             <span>{mode === "internal-test" ? "接続確認の取り扱い" : "評価結果の取り扱い"}</span>
             <p>{mode === "internal-test"
               ? "入力内容は端末内の画面確認だけに使用し、外部送信・保存・録画・文字起こし・採用評価を行っていません。"
-              : "採点結果、評価本文、文字起こし、録画はこの応募者画面には表示されません。認証された採用担当者だけが社内の確認画面で閲覧します。"}</p>
+              : mode === "recorded-fallback"
+                ? "録画と回答文字起こしはこの応募者画面には表示されません。認証された採用担当者が文字起こしを録画と照合します。"
+                : "採点結果、評価本文、文字起こし、録画はこの応募者画面には表示されません。認証された採用担当者だけが社内の確認画面で閲覧します。"}</p>
           </div>
           {processingWarning && <div className="validation-box"><strong>記録状態を採用担当者が確認します</strong><p>{processingWarning}</p></div>}
-          {recordingUploadState === "stored" && <div className="validation-box"><strong>オンライン一次面接の記録を受け付けました</strong><p>録画は面接IDで保管し、採用担当者以外には開示しません。</p></div>}
-          {archiveSyncState === "stored" && <div className="validation-box"><strong>社内Driveへの格納まで完了しました</strong><p>録画・文字起こし・評価資料の格納結果をサーバーで再確認済みです。</p></div>}
+          {recordingUploadState === "stored" && recordingCompleteRef.current && <div className="validation-box"><strong>録画の一次保存が完了しました</strong><p>録画は面接IDで保管し、採用担当者以外には開示しません。社内Driveへの最終格納が確認できるまで受付完了にはなりません。</p></div>}
+          {archiveSyncState === "stored" && <div className="validation-box"><strong>社内Driveへの格納まで完了しました</strong><p>{mode === "recorded-fallback" ? "録画と回答文字起こしの格納結果をサーバーで再確認済みです。採用担当者が両者を照合します。" : mode === "text" ? "回答記録と評価資料の格納結果をサーバーで再確認済みです。" : "録画・文字起こし・評価資料の格納結果をサーバーで再確認済みです。"}</p></div>}
           {archiveSyncState === "syncing" && <div className="validation-box"><strong>社内Driveへの格納を確認中です</strong><p>録画を含む全資料の実読取が終わるまで、この画面を閉じずにお待ちください。</p></div>}
-          {archiveSyncState === "error" && <div className="validation-box"><strong>社内Driveへの格納を再確認できます</strong><p>録画本体は面接IDで保存済みです。この画面を閉じずに再確認してください。</p><button type="button" className="secondary-action" onClick={() => void syncInterviewArchive()}>Drive格納を再確認</button></div>}
-          {mode === "text" && <div className="validation-box"><strong>文字入力によるオンライン一次面接を受け付けました</strong><p>カメラ・マイク・録画は使用していません。回答内容は採用担当者が確認します。</p></div>}
-          {recordingUploadState === "error" && <div className="validation-box"><strong>録画の送信を再開できます</strong><p>受信済みの部分は再送せず、未送信部分から再開します。この画面を閉じずに再試行してください。</p><button type="button" className="secondary-action" onClick={() => void retryRecordingUpload()}>録画送信を再試行</button></div>}
+          {archiveSyncState !== "stored" && archiveSyncState !== "syncing" && (mode === "text" || (recordingUploadState === "stored" && recordingCompleteRef.current)) && <div className="validation-box"><strong>最終保存を再試行できます</strong><p>完了済みの処理は重複させず、未完了の整理または社内Drive格納から再開します。</p><button type="button" className="secondary-action" onClick={() => void retryInterviewFinalization()}>面接記録の保存を再試行</button></div>}
+          {mode === "text" && archiveSyncState === "stored" && <div className="validation-box"><strong>文字入力によるオンライン一次面接を受け付けました</strong><p>カメラ・マイク・録画は使用していません。回答内容は採用担当者が確認します。</p></div>}
+          {recordingUploadState === "error" && recordingBlobRef.current && recordingCompleteRef.current && <div className="validation-box"><strong>録画の送信を再開できます</strong><p>受信済みの部分は再送せず、未送信部分から再開します。この画面を閉じずに再試行してください。</p><button type="button" className="secondary-action" onClick={() => void retryRecordingUpload()}>録画送信を再試行</button></div>}
+          {recordingUploadState === "error" && (!recordingBlobRef.current || !recordingCompleteRef.current) && <div className="validation-box"><strong>この端末から完全な録画を再送できません</strong><p>録画データが生成されていないか、途中で終了したため、採用担当者へ上の受付番号をお知らせください。</p></div>}
           <div className="review-actions"><div><span>{mode === "internal-test" ? "確認時間" : "面接時間"}</span><strong>{formatTime(elapsed)}</strong></div>{mode === "internal-test" && <button className="secondary-action" onClick={resetInterview}>最初から確認</button>}</div>
         </section>
       )}

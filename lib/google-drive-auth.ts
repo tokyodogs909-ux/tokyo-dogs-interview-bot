@@ -152,7 +152,13 @@ export async function fetchGoogleDriveAccessToken() {
   const payload = await readJson(response);
   const accessToken = typeof payload.access_token === "string" ? payload.access_token.trim() : "";
   if (!response.ok || !accessToken) {
-    throw new Error("GOOGLE_DRIVE_TOKEN_REFRESH_FAILED");
+    // invalid_grant, invalid_client, and other 4xx responses require an
+    // administrator to reconnect Google Drive. Retrying those forever would
+    // leave an archive looking "in progress" instead of surfacing the outage.
+    if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+      throw new Error("GOOGLE_DRIVE_TOKEN_REFRESH_RECONNECT_REQUIRED");
+    }
+    throw new Error("GOOGLE_DRIVE_TOKEN_REFRESH_TRANSIENT");
   }
   return accessToken;
 }

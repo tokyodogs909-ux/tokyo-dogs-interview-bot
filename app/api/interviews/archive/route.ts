@@ -1,12 +1,11 @@
-import { syncInterviewToGoogleDrive } from "@/lib/google-drive-sync";
+import { stepInterviewToGoogleDrive } from "@/lib/google-drive-sync";
 import { authorizeInterviewRequest } from "@/lib/interview-persistence";
-import { hasTrustedRequestOrigin, noStoreJson, noStoreJsonStream } from "@/lib/openai-server";
+import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 /**
- * Completes the applicant's own Drive archive in the foreground. Cloudflare
- * cancels waitUntil work 30 seconds after a response; a full interview video
- * can take longer than that to stream from R2 to Drive, so the browser keeps
- * this request open until Drive read-back has succeeded.
+ * Advances the applicant's Drive archive by at most one recording chunk. D1
+ * keeps the resumable offset between requests, preventing the public Worker
+ * request from becoming one multi-minute 70 MB transfer.
  */
 export async function POST(request: Request) {
   try {
@@ -24,30 +23,29 @@ export async function POST(request: Request) {
     if (!authorized?.session) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
     }
-    return noStoreJsonStream(async () => {
-      try {
-        const result = await syncInterviewToGoogleDrive(sessionId);
-        return { stored: result.status === "completed", recordingIncluded: result.recordingIncluded };
-      } catch (error) {
-        const code = error instanceof Error ? error.message : "";
-        const safeCode = /^[A-Z0-9_:-]{3,120}$/.test(code) ? code : "INTERVIEW_ARCHIVE_FAILED";
-        console.error("interview_archive_failed", { code: safeCode });
-        const archiveNotReady = code === "INTERVIEW_NOT_READY_FOR_DRIVE_SYNC" ||
-          code === "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC" ||
-          code === "INTERVIEW_RECORDING_ARTIFACT_MISSING";
-        return {
-          stored: false,
-          error: archiveNotReady
-            ? "録画と面接記録の保存完了後に社内格納できます。"
-            : "面接記録の社内格納を完了できませんでした。採用担当者が保存状態を確認します。",
-        };
-      }
+    const result = await stepInterviewToGoogleDrive(sessionId);
+    const pendingStep = "phase" in result ? result : null;
+    return noStoreJson({
+      stored: result.status === "completed",
+      recordingIncluded: result.recordingIncluded,
+      transcriptAvailable: result.status === "completed" ? result.transcriptAvailable : false,
+      transcriptKind: result.status === "completed" ? result.transcriptKind : null,
+      ...(pendingStep ? {
+        pending: true,
+        phase: pendingStep.phase,
+        committedOffset: pendingStep.committedOffset,
+        totalBytes: pendingStep.totalBytes,
+        retryAfterMs: pendingStep.retryAfterMs,
+      } : {}),
     });
   } catch (error) {
     const code = error instanceof Error ? error.message : "";
+    const safeCode = /^[A-Z0-9_:-]{3,120}$/.test(code) ? code : "INTERVIEW_ARCHIVE_FAILED";
+    console.error("interview_archive_failed", { code: safeCode });
     const archiveNotReady = code === "INTERVIEW_NOT_READY_FOR_DRIVE_SYNC" ||
       code === "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC" ||
-      code === "INTERVIEW_RECORDING_ARTIFACT_MISSING";
+      code === "INTERVIEW_RECORDING_ARTIFACT_MISSING" ||
+      code === "INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC";
     return noStoreJson({
       error: archiveNotReady
         ? "録画と面接記録の保存完了後に社内格納できます。"

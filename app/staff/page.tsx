@@ -7,6 +7,7 @@ import {
   type InterviewEvaluation,
   type TranscriptTurn,
 } from "@/lib/interview";
+import { isVerifiedInterviewArchive } from "@/lib/drive-recovery.js";
 
 type VideoScore = {
   name: (typeof VIDEO_REVIEW_DIMENSIONS)[number]["name"];
@@ -22,6 +23,7 @@ type ReviewRecord = {
   status: string;
   recordingStatus: string;
   transcript: TranscriptTurn[];
+  sourceTranscriptVerified: boolean;
   evaluation: InterviewEvaluation | null;
   completedAt: string | null;
   retentionUntil: string;
@@ -43,6 +45,8 @@ type ReviewRecord = {
     errorCode: string | null;
     updatedAt: string;
     recordingIncluded: boolean;
+    transcriptAvailable: boolean;
+    transcriptKind: string;
     archivedArtifactCount: number;
   } | null;
 };
@@ -61,6 +65,9 @@ type InterviewListItem = {
   driveFolderUrl: string | null;
   driveUpdatedAt: string | null;
   driveRecordingIncluded: boolean | null;
+  driveTranscriptAvailable: boolean | null;
+  driveTranscriptKind: string | null;
+  sourceTranscriptVerified: boolean;
 };
 
 type ArchiveHealth = {
@@ -131,19 +138,32 @@ function driveArchiveLabel(item: InterviewListItem) {
   if (item.driveStatus === "running") return "Drive格納中";
   if (item.driveStatus === "pending") return "Drive格納待ち";
   if (item.driveStatus !== "completed") return "Drive未格納";
+  if (item.sourceTranscriptVerified !== true) return "保存未完了（文字起こし要確認）";
+  if (item.driveTranscriptAvailable !== true || item.driveTranscriptKind !== "actual_transcript") {
+    return "保存未完了（文字起こし未格納）";
+  }
   if (item.recordingStatus === "not_applicable") return "Drive格納済み";
   return item.recordingStatus === "stored" && item.driveRecordingIncluded === true
     ? "動画含め格納済み"
-    : "動画を自動復旧中";
+    : "保存未完了（録画未格納）";
 }
 
 function driveArchiveClass(item: InterviewListItem) {
+  if (
+    item.driveStatus === "completed" &&
+    (item.sourceTranscriptVerified !== true || item.driveTranscriptAvailable !== true || item.driveTranscriptKind !== "actual_transcript")
+  ) return "attention";
   if (
     item.driveStatus === "completed" &&
     item.recordingStatus !== "not_applicable" &&
     !(item.recordingStatus === "stored" && item.driveRecordingIncluded === true)
   ) return "attention";
   return item.driveStatus ?? "not-started";
+}
+
+function interviewInboxStatusLabel(item: InterviewListItem) {
+  if (item.status !== "completed") return interviewStatusLabels[item.status] ?? item.status;
+  return isVerifiedInterviewArchive(item) ? "保存確認済み" : "保存未完了";
 }
 
 function isTextInterviewRecord(value: ReviewRecord | null) {
@@ -180,6 +200,7 @@ export default function StaffReviewPage() {
   const completionMonitorInitializedRef = useRef(false);
   const pollInterviewListRef = useRef<() => Promise<void>>(async () => undefined);
   const driveRecoveryInFlightRef = useRef(new Set<string>());
+  const transcriptionRecoveryInFlightRef = useRef(false);
 
   useEffect(() => () => {
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
@@ -252,8 +273,8 @@ export default function StaffReviewPage() {
     if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
     const first = items[0];
     const body = items.length === 1
-      ? `${first.candidateName || "氏名未登録"}さんの面接が完了しました。担当者画面で保存状態を確認してください。`
-      : `${items.length}件の面接が完了しました。担当者画面で保存状態を確認してください。`;
+      ? `${first.candidateName || "氏名未登録"}さんの面接記録をDriveまで確認しました。`
+      : `${items.length}件の面接記録をDriveまで確認しました。`;
     try {
       const notification = new Notification("TOKYO DOGS｜オンライン一次面接完了", {
         body,
@@ -306,6 +327,37 @@ export default function StaffReviewPage() {
     }
   }
 
+  async function recoverRecordedTranscriptions() {
+    if (transcriptionRecoveryInFlightRef.current) return;
+    transcriptionRecoveryInFlightRef.current = true;
+    try {
+      const response = await fetch("/api/staff/transcriptions/recover", {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      const data = (await response.json().catch(() => null)) as {
+        recording?: { state?: string } | null;
+        transcription?: { state?: string } | null;
+        evaluation?: { state?: string } | null;
+      } | null;
+      if (!response.ok) {
+        setCompletionNotice("録画回答の文字起こしを自動復旧できない記録があります。管理者設定を確認してください。");
+      } else if (data?.recording?.state === "failed" || data?.recording?.state === "incomplete") {
+        setCompletionNotice("完了情報はありますが、録画パーツが不足または破損している記録があります。手動確認してください。");
+      } else if (data?.transcription?.state === "failed") {
+        setCompletionNotice("自動文字起こしできない回答音声があります。録画を手動確認してください。");
+      } else if (data?.transcription?.state === "pending") {
+        setCompletionNotice("完了操作済みの回答音声を文字起こし待ちです。担当者画面を開いている間、間隔を空けて再試行します。");
+      } else if (data?.evaluation?.state === "completed") {
+        setCompletionNotice("中断していた評価整理を自動採点なしの人手確認記録として復旧しました。Drive格納確認を続けます。");
+      }
+    } catch {
+      setCompletionNotice("録画回答の文字起こし自動復旧が一時停止しました。担当者画面で一覧を更新してください。");
+    } finally {
+      transcriptionRecoveryInFlightRef.current = false;
+    }
+  }
+
   async function loadInterviewList(options: { silent?: boolean } = {}) {
     if (!options.silent) {
       setListLoading(true);
@@ -325,7 +377,7 @@ export default function StaffReviewPage() {
       if (!response.ok || !data.interviews) throw new Error(data.error || "候補者一覧を取得できませんでした。");
       setArchiveHealth(data.archiveHealth ?? null);
       setNotificationPermission(typeof Notification === "undefined" ? "unavailable" : Notification.permission);
-      const completedItems = data.interviews.filter((item) => item.status === "completed" && item.completedAt);
+      const completedItems = data.interviews.filter((item) => isVerifiedInterviewArchive(item) && item.completedAt);
       if (!completionMonitorInitializedRef.current) {
         knownCompletedIdsRef.current = new Set(completedItems.map((item) => item.sessionId));
         completionMonitorInitializedRef.current = true;
@@ -336,11 +388,12 @@ export default function StaffReviewPage() {
         if (newlyCompleted.length > 0) {
           setNewCompletedIds((current) => new Set([...current, ...newlyCompleted.map((item) => item.sessionId)]));
           const names = newlyCompleted.map((item) => item.candidateName || "氏名未登録").join("、");
-          setCompletionNotice(`新しい面接完了：${names}。録画保存・Drive格納・技術フラグを確認してください。`);
+          setCompletionNotice(`保存確認完了：${names}。必要な面接記録をDriveまで再照合済みです。`);
           showBrowserCompletionNotification(newlyCompleted);
         }
       }
       setRecentInterviews(data.interviews);
+      void recoverRecordedTranscriptions();
       if (data.driveRecoverySessionIds?.length) void recoverDriveArchives(data.driveRecoverySessionIds);
       if (!options.silent) {
         setMessage(data.interviews.length > 0
@@ -435,7 +488,14 @@ export default function StaffReviewPage() {
       });
       const data = (await response.json()) as {
         synced?: boolean;
-        result?: { status: "completed" | "pending"; folderUrl: string; recordingIncluded: boolean; uploaded: Record<string, unknown> };
+        result?: {
+          status: "completed" | "pending";
+          folderUrl: string;
+          recordingIncluded: boolean;
+          transcriptAvailable: boolean;
+          transcriptKind: string;
+          uploaded: Record<string, unknown>;
+        };
         error?: string;
       };
       if (!response.ok || !data.result) throw new Error(data.error || "Google Driveへの格納を完了できませんでした。");
@@ -447,12 +507,19 @@ export default function StaffReviewPage() {
           errorCode: null,
           updatedAt: new Date().toISOString(),
           recordingIncluded: data.result?.recordingIncluded === true,
+          transcriptAvailable: data.result?.transcriptAvailable === true,
+          transcriptKind: data.result?.transcriptKind ?? "unknown",
           archivedArtifactCount: Object.keys(data.result?.uploaded ?? {}).length,
         },
       } : current);
       setState("ready");
+      const transcriptVerified = review.sourceTranscriptVerified === true &&
+        data.result.transcriptAvailable === true &&
+        data.result.transcriptKind === "actual_transcript";
       const resultMessage = data.result.status === "completed"
-        ? data.result.recordingIncluded
+        ? !transcriptVerified
+          ? "Google Driveへ成果物は送信されましたが、実際の文字起こしを確認できていません。保存未完了として再確認してください。"
+          : data.result.recordingIncluded
           ? "Google Driveへの録画・文字起こし・評価・PDFの格納を完了しました。"
           : isTextInterviewRecord(review)
             ? "文字入力による回答・評価・PDFのGoogle Drive格納を完了しました。"
@@ -519,11 +586,13 @@ export default function StaffReviewPage() {
           {archiveHealth && archiveHealth.completedInterviews > 0 && (
             <div className={`archive-health ${archiveHealth.attention > 0 ? "attention" : "healthy"}`} role="status" aria-live="polite">
               <div>
-                <strong>{archiveHealth.attention > 0 ? "保存の自動復旧を確認中" : "自動格納は正常です"}</strong>
+                <strong>{archiveHealth.attention > 0 ? "保存未完了の記録があります" : "自動格納は正常です"}</strong>
                 <span>面接完了 {archiveHealth.completedInterviews}件・Drive格納済み {archiveHealth.stored}件{archiveHealth.processing > 0 ? `・処理中 ${archiveHealth.processing}件` : ""}</span>
               </div>
               {archiveHealth.attention > 0 && (
-                <small>{archiveHealth.autoRecoveryScheduled > 0 ? `${archiveHealth.autoRecoveryScheduled}件を自動再実行しました。` : `${archiveHealth.attention}件を一定時間後に自動再実行します。`} 通常は手動操作不要です。</small>
+                <small>{archiveHealth.autoRecoveryScheduled > 0
+                  ? `${archiveHealth.autoRecoveryScheduled}件の復旧処理を、この担当者画面を開いている間に再実行しています。完了表示になるまで画面を開いたまま確認してください。`
+                  : `${archiveHealth.attention}件は復旧の待機中または自動再実行の対象外です。「Driveへ再格納」で状態を確認してください。`}</small>
               )}
             </div>
           )}
@@ -535,7 +604,7 @@ export default function StaffReviewPage() {
             {filteredInterviews.map((item) => (
               <button type="button" className={`${review?.sessionId === item.sessionId ? "active" : ""} ${newCompletedIds.has(item.sessionId) ? "new-completion" : ""}`.trim()} key={item.sessionId} onClick={() => void loadReview(item.sessionId)} disabled={state === "loading"}>
                 <span className="staff-inbox-name"><strong>{item.candidateName || "氏名未登録"}{newCompletedIds.has(item.sessionId) && <em>新着完了</em>}</strong><small>{item.employment}・{item.location}</small></span>
-                <span className="staff-inbox-state"><strong>{interviewStatusLabels[item.status] ?? item.status}</strong><small>{recordingStatusLabels[item.recordingStatus] ?? item.recordingStatus}</small></span>
+                <span className="staff-inbox-state"><strong>{interviewInboxStatusLabel(item)}</strong><small>{recordingStatusLabels[item.recordingStatus] ?? item.recordingStatus}</small></span>
                 <span className="staff-inbox-date"><strong>{formatInterviewDate(item.createdAt)}</strong><small>保存見直し {formatRetentionDate(item.retentionUntil)}</small><small>{item.sessionId}</small></span>
                 <span className={`staff-inbox-drive drive-${driveArchiveClass(item)}`}>{driveArchiveLabel(item)}</span>
                 <span className="staff-inbox-arrow">→</span>
@@ -555,7 +624,7 @@ export default function StaffReviewPage() {
             <p>面接完了後、応募者氏名と面接IDの専用フォルダへ、録画・文字起こし・評価データ・PDFレポート・格納結果を保存します。同じ面接IDで再実行しても既存ファイルを更新します。</p>
             <div className="drive-sync-actions">
               <span className={`drive-sync-status drive-sync-${review.driveSync?.status ?? "not-started"}`}>
-                {review.driveSync?.status === "completed" ? review.driveSync.recordingIncluded ? "録画を含め格納完了" : textInterviewSelected ? "回答記録を格納完了" : "録画未格納"
+                {review.driveSync?.status === "completed" ? review.sourceTranscriptVerified !== true ? "保存未完了（文字起こし要確認）" : review.driveSync.transcriptAvailable !== true || review.driveSync.transcriptKind !== "actual_transcript" ? "保存未完了（文字起こし未格納）" : review.driveSync.recordingIncluded ? "録画を含め格納完了" : textInterviewSelected ? "回答記録を格納完了" : "録画未格納"
                   : review.driveSync?.status === "running" ? "格納中"
                     : review.driveSync?.status === "pending" ? "格納待ち"
                       : review.driveSync?.status === "failed" ? "要再実行"
@@ -567,9 +636,11 @@ export default function StaffReviewPage() {
               </button>
             </div>
             {review.driveSync?.status === "failed" && <p className="guardrail-copy">認証・保存先・通信状態を確認し、再実行してください。応募者の評価状態には影響しません。</p>}
-            {review.driveSync?.status === "completed" && !review.driveSync.recordingIncluded && !textInterviewSelected && <p className="guardrail-copy"><strong>録画はDriveへ格納されていません。</strong> 文字起こし・評価・PDFのみ格納済みです。録画状態が「stored」になった後に再格納してください。</p>}
-            {review.driveSync?.status === "completed" && textInterviewSelected && <p className="guardrail-copy">文字入力方式のため録画はありません。回答記録・評価・PDFをDrive側で再照合済みです。</p>}
-            {review.driveSync?.status === "completed" && review.driveSync.recordingIncluded && <p className="guardrail-copy">録画を含む{review.driveSync.archivedArtifactCount}種類の格納結果をDrive側で再照合済みです。</p>}
+            {review.driveSync?.status === "completed" && review.sourceTranscriptVerified !== true && <p className="guardrail-copy"><strong>元の回答記録に文字起こし欠落または未確認の発言があります。</strong> Driveの表示にかかわらず保存完了とは扱わず、録画と回答を確認してください。</p>}
+            {review.driveSync?.status === "completed" && review.sourceTranscriptVerified === true && (review.driveSync.transcriptAvailable !== true || review.driveSync.transcriptKind !== "actual_transcript") && <p className="guardrail-copy"><strong>実際の発言に基づく文字起こしをDriveで確認できていません。</strong> 保存完了とは扱わず、文字起こし処理後に再格納してください。</p>}
+            {review.driveSync?.status === "completed" && review.sourceTranscriptVerified === true && review.driveSync.transcriptAvailable === true && review.driveSync.transcriptKind === "actual_transcript" && !review.driveSync.recordingIncluded && !textInterviewSelected && <p className="guardrail-copy"><strong>録画はDriveへ格納されていません。</strong> 文字起こし・評価・PDFのみ格納済みです。録画状態が「stored」になった後に再格納してください。</p>}
+            {review.driveSync?.status === "completed" && review.sourceTranscriptVerified === true && review.driveSync.transcriptAvailable === true && review.driveSync.transcriptKind === "actual_transcript" && textInterviewSelected && <p className="guardrail-copy">文字入力方式のため録画はありません。回答記録・評価・PDFをDrive側で再照合済みです。</p>}
+            {review.driveSync?.status === "completed" && review.sourceTranscriptVerified === true && review.driveSync.recordingIncluded && review.driveSync.transcriptAvailable === true && review.driveSync.transcriptKind === "actual_transcript" && <p className="guardrail-copy">録画を含む{review.driveSync.archivedArtifactCount}種類の格納結果をDrive側で再照合済みです。</p>}
           </section>
 
           {review.technicalEvents.length > 0 && <div className="staff-message"><strong>進行・技術フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>参加方法や技術的な事象は、応募者の不利益な評価に使用しません。</p></div>}

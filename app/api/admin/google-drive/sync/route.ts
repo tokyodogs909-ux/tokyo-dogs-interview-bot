@@ -1,5 +1,5 @@
 import { authorizeInterviewAdmin } from "@/lib/admin-auth";
-import { syncInterviewToGoogleDrive } from "@/lib/google-drive-sync";
+import { stepInterviewToGoogleDrive } from "@/lib/google-drive-sync";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 export async function POST(request: Request) {
@@ -17,13 +17,14 @@ export async function POST(request: Request) {
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreJson({ error: "面接IDを確認してください。" }, { status: 400 });
     }
-    const result = await syncInterviewToGoogleDrive(sessionId);
+    const result = await stepInterviewToGoogleDrive(sessionId);
     return noStoreJson({ synced: result.status === "completed", result });
   } catch (error) {
     const code = error instanceof Error ? error.message : "";
     const archiveNotReady = code === "INTERVIEW_NOT_READY_FOR_DRIVE_SYNC" ||
       code === "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC" ||
-      code === "INTERVIEW_RECORDING_ARTIFACT_MISSING";
+      code === "INTERVIEW_RECORDING_ARTIFACT_MISSING" ||
+      code === "INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC";
     const status = code === "INTERVIEW_NOT_FOUND" ? 404
       : code.includes("CONFIGURATION") || code.includes("AUTH_UNCONFIGURED") ? 503
         : archiveNotReady ? 409

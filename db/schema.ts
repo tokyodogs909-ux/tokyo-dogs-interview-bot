@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const interviewSessions = sqliteTable("interview_sessions", {
   id: text("id").primaryKey(),
@@ -13,8 +13,6 @@ export const interviewSessions = sqliteTable("interview_sessions", {
   recordingStatus: text("recording_status").notNull().default("not_started"),
   transcriptJson: text("transcript_json"),
   evaluationJson: text("evaluation_json"),
-  evaluationClaimId: text("evaluation_claim_id"),
-  evaluationStartedAt: text("evaluation_started_at"),
   summary: text("summary"),
   expiresAt: text("expires_at").notNull(),
   retentionUntil: text("retention_until").notNull(),
@@ -24,6 +22,16 @@ export const interviewSessions = sqliteTable("interview_sessions", {
 }, (table) => [
   index("interview_sessions_status_idx").on(table.status),
   index("interview_sessions_retention_idx").on(table.retentionUntil),
+]);
+
+export const interviewEvaluationClaims = sqliteTable("interview_evaluation_claims", {
+  sessionId: text("session_id").primaryKey().references(() => interviewSessions.id, { onDelete: "cascade" }),
+  claimId: text("claim_id").notNull(),
+  startedAt: text("started_at").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("interview_evaluation_claims_started_idx").on(table.startedAt),
 ]);
 
 export const interviewArtifacts = sqliteTable("interview_artifacts", {
@@ -110,6 +118,60 @@ export const interviewExternalSyncs = sqliteTable("interview_external_syncs", {
 }, (table) => [
   uniqueIndex("interview_external_syncs_session_provider_unique").on(table.sessionId, table.provider),
   index("interview_external_syncs_status_idx").on(table.status),
+]);
+
+export const interviewDriveUploadSteps = sqliteTable("interview_drive_upload_steps", {
+  sessionId: text("session_id").primaryKey().references(() => interviewSessions.id, { onDelete: "cascade" }),
+  startedAt: text("started_at").notNull(),
+  phase: text("phase").notNull().default("uploading"),
+  uploadUrlCiphertext: text("upload_url_ciphertext").notNull(),
+  uploadUrlIv: text("upload_url_iv").notNull(),
+  committedOffset: integer("committed_offset").notNull().default(0),
+  totalBytes: integer("total_bytes").notNull(),
+  contentType: text("content_type").notNull(),
+  recordingName: text("recording_name").notNull(),
+  folderId: text("folder_id").notNull(),
+  folderUrl: text("folder_url").notNull(),
+  contextJson: text("context_json").notNull(),
+  recordingFileJson: text("recording_file_json"),
+  leaseToken: text("lease_token"),
+  leaseExpiresAt: text("lease_expires_at"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("interview_drive_upload_steps_lease_idx").on(table.leaseExpiresAt),
+]);
+
+export const recordedAnswerTranscriptions = sqliteTable("recorded_answer_transcriptions", {
+  sessionId: text("session_id").notNull().references(() => interviewSessions.id, { onDelete: "cascade" }),
+  answerIndex: integer("answer_index").notNull(),
+  objectKey: text("object_key").notNull().unique(),
+  contentType: text("content_type").notNull(),
+  byteSize: integer("byte_size").notNull(),
+  audioSha256: text("audio_sha256").notNull(),
+  etag: text("etag"),
+  status: text("status").notNull().default("pending"),
+  transcriptText: text("transcript_text"),
+  claimId: text("claim_id"),
+  claimedAt: text("claimed_at"),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  lastErrorCode: text("last_error_code"),
+  nextRetryAt: text("next_retry_at"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  primaryKey({ columns: [table.sessionId, table.answerIndex] }),
+  index("recorded_answer_transcriptions_status_idx").on(table.sessionId, table.status, table.answerIndex),
+]);
+
+export const recordedInterviewCompletions = sqliteTable("recorded_interview_completions", {
+  sessionId: text("session_id").primaryKey().references(() => interviewSessions.id, { onDelete: "cascade" }),
+  expectedAnswerCount: integer("expected_answer_count").notNull(),
+  requestedAt: text("requested_at").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("recorded_interview_completions_requested_idx").on(table.requestedAt),
 ]);
 
 export const googleDriveConnection = sqliteTable("google_drive_connection", {

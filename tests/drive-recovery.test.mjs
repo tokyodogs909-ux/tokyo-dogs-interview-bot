@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  isVerifiedInterviewArchive,
   planDriveRecovery,
   planRecordingRecovery,
   summarizeDriveArchives,
@@ -15,6 +16,9 @@ function interview(sessionId, patch = {}) {
     recordingStatus: "stored",
     driveStatus: "completed",
     driveRecordingIncluded: true,
+    driveTranscriptAvailable: true,
+    driveTranscriptKind: "actual_transcript",
+    sourceTranscriptVerified: true,
     driveUpdatedAt: "2026-08-03T05:59:00.000Z",
     ...patch,
   };
@@ -41,12 +45,29 @@ test("Drive recovery repairs completed camera archives that omitted a now-stored
   assert.deepEqual(planDriveRecovery(items, now), ["TD-VIDEO-MISSING"]);
 });
 
-test("Drive recovery reclaims an abandoned running archive but ignores unfinished interviews", () => {
+test("Drive recovery repairs a legacy transcript receipt only when the durable source is actual", () => {
   const items = [
+    interview("TD-TRANSCRIPT-REPAIR", {
+      driveTranscriptAvailable: false,
+      driveTranscriptKind: "unknown",
+      sourceTranscriptVerified: true,
+    }),
+    interview("TD-PLACEHOLDER-NO-REPAIR", {
+      driveTranscriptAvailable: false,
+      driveTranscriptKind: "recorded_fallback_placeholder",
+      sourceTranscriptVerified: false,
+    }),
+  ];
+  assert.deepEqual(planDriveRecovery(items, now), ["TD-TRANSCRIPT-REPAIR"]);
+});
+
+test("Drive recovery advances every running step but ignores unfinished interviews", () => {
+  const items = [
+    interview("TD-RUNNING-LIVE", { driveStatus: "running", driveUpdatedAt: "2026-08-03T05:59:59.000Z" }),
     interview("TD-RUNNING-STALE", { driveStatus: "running", driveUpdatedAt: "2026-08-03T05:40:00.000Z" }),
     interview("TD-NOT-COMPLETE", { status: "in_progress", driveStatus: null, driveUpdatedAt: null }),
   ];
-  assert.deepEqual(planDriveRecovery(items, now), ["TD-RUNNING-STALE"]);
+  assert.deepEqual(planDriveRecovery(items, now), ["TD-RUNNING-LIVE", "TD-RUNNING-STALE"]);
 });
 
 test("recording recovery finalizes only stale interrupted completed uploads", () => {
@@ -104,4 +125,43 @@ test("Drive archive health does not call a video-less camera archive stored", ()
     attention: 1,
     autoRecoveryScheduled: 1,
   });
+});
+
+test("verified receipt requires every mode-specific Drive artifact", () => {
+  assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA")), true);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA-NO-VIDEO", {
+    driveRecordingIncluded: false,
+  })), false);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA-PLACEHOLDER", {
+    driveTranscriptAvailable: false,
+    driveTranscriptKind: "recorded_fallback_placeholder",
+  })), false);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA-UNKNOWN-TRANSCRIPT", {
+    driveTranscriptAvailable: true,
+    driveTranscriptKind: "unknown",
+  })), false);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA-PARTIAL-SOURCE", {
+    sourceTranscriptVerified: false,
+  })), false);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA-UPLOADING", {
+    recordingStatus: "uploading",
+    driveRecordingIncluded: true,
+  })), false);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-TEXT", {
+    recordingStatus: "not_applicable",
+    driveRecordingIncluded: false,
+  })), true);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-TEXT-NO-DRIVE", {
+    recordingStatus: "not_applicable",
+    driveStatus: "failed",
+    driveRecordingIncluded: false,
+  })), false);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-STATUS-ONLY", {
+    driveStatus: null,
+    recordingStatus: "stored",
+    driveRecordingIncluded: null,
+  })), false);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-NOT-COMPLETE", {
+    status: "in_progress",
+  })), false);
 });

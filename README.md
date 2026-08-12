@@ -102,6 +102,22 @@ OPENAI_API_KEY="$(security find-generic-password -a "$USER" -s "TOKYODOGS_AI_INT
 npm run check
 ```
 
+本番の大容量録画・実文字起こし・Drive格納は、合成データだけで次の順に確認します。回答音声は、リポジトリ内の公開済みガイダンス音声から独立したWebMを生成するため、応募者の音声や個人情報を試験へ流用しません。
+
+```bash
+/opt/homebrew/bin/ffmpeg -y -hide_banner -loglevel error \
+  -i public/audio/motegi-speaker-check.mp3 -vn -c:a libopus -b:a 48k \
+  /tmp/td-e2e-answer.webm
+
+INTERVIEW_E2E_BASE_URL=https://recruit.tokyo-dogs.com \
+INTERVIEW_E2E_RECORDING_PATH=/tmp/td-production-large-e2e-v36.webm \
+INTERVIEW_E2E_ANSWER_AUDIO_PATH=/tmp/td-e2e-answer.webm \
+INTERVIEW_E2E_ANSWER_COUNT=1 \
+node scripts/production-recording-archive-e2e.mjs
+```
+
+成功条件は、回答音声の実文字起こし、録画17分割の中断再開、同一part・完了APIの冪等性、Driveへの1リクエスト1チャンク送信、`recordingIncluded=true`、`transcriptAvailable=true`、`transcriptKind=actual_transcript` のすべてです。最後に出力される面接ID、録画SHA-256／MD5、バイト数を使い、Driveの6成果物を別経路で読戻します。
+
 2026-08-03時点でLint、本番ビルド、自動テスト、production依存関係監査が成功しています。希望店舗自由入力、共通URLの開始制限、候補者別の同時音声回線、評価モデルの多重課金防止、録画の重複防止、Drive OAuth、承認済みルート照合、候補者フォルダ作成、録画・文字起こし・評価・PDF格納、保存後の読戻しを自動テストしています。本番でも合成応募者2名の同時処理と候補者別Drive格納を確認済みです。
 
 ## 本番運用開始・復旧前に必要

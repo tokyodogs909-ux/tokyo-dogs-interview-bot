@@ -101,6 +101,45 @@ async function decryptRefreshToken(ciphertext: string, iv: string) {
   return new TextDecoder().decode(plaintext);
 }
 
+function uploadCapabilityAdditionalData(sessionId: string) {
+  return new TextEncoder().encode(`TOKYO_DOGS_DRIVE_UPLOAD_URI_V1:${sessionId}`);
+}
+
+export async function encryptGoogleDriveUploadCapability(uploadUrl: string, sessionId: string) {
+  const normalized = uploadUrl.trim();
+  if (!/^https:\/\//.test(normalized) || normalized.length > 8192) {
+    throw new Error("GOOGLE_DRIVE_UPLOAD_CAPABILITY_INVALID");
+  }
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: uploadCapabilityAdditionalData(sessionId) },
+    await encryptionKey(),
+    new TextEncoder().encode(normalized),
+  );
+  return { ciphertext: toBase64Url(new Uint8Array(ciphertext)), iv: toBase64Url(iv) };
+}
+
+export async function decryptGoogleDriveUploadCapability(
+  ciphertext: string,
+  iv: string,
+  sessionId: string,
+) {
+  const plaintext = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: fromBase64Url(iv),
+      additionalData: uploadCapabilityAdditionalData(sessionId),
+    },
+    await encryptionKey(),
+    fromBase64Url(ciphertext),
+  );
+  const uploadUrl = new TextDecoder().decode(plaintext);
+  if (!/^https:\/\//.test(uploadUrl) || uploadUrl.length > 8192) {
+    throw new Error("GOOGLE_DRIVE_UPLOAD_CAPABILITY_INVALID");
+  }
+  return uploadUrl;
+}
+
 async function ensureConnectionSchema(db: D1Database) {
   await db.prepare(`CREATE TABLE IF NOT EXISTS google_drive_connection (
     id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),

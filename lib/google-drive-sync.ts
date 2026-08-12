@@ -6,14 +6,26 @@ import {
   validateGoogleDriveRoot,
 } from "@/lib/google-drive-auth";
 import {
+  decryptGoogleDriveUploadCapability,
+  encryptGoogleDriveUploadCapability,
+} from "@/lib/google-drive-connection";
+import {
+  acquireDriveUploadStepLease,
   claimExternalSync,
   completeExternalSync,
+  deleteDriveUploadStep,
   failExternalSync,
+  getDriveUploadStep,
   getExternalSyncStatus,
   getInterviewArchiveSource,
+  getInterviewRecordingChunk,
   heartbeatExternalSync,
+  initializeDriveUploadStep,
+  releaseDriveUploadStepLease,
   requestExternalSync,
+  updateDriveUploadStep,
 } from "@/lib/interview-persistence";
+import { hasVerifiedCandidateTranscript } from "@/lib/interview-transcript-verification";
 
 const FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
@@ -38,12 +50,24 @@ type DriveFile = {
 
 type ArchiveSource = NonNullable<Awaited<ReturnType<typeof getInterviewArchiveSource>>>;
 
+type PreparedDriveArchive = {
+  rootFolderId: string;
+  expectedParentId: string;
+  candidateFolder: DriveFile;
+  folderUrl: string;
+  uploaded: GoogleDriveSyncResult["uploaded"];
+  transcriptAvailable: boolean;
+  transcriptKind: string;
+};
+
 export type GoogleDriveSyncResult = {
   status: "completed" | "pending";
   folderId: string;
   folderUrl: string;
   uploaded: Record<string, { id: string; name: string; size: number | null }>;
   recordingIncluded: boolean;
+  transcriptAvailable: boolean;
+  transcriptKind: string;
 };
 
 function safeErrorCode(error: unknown) {
@@ -54,7 +78,7 @@ function safeErrorCode(error: unknown) {
 function isTransientDriveError(error: unknown) {
   const code = safeErrorCode(error);
   return /^(?:GOOGLE_DRIVE_(?:API|EXPORT|RESUMABLE_INIT|RESUMABLE_UPLOAD)_)(?:429|500|502|503|504)$/.test(code) ||
-    code === "GOOGLE_DRIVE_TOKEN_REFRESH_FAILED" ||
+    code === "GOOGLE_DRIVE_TOKEN_REFRESH_TRANSIENT" ||
     code === "GOOGLE_DRIVE_ROOT_LOOKUP_FAILED" ||
     // safeErrorCode() falls back to this generic code for any error whose message
     // isn't already one of our own UPPER_CASE codes above (e.g. `TypeError: fetch
@@ -116,16 +140,32 @@ function speakerLabel(speaker: "candidate" | "interviewer") {
   return speaker === "candidate" ? "応募者" : "オンライン採用担当者 茂木";
 }
 
+/**
+ * A Drive transcript is an actual interview record only when it contains at
+ * least one substantive candidate utterance. The legacy recorded-fallback IDs
+ * represented questions/placeholders rather than transcribed candidate audio,
+ * so their presence invalidates the whole transcript receipt.
+ */
+function hasActualCandidateTranscript(source: ArchiveSource) {
+  return hasVerifiedCandidateTranscript(source.transcript, source.auditEvents);
+}
+
 function buildTranscriptText(source: ArchiveSource) {
   const isTextInterview = source.recordingStatus === "not_applicable";
+  const isRecordedFallbackPlaceholder = source.transcript.some((turn) =>
+    turn.id.startsWith("recorded-fallback-answer-"));
   const lines = [
-    "TOKYO DOGS オンライン一次面接 文字起こし",
+    isRecordedFallbackPlaceholder
+      ? "TOKYO DOGS 録画式一次面接 質問記録（文字起こし未実施）"
+      : "TOKYO DOGS オンライン一次面接 文字起こし",
     `面接ID: ${source.sessionId}`,
     `応募者氏名: ${source.candidateName}`,
     `雇用形態: ${source.employment}`,
     `入職希望対象店舗: ${source.preferredLocation}`,
     `面接完了日時: ${japaneseDate(source.completedAt)}`,
-    isTextInterview
+    isRecordedFallbackPlaceholder
+      ? "確認区分: 録画式予備面接の質問記録。応募者の発言本文は文字起こし未実施"
+      : isTextInterview
       ? "確認区分: 応募者が文字入力した回答記録（録画なし）"
       : "確認区分: 応募者端末で生成された文字起こし（録画との照合が必要）",
     "",
@@ -363,7 +403,7 @@ async function uploadRecording(input: {
   name: string;
   contentType: string;
   byteSize: number;
-  body: ReadableStream;
+  sessionId: string;
 }) {
   const existing = await findArtifact(input.accessToken, input.folderId, "recording");
   const metadata: Record<string, unknown> = {
@@ -469,37 +509,19 @@ async function uploadRecording(input: {
     throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${lastStatus || 503}`);
   }
 
-  async function* chunks(body: ReadableStream) {
-    const reader = body.getReader();
-    let buffer = new Uint8Array(DRIVE_RECORDING_CHUNK_BYTES);
-    let used = 0;
-    try {
-      while (true) {
-        const next = await reader.read();
-        if (next.done) break;
-        const value = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
-        let valueOffset = 0;
-        while (valueOffset < value.byteLength) {
-          const copied = Math.min(buffer.byteLength - used, value.byteLength - valueOffset);
-          buffer.set(value.subarray(valueOffset, valueOffset + copied), used);
-          used += copied;
-          valueOffset += copied;
-          if (used === buffer.byteLength) {
-            yield buffer;
-            buffer = new Uint8Array(DRIVE_RECORDING_CHUNK_BYTES);
-            used = 0;
-          }
-        }
-      }
-      if (used > 0) yield buffer.slice(0, used);
-    } finally {
-      reader.releaseLock();
-    }
-  }
-
   let uploadedBytes = 0;
   let completedFile: DriveFile | null = null;
-  for await (const chunk of chunks(input.body)) {
+  while (uploadedBytes < input.byteSize) {
+    const expectedLength = Math.min(DRIVE_RECORDING_CHUNK_BYTES, input.byteSize - uploadedBytes);
+    const sourceChunk = await getInterviewRecordingChunk({
+      sessionId: input.sessionId,
+      offset: uploadedBytes,
+      length: expectedLength,
+    });
+    if (!sourceChunk || sourceChunk.byteSize !== input.byteSize || sourceChunk.contentType !== input.contentType) {
+      throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
+    }
+    const chunk = sourceChunk.bytes;
     const uploaded = await putChunk(chunk, uploadedBytes);
     uploadedBytes += chunk.byteLength;
     if (uploaded.complete) completedFile = uploaded.file;
@@ -511,6 +533,109 @@ async function uploadRecording(input: {
   }
   if (!completedFile) throw new Error("GOOGLE_DRIVE_RESUMABLE_UPLOAD_INCOMPLETE");
   return completedFile;
+}
+
+async function initiateRecordingUpload(input: {
+  accessToken: string;
+  folderId: string;
+  name: string;
+  contentType: string;
+  byteSize: number;
+}) {
+  const existing = await findArtifact(input.accessToken, input.folderId, "recording");
+  const metadata: Record<string, unknown> = {
+    name: input.name,
+    appProperties: {
+      tokyoDogsArtifact: "recording",
+      tokyoDogsProvider: DRIVE_PROVIDER,
+    },
+  };
+  if (!existing) metadata.parents = [input.folderId];
+  const initUrl = existing
+    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(existing.id)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink,parents,appProperties`
+    : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink,parents,appProperties`;
+  const response = await fetchWithTimeout(initUrl, {
+    method: existing ? "PATCH" : "POST",
+    headers: {
+      Authorization: `Bearer ${input.accessToken}`,
+      "Content-Type": "application/json; charset=UTF-8",
+      "X-Upload-Content-Type": input.contentType,
+      "X-Upload-Content-Length": String(input.byteSize),
+    },
+    body: JSON.stringify(metadata),
+  }, DRIVE_RECORDING_REQUEST_TIMEOUT_MS);
+  const uploadLocation = response.headers.get("Location");
+  if (!response.ok || !uploadLocation) {
+    await response.body?.cancel();
+    throw new Error(`GOOGLE_DRIVE_RESUMABLE_INIT_${response.status}`);
+  }
+  await response.body?.cancel();
+  return uploadLocation;
+}
+
+type ResumableStatus =
+  | { complete: true; file: DriveFile; uploadLocation: string }
+  | { complete: false; committedBytes: number; uploadLocation: string };
+
+async function queryResumableStatus(uploadLocation: string, totalBytes: number): Promise<ResumableStatus> {
+  const response = await fetchWithTimeout(uploadLocation, {
+    method: "PUT",
+    redirect: "manual",
+    headers: {
+      "Content-Length": "0",
+      "Content-Range": `bytes */${totalBytes}`,
+    },
+  }, DRIVE_RECORDING_REQUEST_TIMEOUT_MS);
+  if (response.ok) {
+    return { complete: true, file: await response.json() as DriveFile, uploadLocation };
+  }
+  const nextLocation = response.headers.get("Location") || uploadLocation;
+  if (response.status !== 308) {
+    await response.body?.cancel();
+    throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${response.status}`);
+  }
+  const range = response.headers.get("Range")?.match(/^bytes=0-(\d+)$/);
+  await response.body?.cancel();
+  return {
+    complete: false,
+    committedBytes: range ? Number(range[1]) + 1 : 0,
+    uploadLocation: nextLocation,
+  };
+}
+
+async function putOneRecordingChunk(input: {
+  uploadLocation: string;
+  contentType: string;
+  totalBytes: number;
+  offset: number;
+  bytes: Uint8Array;
+}): Promise<ResumableStatus> {
+  const end = input.offset + input.bytes.byteLength - 1;
+  const response = await fetchWithTimeout(input.uploadLocation, {
+    method: "PUT",
+    redirect: "manual",
+    headers: {
+      "Content-Type": input.contentType,
+      "Content-Length": String(input.bytes.byteLength),
+      "Content-Range": `bytes ${input.offset}-${end}/${input.totalBytes}`,
+    },
+    body: Uint8Array.from(input.bytes).buffer,
+  }, DRIVE_RECORDING_REQUEST_TIMEOUT_MS);
+  if (response.ok) {
+    return { complete: true, file: await response.json() as DriveFile, uploadLocation: input.uploadLocation };
+  }
+  const nextLocation = response.headers.get("Location") || input.uploadLocation;
+  if (response.status !== 308) {
+    await response.body?.cancel();
+    throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${response.status}`);
+  }
+  const range = response.headers.get("Range")?.match(/^bytes=0-(\d+)$/);
+  await response.body?.cancel();
+  const committedBytes = range ? Number(range[1]) + 1 : 0;
+  if (committedBytes < input.offset || committedBytes > end + 1) {
+    throw new Error("GOOGLE_DRIVE_RESUMABLE_RANGE_MISMATCH");
+  }
+  return { complete: false, committedBytes, uploadLocation: nextLocation };
 }
 
 function fileSummary(file: DriveFile, fallbackName: string) {
@@ -612,6 +737,27 @@ async function performDriveSync(
   source: ArchiveSource,
   reportProgress: DriveSyncProgress,
 ): Promise<GoogleDriveSyncResult> {
+  assertArchiveReady(source);
+  await reportProgress();
+  const accessToken = await fetchGoogleDriveAccessToken();
+  const prepared = await prepareDriveArchive(source, accessToken, reportProgress);
+  let recordingFile: DriveFile | null = null;
+  if (source.recording) {
+    await reportProgress();
+    const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
+    recordingFile = await uploadRecording({
+      accessToken,
+      folderId: prepared.candidateFolder.id,
+      name: `${source.sessionId}_面接録画.${extension}`,
+      contentType: source.recording.contentType,
+      byteSize: source.recording.byteSize,
+      sessionId: source.sessionId,
+    });
+  }
+  return finalizeDriveArchive(source, accessToken, prepared, recordingFile, reportProgress);
+}
+
+function assertArchiveReady(source: ArchiveSource) {
   if (source.status !== "completed" || !source.evaluation) {
     throw new Error("INTERVIEW_NOT_READY_FOR_DRIVE_SYNC");
   }
@@ -625,8 +771,16 @@ async function performDriveSync(
   if (source.recordingStatus === "stored" && !source.recording) {
     throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
   }
-  await reportProgress();
-  const accessToken = await fetchGoogleDriveAccessToken();
+  if (!hasActualCandidateTranscript(source)) {
+    throw new Error("INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC");
+  }
+}
+
+async function prepareDriveArchive(
+  source: ArchiveSource,
+  accessToken: string,
+  reportProgress: DriveSyncProgress,
+): Promise<PreparedDriveArchive> {
   const root = await validateGoogleDriveRoot(accessToken);
   const date = new Date(source.completedAt || source.createdAt);
   if (!Number.isFinite(date.getTime())) throw new Error("INTERVIEW_DATE_INVALID");
@@ -649,20 +803,28 @@ async function performDriveSync(
     source.sessionId,
   );
   const transcript = buildTranscriptText(source);
+  // assertArchiveReady() runs before any Drive access. Recompute here for the
+  // persisted receipt so a future refactor cannot accidentally label a
+  // placeholder/interviewer-only transcript as an actual candidate transcript.
+  const transcriptAvailable = hasActualCandidateTranscript(source);
+  const transcriptKind = transcriptAvailable ? "actual_transcript" : "recorded_fallback_placeholder";
   const resultJson = buildResultJson(source);
   const reportHtml = buildReportHtml(source);
   const filePrefix = source.sessionId;
   const uploaded: GoogleDriveSyncResult["uploaded"] = {};
   await reportProgress();
+  const transcriptFileName = transcriptAvailable
+    ? `${filePrefix}_文字起こし.txt`
+    : `${filePrefix}_録画式面接_質問記録_文字起こし未実施.txt`;
   const transcriptFile = await uploadSmallFile({
     accessToken,
     folderId: candidateFolder.id,
-    name: `${filePrefix}_文字起こし.txt`,
+    name: transcriptFileName,
     artifactKey: "transcript",
     contentType: "text/plain; charset=utf-8",
     body: transcript,
   });
-  uploaded.transcript = fileSummary(transcriptFile, `${filePrefix}_文字起こし.txt`);
+  uploaded.transcript = fileSummary(transcriptFile, transcriptFileName);
   await reportProgress();
   const resultFile = await uploadSmallFile({
     accessToken,
@@ -696,32 +858,46 @@ async function performDriveSync(
     body: pdf,
   });
   uploaded.reportPdf = fileSummary(reportPdf, `${filePrefix}_オンライン一次面接レポート.pdf`);
+  return {
+    rootFolderId: root.id,
+    expectedParentId: monthFolder.id,
+    candidateFolder,
+    folderUrl: candidateFolder.webViewLink || `https://drive.google.com/drive/folders/${candidateFolder.id}`,
+    uploaded,
+    transcriptAvailable,
+    transcriptKind,
+  };
+}
+
+async function finalizeDriveArchive(
+  source: ArchiveSource,
+  accessToken: string,
+  prepared: PreparedDriveArchive,
+  recordingFile: DriveFile | null,
+  reportProgress: DriveSyncProgress,
+): Promise<GoogleDriveSyncResult> {
+  const uploaded = { ...prepared.uploaded };
+  const filePrefix = source.sessionId;
   if (source.recording) {
-    await reportProgress();
+    if (!recordingFile) throw new Error("GOOGLE_DRIVE_RESUMABLE_UPLOAD_INCOMPLETE");
     const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
-    const recording = await uploadRecording({
-      accessToken,
-      folderId: candidateFolder.id,
-      name: `${filePrefix}_面接録画.${extension}`,
-      contentType: source.recording.contentType,
-      byteSize: source.recording.byteSize,
-      body: source.recording.body,
-    });
-    uploaded.recording = fileSummary(recording, `${filePrefix}_面接録画.${extension}`);
+    uploaded.recording = fileSummary(recordingFile, `${filePrefix}_面接録画.${extension}`);
   }
   const manifest = {
     schemaVersion: "2026-07-29-v1",
     generatedAt: new Date().toISOString(),
     sessionId: source.sessionId,
-    rootFolderId: root.id,
-    folderId: candidateFolder.id,
+    rootFolderId: prepared.rootFolderId,
+    folderId: prepared.candidateFolder.id,
     recordingIncluded: Boolean(source.recording),
+    transcriptAvailable: prepared.transcriptAvailable,
+    transcriptKind: prepared.transcriptKind,
     files: uploaded,
   };
   await reportProgress();
   const manifestFile = await uploadSmallFile({
     accessToken,
-    folderId: candidateFolder.id,
+    folderId: prepared.candidateFolder.id,
     name: `${filePrefix}_格納結果.json`,
     artifactKey: "manifest",
     contentType: "application/json; charset=utf-8",
@@ -731,18 +907,19 @@ async function performDriveSync(
   await reportProgress();
   const verifiedFiles = await verifyDriveArchive({
     accessToken,
-    folder: candidateFolder,
-    expectedParentId: monthFolder.id,
+    folder: prepared.candidateFolder,
+    expectedParentId: prepared.expectedParentId,
     sessionId: source.sessionId,
     recordingByteSize: source.recording?.byteSize ?? null,
   });
-  const folderUrl = candidateFolder.webViewLink || `https://drive.google.com/drive/folders/${candidateFolder.id}`;
   return {
     status: "completed",
-    folderId: candidateFolder.id,
-    folderUrl,
+    folderId: prepared.candidateFolder.id,
+    folderUrl: prepared.folderUrl,
     uploaded: verifiedFiles,
     recordingIncluded: Boolean(source.recording),
+    transcriptAvailable: prepared.transcriptAvailable,
+    transcriptKind: prepared.transcriptKind,
   };
 }
 
@@ -760,6 +937,8 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
           folderUrl: current.folderUrl,
           uploaded: (current.manifest?.files ?? {}) as GoogleDriveSyncResult["uploaded"],
           recordingIncluded: current.manifest?.recordingIncluded === true,
+          transcriptAvailable: current.manifest?.transcriptAvailable === true,
+          transcriptKind: typeof current.manifest?.transcriptKind === "string" ? current.manifest.transcriptKind : "unknown",
         };
       }
       throw new Error("GOOGLE_DRIVE_SYNC_ALREADY_RUNNING");
@@ -778,6 +957,8 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
         manifest: {
           files: lastCompleted.uploaded,
           recordingIncluded: lastCompleted.recordingIncluded,
+          transcriptAvailable: lastCompleted.transcriptAvailable,
+          transcriptKind: lastCompleted.transcriptKind,
         },
       });
       if (!retryRequested) return lastCompleted;
@@ -789,6 +970,426 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
   }
   if (lastCompleted) return { ...lastCompleted, status: "pending" };
   throw new Error("GOOGLE_DRIVE_SYNC_DEFERRED");
+}
+
+export type GoogleDriveArchiveStepResult = GoogleDriveSyncResult | {
+  status: "pending";
+  phase: "initializing" | "uploading" | "finalizing" | "busy" | "retrying";
+  folderId: string | null;
+  folderUrl: string | null;
+  recordingIncluded: boolean;
+  committedOffset: number;
+  totalBytes: number;
+  retryAfterMs: number;
+};
+
+function completedResultFromStatus(status: NonNullable<Awaited<ReturnType<typeof getExternalSyncStatus>>>) {
+  if (status.status !== "completed" || !status.folderId || !status.folderUrl) return null;
+  return {
+    status: "completed" as const,
+    folderId: status.folderId,
+    folderUrl: status.folderUrl,
+    uploaded: (status.manifest?.files ?? {}) as GoogleDriveSyncResult["uploaded"],
+    recordingIncluded: status.manifest?.recordingIncluded === true,
+    transcriptAvailable: status.manifest?.transcriptAvailable === true,
+    transcriptKind: typeof status.manifest?.transcriptKind === "string" ? status.manifest.transcriptKind : "unknown",
+  };
+}
+
+function completedReceiptSatisfiesSource(
+  receipt: GoogleDriveSyncResult,
+  source: ArchiveSource,
+) {
+  const transcriptVerified = receipt.transcriptAvailable === true &&
+    receipt.transcriptKind === "actual_transcript";
+  const recordingVerified = source.recordingStatus === "not_applicable" ||
+    (source.recordingStatus === "stored" && receipt.recordingIncluded === true);
+  return transcriptVerified && recordingVerified;
+}
+
+function pendingStep(input: {
+  phase: "initializing" | "uploading" | "finalizing" | "busy" | "retrying";
+  folderId?: string | null;
+  folderUrl?: string | null;
+  committedOffset?: number;
+  totalBytes?: number;
+}): GoogleDriveArchiveStepResult {
+  return {
+    status: "pending",
+    phase: input.phase,
+    folderId: input.folderId ?? null,
+    folderUrl: input.folderUrl ?? null,
+    recordingIncluded: true,
+    committedOffset: input.committedOffset ?? 0,
+    totalBytes: input.totalBytes ?? 0,
+    retryAfterMs: input.phase === "busy" ? 1_500 : 250,
+  };
+}
+
+function preparedArchiveFromContext(value: Record<string, unknown>): PreparedDriveArchive {
+  const candidateFolder = value.candidateFolder as DriveFile | undefined;
+  const uploaded = value.uploaded as GoogleDriveSyncResult["uploaded"] | undefined;
+  if (
+    typeof value.rootFolderId !== "string" ||
+    typeof value.expectedParentId !== "string" ||
+    typeof value.folderUrl !== "string" ||
+    typeof value.transcriptAvailable !== "boolean" ||
+    typeof value.transcriptKind !== "string" ||
+    !candidateFolder || typeof candidateFolder.id !== "string" ||
+    !uploaded || typeof uploaded !== "object"
+  ) {
+    throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_CONTEXT_INVALID");
+  }
+  return {
+    rootFolderId: value.rootFolderId,
+    expectedParentId: value.expectedParentId,
+    candidateFolder,
+    folderUrl: value.folderUrl,
+    uploaded,
+    transcriptAvailable: value.transcriptAvailable,
+    transcriptKind: value.transcriptKind,
+  };
+}
+
+function preparedArchiveContext(prepared: PreparedDriveArchive): Record<string, unknown> {
+  return {
+    rootFolderId: prepared.rootFolderId,
+    expectedParentId: prepared.expectedParentId,
+    candidateFolder: prepared.candidateFolder,
+    folderUrl: prepared.folderUrl,
+    uploaded: prepared.uploaded,
+    transcriptAvailable: prepared.transcriptAvailable,
+    transcriptKind: prepared.transcriptKind,
+  };
+}
+
+async function completeSteppedArchive(input: {
+  sessionId: string;
+  startedAt: string;
+  source: ArchiveSource;
+  accessToken: string;
+  prepared: PreparedDriveArchive;
+  recordingFile: DriveFile;
+  reportProgress: DriveSyncProgress;
+}) {
+  const result = await finalizeDriveArchive(
+    input.source,
+    input.accessToken,
+    input.prepared,
+    input.recordingFile,
+    input.reportProgress,
+  );
+  const retryRequested = await completeExternalSync({
+    sessionId: input.sessionId,
+    startedAt: input.startedAt,
+    folderId: result.folderId,
+    folderUrl: result.folderUrl,
+    manifest: {
+      files: result.uploaded,
+      recordingIncluded: result.recordingIncluded,
+      transcriptAvailable: input.prepared.transcriptAvailable,
+      transcriptKind: input.prepared.transcriptKind,
+    },
+  });
+  await deleteDriveUploadStep(input.sessionId, input.startedAt);
+  return retryRequested ? { ...result, status: "pending" as const } : result;
+}
+
+/**
+ * Advances a candidate archive by at most one Drive recording chunk. The
+ * resumable capability and committed byte offset live in D1, so a Worker
+ * cancellation or browser retry resumes the same Google upload instead of
+ * replaying a 70 MB transfer inside one public HTTP request.
+ */
+export async function stepInterviewToGoogleDrive(sessionId: string): Promise<GoogleDriveArchiveStepResult> {
+  if ((await missingGoogleDriveConfiguration()).length > 0) {
+    throw new Error("GOOGLE_DRIVE_CONFIGURATION_MISSING");
+  }
+
+  let current = await getExternalSyncStatus(sessionId);
+  const alreadyCompleted = current ? completedResultFromStatus(current) : null;
+  if (alreadyCompleted) {
+    const source = await getInterviewArchiveSource(sessionId);
+    if (!source) throw new Error("INTERVIEW_NOT_FOUND");
+    // Receipt flags are not sufficient proof on their own: older rows could be
+    // mislabeled while containing only a question placeholder. Cross-check the
+    // durable D1 transcript before acknowledging even an otherwise complete
+    // Drive receipt.
+    if (!hasActualCandidateTranscript(source)) {
+      throw new Error("INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC");
+    }
+    if (completedReceiptSatisfiesSource(alreadyCompleted, source)) return alreadyCompleted;
+
+    // A legacy completed row can describe a five-file archive created before
+    // the recording was durable, or a placeholder/unknown transcript. Never
+    // return that row as a verified receipt. Validate that today's durable
+    // source can repair it before reopening the fenced sync state; if it cannot,
+    // fail without touching Drive or replacing the evidence of the bad receipt.
+    assertArchiveReady(source);
+    await requestExternalSync(sessionId);
+    current = await getExternalSyncStatus(sessionId);
+  }
+  if (current?.status === "completed") {
+    // A completed row without a usable folder receipt is also incomplete. It
+    // cannot be claimed directly (claims are fenced to `pending`), so validate
+    // the repair source and explicitly reopen it instead of returning `busy`
+    // forever.
+    const source = await getInterviewArchiveSource(sessionId);
+    if (!source) throw new Error("INTERVIEW_NOT_FOUND");
+    assertArchiveReady(source);
+    await requestExternalSync(sessionId);
+    current = await getExternalSyncStatus(sessionId);
+  }
+  let step = await getDriveUploadStep(sessionId);
+
+  if (!step || current?.status !== "running" || step.startedAt !== current.startedAt) {
+    if (current?.status === "running") {
+      // Also performs the fenced stale-claim recovery. A live initializer keeps
+      // its heartbeat and remains untouched; a canceled initializer becomes
+      // claimable without creating a concurrent Drive writer.
+      await requestExternalSync(sessionId);
+      current = await getExternalSyncStatus(sessionId);
+      if (current?.status === "running") {
+        return pendingStep({ phase: "initializing" });
+      }
+    } else if (!current || current.status === "failed") {
+      await requestExternalSync(sessionId);
+      current = await getExternalSyncStatus(sessionId);
+    }
+
+    const startedAt = await claimExternalSync(sessionId);
+    if (!startedAt) return pendingStep({ phase: "busy" });
+    const reportProgress = async () => {
+      if (!await heartbeatExternalSync(sessionId, startedAt)) {
+        throw new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
+      }
+    };
+    try {
+      const source = await getInterviewArchiveSource(sessionId);
+      if (!source) throw new Error("INTERVIEW_NOT_FOUND");
+      assertArchiveReady(source);
+      await reportProgress();
+      const accessToken = await fetchGoogleDriveAccessToken();
+      const prepared = await prepareDriveArchive(source, accessToken, reportProgress);
+      if (!source.recording) {
+        const result = await finalizeDriveArchive(source, accessToken, prepared, null, reportProgress);
+        await completeExternalSync({
+          sessionId,
+          startedAt,
+          folderId: result.folderId,
+          folderUrl: result.folderUrl,
+          manifest: {
+            files: result.uploaded,
+            recordingIncluded: false,
+            transcriptAvailable: prepared.transcriptAvailable,
+            transcriptKind: prepared.transcriptKind,
+          },
+        });
+        return result;
+      }
+      const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
+      const recordingName = `${source.sessionId}_面接録画.${extension}`;
+      const uploadLocation = await initiateRecordingUpload({
+        accessToken,
+        folderId: prepared.candidateFolder.id,
+        name: recordingName,
+        contentType: source.recording.contentType,
+        byteSize: source.recording.byteSize,
+      });
+      const encrypted = await encryptGoogleDriveUploadCapability(uploadLocation, sessionId);
+      step = await initializeDriveUploadStep({
+        sessionId,
+        startedAt,
+        uploadUrlCiphertext: encrypted.ciphertext,
+        uploadUrlIv: encrypted.iv,
+        totalBytes: source.recording.byteSize,
+        contentType: source.recording.contentType,
+        recordingName,
+        folderId: prepared.candidateFolder.id,
+        folderUrl: prepared.folderUrl,
+        context: preparedArchiveContext(prepared),
+      });
+      return pendingStep({
+        phase: "uploading",
+        folderId: step.folderId,
+        folderUrl: step.folderUrl,
+        totalBytes: step.totalBytes,
+      });
+    } catch (error) {
+      await failExternalSync({ sessionId, startedAt, errorCode: safeErrorCode(error) });
+      throw error;
+    }
+  }
+
+  const leaseToken = await acquireDriveUploadStepLease(sessionId, step.startedAt);
+  if (!leaseToken) {
+    return pendingStep({
+      phase: "busy",
+      folderId: step.folderId,
+      folderUrl: step.folderUrl,
+      committedOffset: step.committedOffset,
+      totalBytes: step.totalBytes,
+    });
+  }
+  let leaseHeld = true;
+  const releaseLease = async () => {
+    if (!leaseHeld) return;
+    await releaseDriveUploadStepLease({ sessionId, startedAt: step.startedAt, leaseToken });
+    leaseHeld = false;
+  };
+  const reportProgress = async () => {
+    if (!await heartbeatExternalSync(sessionId, step.startedAt)) {
+      throw new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
+    }
+  };
+  try {
+    await reportProgress();
+    const source = await getInterviewArchiveSource(sessionId);
+    if (!source) throw new Error("INTERVIEW_NOT_FOUND");
+    assertArchiveReady(source);
+    if (!source.recording || source.recording.byteSize !== step.totalBytes || source.recording.contentType !== step.contentType) {
+      throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
+    }
+    const prepared = preparedArchiveFromContext(step.context);
+    const accessToken = await fetchGoogleDriveAccessToken();
+    if (step.phase === "finalizing") {
+      if (!step.recordingFile || typeof step.recordingFile.id !== "string") {
+        throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_CONTEXT_INVALID");
+      }
+      const result = await completeSteppedArchive({
+        sessionId,
+        startedAt: step.startedAt,
+        source,
+        accessToken,
+        prepared,
+        recordingFile: step.recordingFile as DriveFile,
+        reportProgress,
+      });
+      leaseHeld = false;
+      return result;
+    }
+
+    let uploadLocation = await decryptGoogleDriveUploadCapability(
+      step.uploadUrlCiphertext,
+      step.uploadUrlIv,
+      sessionId,
+    );
+    const remote = await queryResumableStatus(uploadLocation, step.totalBytes);
+    uploadLocation = remote.uploadLocation;
+    let encryptedReplacement: { ciphertext: string; iv: string } | null = null;
+    if (uploadLocation !== await decryptGoogleDriveUploadCapability(step.uploadUrlCiphertext, step.uploadUrlIv, sessionId)) {
+      encryptedReplacement = await encryptGoogleDriveUploadCapability(uploadLocation, sessionId);
+    }
+    if (remote.complete) {
+      await updateDriveUploadStep({
+        sessionId,
+        startedAt: step.startedAt,
+        leaseToken,
+        committedOffset: step.totalBytes,
+        phase: "finalizing",
+        recordingFile: remote.file as Record<string, unknown>,
+        uploadUrlCiphertext: encryptedReplacement?.ciphertext,
+        uploadUrlIv: encryptedReplacement?.iv,
+      });
+      const result = await completeSteppedArchive({
+        sessionId,
+        startedAt: step.startedAt,
+        source,
+        accessToken,
+        prepared,
+        recordingFile: remote.file,
+        reportProgress,
+      });
+      leaseHeld = false;
+      return result;
+    }
+
+    const committedOffset = remote.committedBytes;
+    if (
+      !Number.isInteger(committedOffset) || committedOffset < 0 || committedOffset > step.totalBytes ||
+      (committedOffset !== step.totalBytes && committedOffset % (256 * 1024) !== 0)
+    ) {
+      throw new Error("GOOGLE_DRIVE_RESUMABLE_RANGE_MISMATCH");
+    }
+    await updateDriveUploadStep({
+      sessionId,
+      startedAt: step.startedAt,
+      leaseToken,
+      committedOffset,
+      uploadUrlCiphertext: encryptedReplacement?.ciphertext,
+      uploadUrlIv: encryptedReplacement?.iv,
+    });
+    const chunkLength = Math.min(DRIVE_RECORDING_CHUNK_BYTES, step.totalBytes - committedOffset);
+    if (chunkLength <= 0) throw new Error("GOOGLE_DRIVE_RESUMABLE_UPLOAD_INCOMPLETE");
+    const chunk = await getInterviewRecordingChunk({ sessionId, offset: committedOffset, length: chunkLength });
+    if (!chunk || chunk.byteSize !== step.totalBytes || chunk.contentType !== step.contentType) {
+      throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
+    }
+    const uploaded = await putOneRecordingChunk({
+      uploadLocation,
+      contentType: step.contentType,
+      totalBytes: step.totalBytes,
+      offset: committedOffset,
+      bytes: chunk.bytes,
+    });
+    let uploadedLocationEncryption: { ciphertext: string; iv: string } | null = null;
+    if (uploaded.uploadLocation !== uploadLocation) {
+      uploadedLocationEncryption = await encryptGoogleDriveUploadCapability(uploaded.uploadLocation, sessionId);
+    }
+    if (uploaded.complete) {
+      await updateDriveUploadStep({
+        sessionId,
+        startedAt: step.startedAt,
+        leaseToken,
+        committedOffset: step.totalBytes,
+        phase: "finalizing",
+        recordingFile: uploaded.file as Record<string, unknown>,
+        uploadUrlCiphertext: uploadedLocationEncryption?.ciphertext,
+        uploadUrlIv: uploadedLocationEncryption?.iv,
+      });
+      const result = await completeSteppedArchive({
+        sessionId,
+        startedAt: step.startedAt,
+        source,
+        accessToken,
+        prepared,
+        recordingFile: uploaded.file,
+        reportProgress,
+      });
+      leaseHeld = false;
+      return result;
+    }
+    await updateDriveUploadStep({
+      sessionId,
+      startedAt: step.startedAt,
+      leaseToken,
+      committedOffset: uploaded.committedBytes,
+      uploadUrlCiphertext: uploadedLocationEncryption?.ciphertext,
+      uploadUrlIv: uploadedLocationEncryption?.iv,
+      releaseLease: true,
+    });
+    leaseHeld = false;
+    return pendingStep({
+      phase: "uploading",
+      folderId: step.folderId,
+      folderUrl: step.folderUrl,
+      committedOffset: uploaded.committedBytes,
+      totalBytes: step.totalBytes,
+    });
+  } catch (error) {
+    await releaseLease().catch(() => undefined);
+    if (isTransientDriveError(error)) {
+      return pendingStep({
+        phase: "retrying",
+        folderId: step.folderId,
+        folderUrl: step.folderUrl,
+        committedOffset: step.committedOffset,
+        totalBytes: step.totalBytes,
+      });
+    }
+    await failExternalSync({ sessionId, startedAt: step.startedAt, errorCode: safeErrorCode(error) });
+    throw error;
+  }
 }
 
 export async function syncInterviewToGoogleDrive(sessionId: string): Promise<GoogleDriveSyncResult> {

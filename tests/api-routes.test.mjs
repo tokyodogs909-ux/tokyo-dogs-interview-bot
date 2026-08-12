@@ -111,6 +111,112 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("INSERT INTO interview_artifacts")) {
       this.database.artifacts.push(this.values);
       changes = 1;
+    } else if (this.sql.startsWith("INSERT OR IGNORE INTO recorded_answer_transcriptions")) {
+      const [sessionId, answerIndex, objectKey, contentType, byteSize, audioSha256,
+        createdAt, updatedAt] = this.values;
+      const key = `${sessionId}:${answerIndex}`;
+      if (!this.database.recordedAnswers.has(key)) {
+        this.database.recordedAnswers.set(key, {
+          session_id: sessionId,
+          answer_index: answerIndex,
+          object_key: objectKey,
+          content_type: contentType,
+          byte_size: byteSize,
+          audio_sha256: audioSha256,
+          etag: null,
+          status: "pending",
+          transcript_text: null,
+          claim_id: null,
+          claimed_at: null,
+          attempt_count: 0,
+          last_error_code: null,
+          next_retry_at: null,
+          created_at: createdAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("INSERT OR IGNORE INTO recorded_interview_completions")) {
+      const [sessionId, expectedAnswerCount, requestedAt, createdAt, updatedAt] = this.values;
+      if (!this.database.recordedCompletions.has(sessionId)) {
+        this.database.recordedCompletions.set(sessionId, {
+          session_id: sessionId,
+          expected_answer_count: expectedAnswerCount,
+          requested_at: requestedAt,
+          created_at: createdAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET etag")) {
+      const [etag, updatedAt, sessionId, answerIndex, audioSha256] = this.values;
+      const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
+      if (answer?.audio_sha256 === audioSha256) {
+        answer.etag = etag;
+        answer.updated_at = updatedAt;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET status = 'processing'")) {
+      const [claimId, claimedAt, updatedAt, sessionId, answerIndex, staleBefore] = this.values;
+      const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
+      if (answer && (
+        answer.status === "pending" ||
+        (answer.status === "processing" && answer.claimed_at < staleBefore)
+      )) {
+        Object.assign(answer, {
+          status: "processing",
+          claim_id: claimId,
+          claimed_at: claimedAt,
+          attempt_count: answer.attempt_count + 1,
+          last_error_code: null,
+          next_retry_at: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET status = 'pending'")) {
+      const [errorCode, nextRetryAt, updatedAt, sessionId, answerIndex, claimId] = this.values;
+      const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
+      if (answer?.status === "processing" && answer.claim_id === claimId) {
+        Object.assign(answer, {
+          status: "pending",
+          claim_id: null,
+          claimed_at: null,
+          last_error_code: errorCode,
+          next_retry_at: nextRetryAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET status = 'failed'")) {
+      const [errorCode, updatedAt, sessionId, answerIndex, claimId] = this.values;
+      const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
+      if (answer?.status === "processing" && answer.claim_id === claimId) {
+        Object.assign(answer, {
+          status: "failed",
+          claim_id: null,
+          claimed_at: null,
+          last_error_code: errorCode,
+          next_retry_at: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET status = 'completed'")) {
+      const [transcriptText, updatedAt, sessionId, answerIndex, claimId] = this.values;
+      const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
+      if (answer?.status === "processing" && answer.claim_id === claimId) {
+        Object.assign(answer, {
+          status: "completed",
+          transcript_text: transcriptText,
+          claim_id: null,
+          claimed_at: null,
+          last_error_code: null,
+          next_retry_at: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
     } else if (this.sql.startsWith("INSERT INTO interview_external_syncs")) {
       const [sessionId, requestedAt, updatedAt] = this.values;
       const current = this.database.externalSyncs.get(sessionId);
@@ -186,6 +292,68 @@ class FakeD1Statement {
         Object.assign(sync, { status: "failed", error_code: errorCode, updated_at: updatedAt });
         changes = 1;
       }
+    } else if (this.sql.startsWith("INSERT INTO interview_drive_upload_steps")) {
+      const [sessionId, startedAt, uploadUrlCiphertext, uploadUrlIv, totalBytes,
+        contentType, recordingName, folderId, folderUrl, contextJson, createdAt, updatedAt] = this.values;
+      this.database.driveUploadSteps.set(sessionId, {
+        session_id: sessionId,
+        started_at: startedAt,
+        phase: "uploading",
+        upload_url_ciphertext: uploadUrlCiphertext,
+        upload_url_iv: uploadUrlIv,
+        committed_offset: 0,
+        total_bytes: totalBytes,
+        content_type: contentType,
+        recording_name: recordingName,
+        folder_id: folderId,
+        folder_url: folderUrl,
+        context_json: contextJson,
+        recording_file_json: null,
+        lease_token: null,
+        lease_expires_at: null,
+        created_at: createdAt,
+        updated_at: updatedAt,
+      });
+      changes = 1;
+    } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET lease_token = ?, lease_expires_at")) {
+      const [leaseToken, leaseExpiresAt, updatedAt, sessionId, startedAt, now] = this.values;
+      const step = this.database.driveUploadSteps.get(sessionId);
+      if (step?.started_at === startedAt && (!step.lease_token || !step.lease_expires_at || step.lease_expires_at <= now)) {
+        Object.assign(step, { lease_token: leaseToken, lease_expires_at: leaseExpiresAt, updated_at: updatedAt });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET committed_offset")) {
+      const [committedOffset, phase, replaceMarker, recordingFileJson,
+        uploadUrlCiphertext, uploadUrlIv, releaseLease, , updatedAt,
+        sessionId, startedAt, leaseToken] = this.values;
+      const step = this.database.driveUploadSteps.get(sessionId);
+      if (step?.started_at === startedAt && step.lease_token === leaseToken) {
+        step.committed_offset = committedOffset;
+        if (phase) step.phase = phase;
+        if (replaceMarker) step.recording_file_json = recordingFileJson;
+        if (uploadUrlCiphertext) step.upload_url_ciphertext = uploadUrlCiphertext;
+        if (uploadUrlIv) step.upload_url_iv = uploadUrlIv;
+        if (releaseLease === 1) {
+          step.lease_token = null;
+          step.lease_expires_at = null;
+        }
+        step.updated_at = updatedAt;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET lease_token = NULL")) {
+      const [updatedAt, sessionId, startedAt, leaseToken] = this.values;
+      const step = this.database.driveUploadSteps.get(sessionId);
+      if (step?.started_at === startedAt && step.lease_token === leaseToken) {
+        Object.assign(step, { lease_token: null, lease_expires_at: null, updated_at: updatedAt });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("DELETE FROM interview_drive_upload_steps")) {
+      const [sessionId, startedAt] = this.values;
+      const step = this.database.driveUploadSteps.get(sessionId);
+      if (step?.started_at === startedAt) {
+        this.database.driveUploadSteps.delete(sessionId);
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'uploading'")) {
       const [updatedAt, id, staleBefore] = this.values;
       const session = this.database.sessions.get(id);
@@ -200,7 +368,7 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'failed'")) {
       const [updatedAt, id] = this.values;
       const session = this.database.sessions.get(id);
-      if (session?.recording_status === "uploading") {
+      if (session && ["uploading", "failed"].includes(session.recording_status)) {
         session.recording_status = "failed";
         session.updated_at = updatedAt;
         changes = 1;
@@ -210,6 +378,25 @@ class FakeD1Statement {
       const session = this.database.sessions.get(id);
       if (session) {
         session.recording_status = "stored";
+        session.updated_at = updatedAt;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_sessions SET transcript_json = ?")) {
+      const [transcriptJson, updatedAt, sessionId, comparedTranscriptJson,
+        fallbackSessionId, sealSessionId] = this.values;
+      const session = this.database.sessions.get(sessionId);
+      const fallbackStarted = this.database.auditEvents.some((event) =>
+        event.session_id === fallbackSessionId && event.event_type === "recorded_fallback_started");
+      const alreadySealed = this.database.auditEvents.some((event) =>
+        event.session_id === sealSessionId && event.event_type === "voice_transcript_sealed");
+      if (
+        session &&
+        ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+        (session.transcript_json == null || session.transcript_json === comparedTranscriptJson) &&
+        !fallbackStarted &&
+        !alreadySealed
+      ) {
+        session.transcript_json = transcriptJson;
         session.updated_at = updatedAt;
         changes = 1;
       }
@@ -224,19 +411,49 @@ class FakeD1Statement {
         session.updated_at = updatedAt;
         changes = 1;
       }
-    } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'evaluation_processing'")) {
-      const [transcriptJson, claimId, startedAt, updatedAt, id, staleBefore] = this.values;
-      const session = this.database.sessions.get(id);
-      if (session && (
+    } else if (this.sql.startsWith("INSERT INTO interview_evaluation_claims")) {
+      const [claimId, startedAt, createdAt, updatedAt, sessionId, staleBefore] = this.values;
+      const session = this.database.sessions.get(sessionId);
+      const current = this.database.evaluationClaims.get(sessionId);
+      const eligible = session && (
         ["in_progress", "evaluation_pending"].includes(session.status) ||
-        (session.status === "evaluation_processing" &&
-          (!session.evaluation_started_at || session.evaluation_started_at < staleBefore))
-      )) {
+        (session.status === "evaluation_processing" && (
+          (current?.started_at && current.started_at <= staleBefore) ||
+          (!current && session.updated_at <= staleBefore)
+        ))
+      );
+      if (eligible && (!current || current.started_at <= staleBefore)) {
+        this.database.evaluationClaims.set(sessionId, {
+          session_id: sessionId,
+          claim_id: claimId,
+          started_at: startedAt,
+          created_at: current?.created_at ?? createdAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("DELETE FROM interview_evaluation_claims")) {
+      const [sessionId, claimId] = this.values;
+      const current = this.database.evaluationClaims.get(sessionId);
+      const completedAt = this.values[3];
+      const session = this.database.sessions.get(sessionId);
+      const completionFencePassed = completedAt === undefined || session?.completed_at === completedAt;
+      if (current?.claim_id === claimId && completionFencePassed) {
+        this.database.evaluationClaims.delete(sessionId);
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'evaluation_processing'")) {
+      const [transcriptJson, updatedAt, id, claimSessionId, claimId, sealSessionId, sealedTranscriptJson] = this.values;
+      const session = this.database.sessions.get(id);
+      const claim = this.database.evaluationClaims.get(claimSessionId);
+      const voiceSealed = this.database.auditEvents.some((event) =>
+        event.session_id === sealSessionId && event.event_type === "voice_transcript_sealed");
+      if (session && claim?.claim_id === claimId &&
+        ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+        (!voiceSealed || session.transcript_json === sealedTranscriptJson)) {
         Object.assign(session, {
           status: "evaluation_processing",
           transcript_json: transcriptJson,
-          evaluation_claim_id: claimId,
-          evaluation_started_at: startedAt,
           updated_at: updatedAt,
         });
         changes = 1;
@@ -245,13 +462,12 @@ class FakeD1Statement {
       this.sql.startsWith("UPDATE interview_sessions SET status = 'evaluation_pending'") &&
       this.sql.includes("WHERE id = ? AND status = 'evaluation_processing'")
     ) {
-      const [updatedAt, id, claimId] = this.values;
+      const [updatedAt, id, claimSessionId] = this.values;
       const session = this.database.sessions.get(id);
-      if (session?.status === "evaluation_processing" && session.evaluation_claim_id === claimId) {
+      if (session?.status === "evaluation_processing" &&
+        !this.database.evaluationClaims.has(claimSessionId)) {
         Object.assign(session, {
           status: "evaluation_pending",
-          evaluation_claim_id: null,
-          evaluation_started_at: null,
           updated_at: updatedAt,
         });
         changes = 1;
@@ -261,15 +477,18 @@ class FakeD1Statement {
       const session = this.database.sessions.get(id);
       if (session) Object.assign(session, { status: "evaluation_pending", transcript_json: transcriptJson, updated_at: updatedAt });
     } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'completed'")) {
-      const [transcriptJson, evaluationJson, summary, completedAt, updatedAt, id, claimId] = this.values;
+      const [transcriptJson, evaluationJson, summary, completedAt, updatedAt, id,
+        claimSessionId, claimId, sealSessionId, sealedTranscriptJson] = this.values;
       const session = this.database.sessions.get(id);
-      if (session?.status === "evaluation_processing" && session.evaluation_claim_id === claimId) {
+      const claim = this.database.evaluationClaims.get(claimSessionId);
+      const voiceSealed = this.database.auditEvents.some((event) =>
+        event.session_id === sealSessionId && event.event_type === "voice_transcript_sealed");
+      if (session?.status === "evaluation_processing" && claim?.claim_id === claimId &&
+        (!voiceSealed || session.transcript_json === sealedTranscriptJson)) {
         Object.assign(session, {
           status: "completed",
           transcript_json: transcriptJson,
           evaluation_json: evaluationJson,
-          evaluation_claim_id: null,
-          evaluation_started_at: null,
           summary,
           completed_at: completedAt,
           updated_at: updatedAt,
@@ -284,6 +503,62 @@ class FakeD1Statement {
         overall_note: overallNote,
         updated_at: updatedAt,
       });
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'voice_transcript_sealed'")
+    ) {
+      const [, detailJson, sessionId, transcriptJson] = this.values;
+      const session = this.database.sessions.get(sessionId);
+      const fallbackStarted = this.database.auditEvents.some((event) =>
+        event.session_id === sessionId && event.event_type === "recorded_fallback_started");
+      const alreadySealed = this.database.auditEvents.some((event) =>
+        event.session_id === sessionId && event.event_type === "voice_transcript_sealed");
+      if (
+        session &&
+        ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+        session.transcript_json === transcriptJson &&
+        !fallbackStarted &&
+        !alreadySealed
+      ) {
+        this.database.auditEvents.push({
+          event_type: "voice_transcript_sealed",
+          detail_json: detailJson,
+          created_at: new Date().toISOString(),
+          session_id: sessionId,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'recorded_fallback_started'")
+    ) {
+      const [, sessionId, existingSessionId, checkedSessionId] = this.values;
+      const exists = this.database.sessions.has(existingSessionId);
+      const alreadyStarted = this.database.auditEvents.some((event) =>
+        event.session_id === checkedSessionId && event.event_type === "recorded_fallback_started");
+      if (exists && !alreadyStarted) {
+        this.database.auditEvents.push({
+          event_type: "recorded_fallback_started",
+          detail_json: "{}",
+          created_at: new Date().toISOString(),
+          session_id: sessionId,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'interview_started'")
+    ) {
+      const [, sessionId, existingSessionId] = this.values;
+      if (this.database.sessions.has(existingSessionId)) {
+        this.database.auditEvents.push({
+          event_type: "interview_started",
+          detail_json: "{}",
+          created_at: new Date().toISOString(),
+          session_id: sessionId,
+        });
+        changes = 1;
+      }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("'realtime_connection_reserved'")
@@ -307,6 +582,18 @@ class FakeD1Statement {
       const [, sessionId, detailJson] = this.values;
       this.database.auditEvents.push({
         event_type: "reasonable_accommodation_text_selected",
+        detail_json: detailJson,
+        created_at: new Date().toISOString(),
+        session_id: sessionId,
+      });
+      changes = 1;
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'transcription_failed', 'system'")
+    ) {
+      const [, sessionId, detailJson] = this.values;
+      this.database.auditEvents.push({
+        event_type: "transcription_failed",
         detail_json: detailJson,
         created_at: new Date().toISOString(),
         session_id: sessionId,
@@ -361,12 +648,137 @@ class FakeD1Statement {
   }
 
   async first() {
+    if (this.sql.startsWith("SELECT s.status, s.transcript_json,")) {
+      const session = this.database.sessions.get(this.values[0]);
+      if (!session) return null;
+      return {
+        status: session.status,
+        transcript_json: session.transcript_json ?? null,
+        voice_transcript_sealed: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && event.event_type === "voice_transcript_sealed") ? 1 : 0,
+      };
+    }
+    if (this.sql.startsWith("SELECT EXISTS ( SELECT 1 FROM recorded_interview_completions")) {
+      const sessionId = this.values[0];
+      const session = this.database.sessions.get(sessionId);
+      const transcriptHasCandidate = (() => {
+        try {
+          return JSON.parse(session?.transcript_json ?? "[]").some((turn) =>
+            turn?.speaker === "candidate" && typeof turn.text === "string" && turn.text.trim());
+        } catch {
+          return false;
+        }
+      })();
+      const fallbackStarted = this.database.auditEvents.some((event) =>
+        event.session_id === sessionId && event.event_type === "recorded_fallback_started");
+      const voiceSealed = this.database.auditEvents.some((event) =>
+        event.session_id === sessionId && event.event_type === "voice_transcript_sealed");
+      return session ? {
+        recorded_fallback_sealed: this.database.recordedCompletions.has(sessionId) ? 1 : 0,
+        voice_transcript_sealed: voiceSealed && !fallbackStarted && transcriptHasCandidate ? 1 : 0,
+      } : null;
+    }
+    if (this.sql.startsWith("SELECT s.id, s.transcript_json FROM interview_sessions")) {
+      const [staleBefore, legacyStaleBefore, pendingStaleBefore] = this.values;
+      return [...this.database.sessions.values()]
+        .filter((session) => {
+          const claim = this.database.evaluationClaims.get(session.id);
+          if (
+            !((session.status === "evaluation_processing" &&
+              ((claim?.started_at && claim.started_at <= staleBefore) ||
+                (!claim && session.updated_at <= legacyStaleBefore))) ||
+              (session.status === "evaluation_pending" && !claim &&
+                session.updated_at <= pendingStaleBefore) ||
+              (session.status === "in_progress" && session.recording_status === "stored" && !claim &&
+                this.database.auditEvents.some((event) =>
+                  event.session_id === session.id && event.event_type === "voice_transcript_sealed"))) ||
+            typeof session.transcript_json !== "string"
+          ) return false;
+          try {
+            const transcript = JSON.parse(session.transcript_json);
+            return Array.isArray(transcript) && transcript.some((turn) =>
+              turn?.speaker === "candidate" && typeof turn.text === "string" && turn.text.trim());
+          } catch {
+            return false;
+          }
+        })
+        .sort((left, right) => {
+          const leftStartedAt = this.database.evaluationClaims.get(left.id)?.started_at ?? left.updated_at;
+          const rightStartedAt = this.database.evaluationClaims.get(right.id)?.started_at ?? right.updated_at;
+          return leftStartedAt.localeCompare(rightStartedAt) || left.id.localeCompare(right.id);
+        })
+        .map((session) => ({ id: session.id, transcript_json: session.transcript_json }))[0] ?? null;
+    }
+    if (this.sql.startsWith("SELECT s.id FROM interview_sessions s WHERE s.status IN")) {
+      const [staleBefore] = this.values;
+      return [...this.database.sessions.values()]
+        .filter((session) => {
+          let transcriptHasCandidate = false;
+          try {
+            transcriptHasCandidate = JSON.parse(session.transcript_json ?? "[]").some((turn) =>
+              turn?.speaker === "candidate" && typeof turn.text === "string" && turn.text.trim());
+          } catch {
+            transcriptHasCandidate = false;
+          }
+          const fallbackStarted = this.database.auditEvents.some((event) =>
+            event.session_id === session.id && event.event_type === "recorded_fallback_started");
+          const voiceSealed = this.database.auditEvents.some((event) =>
+            event.session_id === session.id && event.event_type === "voice_transcript_sealed");
+          const hasSeal = this.database.recordedCompletions.has(session.id) ||
+            (voiceSealed && !fallbackStarted && transcriptHasCandidate);
+          return hasSeal &&
+          ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+          ["uploading", "failed"].includes(session.recording_status) &&
+          session.updated_at <= staleBefore;
+        })
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map((session) => ({ id: session.id }))[0] ?? null;
+    }
+    if (this.sql.startsWith("SELECT r.session_id, r.answer_index, r.object_key")) {
+      const [now, staleBefore] = this.values;
+      return [...this.database.recordedAnswers.values()]
+        .filter((answer) => {
+          const session = this.database.sessions.get(answer.session_id);
+          if (!session || !["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status)) return false;
+          if (session.recording_status !== "stored") return false;
+          return (answer.status === "pending" && (!answer.next_retry_at || answer.next_retry_at <= now)) ||
+            (answer.status === "processing" && (!answer.claimed_at || answer.claimed_at < staleBefore));
+        })
+        .sort((left, right) =>
+          String(left.updated_at).localeCompare(String(right.updated_at)) ||
+          left.session_id.localeCompare(right.session_id) ||
+          left.answer_index - right.answer_index)[0] ?? null;
+    }
+    if (this.sql.startsWith("SELECT c.session_id, c.expected_answer_count")) {
+      const [staleBefore, legacyStaleBefore] = this.values;
+      return [...this.database.recordedCompletions.values()]
+        .filter((completion) => {
+          const session = this.database.sessions.get(completion.session_id);
+          if (!session || !["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status)) return false;
+          if (session.status === "evaluation_processing") {
+            const claim = this.database.evaluationClaims.get(session.id);
+            if (!((claim?.started_at && claim.started_at < staleBefore) ||
+              (!claim && session.updated_at < legacyStaleBefore))) return false;
+          }
+          if (session.recording_status !== "stored") return false;
+          const answers = [...this.database.recordedAnswers.values()]
+            .filter((answer) => answer.session_id === completion.session_id);
+          if (answers.some((answer) => answer.answer_index > completion.expected_answer_count)) return false;
+          return Array.from({ length: completion.expected_answer_count }, (_, index) => answers.find((answer) =>
+            answer.answer_index === index + 1 && answer.status === "completed" && answer.transcript_text?.trim())).every(Boolean);
+        })
+        .sort((left, right) => left.requested_at.localeCompare(right.requested_at) || left.session_id.localeCompare(right.session_id))[0] ?? null;
+    }
     if (this.sql.startsWith("SELECT used_at, expires_at FROM interview_invites")) {
       const invite = this.database.invites.get(this.values[0]);
       return invite ? { used_at: invite.used_at, expires_at: invite.expires_at } : null;
     }
     if (this.sql.startsWith("SELECT id, access_token_hash")) {
       return this.database.sessions.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT id, status, recording_status")) {
+      const session = this.database.sessions.get(this.values[0]);
+      return session ? { id: session.id, status: session.status, recording_status: session.recording_status } : null;
     }
     if (this.sql.startsWith("SELECT id, candidate_name, employment, preferred_location")) {
       return this.database.sessions.get(this.values[0]) ?? null;
@@ -382,6 +794,19 @@ class FakeD1Statement {
     }
     if (this.sql.startsWith("SELECT provider, status, requested_at")) {
       return this.database.externalSyncs.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT session_id, answer_index, object_key")) {
+      return this.database.recordedAnswers.get(`${this.values[0]}:${this.values[1]}`) ?? null;
+    }
+    if (this.sql.startsWith("SELECT session_id, expected_answer_count, requested_at")) {
+      return this.database.recordedCompletions.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT session_id FROM recorded_interview_completions")) {
+      const completion = this.database.recordedCompletions.get(this.values[0]);
+      return completion ? { session_id: completion.session_id } : null;
+    }
+    if (this.sql.startsWith("SELECT session_id, started_at, phase")) {
+      return this.database.driveUploadSteps.get(this.values[0]) ?? null;
     }
     if (this.sql.startsWith("SELECT refresh_token_ciphertext")) {
       return this.database.driveConnection;
@@ -401,6 +826,13 @@ class FakeD1Statement {
           .map(([, value]) => value),
       };
     }
+    if (this.sql.startsWith("SELECT event_type, detail_json FROM interview_audit_events")) {
+      return {
+        results: this.database.auditEvents
+          .filter((event) => event.session_id === this.values[0] && event.event_type === "transcription_failed")
+          .map((event) => ({ event_type: event.event_type, detail_json: event.detail_json })),
+      };
+    }
     if (this.sql.startsWith("SELECT s.id, s.candidate_name")) {
       const limit = this.values[0];
       return {
@@ -416,6 +848,11 @@ class FakeD1Statement {
               preferred_location: session.preferred_location,
               status: session.status,
               recording_status: session.recording_status,
+              transcript_json: session.transcript_json,
+              candidate_transcription_failed: this.database.auditEvents.some((event) =>
+                event.session_id === session.id &&
+                event.event_type === "transcription_failed" &&
+                JSON.parse(event.detail_json ?? "{}").code === "TRANSCRIPTION_FAILED") ? 1 : 0,
               created_at: session.created_at,
               completed_at: session.completed_at ?? null,
               retention_until: session.retention_until,
@@ -438,6 +875,40 @@ class FakeD1Statement {
           event.session_id === this.values[0] && technicalEventTypes.has(event.event_type)),
       };
     }
+    if (this.sql.startsWith("SELECT answer_index, status, transcript_text")) {
+      return {
+        results: [...this.database.recordedAnswers.values()]
+          .filter((answer) => answer.session_id === this.values[0])
+          .sort((left, right) => left.answer_index - right.answer_index)
+          .map((answer) => ({
+            answer_index: answer.answer_index,
+            status: answer.status,
+            transcript_text: answer.transcript_text,
+          })),
+      };
+    }
+    if (this.sql.startsWith("SELECT r.session_id, r.answer_index, r.status, r.transcript_text")) {
+      return {
+        results: [...this.database.recordedAnswers.values()]
+          .filter((answer) => {
+            const session = this.database.sessions.get(answer.session_id);
+            return session &&
+              ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+              session.recording_status === "stored";
+          })
+          .sort((left, right) =>
+            String(left.updated_at).localeCompare(String(right.updated_at)) ||
+            left.session_id.localeCompare(right.session_id) ||
+            left.answer_index - right.answer_index)
+          .slice(0, 300)
+          .map((answer) => ({
+            session_id: answer.session_id,
+            answer_index: answer.answer_index,
+            status: answer.status,
+            transcript_text: answer.transcript_text,
+          })),
+      };
+    }
     return { results: [] };
   }
 
@@ -453,6 +924,10 @@ class FakeD1 {
     this.invites = new Map();
     this.publicEntries = [];
     this.externalSyncs = new Map();
+    this.driveUploadSteps = new Map();
+    this.evaluationClaims = new Map();
+    this.recordedAnswers = new Map();
+    this.recordedCompletions = new Map();
     this.driveConnection = null;
   }
 
@@ -475,17 +950,35 @@ class FakeR2 {
 
   async put(key, body, options) {
     this.putCount += 1;
-    this.objects.set(key, { body, options });
-    return { etag: "test-etag" };
+    const bytes = body instanceof ReadableStream
+      ? new Uint8Array(await new Response(body).arrayBuffer())
+      : body instanceof Uint8Array
+        ? Uint8Array.from(body)
+        : body instanceof ArrayBuffer
+          ? new Uint8Array(body.slice(0))
+          : typeof body === "string"
+            ? new TextEncoder().encode(body)
+            : new Uint8Array(await new Response(body).arrayBuffer());
+    this.objects.set(key, { body: bytes, options });
+    return { etag: "test-etag", size: bytes.byteLength };
   }
 
-  async get(key) {
+  async get(key, options = {}) {
     this.getCount += 1;
     const object = this.objects.get(key);
     if (!object) return null;
+    const storedBytes = object.body instanceof Uint8Array
+      ? object.body
+      : new Uint8Array(await new Response(object.body).arrayBuffer());
+    object.body = storedBytes;
+    const offset = options.range?.offset ?? 0;
+    const length = options.range?.length ?? (storedBytes.byteLength - offset);
+    const bytes = storedBytes.slice(offset, offset + length);
     return {
-      body: object.body,
+      body: new Blob([bytes]).stream(),
+      arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
       etag: "test-etag",
+      size: bytes.byteLength,
       customMetadata: object.options?.customMetadata ?? {},
     };
   }
@@ -496,6 +989,7 @@ class FakeR2 {
     if (!object) return null;
     return {
       etag: "test-etag",
+      size: object.body.byteLength,
       customMetadata: object.options?.customMetadata ?? {},
     };
   }
@@ -510,6 +1004,34 @@ async function createTestInterviewSession(env, employment = "正社員", locatio
   }, env);
   assert.equal(response.status, 201);
   return response.json();
+}
+
+async function sealRecordedCompletion(env, session, expectedAnswerCount) {
+  const response = await request("/api/interviews/recorded/seal", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId, expectedAnswerCount }),
+  }, env);
+  assert.equal(response.status, 200, JSON.stringify(await response.clone().json()));
+  assert.deepEqual(await response.json(), { sealed: true, expectedAnswerCount });
+}
+
+async function sealVoiceTranscript(env, session, transcript, transcriptionComplete = true) {
+  return await request("/api/interviews/voice/transcript/seal", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      transcript,
+      transcriptionComplete,
+    }),
+  }, env);
 }
 
 test("health endpoint verifies server authentication without returning the key", async () => {
@@ -975,7 +1497,7 @@ test("Google Drive setup creates and reuses an app-managed root when drive.file 
   }
 });
 
-test("candidate foreground archive waits for Drive readback and stores all six artifacts", async () => {
+test("candidate archive repairs a completed video-less receipt and sends at most one recording chunk per API call", async () => {
   const originalFetch = globalThis.fetch;
   const database = new FakeD1();
   const recordings = new FakeR2();
@@ -988,6 +1510,7 @@ test("candidate foreground archive waits for Drive readback and stores all six a
     GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
     GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
     GOOGLE_DRIVE_REFRESH_TOKEN: "google-refresh-token",
+    GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: "test-only-drive-step-encryption-secret-at-least-32-characters",
     GOOGLE_DRIVE_ROOT_FOLDER_ID: rootFolderId,
     GOOGLE_DRIVE_EXPECTED_ROOT_NAME: "オンライン一次面接_自動格納",
   };
@@ -1013,30 +1536,58 @@ test("candidate foreground archive waits for Drive readback and stores all six a
     humanReviewRequired: true,
   });
   stored.summary = "採用担当者による確認が必要です。";
-  const recordingKey = `interviews/${session.sessionId}/recording.webm`;
-  const recordingBytes = new Uint8Array(20 * 1024 * 1024 + 123).fill(90);
+  const recordingKey = `interviews/${session.sessionId}/recording.manifest.json`;
+  const recordingByteSize = 71 * 1024 * 1024 + 123;
+  const recordingPartSize = 4 * 1024 * 1024;
+  const recordingParts = [];
+  for (let index = 0, offset = 0; offset < recordingByteSize; index += 1, offset += recordingPartSize) {
+    const byteSize = Math.min(recordingPartSize, recordingByteSize - offset);
+    const key = `interviews/${session.sessionId}/recording-parts/part-${String(index).padStart(3, "0")}`;
+    recordingParts.push({ key, byteSize });
+    recordings.objects.set(key, {
+      body: new Uint8Array(byteSize).fill(65 + (index % 20)),
+      options: { httpMetadata: { contentType: "application/octet-stream" } },
+    });
+  }
+  assert.equal(recordingParts.length, 18);
   recordings.objects.set(recordingKey, {
-    body: new Blob([recordingBytes], { type: "video/webm" }).stream(),
-    options: { httpMetadata: { contentType: "video/webm" } },
+    body: new TextEncoder().encode(JSON.stringify({
+      version: 1,
+      contentType: "video/webm",
+      byteSize: recordingByteSize,
+      audioCoverage: "both",
+      parts: recordingParts,
+    })),
+    options: { httpMetadata: { contentType: "application/json" } },
   });
   database.artifacts.push([
     "artifact-id",
     session.sessionId,
     recordingKey,
     "video/webm",
-    recordingBytes.byteLength,
+    recordingByteSize,
     "test-etag",
     "2027-07-29T02:00:00.000Z",
   ]);
   database.externalSyncs.set(session.sessionId, {
     provider: "google_drive",
-    status: "running",
+    // This models the production failure: the old worker wrote the five small
+    // files and marked the row completed before the durable recording existed.
+    // A completed status must not short-circuit today's repair sync.
+    status: "completed",
     requested_at: "2026-07-29T02:00:00.000Z",
     started_at: "2026-07-29T02:00:00.000Z",
-    completed_at: null,
-    folder_id: null,
-    folder_url: null,
-    manifest_json: null,
+    completed_at: "2026-07-29T02:10:00.000Z",
+    folder_id: "legacy-video-less-folder",
+    folder_url: "https://drive.google.com/drive/folders/legacy-video-less-folder",
+    manifest_json: JSON.stringify({
+      files: {
+        transcript: { id: "old-transcript", name: `${session.sessionId}_文字起こし.txt`, size: 100 },
+      },
+      recordingIncluded: false,
+      transcriptAvailable: true,
+      transcriptKind: "actual_transcript",
+    }),
     error_code: null,
     updated_at: "2026-07-29T02:00:00.000Z",
   });
@@ -1048,8 +1599,11 @@ test("candidate foreground archive waits for Drive readback and stores all six a
   let recordingUploadFinished = false;
   const recordingUploadRanges = [];
   let recordingMetadata = null;
+  let uploadedTranscriptText = "";
   let injectFirstRecordingChunkFailure = true;
   let replacedRecordingUploadLocation = false;
+  let recordingCommittedBytes = 0;
+  let recordingDataPutsThisApiCall = 0;
   try {
     globalThis.fetch = async (url, init = {}) => {
       const href = String(url);
@@ -1115,9 +1669,14 @@ test("candidate foreground archive waits for Drive readback and stores all six a
         assert.equal(init.method, "PUT");
         assert.equal(init.redirect, "manual");
         const contentRange = init.headers["Content-Range"];
-        if (contentRange === `bytes */${recordingBytes.byteLength}`) {
-          return new Response(null, { status: 308 });
+        if (contentRange === `bytes */${recordingByteSize}`) {
+          return new Response(null, {
+            status: 308,
+            headers: recordingCommittedBytes > 0 ? { Range: `bytes=0-${recordingCommittedBytes - 1}` } : {},
+          });
         }
+        recordingDataPutsThisApiCall += 1;
+        assert.ok(recordingDataPutsThisApiCall <= 1, "one archive API call must send at most one Drive data chunk");
         assert.match(contentRange, /^bytes \d+-\d+\/\d+$/);
         recordingUploadRanges.push(contentRange);
         const match = contentRange.match(/^bytes (\d+)-(\d+)\/(\d+)$/);
@@ -1129,6 +1688,7 @@ test("candidate foreground archive waits for Drive readback and stores all six a
           return new Response(null, { status: 503 });
         }
         if (end + 1 < total) {
+          recordingCommittedBytes = end + 1;
           const headers = { Range: `bytes=0-${end}` };
           if (!replacedRecordingUploadLocation) {
             replacedRecordingUploadLocation = true;
@@ -1137,12 +1697,13 @@ test("candidate foreground archive waits for Drive readback and stores all six a
           return new Response(null, { status: 308, headers });
         }
         await new Promise((resolve) => setTimeout(resolve, 75));
+        recordingCommittedBytes = total;
         recordingUploadFinished = true;
         const recordingFile = {
           id: `file-${++nextFile}`,
           name: recordingMetadata.name,
           mimeType: "video/webm",
-          size: String(recordingBytes.byteLength),
+          size: String(recordingByteSize),
           parents: recordingMetadata.parents,
           appProperties: recordingMetadata.appProperties,
         };
@@ -1154,6 +1715,9 @@ test("candidate foreground archive waits for Drive readback and stores all six a
         const metadata = JSON.parse(await metadataBlob.text());
         uploadedNames.push(metadata.name);
         const mediaBlob = init.body.get("media");
+        if (metadata.appProperties?.tokyoDogsArtifact === "transcript") {
+          uploadedTranscriptText = await mediaBlob.text();
+        }
         const uploadedFile = {
           id: `file-${++nextFile}`,
           name: metadata.name,
@@ -1175,32 +1739,54 @@ test("candidate foreground archive waits for Drive readback and stores all six a
     }, env);
     assert.equal(unauthorized.status, 401);
 
-    const archiveStartedAt = Date.now();
-    const response = await request("/api/interviews/archive", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${session.accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ sessionId: session.sessionId }),
-    }, env);
-    const responseHeadersElapsed = Date.now() - archiveStartedAt;
-    const payload = await response.json();
-    assert.equal(response.status, 200, JSON.stringify({ payload, sync: database.externalSyncs.get(session.sessionId), uploadedNames, createdFolders }));
+    let payload = null;
+    let archiveApiCalls = 0;
+    for (; archiveApiCalls < 20; archiveApiCalls += 1) {
+      recordingDataPutsThisApiCall = 0;
+      const response = await request("/api/interviews/archive", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ sessionId: session.sessionId }),
+      }, env);
+      payload = await response.json();
+      assert.equal(response.status, 200, JSON.stringify({ payload, sync: database.externalSyncs.get(session.sessionId), uploadedNames, createdFolders }));
+      assert.ok(recordingDataPutsThisApiCall <= 1);
+      if (payload.stored) break;
+      assert.equal(payload.pending, true);
+      assert.ok(["initializing", "uploading", "finalizing", "busy", "retrying"].includes(payload.phase));
+      assert.equal(Number.isInteger(payload.committedOffset), true);
+      assert.equal(Number.isInteger(payload.totalBytes), true);
+      assert.equal(Number.isInteger(payload.retryAfterMs), true);
+      if (archiveApiCalls === 0) {
+        const durableStep = database.driveUploadSteps.get(session.sessionId);
+        assert.ok(durableStep, "the first request must persist the resumable session before returning");
+        assert.equal(durableStep.committed_offset, 0);
+        assert.equal(durableStep.upload_url_ciphertext.includes("upload.example.test"), false);
+        assert.equal(JSON.stringify(durableStep).includes("https://upload.example.test"), false,
+          "the bearer-like Drive upload URI must never be stored in plaintext");
+      }
+    }
+    assert.ok(archiveApiCalls < 20, JSON.stringify({ payload, sync: database.externalSyncs.get(session.sessionId) }));
     assert.equal(payload.stored, true);
     assert.equal(payload.recordingIncluded, true);
+    assert.equal(payload.transcriptAvailable, true);
+    assert.equal(payload.transcriptKind, "actual_transcript");
+    assert.match(uploadedTranscriptText, /応募者[\s\S]*接客経験があります。/,
+      "the verified transcript artifact must contain a non-empty candidate utterance");
     assert.equal(recordingUploadFinished, true, "the API must not respond before the recording upload finishes");
-    assert.ok(responseHeadersElapsed < 70, "streaming headers must arrive before the simulated Drive upload completes");
     assert.deepEqual(recordingUploadRanges, [
-      `bytes 0-4194303/${recordingBytes.byteLength}`,
-      `bytes 0-4194303/${recordingBytes.byteLength}`,
-      `bytes 4194304-8388607/${recordingBytes.byteLength}`,
-      `bytes 8388608-12582911/${recordingBytes.byteLength}`,
-      `bytes 12582912-16777215/${recordingBytes.byteLength}`,
-      `bytes 16777216-20971519/${recordingBytes.byteLength}`,
-      `bytes 20971520-${recordingBytes.byteLength - 1}/${recordingBytes.byteLength}`,
+      `bytes 0-4194303/${recordingByteSize}`,
+      `bytes 0-4194303/${recordingByteSize}`,
+      ...Array.from({ length: 17 }, (_, index) => {
+        const start = (index + 1) * recordingPartSize;
+        const end = Math.min(start + recordingPartSize, recordingByteSize) - 1;
+        return `bytes ${start}-${end}/${recordingByteSize}`;
+      }),
     ]);
-    assert.ok(Date.now() - archiveStartedAt >= 70, "the foreground archive response must await Drive readback");
+    assert.equal(database.driveUploadSteps.has(session.sessionId), false, "durable upload capability is removed after exact readback");
     assert.match(database.externalSyncs.get(session.sessionId).folder_url, /^https:\/\/drive\.google\.com\/drive\/folders\/folder-/);
     assert.deepEqual(createdFolders, ["2026", "07", `テスト 応募者_${session.sessionId}`]);
     assert.deepEqual(new Set(uploadedNames), new Set([
@@ -1217,6 +1803,26 @@ test("candidate foreground archive waits for Drive readback and stores all six a
     assert.equal(responseText.includes("google-client-secret"), false);
     assert.equal(responseText.includes("google-refresh-token"), false);
     assert.equal(responseText.includes("temporary-google-access-token"), false);
+
+    const driveCallsBeforeIdempotentRead = uploadedNames.length + recordingUploadRanges.length + createdFolders.length;
+    recordingDataPutsThisApiCall = 0;
+    const replay = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.deepEqual(await replay.json(), {
+      stored: true,
+      recordingIncluded: true,
+      transcriptAvailable: true,
+      transcriptKind: "actual_transcript",
+    });
+    assert.equal(recordingDataPutsThisApiCall, 0);
+    assert.equal(uploadedNames.length + recordingUploadRanges.length + createdFolders.length, driveCallsBeforeIdempotentRead,
+      "a completed receipt must be an exact D1 readback, not another Drive write");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1713,10 +2319,22 @@ test("staff inbox lists recent candidates with one shared login and records list
   database.sessions.get(second.sessionId).candidate_name = "佐藤 太郎";
   database.sessions.get(second.sessionId).status = "completed";
   database.sessions.get(second.sessionId).recording_status = "not_applicable";
+  database.sessions.get(second.sessionId).transcript_json = JSON.stringify([
+    {
+      id: "candidate-answer-1",
+      speaker: "candidate",
+      text: "接客経験があり、安全確認を大切にしています。",
+      createdAt: "2026-07-29T02:50:10.000Z",
+    },
+  ]);
   database.externalSyncs.set(second.sessionId, {
     status: "completed",
     folder_url: "https://drive.google.com/drive/folders/test",
-    manifest_json: JSON.stringify({ recordingIncluded: false }),
+    manifest_json: JSON.stringify({
+      recordingIncluded: false,
+      transcriptAvailable: true,
+      transcriptKind: "actual_transcript",
+    }),
   });
 
   const unauthorized = await request("/api/staff/interviews", {}, env);
@@ -1924,6 +2542,99 @@ test("resumable recording upload resumes 14 parts without opening stored body st
   assert.equal(recording.at(-1), 65 + totalParts - 1);
 });
 
+test("voice transcript seal is authenticated, fail-closed, and exactly idempotent without completing the interview", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  const transcript = [
+    { id: "voice-question-1", speaker: "interviewer", text: "志望理由を教えてください。", createdAt: "2026-08-12T10:00:00.000Z" },
+    { id: "voice-answer-1", speaker: "candidate", text: " 犬とご家族に誠実に向き合います。 ", createdAt: "2026-08-12T10:00:10.000Z" },
+  ];
+
+  const incomplete = await sealVoiceTranscript(env, session, transcript, false);
+  assert.equal(incomplete.status, 400);
+  assert.equal(stored.transcript_json, undefined);
+
+  const interviewerOnly = await sealVoiceTranscript(env, session, transcript.slice(0, 1));
+  assert.equal(interviewerOnly.status, 400);
+  assert.equal(stored.transcript_json, undefined);
+
+  const unauthorized = await request("/api/interviews/voice/transcript/seal", {
+    method: "POST",
+    headers: { Authorization: "Bearer wrong-token", "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId: session.sessionId, transcript, transcriptionComplete: true }),
+  }, env);
+  assert.equal(unauthorized.status, 401);
+
+  const crossOrigin = await request("/api/interviews/voice/transcript/seal", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+      Origin: "https://attacker.example",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId, transcript, transcriptionComplete: true }),
+  }, env);
+  assert.equal(crossOrigin.status, 403);
+
+  const first = await sealVoiceTranscript(env, session, transcript);
+  const firstPayload = await first.json();
+  assert.equal(first.status, 200, JSON.stringify(firstPayload));
+  assert.deepEqual(firstPayload, { sealed: true, alreadySealed: false, turnCount: 2 });
+  assert.equal(stored.status, "in_progress", "a transcript seal is not an interview completion receipt");
+  assert.equal(JSON.parse(stored.transcript_json)[1].text, "犬とご家族に誠実に向き合います。");
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === session.sessionId && event.event_type === "voice_transcript_sealed").length, 1);
+
+  const replay = await sealVoiceTranscript(env, session, transcript);
+  assert.equal(replay.status, 200, await replay.clone().text());
+  assert.equal((await replay.json()).alreadySealed, true);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === session.sessionId && event.event_type === "voice_transcript_sealed").length, 1);
+
+  const conflicting = await sealVoiceTranscript(env, session, [
+    transcript[0],
+    { ...transcript[1], text: "後から別内容へ差し替えます。" },
+  ]);
+  assert.equal(conflicting.status, 409);
+  assert.equal(JSON.parse(stored.transcript_json)[1].text, "犬とご家族に誠実に向き合います。");
+
+  // A lost HTTP response can be replayed even after a separate evaluation has
+  // completed; the exact transcript still gets a 200 durable receipt.
+  stored.status = "completed";
+  const completedReplay = await sealVoiceTranscript(env, session, transcript);
+  assert.equal(completedReplay.status, 200, await completedReplay.clone().text());
+  assert.equal((await completedReplay.json()).alreadySealed, true);
+});
+
+test("recorded fallback mode cannot forge the normal voice transcript recovery fence", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const session = await createTestInterviewSession(env);
+  const started = await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  assert.equal(started.status, 200);
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId && event.event_type === "recorded_fallback_started"), true);
+
+  const forged = await sealVoiceTranscript(env, session, [{
+    id: "placeholder-answer",
+    speaker: "candidate",
+    text: "回答音声に記録されています。",
+    createdAt: "2026-08-12T10:00:10.000Z",
+  }]);
+  assert.equal(forged.status, 409);
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId && event.event_type === "voice_transcript_sealed"), false);
+});
+
 test("candidate technical incidents are audited and cross-origin mutations are rejected", async () => {
   process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const database = new FakeD1();
@@ -1975,11 +2686,31 @@ test("candidate technical incidents are audited and cross-origin mutations are r
   const staffPayload = await staffResponse.json();
   assert.equal(staffResponse.status, 200);
   assert.equal(staffPayload.review.technicalEvents[0].type, "transcription_failed");
+  assert.equal(staffPayload.review.sourceTranscriptVerified, false);
 });
 
-test("recorded contingency interview completes without OpenAI and forces human recording review", async () => {
+test("recorded contingency requires all 15 actual answer transcriptions before completion", async () => {
   const database = new FakeD1();
-  const env = { ...workerEnv, DB: database };
+  const recordings = new FakeR2();
+  const upstreamRequests = [];
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    OPENAI_API_KEY: "test-key-never-returned",
+    OPENAI_API: {
+      fetch: async (upstreamRequest) => {
+        upstreamRequests.push(upstreamRequest);
+        const form = await upstreamRequest.clone().formData();
+        const file = form.get("file");
+        assert.equal(form.get("model"), "gpt-4o-transcribe");
+        assert.equal(form.get("language"), "ja");
+        assert.ok(file instanceof File);
+        const index = Number(file.name.match(/answer-(\d+)/)?.[1]);
+        return Response.json({ text: `応募者の実際の回答${index}` });
+      },
+    },
+  };
   const session = await createTestInterviewSession(env);
 
   const unauthorized = await request("/api/interviews/recorded/start", {
@@ -1998,6 +2729,64 @@ test("recorded contingency interview completes without OpenAI and forces human r
   assert.equal(start.status, 200);
   assert.deepEqual(await start.json(), { started: true });
   assert.equal(database.sessions.get(session.sessionId).status, "in_progress");
+  database.sessions.get(session.sessionId).recording_status = "stored";
+
+  const unsealed = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 15 }),
+  }, env);
+  assert.equal(unsealed.status, 409, "recording storage alone must never infer the intended answer count");
+  assert.equal(database.sessions.get(session.sessionId).status, "in_progress");
+
+  await sealRecordedCompletion(env, session, 15);
+
+  const premature = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 15 }),
+  }, env);
+  const prematurePayload = await premature.json();
+  assert.equal(premature.status, 409);
+  assert.equal(prematurePayload.transcriptionPending, true);
+  assert.equal(prematurePayload.completedAnswerCount, 0);
+  assert.deepEqual(prematurePayload.missingAnswerIndexes, Array.from({ length: 15 }, (_, index) => index + 1));
+  assert.equal(database.sessions.get(session.sessionId).transcript_json, undefined, "placeholder transcript must never be saved");
+
+  for (let answerIndex = 1; answerIndex <= 15; answerIndex += 1) {
+    const bytes = new TextEncoder().encode(`valid-independent-webm-answer-${answerIndex}`);
+    const answer = await request("/api/interviews/recorded/answer", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "audio/webm;codecs=opus",
+        "X-Interview-Session": session.sessionId,
+        "X-Recorded-Answer-Index": String(answerIndex),
+        "X-Recorded-Answer-Bytes": String(bytes.byteLength),
+      },
+      body: bytes,
+    }, env);
+    const answerPayload = await answer.json();
+    assert.equal(answer.status, 200, JSON.stringify(answerPayload));
+    assert.deepEqual(answerPayload, {
+      stored: true,
+      transcribed: true,
+      answerIndex,
+      alreadyCompleted: false,
+    });
+  }
+  assert.equal(upstreamRequests.length, 15);
+  assert.ok(upstreamRequests.every((upstreamRequest) =>
+    upstreamRequest.url === "https://api.openai.com/v1/audio/transcriptions"));
+  assert.ok(upstreamRequests.every((upstreamRequest) =>
+    upstreamRequest.headers.get("Authorization") === "Bearer test-key-never-returned"));
+  assert.equal(recordings.putCount, 15);
 
   const complete = await request("/api/interviews/recorded/complete", {
     method: "POST",
@@ -2017,11 +2806,15 @@ test("recorded contingency interview completes without OpenAI and forces human r
   const evaluation = JSON.parse(stored.evaluation_json);
   assert.equal(transcript.length, 30);
   assert.equal(transcript.filter((turn) => turn.speaker === "candidate").length, 15);
-  assert.ok(transcript.every((turn) => turn.speaker !== "candidate" || /録画音声/.test(turn.text)));
-  assert.equal(evaluation.recommendation, "insufficient_information");
+  assert.deepEqual(
+    transcript.filter((turn) => turn.speaker === "candidate").map((turn) => turn.text),
+    Array.from({ length: 15 }, (_, index) => `応募者の実際の回答${index + 1}`),
+  );
+  assert.ok(transcript.every((turn) => !/録画音声に記録/.test(turn.text)));
+  assert.equal(evaluation.recommendation, "human_review");
   assert.equal(evaluation.humanReviewRequired, true);
   assert.ok(evaluation.dimensions.every((dimension) => dimension.score === null));
-  assert.match(evaluation.summary, /自動文字起こしと自動評価は未実施/);
+  assert.match(evaluation.summary, /自動文字起こしは完了/);
 
   const replay = await request("/api/interviews/recorded/complete", {
     method: "POST",
@@ -2031,7 +2824,951 @@ test("recorded contingency interview completes without OpenAI and forces human r
     },
     body: JSON.stringify({ sessionId: session.sessionId, questionCount: 15 }),
   }, env);
-  assert.equal(replay.status, 409);
+  assert.equal(replay.status, 200);
+  assert.deepEqual(await replay.json(), { stored: true, humanReviewRequired: true, alreadyCompleted: true });
+});
+
+test("recorded contingency can complete a stopped interview with only its answered questions", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    OPENAI_API_KEY: "test-key-never-returned",
+    OPENAI_API: {
+      fetch: async (upstreamRequest) => {
+        const file = (await upstreamRequest.formData()).get("file");
+        assert.ok(file instanceof File);
+        return Response.json({ text: `途中終了の実回答${Number(file.name.match(/answer-(\d+)/)?.[1])}` });
+      },
+    },
+  };
+  const session = await createTestInterviewSession(env);
+  await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  await sealRecordedCompletion(env, session, 3);
+  database.sessions.get(session.sessionId).recording_status = "stored";
+  for (let answerIndex = 1; answerIndex <= 3; answerIndex += 1) {
+    const bytes = new TextEncoder().encode(`partial-answer-${answerIndex}`);
+    const response = await request("/api/interviews/recorded/answer", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-Interview-Session": session.sessionId,
+        "X-Recorded-Answer-Index": String(answerIndex),
+        "X-Recorded-Answer-Bytes": String(bytes.byteLength),
+        "Content-Type": "audio/webm",
+      },
+      body: bytes,
+    }, env);
+    assert.equal(response.status, 200);
+  }
+  const understated = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 2 }),
+  }, env);
+  assert.equal(understated.status, 409, "client must not omit a higher answer already stored on the server");
+  const completed = await request("/api/interviews/recorded/complete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId, questionCount: 3 }),
+  }, env);
+  assert.equal(completed.status, 200, JSON.stringify(await completed.clone().json()));
+  const transcript = JSON.parse(database.sessions.get(session.sessionId).transcript_json);
+  assert.equal(transcript.length, 6);
+  assert.deepEqual(
+    transcript.filter((turn) => turn.speaker === "candidate").map((turn) => turn.text),
+    ["途中終了の実回答1", "途中終了の実回答2", "途中終了の実回答3"],
+  );
+});
+
+test("recorded answer keeps durable audio pending across OpenAI quota failure and retries without re-upload", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  let upstreamCalls = 0;
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    OPENAI_API_KEY: "test-key-never-returned",
+    OPENAI_API: {
+      fetch: async () => {
+        upstreamCalls += 1;
+        if (upstreamCalls === 1) {
+          return Response.json(
+            { error: { code: "insufficient_quota", type: "insufficient_quota" } },
+            { status: 429, headers: { "Retry-After": "2" } },
+          );
+        }
+        return Response.json({ text: "再試行で復旧した実回答" });
+      },
+    },
+  };
+  const session = await createTestInterviewSession(env);
+  await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  const bytes = new TextEncoder().encode("one-independent-valid-webm-answer");
+  const headers = {
+    Authorization: `Bearer ${session.accessToken}`,
+    "X-Interview-Session": session.sessionId,
+    "X-Recorded-Answer-Index": "1",
+  };
+  const first = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: {
+      ...headers,
+      "Content-Type": "audio/webm",
+      "X-Recorded-Answer-Bytes": String(bytes.byteLength),
+    },
+    body: bytes,
+  }, env);
+  const firstPayload = await first.json();
+  assert.equal(first.status, 202);
+  assert.equal(firstPayload.stored, true);
+  assert.equal(firstPayload.transcribed, false);
+  assert.equal(first.headers.get("retry-after"), "2");
+  const pending = database.recordedAnswers.get(`${session.sessionId}:1`);
+  assert.equal(pending.status, "pending");
+  assert.equal(pending.last_error_code, "insufficient_quota");
+  assert.equal(recordings.putCount, 1);
+  assert.equal(database.auditEvents.filter((event) => event.event_type === "transcription_failed").length, 1);
+  assert.doesNotMatch(database.auditEvents.at(-1).detail_json, /one-independent-valid-webm-answer/);
+
+  const tooEarly = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers,
+  }, env);
+  assert.equal(tooEarly.status, 202);
+  assert.equal(upstreamCalls, 1, "Retry-After must suppress immediate paid retries");
+
+  pending.next_retry_at = new Date(0).toISOString();
+  const retried = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers,
+  }, env);
+  assert.equal(retried.status, 200, JSON.stringify(await retried.clone().json()));
+  assert.equal((await retried.json()).transcribed, true);
+  assert.equal(upstreamCalls, 2);
+  assert.equal(recordings.putCount, 1, "body-less retry must reuse the exact durable R2 object");
+  assert.equal(database.recordedAnswers.get(`${session.sessionId}:1`).transcript_text, "再試行で復旧した実回答");
+});
+
+test("staff polling completes a durable pending transcription after the candidate closes the browser", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  let upstreamCalls = 0;
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+    OPENAI_API_KEY: "test-key-never-returned",
+    OPENAI_API: {
+      fetch: async () => {
+        upstreamCalls += 1;
+        if (upstreamCalls === 1) {
+          return Response.json(
+            { error: { code: "rate_limit_exceeded" } },
+            { status: 429, headers: { "Retry-After": "2" } },
+          );
+        }
+        return Response.json({ text: "候補者離脱後に復旧した実回答" });
+      },
+    },
+  };
+  const session = await createTestInterviewSession(env);
+  await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  const bytes = new TextEncoder().encode("standalone-recorded-answer-before-browser-close");
+  const initial = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "X-Recorded-Answer-Index": "1",
+      "X-Recorded-Answer-Bytes": String(bytes.byteLength),
+      "Content-Type": "audio/webm",
+    },
+    body: bytes,
+  }, env);
+  assert.equal(initial.status, 202);
+  const storedSession = database.sessions.get(session.sessionId);
+  await sealRecordedCompletion(env, session, 1);
+  storedSession.recording_status = "stored";
+  const pending = database.recordedAnswers.get(`${session.sessionId}:1`);
+  pending.next_retry_at = new Date(0).toISOString();
+
+  // No candidate request follows. An authenticated staff poll advances exactly
+  // one R2-backed transcription and seals the interview from durable state.
+  const recovered = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await recovered.json();
+  assert.equal(recovered.status, 200, JSON.stringify(payload));
+  assert.equal(payload.processed, true);
+  assert.equal(payload.transcription.sessionId, session.sessionId);
+  assert.equal(payload.transcription.answerIndex, 1);
+  assert.equal(payload.transcription.state, "completed");
+  assert.equal(payload.completion.sessionId, session.sessionId);
+  assert.equal(payload.completion.state, "completed");
+  assert.equal(database.sessions.get(session.sessionId).status, "completed");
+  assert.equal(recordings.putCount, 1, "staff recovery must reuse the durable answer audio");
+  assert.equal(upstreamCalls, 2);
+  const transcript = JSON.parse(database.sessions.get(session.sessionId).transcript_json);
+  assert.equal(transcript.find((turn) => turn.speaker === "candidate").text, "候補者離脱後に復旧した実回答");
+});
+
+test("staff polling completes one stale durable evaluation as human review without an OpenAI call", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "evaluation_processing";
+  stored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
+  database.evaluationClaims.set(session.sessionId, {
+    session_id: session.sessionId,
+    claim_id: "worker-that-died",
+    started_at: stored.updated_at,
+    created_at: stored.updated_at,
+    updated_at: stored.updated_at,
+  });
+  stored.transcript_json = JSON.stringify([
+    { id: "question-1", speaker: "interviewer", text: "経験を教えてください。", createdAt: "2026-07-29T02:00:00.000Z" },
+    { id: "answer-1", speaker: "candidate", text: "接客経験があり、安全確認を徹底しました。", createdAt: "2026-07-29T02:00:10.000Z" },
+  ]);
+
+  const recovered = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await recovered.json();
+  assert.equal(recovered.status, 200, JSON.stringify(payload));
+  assert.deepEqual(payload.evaluation, { sessionId: session.sessionId, state: "completed" });
+  assert.equal(payload.processed, true);
+  assert.equal(stored.status, "completed");
+  assert.equal(database.evaluationClaims.has(session.sessionId), false);
+  const evaluation = JSON.parse(stored.evaluation_json);
+  assert.equal(evaluation.recommendation, "human_review");
+  assert.equal(evaluation.humanReviewRequired, true);
+  assert.equal(evaluation.dimensions.every((dimension) => dimension.score === null), true);
+});
+
+test("staff polling completes a stale released evaluation_pending transcript after the candidate leaves", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "evaluation_pending";
+  stored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
+  stored.transcript_json = JSON.stringify([
+    { id: "question-pending", speaker: "interviewer", text: "経験を教えてください。", createdAt: "2026-07-29T02:00:00.000Z" },
+    { id: "answer-pending", speaker: "candidate", text: "接客経験を安全確認に生かしました。", createdAt: "2026-07-29T02:00:10.000Z" },
+  ]);
+
+  const recovered = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await recovered.json();
+  assert.equal(recovered.status, 200, JSON.stringify(payload));
+  assert.deepEqual(payload.evaluation, { sessionId: session.sessionId, state: "completed" });
+  assert.equal(stored.status, "completed");
+  assert.equal(database.evaluationClaims.has(session.sessionId), false);
+  assert.equal(JSON.parse(stored.evaluation_json).recommendation, "human_review");
+});
+
+test("staff polling leaves a fresh released evaluation_pending transcript for the candidate retry", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "evaluation_pending";
+  stored.updated_at = new Date(Date.now() - 9 * 60 * 1_000).toISOString();
+  stored.transcript_json = JSON.stringify([
+    { id: "answer-fresh-pending", speaker: "candidate", text: "候補者の再試行を待つ回答です。", createdAt: "2026-07-29T02:00:10.000Z" },
+  ]);
+
+  const response = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.equal(payload.evaluation, null);
+  assert.equal(stored.status, "evaluation_pending");
+  assert.equal(stored.evaluation_json, undefined);
+});
+
+test("staff evaluation recovery excludes a stale evaluation_pending transcript with a known candidate gap", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "evaluation_pending";
+  stored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
+  stored.transcript_json = JSON.stringify([
+    { id: "answer-before-gap", speaker: "candidate", text: "途中まで保存された回答です。", createdAt: "2026-07-29T02:00:10.000Z" },
+  ]);
+  database.auditEvents.push({
+    session_id: session.sessionId,
+    event_type: "transcription_failed",
+    detail_json: JSON.stringify({ code: "TRANSCRIPTION_FAILED" }),
+    created_at: stored.updated_at,
+  });
+
+  const response = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.equal(payload.evaluation, null);
+  assert.equal(stored.status, "evaluation_pending");
+  assert.equal(stored.evaluation_json, undefined);
+});
+
+test("recorded-answer transcripts supersede an earlier realtime gap during evaluation recovery", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "evaluation_pending";
+  stored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
+  stored.transcript_json = JSON.stringify([
+    { id: "recorded-transcribed-question-1", speaker: "interviewer", text: "経験を教えてください。", createdAt: stored.updated_at },
+    { id: "recorded-transcribed-answer-1", speaker: "candidate", text: "録画回答で全回答を復旧しました。", createdAt: stored.updated_at },
+  ]);
+  database.auditEvents.push({
+    session_id: session.sessionId,
+    event_type: "transcription_failed",
+    detail_json: JSON.stringify({ code: "TRANSCRIPTION_FAILED" }),
+    created_at: stored.updated_at,
+  });
+
+  const response = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.deepEqual(payload.evaluation, { sessionId: session.sessionId, state: "completed" });
+  assert.equal(stored.status, "completed");
+  assert.equal(JSON.parse(stored.evaluation_json).recommendation, "human_review");
+});
+
+test("staff polling completes a sealed voice transcript once its recording is stored", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  stored.recording_status = "stored";
+  stored.transcript_json = JSON.stringify([
+    { id: "voice-answer-sealed", speaker: "candidate", text: "音声面接で確定済みの回答です。", createdAt: new Date().toISOString() },
+  ]);
+  database.auditEvents.push({
+    session_id: session.sessionId,
+    event_type: "voice_transcript_sealed",
+    detail_json: "{}",
+    created_at: new Date().toISOString(),
+  });
+
+  const response = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.deepEqual(payload.evaluation, { sessionId: session.sessionId, state: "completed" });
+  assert.equal(stored.status, "completed");
+  assert.equal(JSON.parse(stored.evaluation_json).recommendation, "human_review");
+});
+
+test("staff polling never completes an ordinary in-progress interview without a voice seal", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  stored.recording_status = "stored";
+  stored.updated_at = new Date(0).toISOString();
+  stored.transcript_json = JSON.stringify([
+    { id: "ordinary-answer", speaker: "candidate", text: "まだ面接は進行中です。", createdAt: stored.updated_at },
+  ]);
+
+  const response = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.equal(payload.evaluation, null);
+  assert.equal(stored.status, "in_progress");
+  assert.equal(stored.evaluation_json, undefined);
+});
+
+test("an evaluation claim cannot replace a sealed voice transcript with different content", async () => {
+  const database = new FakeD1();
+  const openAI = {
+    fetch: async () => {
+      assert.fail("the sealed transcript fence must reject before the paid model call");
+    },
+  };
+  const env = { ...workerEnv, DB: database, OPENAI_API_KEY: "test-key-never-returned", OPENAI_API: openAI };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  stored.transcript_json = JSON.stringify([
+    { id: "sealed-answer", speaker: "candidate", text: "封印済みの実回答です。", createdAt: "2026-07-29T02:00:10.000Z" },
+  ]);
+  database.auditEvents.push({
+    session_id: session.sessionId,
+    event_type: "voice_transcript_sealed",
+    detail_json: "{}",
+    created_at: new Date().toISOString(),
+  });
+
+  const response = await request("/api/evaluate", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      employment: stored.employment,
+      preferredLocation: stored.preferred_location,
+      transcript: [
+        { id: "replacement-answer", speaker: "candidate", text: "別内容へ置換します。", createdAt: "2026-07-29T02:00:20.000Z" },
+      ],
+    }),
+  }, env);
+  assert.equal(response.status, 409);
+  assert.equal(stored.status, "in_progress");
+  assert.equal(JSON.parse(stored.transcript_json)[0].text, "封印済みの実回答です。");
+  assert.equal(database.evaluationClaims.has(session.sessionId), false);
+});
+
+test("staff evaluation recovery leaves fresh and interviewer-only claims untouched", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const fresh = await createTestInterviewSession(env);
+  const freshStored = database.sessions.get(fresh.sessionId);
+  freshStored.status = "evaluation_processing";
+  freshStored.updated_at = new Date(Date.now() - 9 * 60 * 1_000).toISOString();
+  database.evaluationClaims.set(fresh.sessionId, {
+    session_id: fresh.sessionId,
+    claim_id: "live-worker",
+    started_at: freshStored.updated_at,
+    created_at: freshStored.updated_at,
+    updated_at: freshStored.updated_at,
+  });
+  freshStored.transcript_json = JSON.stringify([
+    { id: "answer-fresh", speaker: "candidate", text: "処理中の回答です。", createdAt: "2026-07-29T02:00:10.000Z" },
+  ]);
+  const interviewerOnly = await createTestInterviewSession(env);
+  const interviewerStored = database.sessions.get(interviewerOnly.sessionId);
+  interviewerStored.status = "evaluation_processing";
+  interviewerStored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
+  database.evaluationClaims.set(interviewerOnly.sessionId, {
+    session_id: interviewerOnly.sessionId,
+    claim_id: "old-worker-without-answer",
+    started_at: interviewerStored.updated_at,
+    created_at: interviewerStored.updated_at,
+    updated_at: interviewerStored.updated_at,
+  });
+  interviewerStored.transcript_json = JSON.stringify([
+    { id: "question-only", speaker: "interviewer", text: "経験を教えてください。", createdAt: "2026-07-29T02:00:00.000Z" },
+  ]);
+
+  const response = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.equal(payload.evaluation, null);
+  assert.equal(freshStored.status, "evaluation_processing");
+  assert.equal(database.evaluationClaims.get(fresh.sessionId).claim_id, "live-worker");
+  assert.equal(interviewerStored.status, "evaluation_processing");
+  assert.equal(database.evaluationClaims.get(interviewerOnly.sessionId).claim_id, "old-worker-without-answer");
+  assert.equal(freshStored.evaluation_json, undefined);
+  assert.equal(interviewerStored.evaluation_json, undefined);
+});
+
+test("concurrent staff polls complete a stale evaluation only once", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "evaluation_processing";
+  stored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
+  database.evaluationClaims.set(session.sessionId, {
+    session_id: session.sessionId,
+    claim_id: "worker-that-died",
+    started_at: stored.updated_at,
+    created_at: stored.updated_at,
+    updated_at: stored.updated_at,
+  });
+  stored.transcript_json = JSON.stringify([
+    { id: "answer-1", speaker: "candidate", text: "保存済みの実回答です。", createdAt: "2026-07-29T02:00:10.000Z" },
+  ]);
+  const poll = () => request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+
+  const payloads = await Promise.all((await Promise.all([poll(), poll()])).map((response) => response.json()));
+  assert.equal(payloads.filter((payload) => payload.evaluation?.state === "completed").length, 1);
+  assert.equal(payloads.filter((payload) => payload.evaluation === null).length, 1);
+  assert.equal(stored.status, "completed");
+  assert.equal(JSON.parse(stored.evaluation_json).recommendation, "human_review");
+});
+
+test("staff polling finalizes all uploaded recording parts after a sealed candidate browser closes", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+    OPENAI_API_KEY: "test-key-never-returned",
+    OPENAI_API: { fetch: async () => Response.json({ text: "終了直前に保存済みの実回答" }) },
+  };
+  const session = await createTestInterviewSession(env);
+  await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  const answerBytes = new TextEncoder().encode("standalone-answer-before-recording-finalize-loss");
+  const answer = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "X-Recorded-Answer-Index": "1",
+      "X-Recorded-Answer-Bytes": String(answerBytes.byteLength),
+      "Content-Type": "audio/webm",
+    },
+    body: answerBytes,
+  }, env);
+  assert.equal(answer.status, 200);
+  await sealRecordedCompletion(env, session, 1);
+
+  const recordingBytes = new Uint8Array(1_024).fill(7);
+  const startUpload = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize: recordingBytes.byteLength,
+      partSize: 256 * 1024,
+      totalParts: 1,
+      audioCoverage: "both",
+    }),
+  }, env);
+  assert.equal(startUpload.status, 200);
+  const part = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(recordingBytes.byteLength),
+      "Content-Type": "application/octet-stream",
+    },
+    body: recordingBytes,
+  }, env);
+  assert.equal(part.status, 200);
+  // Simulate the tab closing after its final part acknowledgement but before
+  // /upload/complete. Only the authenticated staff poll runs from here.
+  database.sessions.get(session.sessionId).updated_at = new Date(0).toISOString();
+  const recovered = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await recovered.json();
+  assert.equal(recovered.status, 200, JSON.stringify(payload));
+  assert.equal(payload.recording.sessionId, session.sessionId);
+  assert.equal(payload.recording.state, "stored");
+  assert.equal(payload.completion.sessionId, session.sessionId);
+  assert.equal(payload.completion.state, "completed");
+  assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
+  assert.equal(database.sessions.get(session.sessionId).status, "completed");
+  assert.equal(database.artifacts.some((artifact) => artifact[1] === session.sessionId && artifact[2].includes("recording.manifest.json")), true);
+});
+
+test("staff polling finalizes normal voice recording parts only behind the durable actual-transcript seal", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  const transcript = [
+    { id: "voice-question-final", speaker: "interviewer", text: "最後に伝えたいことはありますか。", createdAt: "2026-08-12T10:00:00.000Z" },
+    { id: "voice-answer-final", speaker: "candidate", text: "安全と誠実さを大切に勤務します。", createdAt: "2026-08-12T10:00:10.000Z" },
+  ];
+  const seal = await sealVoiceTranscript(env, session, transcript);
+  assert.equal(seal.status, 200, await seal.clone().text());
+  assert.equal(stored.status, "in_progress");
+
+  const recordingBytes = new Uint8Array(1_024).fill(23);
+  const commonHeaders = { Authorization: `Bearer ${session.accessToken}` };
+  const start = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...commonHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize: recordingBytes.byteLength,
+      partSize: 256 * 1024,
+      totalParts: 1,
+      audioCoverage: "both",
+    }),
+  }, env);
+  assert.equal(start.status, 200);
+  const part = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "X-Interview-Session": session.sessionId,
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(recordingBytes.byteLength),
+      "Content-Type": "application/octet-stream",
+    },
+    body: recordingBytes,
+  }, env);
+  assert.equal(part.status, 200);
+
+  // Simulate the exact loss window: the final part was acknowledged, but the
+  // candidate closed before /upload/complete. No candidate request follows.
+  stored.updated_at = new Date(0).toISOString();
+  const recovered = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await recovered.json();
+  assert.equal(recovered.status, 200, JSON.stringify(payload));
+  assert.deepEqual(payload.recording, { sessionId: session.sessionId, state: "stored" });
+  assert.deepEqual(payload.evaluation, { sessionId: session.sessionId, state: "completed" });
+  assert.equal(stored.recording_status, "stored");
+  assert.equal(stored.status, "completed");
+  assert.deepEqual(JSON.parse(stored.transcript_json), transcript);
+  assert.equal(database.artifacts.some((artifact) =>
+    artifact[1] === session.sessionId && artifact[2].includes("recording.manifest.json")), true);
+});
+
+test("staff voice recovery leaves an upload with any missing part non-stored", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  const transcript = [{
+    id: "voice-answer-before-part-loss",
+    speaker: "candidate",
+    text: "最後まで回答しました。",
+    createdAt: "2026-08-12T10:00:10.000Z",
+  }];
+  assert.equal((await sealVoiceTranscript(env, session, transcript)).status, 200);
+
+  const partSize = 256 * 1024;
+  const start = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize: partSize + 17,
+      partSize,
+      totalParts: 2,
+      audioCoverage: "both",
+    }),
+  }, env);
+  assert.equal(start.status, 200);
+  const firstPart = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(partSize),
+      "Content-Type": "application/octet-stream",
+    },
+    body: new Uint8Array(partSize).fill(31),
+  }, env);
+  assert.equal(firstPart.status, 200);
+  stored.updated_at = new Date(0).toISOString();
+
+  const recovered = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await recovered.json();
+  assert.equal(recovered.status, 200, JSON.stringify(payload));
+  assert.deepEqual(payload.recording, { sessionId: session.sessionId, state: "incomplete" });
+  assert.equal(payload.evaluation, null);
+  assert.equal(stored.recording_status, "failed");
+  assert.equal(stored.status, "in_progress");
+  assert.equal(database.artifacts.some((artifact) => artifact[1] === session.sessionId), false);
+  assert.deepEqual(JSON.parse(stored.transcript_json), transcript);
+});
+
+test("recording parts compare R2 actual size and never trust only the declared metadata", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const session = await createTestInterviewSession(env);
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const declaredBytes = 256 * 1024;
+  const start = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize: declaredBytes,
+      partSize: declaredBytes,
+      totalParts: 1,
+      audioCoverage: "both",
+    }),
+  }, env);
+  assert.equal(start.status, 200);
+
+  const truncated = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(declaredBytes),
+      "Content-Type": "application/octet-stream",
+    },
+    body: new Uint8Array([1]),
+  }, env);
+  assert.equal(truncated.status, 400);
+
+  const resume = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize: declaredBytes,
+      partSize: declaredBytes,
+      totalParts: 1,
+      audioCoverage: "both",
+    }),
+  }, env);
+  assert.equal(resume.status, 200);
+  assert.deepEqual((await resume.json()).uploadedParts, [], "truncated R2 data must be re-uploaded, never acknowledged");
+
+  const complete = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  assert.equal(complete.status, 409);
+  assert.notEqual(database.sessions.get(session.sessionId).recording_status, "stored");
+  assert.equal(database.artifacts.some((artifact) => artifact[1] === session.sessionId), false);
+});
+
+test("recorded answer rejects cross-origin, oversize, and conflicting replacement audio", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    OPENAI_API_KEY: "test-key-never-returned",
+    OPENAI_API: {
+      fetch: async () => Response.json(
+        { error: { code: "invalid_api_key" } },
+        { status: 401 },
+      ),
+    },
+  };
+  const session = await createTestInterviewSession(env);
+  await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  const authHeaders = {
+    Authorization: `Bearer ${session.accessToken}`,
+    "X-Interview-Session": session.sessionId,
+    "X-Recorded-Answer-Index": "1",
+  };
+  const crossOrigin = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: { ...authHeaders, Origin: "https://attacker.example" },
+  }, env);
+  assert.equal(crossOrigin.status, 403);
+
+  const oversized = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: {
+      ...authHeaders,
+      "Content-Type": "audio/webm",
+      "X-Recorded-Answer-Bytes": String(10 * 1024 * 1024 + 1),
+    },
+    body: new Uint8Array([1]),
+  }, env);
+  assert.equal(oversized.status, 413);
+
+  const original = new TextEncoder().encode("original-answer-audio");
+  const accepted = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: {
+      ...authHeaders,
+      "Content-Type": "audio/webm",
+      "X-Recorded-Answer-Bytes": String(original.byteLength),
+    },
+    body: original,
+  }, env);
+  assert.equal(accepted.status, 202);
+  assert.equal(database.recordedAnswers.get(`${session.sessionId}:1`).status, "pending", "service authentication failure is not invalid candidate audio");
+  assert.equal(database.recordedAnswers.get(`${session.sessionId}:1`).last_error_code, "invalid_api_key");
+  const replacement = new TextEncoder().encode("different-answer-audio");
+  const conflict = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: {
+      ...authHeaders,
+      "Content-Type": "audio/webm",
+      "X-Recorded-Answer-Bytes": String(replacement.byteLength),
+    },
+    body: replacement,
+  }, env);
+  assert.equal(conflict.status, 409);
+  assert.equal(recordings.putCount, 1, "conflicting audio must not overwrite the accepted R2 object");
 });
 
 test("realtime endpoint mints a short-lived token with the interview safety settings", async () => {
@@ -2443,6 +4180,7 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
   assert.equal(staffPayload.review.evaluation.transcriptProvenance, "candidate_device_unverified");
   assert.equal(staffPayload.review.evaluation.dimensions.every((item) => item.evidence[0].verified), true);
   assert.equal(staffPayload.review.reviewPolicy, "authorized_staff");
+  assert.equal(staffPayload.review.sourceTranscriptVerified, true);
   assert.equal("authorizedReviewers" in staffPayload.review, false);
 
   const videoScores = [
@@ -2470,6 +4208,77 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
   const refreshedPayload = await refreshed.json();
   assert.equal(refreshedPayload.review.humanReviews[0].reviewerName, "採用担当A");
   assert.equal(refreshedPayload.review.humanReviews[0].videoScores.length, 4);
+});
+
+test("candidate evaluation rejects an interviewer-only transcript before any OpenAI call", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  database.sessions.get(session.sessionId).status = "in_progress";
+  let upstreamCalls = 0;
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      upstreamCalls += 1;
+      throw new Error("interviewer-only transcript must not reach OpenAI");
+    };
+    const response = await request("/api/evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.accessToken}` },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+        transcript: [{
+          id: "question-only",
+          speaker: "interviewer",
+          text: "自己紹介をお願いします。",
+          createdAt: "2026-07-29T02:00:00.000Z",
+        }],
+      }),
+    }, env);
+    assert.equal(response.status, 400);
+    assert.equal(upstreamCalls, 0);
+    assert.equal(database.sessions.get(session.sessionId).status, "in_progress");
+    assert.equal(database.sessions.get(session.sessionId).evaluation_json, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("completed evaluation replay returns its durable receipt without another model call", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "completed";
+  stored.completed_at = "2026-07-29T03:00:00.000Z";
+  stored.transcript_json = JSON.stringify(candidateTurns);
+  stored.evaluation_json = JSON.stringify(modelEvaluation());
+  let upstreamCalls = 0;
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      upstreamCalls += 1;
+      throw new Error("completed replay must not call the model");
+    };
+    const replay = await request("/api/evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.accessToken}` },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+        transcript: candidateTurns,
+      }),
+    }, env);
+    assert.equal(replay.status, 200);
+    assert.deepEqual(await replay.json(), { stored: true, alreadyStored: true });
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("staff-only evaluation drops invented evidence and forces human review", async () => {
@@ -2569,7 +4378,7 @@ test("concurrent evaluation submissions for the same session never both report s
   }
 });
 
-test("a failed evaluation releases its claim so the candidate record can be retried", async () => {
+test("an unavailable evaluation service persists a human-review fallback without retrying", async () => {
   process.env.OPENAI_API_KEY = "test-key-never-returned";
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
@@ -2580,15 +4389,10 @@ test("a failed evaluation releases its claim so the candidate record can be retr
   try {
     globalThis.fetch = async () => {
       callCount += 1;
-      if (callCount === 1) {
-        return Response.json({ error: { code: "rate_limit_exceeded" } }, { status: 429 });
-      }
-      return Response.json({
-        output: [{
-          type: "message",
-          content: [{ type: "output_text", text: JSON.stringify(modelEvaluation()) }],
-        }],
-      });
+      return Response.json(
+        { error: { code: "rate_limit_exceeded", message: "upstream-private-detail" } },
+        { status: 429 },
+      );
     };
     const submit = () => request("/api/evaluate", {
       method: "POST",
@@ -2601,14 +4405,94 @@ test("a failed evaluation releases its claim so the candidate record can be retr
       }),
     }, env);
 
-    const failed = await submit();
-    assert.equal(failed.status, 429);
-    assert.equal(database.sessions.get(session.sessionId).status, "evaluation_pending");
+    const deferred = await submit();
+    const payload = await deferred.json();
+    assert.equal(deferred.status, 200);
+    assert.deepEqual(payload, {
+      stored: true,
+      humanReviewRequired: true,
+      automaticEvaluationDeferred: true,
+    });
+    assert.equal(JSON.stringify(payload).includes("upstream-private-detail"), false);
+    assert.equal(callCount, 1);
 
-    const retried = await submit();
-    assert.equal(retried.status, 200);
-    assert.equal(callCount, 2);
-    assert.equal(database.sessions.get(session.sessionId).status, "completed");
+    const stored = database.sessions.get(session.sessionId);
+    assert.equal(stored.status, "completed");
+    const evaluation = JSON.parse(stored.evaluation_json);
+    assert.equal(evaluation.recommendation, "human_review");
+    assert.equal(evaluation.humanReviewRequired, true);
+    assert.equal(evaluation.dimensions.every((dimension) => dimension.score === null), true);
+
+    const replay = await submit();
+    assert.equal(replay.status, 200);
+    assert.deepEqual(await replay.json(), { stored: true, alreadyStored: true });
+    assert.equal(callCount, 1, "the durable fallback receipt must prevent another paid model call");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a malformed evaluation response is stored as a human-review fallback", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => Response.json({
+      output: [{
+        type: "message",
+        content: [{ type: "output_text", text: "not-json" }],
+      }],
+    });
+    const response = await request("/api/evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.accessToken}` },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+        transcript: candidateTurns,
+      }),
+    }, env);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      stored: true,
+      humanReviewRequired: true,
+      automaticEvaluationDeferred: true,
+    });
+    const stored = database.sessions.get(session.sessionId);
+    assert.equal(stored.status, "completed");
+    assert.equal(JSON.parse(stored.evaluation_json).recommendation, "human_review");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a permanent Google Drive refresh-token failure is surfaced instead of retried forever", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  let tokenCalls = 0;
+  try {
+    globalThis.fetch = async (url) => {
+      if (String(url) === "https://oauth2.googleapis.com/token") {
+        tokenCalls += 1;
+        return Response.json({ error: "invalid_grant" }, { status: 400 });
+      }
+      throw new Error("Drive must not be contacted without a refreshed token");
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    const payload = await response.json();
+    assert.equal(response.status, 502, JSON.stringify(payload));
+    assert.equal(tokenCalls, 1, "invalid_grant must never enter the transient retry loop");
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "failed");
+    assert.equal(
+      database.externalSyncs.get(session.sessionId).error_code,
+      "GOOGLE_DRIVE_TOKEN_REFRESH_RECONNECT_REQUIRED",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2688,6 +4572,165 @@ test("Drive archive waits for a camera interview recording instead of completing
   }
 });
 
+test("Drive archive rejects an interviewer-only transcript before any Drive request", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  database.sessions.get(session.sessionId).transcript_json = JSON.stringify([
+    {
+      id: "interviewer-only-1",
+      speaker: "interviewer",
+      text: "自己紹介をお願いします。",
+      createdAt: "2026-07-29T02:50:00.000Z",
+    },
+  ]);
+  let driveCalls = 0;
+  try {
+    globalThis.fetch = async () => {
+      driveCalls += 1;
+      throw new Error("Drive must not be touched without a candidate utterance");
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    assert.equal(response.status, 409);
+    assert.equal(driveCalls, 0);
+    assert.equal(
+      database.externalSyncs.get(session.sessionId).error_code,
+      "INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Drive archive rejects a partial realtime transcript after a candidate turn was lost", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  database.auditEvents.push({
+    session_id: session.sessionId,
+    event_type: "transcription_failed",
+    detail_json: JSON.stringify({ code: "TRANSCRIPTION_FAILED" }),
+    created_at: "2026-07-29T02:55:00.000Z",
+  });
+  let driveCalls = 0;
+  try {
+    globalThis.fetch = async () => {
+      driveCalls += 1;
+      throw new Error("Drive must not be touched with a known missing candidate turn");
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    assert.equal(response.status, 409);
+    assert.equal(driveCalls, 0);
+    assert.equal(
+      database.externalSyncs.get(session.sessionId).error_code,
+      "INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("completed recorded-answer transcripts supersede an earlier realtime transcription failure", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  database.sessions.get(session.sessionId).transcript_json = JSON.stringify([
+    {
+      id: "recorded-transcribed-answer-1",
+      speaker: "candidate",
+      text: "接客経験があり、安全確認を大切にしています。",
+      createdAt: "2026-07-29T02:50:10.000Z",
+    },
+  ]);
+  database.auditEvents.push({
+    session_id: session.sessionId,
+    event_type: "transcription_failed",
+    detail_json: JSON.stringify({ code: "TRANSCRIPTION_FAILED" }),
+    created_at: "2026-07-29T02:49:00.000Z",
+  });
+  database.externalSyncs.set(session.sessionId, {
+    provider: "google_drive",
+    status: "completed",
+    requested_at: "2026-07-29T02:00:00.000Z",
+    started_at: "2026-07-29T02:00:01.000Z",
+    completed_at: "2026-07-29T02:01:00.000Z",
+    folder_id: "recorded-recovery-folder",
+    folder_url: "https://drive.google.com/drive/folders/recorded-recovery-folder",
+    manifest_json: JSON.stringify({
+      files: { transcript: { id: "actual-transcript", name: "transcript.txt", size: 80 } },
+      recordingIncluded: false,
+      transcriptAvailable: true,
+      transcriptKind: "actual_transcript",
+    }),
+    error_code: null,
+    updated_at: "2026-07-29T02:01:00.000Z",
+  });
+  let driveCalls = 0;
+  try {
+    globalThis.fetch = async () => {
+      driveCalls += 1;
+      throw new Error("verified completed receipt must be an exact D1 readback");
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.result.transcriptKind, "actual_transcript");
+    assert.equal(driveCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a completed receipt cannot verify a recorded-fallback placeholder transcript", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  database.sessions.get(session.sessionId).transcript_json = JSON.stringify([
+    {
+      id: "recorded-fallback-answer-1",
+      speaker: "candidate",
+      text: "自己紹介をお願いします。の回答を録画で受領しました。",
+      createdAt: "2026-07-29T02:50:10.000Z",
+    },
+  ]);
+  database.externalSyncs.set(session.sessionId, {
+    provider: "google_drive",
+    status: "completed",
+    requested_at: "2026-07-29T02:00:00.000Z",
+    started_at: "2026-07-29T02:00:01.000Z",
+    completed_at: "2026-07-29T02:01:00.000Z",
+    folder_id: "legacy-placeholder-folder",
+    folder_url: "https://drive.google.com/drive/folders/legacy-placeholder-folder",
+    manifest_json: JSON.stringify({
+      files: { transcript: { id: "legacy-placeholder", name: "placeholder.txt", size: 80 } },
+      recordingIncluded: false,
+      transcriptAvailable: true,
+      transcriptKind: "unknown",
+    }),
+    error_code: null,
+    updated_at: "2026-07-29T02:01:00.000Z",
+  });
+  let driveCalls = 0;
+  try {
+    globalThis.fetch = async () => {
+      driveCalls += 1;
+      throw new Error("Drive must not be touched with a placeholder transcript");
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    assert.equal(response.status, 409);
+    assert.equal(driveCalls, 0);
+    const receipt = database.externalSyncs.get(session.sessionId);
+    assert.equal(receipt.status, "completed", "the invalid historical receipt remains visible for repair/audit");
+    assert.equal(JSON.parse(receipt.manifest_json).transcriptKind, "unknown");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("a Google Drive archive still reporting progress is never restarted underneath itself", async () => {
   // Two workers archiving the same interview both create the candidate folder and
   // both upload each artifact, so Drive ends up with duplicates and the read-back
@@ -2720,7 +4763,11 @@ test("a Google Drive archive still reporting progress is never restarted underne
       throw new Error("a second worker must never reach Google Drive");
     };
     const response = await requestAdminSync(session.sessionId, env);
-    assert.equal(response.status, 502);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json().then((payload) => ({ synced: payload.synced, phase: payload.result?.phase })), {
+      synced: false,
+      phase: "initializing",
+    });
     assert.equal(driveCalls, 0, "the live archive must not be duplicated by a second worker");
     const sync = database.externalSyncs.get(session.sessionId);
     assert.equal(sync.status, "running");

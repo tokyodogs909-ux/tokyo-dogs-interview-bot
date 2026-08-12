@@ -1,63 +1,13 @@
 import {
-  EVALUATION_DIMENSIONS,
-  INTERVIEW_TOPIC_IDS,
-  RECORDED_FALLBACK_QUESTIONS,
-  type InterviewEvaluation,
-  type TranscriptTurn,
-} from "@/lib/interview";
-import {
   authorizeInterviewRequest,
-  claimInterviewEvaluation,
-  failInterviewEvaluation,
-  saveInterviewEvaluation,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
-
-function canonicalRecordedTranscript(): TranscriptTurn[] {
-  const now = new Date().toISOString();
-  return RECORDED_FALLBACK_QUESTIONS.flatMap((question, index) => [
-    {
-      id: `recorded-fallback-question-${index + 1}`,
-      speaker: "interviewer" as const,
-      text: question,
-      createdAt: now,
-    },
-    {
-      id: `recorded-fallback-answer-${index + 1}`,
-      speaker: "candidate" as const,
-      text: `回答${index + 1}の発言内容は録画音声に記録されています。自動文字起こしではないため、採用担当者が録画を確認します。`,
-      createdAt: now,
-    },
-  ]);
-}
-
-function recordedFallbackEvaluation(): InterviewEvaluation {
-  return {
-    recommendation: "insufficient_information",
-    summary: "音声回線障害時の録画式予備面接です。回答本文の自動文字起こしと自動評価は未実施のため、権限を付与された採用担当者が録画を確認します。",
-    dimensions: EVALUATION_DIMENSIONS.map((name) => ({
-      name,
-      score: null,
-      confidence: "low" as const,
-      rationale: "自動文字起こしのない予備面接のため、録画による人の確認が必要です。",
-      evidence: [],
-    })),
-    strengths: [],
-    concerns: [],
-    contradictions: [],
-    missingTopics: INTERVIEW_TOPIC_IDS.map((topicId) => `${topicId}: 録画確認待ち`),
-    conditions: [],
-    transcriptProvenance: "candidate_device_unverified",
-    evidenceValidationWarnings: [
-      "応募者の回答本文は自動文字起こしされていません。録画を確認してください。",
-      "カメラ、マイク、音声回線の不具合は応募者の評価に使用しないでください。",
-    ],
-    humanReviewRequired: true,
-  };
-}
+import {
+  RECORDED_ANSWER_COUNT,
+} from "@/lib/recorded-transcription";
+import { finalizeRecordedInterview } from "@/lib/recorded-interview-completion";
 
 export async function POST(request: Request) {
-  let claimId = "";
   let sessionId = "";
   try {
     if (!hasTrustedRequestOrigin(request)) {
@@ -69,33 +19,52 @@ export async function POST(request: Request) {
     }
     const payload = JSON.parse(rawBody) as { sessionId?: string; questionCount?: number };
     sessionId = payload.sessionId?.trim() ?? "";
-    if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId) || payload.questionCount !== RECORDED_FALLBACK_QUESTIONS.length) {
+    const questionCount = Number(payload.questionCount);
+    if (
+      !/^TD-[A-Z0-9-]{6,40}$/.test(sessionId) ||
+      !Number.isInteger(questionCount) ||
+      questionCount < 1 ||
+      questionCount > RECORDED_ANSWER_COUNT
+    ) {
       return noStoreJson({ error: "録画式面接の完了情報を確認できません。" }, { status: 400 });
     }
     const authorized = await authorizeInterviewRequest(request, sessionId);
     if (!authorized?.session) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
     }
-    if (!["in_progress", "evaluation_pending"].includes(authorized.session.status)) {
+    // A lost HTTP response must not make a successfully completed interview look
+    // failed on the candidate's retry. The completed D1 state is the receipt.
+    if (authorized.session.status === "completed") {
+      return noStoreJson({ stored: true, humanReviewRequired: true, alreadyCompleted: true });
+    }
+    if (!["in_progress", "evaluation_pending", "evaluation_processing"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接の受付は完了しています。" }, { status: 409 });
     }
-    const transcript = canonicalRecordedTranscript();
-    claimId = await claimInterviewEvaluation({ sessionId, transcript }) ?? "";
-    if (!claimId) {
+    const completion = await finalizeRecordedInterview(sessionId, questionCount);
+    if (completion.state === "pending") {
+      return noStoreJson({
+        stored: false,
+        transcriptionPending: true,
+        completedAnswerCount: completion.completedAnswerCount,
+        missingAnswerIndexes: completion.missingAnswerIndexes,
+        error: "回答音声の文字起こしが完了していません。自動再試行後に面接を受領します。",
+      }, { status: 409 });
+    }
+    if (completion.state === "busy") {
       return noStoreJson({ error: "このオンライン一次面接の受付は進行中、または完了しています。" }, { status: 409 });
     }
-    const saved = await saveInterviewEvaluation({
-      sessionId,
-      transcript,
-      evaluation: recordedFallbackEvaluation(),
-      claimId,
-    });
-    if (!saved) {
-      return noStoreJson({ error: "録画式面接の受付を完了できませんでした。" }, { status: 409 });
-    }
     return noStoreJson({ stored: true, humanReviewRequired: true });
-  } catch {
-    if (claimId && sessionId) await failInterviewEvaluation(sessionId, claimId);
+  } catch (error) {
+    if (error instanceof Error && error.message === "RECORDED_ANSWER_COUNT_MISMATCH") {
+      return noStoreJson({ error: "実際に保存された回答数と完了情報が一致しません。" }, { status: 409 });
+    }
+    if (error instanceof Error && [
+      "RECORDED_COMPLETION_NOT_SEALED",
+      "INTERVIEW_RECORDING_NOT_READY_FOR_COMPLETION",
+      "INTERVIEW_NOT_READY_FOR_COMPLETION",
+    ].includes(error.message)) {
+      return noStoreJson({ error: "録画と回答数の完了確認がまだ揃っていません。" }, { status: 409 });
+    }
     return noStoreJson({ error: "録画式面接の受付を完了できませんでした。" }, { status: 500 });
   }
 }
