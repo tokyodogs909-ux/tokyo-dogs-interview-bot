@@ -50,6 +50,7 @@ function runInterviewRecovery() {
         headers: { Authorization: "Bearer " + token },
         muteHttpExceptions: true,
         followRedirects: false,
+        timeoutSeconds: 120,
       });
     } catch (_) {
       throw new Error("INTERVIEW_RECOVERY_REQUEST_FAILED");

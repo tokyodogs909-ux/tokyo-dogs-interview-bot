@@ -1390,6 +1390,7 @@ test("Apps Script recovery uses one locked strict and secret-free minute trigger
   assert.match(script, /payload: "\{\}"/);
   assert.match(script, /muteHttpExceptions: true/);
   assert.match(script, /followRedirects: false/);
+  assert.match(script, /timeoutSeconds: 120/);
   assert.match(script, /response\.getResponseCode\(\) !== 200/);
   assert.match(script, /\^application\\\/json;\\s\*charset=utf-8\$\/i/);
   assert.match(script, /isExactObjectWithKeys_\(result, \["states", "tick"\]\)/);
