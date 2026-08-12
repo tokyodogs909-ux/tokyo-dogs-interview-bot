@@ -5,7 +5,6 @@ import {
   type VideoReviewScore,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
-import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
 
 function cleanScores(value: unknown): VideoReviewScore[] | null {
   if (!Array.isArray(value) || value.length !== VIDEO_REVIEW_DIMENSIONS.length) return null;
@@ -62,7 +61,6 @@ export async function POST(request: Request) {
     if (!saved) {
       return noStoreJson({ error: "該当するオンライン一次面接記録がありません。" }, { status: 404 });
     }
-    scheduleGoogleDriveSync(sessionId);
     return noStoreJson({ stored: true, reviewer });
   } catch (error) {
     const message = error instanceof Error ? error.message : "";

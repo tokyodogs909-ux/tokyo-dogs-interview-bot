@@ -194,7 +194,21 @@ if (!evaluationResponse.ok || evaluation.stored !== true) {
   fail("Evaluation failed", { sessionId: session.sessionId, error: evaluation.error });
 }
 
-await new Promise((resolve) => setTimeout(resolve, 8_000));
+const archiveStartedAt = Date.now();
+const archiveResponse = await fetch(`${baseUrl}/api/interviews/archive`, {
+  method: "POST",
+  headers: { ...authorizedHeaders, "Content-Type": "application/json" },
+  body: JSON.stringify({ sessionId: session.sessionId }),
+});
+const archive = await safeJson(archiveResponse);
+record("foreground_drive_archive", archiveResponse, {
+  elapsedMs: Date.now() - archiveStartedAt,
+  stored: archive.stored === true,
+  recordingIncluded: archive.recordingIncluded === true,
+});
+if (!archiveResponse.ok || archive.stored !== true || archive.recordingIncluded !== true) {
+  fail("Foreground Drive archive failed", { sessionId: session.sessionId, error: archive.error });
+}
 
 process.stdout.write(`${JSON.stringify({
   testData: "synthetic",

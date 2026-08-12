@@ -975,7 +975,7 @@ test("Google Drive setup creates and reuses an app-managed root when drive.file 
   }
 });
 
-test("completed interview archive creates candidate folders and stores recording, transcript, evaluation, and PDF", async () => {
+test("candidate foreground archive waits for Drive readback and stores all six artifacts", async () => {
   const originalFetch = globalThis.fetch;
   const database = new FakeD1();
   const recordings = new FakeR2();
@@ -1045,6 +1045,7 @@ test("completed interview archive creates candidate folders and stores recording
   const uploadedNames = [];
   const createdFolders = [];
   const uploadedDriveFiles = [];
+  let recordingUploadFinished = false;
   try {
     globalThis.fetch = async (url, init = {}) => {
       const href = String(url);
@@ -1115,6 +1116,8 @@ test("completed interview archive creates candidate folders and stores recording
       if (href === "https://upload.example.test/recording-session") {
         assert.equal(init.method, "PUT");
         assert.equal(init.headers["Content-Length"], String(recordingBytes.byteLength));
+        await new Promise((resolve) => setTimeout(resolve, 75));
+        recordingUploadFinished = true;
         return Response.json({
           id: `file-${++nextFile}`,
           name: `${session.sessionId}_面接録画.webm`,
@@ -1140,19 +1143,29 @@ test("completed interview archive creates candidate folders and stores recording
       throw new Error(`Unexpected Drive request: ${href}`);
     };
 
-    const response = await request("/api/admin/google-drive/sync", {
+    const unauthorized = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.equal(unauthorized.status, 401);
+
+    const archiveStartedAt = Date.now();
+    const response = await request("/api/interviews/archive", {
       method: "POST",
       headers: {
-        Authorization: "Bearer interview-admin-secret",
+        Authorization: `Bearer ${session.accessToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ sessionId: session.sessionId }),
     }, env);
     const payload = await response.json();
     assert.equal(response.status, 200, JSON.stringify({ payload, sync: database.externalSyncs.get(session.sessionId), uploadedNames, createdFolders }));
-    assert.equal(payload.synced, true);
-    assert.equal(payload.result.recordingIncluded, true);
-    assert.match(payload.result.folderUrl, /^https:\/\/drive\.google\.com\/drive\/folders\/folder-/);
+    assert.equal(payload.stored, true);
+    assert.equal(payload.recordingIncluded, true);
+    assert.equal(recordingUploadFinished, true, "the API must not respond before the recording upload finishes");
+    assert.ok(Date.now() - archiveStartedAt >= 70, "the foreground archive response must await Drive readback");
+    assert.match(database.externalSyncs.get(session.sessionId).folder_url, /^https:\/\/drive\.google\.com\/drive\/folders\/folder-/);
     assert.deepEqual(createdFolders, ["2026", "07", `テスト 応募者_${session.sessionId}`]);
     assert.deepEqual(new Set(uploadedNames), new Set([
       `${session.sessionId}_文字起こし.txt`,
@@ -1756,7 +1769,7 @@ test("recording upload survives one transient D1 failure after the R2 object is 
   assert.equal(database.artifacts.some((row) => row[2] === storedObjectKey), true);
 });
 
-test("resumable recording upload stores independent parts and streams the completed recording to staff", async () => {
+test("resumable recording upload resumes 14 parts without opening stored body streams", async () => {
   process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const database = new FakeD1();
   const recordings = new FakeR2();
@@ -1776,6 +1789,8 @@ test("resumable recording upload stores independent parts and streams the comple
   database.sessions.get(session.sessionId).status = "in_progress";
   const partSize = 256 * 1024;
   const lastSize = 123;
+  const totalParts = 14;
+  const byteSize = partSize * (totalParts - 1) + lastSize;
   const commonHeaders = {
     Authorization: `Bearer ${session.accessToken}`,
     "X-Interview-Session": session.sessionId,
@@ -1786,16 +1801,16 @@ test("resumable recording upload stores independent parts and streams the comple
     body: JSON.stringify({
       sessionId: session.sessionId,
       contentType: "video/webm",
-      byteSize: partSize + lastSize,
+      byteSize,
       partSize,
-      totalParts: 2,
+      totalParts,
       audioCoverage: "both",
     }),
   }, env);
   assert.equal(start.status, 200, await start.clone().text());
   assert.deepEqual((await start.json()).uploadedParts, []);
 
-  for (const [index, size, fill] of [[0, partSize, 65], [1, lastSize, 66]]) {
+  const uploadPart = async (index, size, fill) => {
     const part = await request("/api/interviews/recording/upload/part", {
       method: "PUT",
       headers: {
@@ -1807,8 +1822,42 @@ test("resumable recording upload stores independent parts and streams the comple
       body: new Uint8Array(size).fill(fill),
     }, env);
     assert.equal(part.status, 200, await part.clone().text());
+    return await part.json();
+  };
+
+  for (let index = 0; index < 7; index += 1) {
+    await uploadPart(index, partSize, 65 + index);
   }
 
+  const duplicate = await uploadPart(0, partSize, 65);
+  assert.equal(duplicate.duplicate, true);
+  const getCountBeforeResume = recordings.getCount;
+  const headCountBeforeResume = recordings.headCount;
+  const resume = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...commonHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize,
+      partSize,
+      totalParts,
+      audioCoverage: "both",
+    }),
+  }, env);
+  const resumed = await resume.json();
+  assert.equal(resume.status, 200, JSON.stringify(resumed));
+  assert.deepEqual(resumed.uploadedParts, [0, 1, 2, 3, 4, 5, 6]);
+  assert.equal(recordings.getCount, getCountBeforeResume + 1, "resume may read only the small upload state body");
+  assert.equal(recordings.headCount, headCountBeforeResume + totalParts, "resume must use metadata-only head for every part");
+
+  for (let index = 7; index < totalParts; index += 1) {
+    const size = index === totalParts - 1 ? lastSize : partSize;
+    await uploadPart(index, size, 65 + index);
+  }
+
+  const getCountBeforeComplete = recordings.getCount;
+  const headCountBeforeComplete = recordings.headCount;
   const complete = await request("/api/interviews/recording/upload/complete", {
     method: "POST",
     headers: commonHeaders,
@@ -1816,11 +1865,12 @@ test("resumable recording upload stores independent parts and streams the comple
   const completed = await complete.json();
   assert.equal(complete.status, 200, JSON.stringify(completed));
   assert.equal(completed.stored, true);
-  assert.equal(completed.totalParts, 2);
+  assert.equal(completed.totalParts, totalParts);
   // Finalization must inspect metadata without opening unread R2 body streams.
   // Opening one body per part exhausts Worker connections on real 15-27 minute
   // Android recordings and leaves the completion request hanging.
-  assert.equal(recordings.headCount, 2);
+  assert.equal(recordings.getCount, getCountBeforeComplete + 1, "finalize may read only the small upload state body");
+  assert.equal(recordings.headCount, headCountBeforeComplete + totalParts);
   assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
   assert.equal(database.artifacts.some((row) => String(row[2]).endsWith("recording.manifest.json")), true);
 
@@ -1831,11 +1881,11 @@ test("resumable recording upload stores independent parts and streams the comple
     },
   }, env);
   assert.equal(staffRecording.status, 200);
-  assert.equal(Number(staffRecording.headers.get("content-length")), partSize + lastSize);
+  assert.equal(Number(staffRecording.headers.get("content-length")), byteSize);
   const recording = new Uint8Array(await staffRecording.arrayBuffer());
-  assert.equal(recording.length, partSize + lastSize);
+  assert.equal(recording.length, byteSize);
   assert.equal(recording[0], 65);
-  assert.equal(recording.at(-1), 66);
+  assert.equal(recording.at(-1), 65 + totalParts - 1);
 });
 
 test("candidate technical incidents are audited and cross-origin mutations are rejected", async () => {

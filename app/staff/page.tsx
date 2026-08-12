@@ -413,15 +413,17 @@ export default function StaffReviewPage() {
       });
       const data = (await response.json()) as { stored?: boolean; error?: string };
       if (!response.ok || !data.stored) throw new Error(data.error || "映像評価を保存できませんでした。");
-      setState("ready");
-      setMessage(`${reviewer.normalize("NFKC").replace(/\s+/gu, " ").trim()}の映像評価を保存しました。`);
+      await syncGoogleDrive({
+        successPrefix: `${reviewer.normalize("NFKC").replace(/\s+/gu, " ").trim()}の映像評価を保存し、`,
+        failurePrefix: "映像評価は保存しましたが、",
+      });
     } catch (error) {
       setState("ready");
       setMessage(error instanceof Error ? error.message : "映像評価を保存できませんでした。");
     }
   }
 
-  async function syncGoogleDrive() {
+  async function syncGoogleDrive(options: { successPrefix?: string; failurePrefix?: string } = {}) {
     if (!review) return;
     setState("syncing");
     setMessage("");
@@ -449,16 +451,18 @@ export default function StaffReviewPage() {
         },
       } : current);
       setState("ready");
-      setMessage(data.result.status === "completed"
+      const resultMessage = data.result.status === "completed"
         ? data.result.recordingIncluded
           ? "Google Driveへの録画・文字起こし・評価・PDFの格納を完了しました。"
           : isTextInterviewRecord(review)
             ? "文字入力による回答・評価・PDFのGoogle Drive格納を完了しました。"
             : "文字起こし・評価・PDFを格納しましたが、録画はまだ格納されていません。録画保存状態を確認してください。"
-        : "Google Driveへの再格納を予約しました。");
+        : "Google Driveへの再格納を予約しました。";
+      setMessage(`${options.successPrefix ?? ""}${resultMessage}`);
     } catch (error) {
       setState("ready");
-      setMessage(error instanceof Error ? error.message : "Google Driveへの格納を完了できませんでした。");
+      const detail = error instanceof Error ? error.message : "Google Driveへの格納を完了できませんでした。";
+      setMessage(`${options.failurePrefix ?? ""}${detail}`);
     }
   }
 

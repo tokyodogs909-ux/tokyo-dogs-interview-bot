@@ -3,7 +3,6 @@ import {
   completeResumableInterviewRecording,
   failInterviewRecordingUpload,
 } from "@/lib/interview-persistence";
-import { scheduleGoogleDriveSync } from "@/lib/google-drive-sync";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 export async function POST(request: Request) {
@@ -22,7 +21,6 @@ export async function POST(request: Request) {
     }
     if (authorized.session.recording_status === "stored") return noStoreJson({ stored: true, alreadyStored: true });
     const result = await completeResumableInterviewRecording(authorized.session);
-    scheduleGoogleDriveSync(sessionId);
     return noStoreJson(result);
   } catch (error) {
     const code = error instanceof Error ? error.message : "";

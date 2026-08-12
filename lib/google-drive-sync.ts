@@ -1,4 +1,3 @@
-import { getRequestExecutionContext } from "vinext/shims/request-context";
 import {
   DRIVE_API_ENDPOINT,
   DRIVE_UPLOAD_ENDPOINT,
@@ -675,11 +674,4 @@ export async function syncInterviewToGoogleDrive(sessionId: string): Promise<Goo
     await wait(TRANSIENT_DRIVE_RETRY_DELAY_MS);
     return await syncInterviewToGoogleDriveOnce(sessionId);
   }
-}
-
-export function scheduleGoogleDriveSync(sessionId: string) {
-  const promise = syncInterviewToGoogleDrive(sessionId).catch(() => undefined);
-  const context = getRequestExecutionContext();
-  if (context) context.waitUntil(promise);
-  return Boolean(context);
 }

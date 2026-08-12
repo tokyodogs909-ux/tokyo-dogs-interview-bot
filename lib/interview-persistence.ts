@@ -1380,7 +1380,9 @@ export async function beginResumableInterviewRecording(input: {
   }
   const uploadedParts: number[] = [];
   for (let index = 0; index < state.totalParts; index += 1) {
-    const part = await bucket.get(recordingPartKey(state.sessionId, index));
+    // Resume needs metadata only. Opening every stored part body here recreates
+    // the same Worker connection exhaustion that previously broke finalization.
+    const part = await bucket.head(recordingPartKey(state.sessionId, index));
     if (part?.customMetadata?.byteSize) uploadedParts.push(index);
   }
   return { stored: false, uploadedParts };
@@ -1405,7 +1407,8 @@ export async function saveResumableInterviewRecordingPart(input: {
     : state.partSize;
   if (input.byteSize !== expectedSize) throw new Error("INTERVIEW_RECORDING_PART_SIZE_INVALID");
   const key = recordingPartKey(input.sessionId, input.index);
-  const existing = await bucket.get(key);
+  // A duplicate retry is decided entirely from metadata; never open its body.
+  const existing = await bucket.head(key);
   if (Number(existing?.customMetadata?.byteSize ?? 0) === input.byteSize) return { stored: true, duplicate: true };
   await bucket.put(key, input.body, {
     httpMetadata: { contentType: "application/octet-stream" },

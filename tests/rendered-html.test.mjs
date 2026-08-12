@@ -134,6 +134,9 @@ test("voice interview implements bidirectional audio health and recovery guards"
   const archiveRouteSource = await readFile(new URL("../app/api/interviews/archive/route.ts", import.meta.url), "utf8");
   const evaluationRouteSource = await readFile(new URL("../app/api/evaluate/route.ts", import.meta.url), "utf8");
   const recordedCompleteRouteSource = await readFile(new URL("../app/api/interviews/recorded/complete/route.ts", import.meta.url), "utf8");
+  const recordingCompleteRouteSource = await readFile(new URL("../app/api/interviews/recording/upload/complete/route.ts", import.meta.url), "utf8");
+  const staffReviewRouteSource = await readFile(new URL("../app/api/staff/review/route.ts", import.meta.url), "utf8");
+  const driveSyncSource = await readFile(new URL("../lib/google-drive-sync.ts", import.meta.url), "utf8");
   const recordingUploadSource = await readFile(new URL("../lib/recording-upload.js", import.meta.url), "utf8");
   const interviewerStageSource = await readFile(new URL("../app/interviewer-stage.tsx", import.meta.url), "utf8");
   assert.match(source, /あなたの音声/);
@@ -194,6 +197,10 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(archiveRouteSource, /await syncInterviewToGoogleDrive\(sessionId\)/);
   assert.doesNotMatch(evaluationRouteSource, /scheduleGoogleDriveSync/);
   assert.doesNotMatch(recordedCompleteRouteSource, /scheduleGoogleDriveSync/);
+  assert.doesNotMatch(recordingRouteSource, /scheduleGoogleDriveSync/);
+  assert.doesNotMatch(recordingCompleteRouteSource, /scheduleGoogleDriveSync/);
+  assert.doesNotMatch(staffReviewRouteSource, /scheduleGoogleDriveSync/);
+  assert.doesNotMatch(driveSyncSource, /waitUntil|scheduleGoogleDriveSync/);
   assert.match(source, /await startRecording\(activeStream, displayStreamRef\.current, remoteStreamRef\.current, \{/);
   assert.match(source, /resume: !isNewInterviewSession/);
   assert.match(source, /recordedInterviewSessionRef/);
@@ -218,7 +225,6 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(staffSource, /評価本文の要確認事項/);
   assert.match(staffSource, /録画内の双方音声は未確認です/);
   assert.match(staffSource, /応募者の回答記録を基にした補助情報/);
-  const driveSyncSource = await readFile(new URL("../lib/google-drive-sync.ts", import.meta.url), "utf8");
   assert.match(driveSyncSource, /評価本文の要確認事項/);
   assert.match(driveSyncSource, /応募者端末で生成された文字起こし/);
   assert.match(source, /stage === "setup"/);
