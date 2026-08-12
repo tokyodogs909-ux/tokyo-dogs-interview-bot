@@ -1285,6 +1285,7 @@ test("health endpoint verifies server authentication without returning the key",
 test("health endpoint fails closed when the configured OpenAI key is rejected", async () => {
   process.env.OPENAI_API_KEY = "rejected-test-key-never-returned";
   const warnings = [];
+  let upstreamCalls = 0;
   const originalWarn = console.warn;
   console.warn = (...args) => warnings.push(args);
   let response;
@@ -1292,14 +1293,17 @@ test("health endpoint fails closed when the configured OpenAI key is rejected", 
     response = await request("/api/health", {}, {
       ...workerEnv,
       OPENAI_API_KEY: "rejected-test-key-never-returned",
-      OPENAI_API: { fetch: async () => Response.json(
-        { error: {
-          code: "invalid_api_key",
-          type: "invalid_request_error",
-          message: "rejected-test-key-never-returned",
-        } },
-        { status: 401 },
-      ) },
+      OPENAI_API: { fetch: async () => {
+        upstreamCalls += 1;
+        return Response.json(
+          { error: {
+            code: "invalid_api_key",
+            type: "invalid_request_error",
+            message: "rejected-test-key-never-returned",
+          } },
+          { status: 401 },
+        );
+      } },
     });
   } finally {
     console.warn = originalWarn;
@@ -1311,6 +1315,35 @@ test("health endpoint fails closed when the configured OpenAI key is rejected", 
   assert.equal(JSON.stringify(warnings).includes("rejected-test-key-never-returned"), false);
   assert.match(JSON.stringify(warnings), /invalid_api_key/);
   assert.match(JSON.stringify(warnings), /invalid_request_error/);
+  assert.equal(upstreamCalls, 2, "definitive authentication failures must not be retried");
+});
+
+test("a cold isolate retries each transient model probe once and turns green on exact recovery", async () => {
+  const attempts = new Map();
+  const originalWarn = console.warn;
+  console.warn = () => undefined;
+  const env = {
+    ...workerEnv,
+    OPENAI_API_KEY: "cold-transient-recovery-health-test-key",
+    OPENAI_API: {
+      fetch: async (upstreamRequest) => {
+        const attempt = (attempts.get(upstreamRequest.url) ?? 0) + 1;
+        attempts.set(upstreamRequest.url, attempt);
+        return attempt === 1
+          ? Response.json({ error: { type: "server_error" } }, { status: 500 })
+          : Response.json({ data: [] });
+      },
+    },
+  };
+  try {
+    assert.equal((await request("/api/health", {}, env)).status, 200);
+    assert.deepEqual([...attempts.values()].sort(), [2, 2]);
+    assert.equal((await request("/api/health", {}, env)).status, 200);
+    assert.deepEqual([...attempts.values()].sort(), [2, 2],
+      "the recovered result must enter the normal healthy cache");
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 test("health checks models independently and keeps a recent known-good model green across a transient timeout", async () => {
@@ -1346,16 +1379,16 @@ test("health checks models independently and keeps a recent known-good model gre
     mode = "partial-timeout";
     assert.equal((await request("/api/health", {}, env)).status, 200,
       "a transient timeout must not erase a recent verified success");
-    assert.equal(calls.length, 4);
+    assert.equal(calls.length, 5);
     assert.match(JSON.stringify(warnings), /OPENAI_AUTHENTICATION_CHECK_TRANSIENT/);
 
     assert.equal((await request("/api/health", {}, env)).status, 200);
-    assert.equal(calls.length, 4, "transient results have a short anti-amplification cache");
+    assert.equal(calls.length, 5, "transient results have a short anti-amplification cache");
 
     now += 30 * 1_000 + 1;
     mode = "healthy";
     assert.equal((await request("/api/health", {}, env)).status, 200);
-    assert.equal(calls.length, 5, "only the model whose transient cache expired is re-probed");
+    assert.equal(calls.length, 6, "only the model whose transient cache expired is re-probed");
   } finally {
     Date.now = originalNow;
     console.warn = originalWarn;
@@ -1380,35 +1413,58 @@ test("health fails closed and caches a transient partial failure before any know
   };
   try {
     assert.equal((await request("/api/health", {}, env)).status, 503);
-    assert.equal(calls, 2);
+    assert.equal(calls, 3);
     assert.equal((await request("/api/health", {}, env)).status, 503);
-    assert.equal(calls, 2, "cold transient failure is cached briefly without claiming healthy");
+    assert.equal(calls, 3, "two cold transient failures are cached briefly without claiming healthy");
   } finally {
     console.warn = originalWarn;
   }
 });
 
-test("health never hides exhausted credit behind a known-good cache", async () => {
+test("health clears known-good evidence after exhausted credit and cannot resurrect it on transients", async () => {
   const originalNow = Date.now;
   const originalWarn = console.warn;
   let now = originalNow();
-  let exhausted = false;
+  let mode = "healthy";
+  let calls = 0;
   Date.now = () => now;
   console.warn = () => undefined;
   const env = {
     ...workerEnv,
     OPENAI_API_KEY: "credit-exhaustion-health-test-key",
     OPENAI_API: {
-      fetch: async (upstreamRequest) => exhausted && upstreamRequest.url.includes("gpt-realtime")
-        ? Response.json({ error: { code: "credit_balance_exhausted", type: "insufficient_quota" } }, { status: 429 })
-        : Response.json({ data: [] }),
+      fetch: async (upstreamRequest) => {
+        calls += 1;
+        if (!upstreamRequest.url.includes("gpt-realtime")) return Response.json({ data: [] });
+        if (mode === "quota") {
+          return Response.json(
+            { error: { code: "credit_balance_exhausted", type: "insufficient_quota" } },
+            { status: 429 },
+          );
+        }
+        if (mode === "transient") {
+          return Response.json({ error: { type: "server_error" } }, { status: 503 });
+        }
+        return Response.json({ data: [] });
+      },
     },
   };
   try {
     assert.equal((await request("/api/health", {}, env)).status, 200);
     now += 5 * 60 * 1_000 + 1;
-    exhausted = true;
+    mode = "quota";
     assert.equal((await request("/api/health", {}, env)).status, 503);
+    assert.equal(calls, 4, "a definitive credit failure must not receive a transient retry");
+    now += 30 * 1_000 + 1;
+    mode = "transient";
+    assert.equal((await request("/api/health", {}, env)).status, 503,
+      "a definitive failure must erase stale-good before later transient probes");
+    assert.equal(calls, 6, "the transient class receives exactly one retry after the red cache expires");
+    now += 30 * 1_000 + 1;
+    mode = "healthy";
+    assert.equal((await request("/api/health", {}, env)).status, 200,
+      "only a new verified healthy probe may restore green after a definitive failure");
+    assert.equal(calls, 7);
   } finally {
     Date.now = originalNow;
     console.warn = originalWarn;

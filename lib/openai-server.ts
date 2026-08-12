@@ -129,7 +129,14 @@ async function verifyOpenAIModel(model: string, apiKey: string, apiKeyHash: stri
   if (running) return await running;
 
   const check = (async () => {
-    const probe = await probeOpenAIModel(model, apiKey);
+    const firstProbe = await probeOpenAIModel(model, apiKey);
+    // A fresh Worker isolate has no stale-good evidence. Do not turn a single
+    // edge timeout or upstream 5xx into a cached public 503: retry only that
+    // transient class once inside the same readiness request. Authentication,
+    // permission and quota failures remain definitive and are never retried.
+    const probe = firstProbe.outcome === "transient"
+      ? await probeOpenAIModel(model, apiKey)
+      : firstProbe;
     const checkedAt = Date.now();
     if (probe.outcome === "healthy") {
       openAIModelHealthCache.set(cacheKey, {
@@ -151,7 +158,13 @@ async function verifyOpenAIModel(model: string, apiKey: string, apiKeyHash: stri
       model,
       checkedAt,
       healthy,
-      lastHealthyAt: cached?.lastHealthyAt ?? null,
+      // A definitive credential, permission or quota rejection invalidates
+      // every older success for this key/model. Otherwise, after the 30-second
+      // red cache expires, two transient probes could incorrectly resurrect
+      // stale-good from evidence that the definitive response superseded.
+      lastHealthyAt: probe.outcome === "definitive-unhealthy"
+        ? null
+        : cached?.lastHealthyAt ?? null,
       ttlMs: probe.outcome === "transient" ? OPENAI_TRANSIENT_CACHE_MS : OPENAI_UNHEALTHY_CACHE_MS,
     });
     // Restrict upstream metadata to short machine-readable tokens. Never log
