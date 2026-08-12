@@ -2954,20 +2954,38 @@ test("recorded answer keeps durable audio pending across OpenAI quota failure an
   const tooEarly = await request("/api/interviews/recorded/answer", {
     method: "POST",
     headers,
+    body: new Uint8Array(0),
   }, env);
   assert.equal(tooEarly.status, 202);
+  assert.equal((await tooEarly.json()).pending, true);
   assert.equal(upstreamCalls, 1, "Retry-After must suppress immediate paid retries");
 
   pending.next_retry_at = new Date(0).toISOString();
+  // Cloudflare/Vinext may normalize an omitted POST body to a truthy, empty
+  // ReadableStream. This is still the body-less retry contract because no
+  // X-Recorded-Answer-Bytes upload declaration is present.
   const retried = await request("/api/interviews/recorded/answer", {
     method: "POST",
     headers,
+    body: new Uint8Array(0),
   }, env);
   assert.equal(retried.status, 200, JSON.stringify(await retried.clone().json()));
   assert.equal((await retried.json()).transcribed, true);
   assert.equal(upstreamCalls, 2);
   assert.equal(recordings.putCount, 1, "body-less retry must reuse the exact durable R2 object");
   assert.equal(database.recordedAnswers.get(`${session.sessionId}:1`).transcript_text, "再試行で復旧した実回答");
+
+  const completedReplay = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers,
+    body: new Uint8Array(0),
+  }, env);
+  const completedPayload = await completedReplay.json();
+  assert.equal(completedReplay.status, 200, JSON.stringify(completedPayload));
+  assert.equal(completedPayload.transcribed, true);
+  assert.equal(completedPayload.alreadyCompleted, true);
+  assert.equal(upstreamCalls, 2, "a completed body-less replay must not call OpenAI again");
+  assert.equal(recordings.putCount, 1, "a completed body-less replay must not re-upload audio");
 });
 
 test("staff polling completes a durable pending transcription after the candidate closes the browser", async () => {
@@ -3745,6 +3763,15 @@ test("recorded answer rejects cross-origin, oversize, and conflicting replacemen
   assert.equal(oversized.status, 413);
 
   const original = new TextEncoder().encode("original-answer-audio");
+  const undeclaredUpload = await request("/api/interviews/recorded/answer", {
+    method: "POST",
+    headers: authHeaders,
+    body: original,
+  }, env);
+  assert.equal(undeclaredUpload.status, 409, "audio bytes without the upload declaration are only a retry");
+  assert.equal(database.recordedAnswers.has(`${session.sessionId}:1`), false);
+  assert.equal(recordings.putCount, 0, "an undeclared body must never register or replace answer audio");
+
   const accepted = await request("/api/interviews/recorded/answer", {
     method: "POST",
     headers: {

@@ -241,6 +241,12 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /\/api\/interviews\/recorded\/start/);
   assert.match(source, /\/api\/interviews\/recorded\/answer/);
   assert.match(source, /\/api\/interviews\/recorded\/complete/);
+  const recordedAnswerRetry = source.slice(
+    source.indexOf("async function retryRecordedAnswerTranscription("),
+    source.indexOf("function finishRecordedAnswerCapture("),
+  );
+  assert.match(recordedAnswerRetry, /\/api\/interviews\/recorded\/answer/);
+  assert.doesNotMatch(recordedAnswerRetry, /X-Recorded-Answer-Bytes|body:/);
   assert.match(source, /回答音声の自動文字起こしは完了しています。自動評価は行わず/);
   assert.match(source, /recordedAnswerBlobsRef/);
   assert.match(source, /audioBitsPerSecond: 48_000/);

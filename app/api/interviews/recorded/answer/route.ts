@@ -28,7 +28,13 @@ export async function POST(request: Request) {
     const declaredBytesHeader = request.headers.get("X-Recorded-Answer-Bytes");
     let bytes: Uint8Array | undefined;
     let contentType: string | undefined;
-    if (request.body || declaredBytesHeader !== null) {
+    // X-Recorded-Answer-Bytes is the explicit upload/retry discriminator.
+    // Cloudflare/Vinext can expose a zero-length ReadableStream as request.body
+    // for a POST whose caller omitted body entirely. Treating body truthiness as
+    // an upload therefore rejects legitimate R2-backed retries as malformed.
+    // A request without the declaration can never register or replace audio;
+    // saveAndTranscribeRecordedAnswer only reuses an already durable D1/R2 row.
+    if (declaredBytesHeader !== null) {
       const declaredBytes = Number(declaredBytesHeader);
       contentType = validateRecordedAnswerContentType(request.headers.get("Content-Type") ?? "") ?? undefined;
       if (
