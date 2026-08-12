@@ -10,6 +10,72 @@ import {
 } from "@/lib/recorded-transcription";
 import { stepInterviewToGoogleDrive } from "@/lib/google-drive-sync";
 
+type InterviewBackgroundRecoveryBindings = {
+  INTERVIEW_RECOVERY_TOKEN?: string;
+};
+
+export type InterviewBackgroundRecoveryAuthorization =
+  | "authorized"
+  | "unauthorized"
+  | "unconfigured";
+
+const MINIMUM_RECOVERY_TOKEN_LENGTH = 43;
+
+function recoveryBindings() {
+  return (globalThis as typeof globalThis & {
+    __TOKYO_DOGS_INTERVIEW_BINDINGS__?: InterviewBackgroundRecoveryBindings;
+  }).__TOKYO_DOGS_INTERVIEW_BINDINGS__ ?? {};
+}
+
+function configuredRecoveryToken() {
+  return (
+    recoveryBindings().INTERVIEW_RECOVERY_TOKEN ??
+    (typeof process === "undefined" ? "" : process.env.INTERVIEW_RECOVERY_TOKEN) ??
+    ""
+  ).trim();
+}
+
+async function sha256(value: string) {
+  return new Uint8Array(await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  ));
+}
+
+function constantTimeEqual(left: Uint8Array, right: Uint8Array) {
+  if (left.byteLength !== right.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    difference |= left[index] ^ right[index];
+  }
+  return difference === 0;
+}
+
+/**
+ * Authenticates the machine-only recovery endpoint with a dedicated 256-bit
+ * bearer token. Hashing both inputs before comparison keeps the comparison
+ * length fixed and prevents timing differences from revealing token prefixes.
+ */
+export async function authorizeInterviewBackgroundRecoveryRequest(
+  request: Request,
+): Promise<InterviewBackgroundRecoveryAuthorization> {
+  const expected = configuredRecoveryToken();
+  if (expected.length < MINIMUM_RECOVERY_TOKEN_LENGTH) return "unconfigured";
+
+  const authorization = request.headers.get("Authorization") ?? "";
+  if (authorization.length > 512 || !authorization.startsWith("Bearer ")) {
+    return "unauthorized";
+  }
+  const actual = authorization.slice(7).trim();
+  if (!actual) return "unauthorized";
+
+  const [actualHash, expectedHash] = await Promise.all([
+    sha256(actual),
+    sha256(expected),
+  ]);
+  return constantTimeEqual(actualHash, expectedHash) ? "authorized" : "unauthorized";
+}
+
 type RecoveryStageState = "idle" | "advanced" | "waiting" | "attention";
 
 export type InterviewBackgroundRecoverySummary = {

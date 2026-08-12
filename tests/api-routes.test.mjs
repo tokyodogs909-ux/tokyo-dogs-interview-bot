@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 // vinext evaluates the worker module at import time. Set a non-secret fixture
@@ -1249,6 +1250,174 @@ test("scheduled recovery runs a bounded global tick without staff browser authen
       drive: "idle",
     },
   }]]);
+});
+
+test("internal recovery fails closed without a dedicated strong bearer token", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  for (const token of ["", "x".repeat(42)]) {
+    const response = await request("/api/internal/recovery", {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    }, {
+      ...workerEnv,
+      DB: database,
+      RECORDINGS: recordings,
+      INTERVIEW_RECOVERY_TOKEN: token,
+    });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      error: "Background recovery authentication is not configured.",
+    });
+  }
+});
+
+test("internal recovery rejects the wrong bearer and returns only aggregate states for the right one", async () => {
+  const recoveryToken = "recovery-token-never-returned-0123456789abcdef";
+  assert.ok(recoveryToken.length >= 43);
+  const privateSessionId = "TD-PRIVATE-SESSION";
+  const privateCandidateMarker = "PRIVATE-CANDIDATE-MARKER";
+  const database = new FakeD1();
+  database.sessions.set(privateSessionId, {
+    id: privateSessionId,
+    candidate_name: privateCandidateMarker,
+    status: "created",
+    recording_status: "not_started",
+    transcript_json: null,
+    created_at: "2026-08-12T00:00:00.000Z",
+    updated_at: "2026-08-12T00:00:00.000Z",
+  });
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_RECOVERY_TOKEN: recoveryToken,
+  };
+
+  const unauthorized = await request("/api/internal/recovery", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${"z".repeat(43)}` },
+  }, env);
+  assert.equal(unauthorized.status, 401);
+  const unauthorizedText = await unauthorized.text();
+  assert.deepEqual(JSON.parse(unauthorizedText), {
+    error: "Background recovery authentication failed.",
+  });
+
+  const logs = [];
+  const originals = {
+    info: console.info,
+    warn: console.warn,
+    error: console.error,
+  };
+  console.info = (...args) => logs.push(args);
+  console.warn = (...args) => logs.push(args);
+  console.error = (...args) => logs.push(args);
+  let authorized;
+  try {
+    authorized = await request("/api/internal/recovery", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${recoveryToken}`,
+        "Content-Type": "application/json",
+        "Content-Length": "2",
+      },
+      body: "{}",
+    }, env);
+  } finally {
+    console.info = originals.info;
+    console.warn = originals.warn;
+    console.error = originals.error;
+  }
+
+  assert.equal(authorized.status, 200);
+  assert.match(authorized.headers.get("cache-control") ?? "", /no-store/);
+  const authorizedText = await authorized.text();
+  assert.deepEqual(JSON.parse(authorizedText), {
+    tick: "completed",
+    states: {
+      recording: "idle",
+      transcription: "idle",
+      completion: "idle",
+      evaluation: "idle",
+      drive: "idle",
+    },
+  });
+  const observableOutput = `${unauthorizedText}\n${authorizedText}\n${JSON.stringify(logs)}`;
+  assert.equal(observableOutput.includes(recoveryToken), false);
+  assert.equal(observableOutput.includes(privateSessionId), false);
+  assert.equal(observableOutput.includes(privateCandidateMarker), false);
+
+  const invalidContentType = await request("/api/internal/recovery", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${recoveryToken}`,
+      "Content-Type": "text/plain",
+      "Content-Length": "2",
+    },
+    body: "{}",
+  }, env);
+  assert.equal(invalidContentType.status, 415);
+
+  const oversizedBody = " ".repeat(65);
+  const oversized = await request("/api/internal/recovery", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${recoveryToken}`,
+      "Content-Type": "application/json",
+      "Content-Length": String(oversizedBody.length),
+    },
+    body: oversizedBody,
+  }, env);
+  assert.equal(oversized.status, 413);
+});
+
+test("Apps Script recovery uses one locked strict and secret-free minute trigger", async () => {
+  const script = await readFile(
+    new URL("../scripts/apps-script-interview-recovery.gs", import.meta.url),
+    "utf8",
+  );
+  assert.match(script, /INTERVIEW_RECOVERY_URL\s*=\s*\n?\s*"https:\/\/recruit\.tokyo-dogs\.com\/api\/internal\/recovery"/);
+  assert.match(script, /getScriptProperties\(\)[\s\S]*?\.getProperty\(INTERVIEW_RECOVERY_TOKEN_PROPERTY\)/);
+  assert.match(script, /token\.length < 43/);
+  assert.match(script, /\^\[A-Za-z0-9_-\]\+\$/);
+  assert.match(script, /LockService\.getScriptLock\(\)/);
+  assert.match(script, /lock\.tryLock\(1000\)/);
+  assert.match(script, /finally\s*\{\s*lock\.releaseLock\(\)/);
+  assert.match(script, /UrlFetchApp\.fetch\(INTERVIEW_RECOVERY_URL/);
+  assert.match(script, /method: "post"/);
+  assert.match(script, /contentType: "application\/json"/);
+  assert.match(script, /payload: "\{\}"/);
+  assert.match(script, /muteHttpExceptions: true/);
+  assert.match(script, /followRedirects: false/);
+  assert.match(script, /response\.getResponseCode\(\) !== 200/);
+  assert.match(script, /\^application\\\/json;\\s\*charset=utf-8\$\/i/);
+  assert.match(script, /isExactObjectWithKeys_\(result, \["states", "tick"\]\)/);
+  assert.match(script, /result\.tick !== "completed"/);
+  assert.deepEqual(
+    [...script.matchAll(/^\s+"(completion|drive|evaluation|recording|transcription)",$/gm)]
+      .map((match) => match[1]),
+    ["completion", "drive", "evaluation", "recording", "transcription"],
+  );
+  assert.match(script, /"idle",\s+"advanced",\s+"waiting",\s+"attention",/s);
+  assert.match(script, /throw new Error\("INTERVIEW_RECOVERY_ATTENTION"\)/);
+  assert.match(script, /ScriptApp\.getProjectTriggers\(\)/);
+  assert.match(script, /trigger\.getHandlerFunction\(\) === INTERVIEW_RECOVERY_HANDLER/);
+  assert.match(script, /ScriptApp\.deleteTrigger\(trigger\)/);
+  assert.match(script, /ScriptApp\.newTrigger\(INTERVIEW_RECOVERY_HANDLER\)[\s\S]*?\.everyMinutes\(1\)[\s\S]*?\.create\(\)/);
+  assert.doesNotMatch(script, /Logger\.|console\.|console\.log|gh api|github\.token|secrets\./i);
+  for (const error of script.matchAll(/new Error\(([^)]+)\)/g)) {
+    assert.match(error[1], /^"INTERVIEW_RECOVERY_[A-Z_]+"$/);
+  }
+
+  await assert.rejects(
+    readFile(new URL("../.github/workflows/interview-background-recovery.yml", import.meta.url)),
+    { code: "ENOENT" },
+  );
+  await assert.rejects(
+    readFile(new URL("../.github/workflows/repository-activity-heartbeat.yml", import.meta.url)),
+    { code: "ENOENT" },
+  );
 });
 
 test("health endpoint verifies server authentication without returning the key", async () => {

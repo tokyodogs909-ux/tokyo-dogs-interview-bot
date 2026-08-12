@@ -22,6 +22,7 @@ interface Env {
   GOOGLE_CLOUD_PROJECT_NUMBER?: string;
   INTERVIEW_INVITE_SIGNING_SECRET?: string;
   INTERVIEW_REQUIRE_SIGNED_INVITE?: string;
+  INTERVIEW_RECOVERY_TOKEN?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -54,6 +55,7 @@ type InterviewBindings = Pick<Env,
   | "GOOGLE_CLOUD_PROJECT_NUMBER"
   | "INTERVIEW_INVITE_SIGNING_SECRET"
   | "INTERVIEW_REQUIRE_SIGNED_INVITE"
+  | "INTERVIEW_RECOVERY_TOKEN"
 >;
 
 function installInterviewBindings(bindings: Env) {
@@ -77,6 +79,7 @@ function installInterviewBindings(bindings: Env) {
     GOOGLE_CLOUD_PROJECT_NUMBER: bindings.GOOGLE_CLOUD_PROJECT_NUMBER,
     INTERVIEW_INVITE_SIGNING_SECRET: bindings.INTERVIEW_INVITE_SIGNING_SECRET,
     INTERVIEW_REQUIRE_SIGNED_INVITE: bindings.INTERVIEW_REQUIRE_SIGNED_INVITE,
+    INTERVIEW_RECOVERY_TOKEN: bindings.INTERVIEW_RECOVERY_TOKEN,
   };
 }
 
