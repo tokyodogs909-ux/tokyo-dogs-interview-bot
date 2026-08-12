@@ -684,6 +684,36 @@ class FakeD1Statement {
   }
 
   async first() {
+    if (this.sql.startsWith("SELECT s.status AS session_status")) {
+      const sessionId = this.values[0];
+      const session = this.database.sessions.get(sessionId);
+      if (!session) return null;
+      const artifact = this.database.artifacts.find((item) =>
+        item[1] === sessionId && item[2] && item[3] && Number.isFinite(Number(item[4])));
+      const sync = this.database.externalSyncs.get(sessionId);
+      const step = this.database.driveUploadSteps.get(sessionId);
+      const candidateTranscriptionFailed = this.database.auditEvents.some((event) => {
+        if (event.session_id !== sessionId || event.event_type !== "transcription_failed") return false;
+        try {
+          return JSON.parse(event.detail_json ?? "{}").code === "TRANSCRIPTION_FAILED";
+        } catch {
+          return false;
+        }
+      });
+      return {
+        session_status: session.status,
+        recording_status: session.recording_status,
+        transcript_json: session.transcript_json ?? null,
+        candidate_transcription_failed: candidateTranscriptionFailed ? 1 : 0,
+        recording_byte_size: artifact ? Number(artifact[4]) : null,
+        drive_status: sync?.status ?? null,
+        drive_manifest_json: sync?.manifest_json ?? null,
+        drive_error_code: sync?.error_code ?? null,
+        drive_step_phase: step?.phase ?? null,
+        drive_committed_offset: step?.committed_offset ?? null,
+        drive_total_bytes: step?.total_bytes ?? null,
+      };
+    }
     if (this.sql.startsWith("SELECT s.status, s.transcript_json,")) {
       const session = this.database.sessions.get(this.values[0]);
       if (!session) return null;
@@ -1372,11 +1402,181 @@ test("internal recovery rejects the wrong bearer and returns only aggregate stat
   assert.equal(oversized.status, 413);
 });
 
-test("Apps Script recovery uses one locked strict and secret-free minute trigger", async () => {
+test("internal recovery status returns only the fixed technical projection", async () => {
+  const recoveryToken = "status-recovery-token-never-returned-0123456789abcdef";
+  const sessionId = "TD-STATUS-123456";
+  const privateCandidateMarker = "PRIVATE-CANDIDATE-NAME";
+  const privateTranscriptMarker = "PRIVATE-TRANSCRIPT-TEXT";
+  const privateObjectKey = "interviews/private-recording-object.manifest.json";
+  const privateFolderId = "PRIVATE-DRIVE-FOLDER-ID";
+  const privateFolderUrl = "https://drive.example/private-folder";
+  const privateFileId = "PRIVATE-DRIVE-FILE-ID";
+  const database = new FakeD1();
+  database.sessions.set(sessionId, {
+    id: sessionId,
+    candidate_name: privateCandidateMarker,
+    employment: "private-employment",
+    preferred_location: "private-location",
+    status: "completed",
+    recording_status: "stored",
+    transcript_json: JSON.stringify([{
+      id: "candidate-1",
+      speaker: "candidate",
+      text: privateTranscriptMarker,
+      createdAt: "2026-08-13T00:00:00.000Z",
+    }]),
+    created_at: "2026-08-13T00:00:00.000Z",
+    updated_at: "2026-08-13T00:00:00.000Z",
+  });
+  database.artifacts.push([
+    "artifact-private", sessionId, privateObjectKey, "video/webm", 73_400_321,
+  ]);
+  database.externalSyncs.set(sessionId, {
+    provider: "google_drive",
+    status: "failed",
+    requested_at: "2026-08-13T00:00:00.000Z",
+    started_at: "2026-08-13T00:01:00.000Z",
+    completed_at: null,
+    folder_id: privateFolderId,
+    folder_url: privateFolderUrl,
+    manifest_json: JSON.stringify({
+      files: { recording: { id: privateFileId, name: "private-name" } },
+      recordingIncluded: false,
+      transcriptAvailable: true,
+      transcriptKind: "actual_transcript",
+    }),
+    error_code: "GOOGLE_DRIVE_API_503",
+    updated_at: "2026-08-13T00:02:00.000Z",
+  });
+  database.driveUploadSteps.set(sessionId, {
+    session_id: sessionId,
+    phase: "uploading",
+    committed_offset: 4_194_304,
+    total_bytes: 73_400_321,
+    upload_url_ciphertext: "PRIVATE-UPLOAD-CAPABILITY",
+    upload_url_iv: "PRIVATE-UPLOAD-IV",
+    folder_id: privateFolderId,
+    folder_url: privateFolderUrl,
+    recording_file_json: JSON.stringify({ id: privateFileId }),
+  });
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_RECOVERY_TOKEN: recoveryToken,
+  };
+  const body = JSON.stringify({ sessionId });
+
+  const unauthorized = await request("/api/internal/recovery/status", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${"z".repeat(43)}`,
+      "Content-Type": "application/json",
+      "Content-Length": String(body.length),
+    },
+    body,
+  }, env);
+  assert.equal(unauthorized.status, 401);
+
+  const response = await request("/api/internal/recovery/status", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${recoveryToken}`,
+      "Content-Type": "application/json",
+      "Content-Length": String(body.length),
+      Origin: "https://machine.invalid",
+    },
+    body,
+  }, env);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("cache-control") ?? "", /no-store/);
+  const responseText = await response.text();
+  assert.deepEqual(JSON.parse(responseText), {
+    technicalStatus: {
+      session: { status: "completed", recordingStatus: "stored" },
+      sourceTranscriptVerified: true,
+      recording: { byteSize: 73_400_321 },
+      driveSync: {
+        status: "failed",
+        manifest: {
+          present: true,
+          recordingIncluded: false,
+          transcriptAvailable: true,
+          transcriptKind: "actual_transcript",
+        },
+      },
+      driveStep: {
+        phase: "uploading",
+        committedOffset: 4_194_304,
+        totalBytes: 73_400_321,
+        lastError: "GOOGLE_DRIVE_API_503",
+      },
+    },
+  });
+  for (const privateValue of [
+    recoveryToken,
+    sessionId,
+    privateCandidateMarker,
+    privateTranscriptMarker,
+    privateObjectKey,
+    privateFolderId,
+    privateFolderUrl,
+    privateFileId,
+    "PRIVATE-UPLOAD-CAPABILITY",
+    "PRIVATE-UPLOAD-IV",
+  ]) {
+    assert.equal(responseText.includes(privateValue), false);
+  }
+
+  database.externalSyncs.get(sessionId).error_code = "GOOGLE_DRIVE_PRIVATE_CANDIDATE_NAME";
+  const sanitizedErrorResponse = await request("/api/internal/recovery/status", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${recoveryToken}`,
+      "Content-Type": "application/json",
+      "Content-Length": String(body.length),
+    },
+    body,
+  }, env);
+  const sanitizedErrorText = await sanitizedErrorResponse.text();
+  assert.equal(sanitizedErrorResponse.status, 200);
+  assert.equal(
+    JSON.parse(sanitizedErrorText).technicalStatus.driveStep.lastError,
+    "GOOGLE_DRIVE_SYNC_FAILED",
+  );
+  assert.equal(sanitizedErrorText.includes("PRIVATE_CANDIDATE_NAME"), false);
+
+  const invalidBody = JSON.stringify({ sessionId, extra: true });
+  const invalid = await request("/api/internal/recovery/status", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${recoveryToken}`,
+      "Content-Type": "application/json",
+      "Content-Length": String(invalidBody.length),
+    },
+    body: invalidBody,
+  }, env);
+  assert.equal(invalid.status, 400);
+
+  const oversizedBody = JSON.stringify({ sessionId: `TD-${"A".repeat(110)}` });
+  const oversized = await request("/api/internal/recovery/status", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${recoveryToken}`,
+      "Content-Type": "application/json",
+      "Content-Length": String(oversizedBody.length),
+    },
+    body: oversizedBody,
+  }, env);
+  assert.equal(oversized.status, 413);
+});
+
+test("Apps Script recovery uses one locked strict and secret-free five-minute trigger", async () => {
   const script = await readFile(
     new URL("../scripts/apps-script-interview-recovery.gs", import.meta.url),
     "utf8",
   );
+  const viteConfig = await readFile(new URL("../vite.config.ts", import.meta.url), "utf8");
   assert.match(script, /INTERVIEW_RECOVERY_URL\s*=\s*\n?\s*"https:\/\/recruit\.tokyo-dogs\.com\/api\/internal\/recovery"/);
   assert.match(script, /getScriptProperties\(\)[\s\S]*?\.getProperty\(INTERVIEW_RECOVERY_TOKEN_PROPERTY\)/);
   assert.match(script, /token\.length < 43/);
@@ -1405,7 +1605,10 @@ test("Apps Script recovery uses one locked strict and secret-free minute trigger
   assert.match(script, /ScriptApp\.getProjectTriggers\(\)/);
   assert.match(script, /trigger\.getHandlerFunction\(\) === INTERVIEW_RECOVERY_HANDLER/);
   assert.match(script, /ScriptApp\.deleteTrigger\(trigger\)/);
-  assert.match(script, /ScriptApp\.newTrigger\(INTERVIEW_RECOVERY_HANDLER\)[\s\S]*?\.everyMinutes\(1\)[\s\S]*?\.create\(\)/);
+  assert.match(script, /ScriptApp\.newTrigger\(INTERVIEW_RECOVERY_HANDLER\)[\s\S]*?\.everyMinutes\(5\)[\s\S]*?\.create\(\)/);
+  assert.doesNotMatch(script, /\.everyMinutes\(1\)/);
+  assert.match(viteConfig, /triggers:\s*\{\s*crons:\s*\["2-59\/5 \* \* \* \*"\]\s*\}/);
+  assert.doesNotMatch(viteConfig, /crons:\s*\["\* \* \* \* \*"\]/);
   assert.doesNotMatch(script, /Logger\.|console\.|console\.log|gh api|github\.token|secrets\./i);
   for (const error of script.matchAll(/new Error\(([^)]+)\)/g)) {
     assert.match(error[1], /^"INTERVIEW_RECOVERY_[A-Z_]+"$/);

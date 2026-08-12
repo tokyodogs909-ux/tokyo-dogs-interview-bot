@@ -17,7 +17,7 @@ const localBindingConfig = {
   // Cloudflare Cron is the production recovery clock. Each tick is bounded to
   // one paid transcription and one <=4 MiB Drive chunk; D1 CAS/leases make
   // overlap with candidate or staff retries safe.
-  triggers: { crons: ["* * * * *"] },
+  triggers: { crons: ["2-59/5 * * * *"] },
   vars: {
     ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
     ...(process.env.INTERVIEW_STAFF_TOKEN

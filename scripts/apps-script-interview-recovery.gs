@@ -3,7 +3,7 @@
  *
  * Set INTERVIEW_RECOVERY_TOKEN in Script Properties. Never put the token in
  * this file. Run installInterviewRecoveryTrigger() once to converge the
- * project to exactly one one-minute trigger for runInterviewRecovery().
+ * project to exactly one five-minute trigger for runInterviewRecovery().
  */
 const INTERVIEW_RECOVERY_HANDLER = "runInterviewRecovery";
 const INTERVIEW_RECOVERY_TOKEN_PROPERTY = "INTERVIEW_RECOVERY_TOKEN";
@@ -31,7 +31,7 @@ function installInterviewRecoveryTrigger() {
   });
   ScriptApp.newTrigger(INTERVIEW_RECOVERY_HANDLER)
     .timeBased()
-    .everyMinutes(1)
+    .everyMinutes(5)
     .create();
 }
 

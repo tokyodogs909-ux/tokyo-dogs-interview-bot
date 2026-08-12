@@ -129,6 +129,225 @@ export async function getInterviewSessionState(sessionId: string) {
     .first<{ id: string; status: string; recording_status: string; transcript_json: string | null }>();
 }
 
+export type InterviewRecoveryTechnicalStatus = {
+  session: {
+    status: string;
+    recordingStatus: string;
+  };
+  sourceTranscriptVerified: boolean;
+  recording: {
+    byteSize: number | null;
+  };
+  driveSync: {
+    status: string | null;
+    manifest: {
+      present: boolean;
+      recordingIncluded: boolean | null;
+      transcriptAvailable: boolean | null;
+      transcriptKind: "actual_transcript" | "unknown" | null;
+    };
+  };
+  driveStep: {
+    phase: "uploading" | "finalizing" | null;
+    committedOffset: number | null;
+    totalBytes: number | null;
+    lastError: string | null;
+  };
+};
+
+type InterviewRecoveryTechnicalRow = {
+  session_status: string;
+  recording_status: string;
+  transcript_json: string | null;
+  candidate_transcription_failed: number;
+  recording_byte_size: number | null;
+  drive_status: string | null;
+  drive_manifest_json: string | null;
+  drive_error_code: string | null;
+  drive_step_phase: string | null;
+  drive_committed_offset: number | null;
+  drive_total_bytes: number | null;
+};
+
+function recoveryTranscriptForVerification(value: unknown): TranscriptTurn[] {
+  const decoded = parseJson<unknown>(value, null);
+  if (!Array.isArray(decoded)) return [];
+  return decoded.slice(0, 300).flatMap((item): TranscriptTurn[] => {
+    if (!item || typeof item !== "object") return [];
+    const turn = item as Partial<TranscriptTurn>;
+    if (
+      typeof turn.id !== "string" ||
+      (turn.speaker !== "candidate" && turn.speaker !== "interviewer") ||
+      typeof turn.text !== "string"
+    ) return [];
+    return [{
+      id: turn.id.slice(0, 120),
+      speaker: turn.speaker,
+      text: turn.text.replace(/\0/g, "").trim().slice(0, 5_000),
+      createdAt: typeof turn.createdAt === "string" ? turn.createdAt.slice(0, 40) : "",
+    }];
+  });
+}
+
+function recoveryTechnicalLastError(value: unknown) {
+  if (typeof value !== "string" || !value) return null;
+  if (value.startsWith("GOOGLE_DRIVE_CONFIGURATION_MISSING")) {
+    return "GOOGLE_DRIVE_CONFIGURATION_MISSING";
+  }
+  if (/^GOOGLE_DRIVE_(?:API|EXPORT|RESUMABLE_INIT|RESUMABLE_UPLOAD)_[1-5]\d{2}$/.test(value)) {
+    return value;
+  }
+  const knownCodes = new Set([
+    "GOOGLE_DRIVE_ACCOUNT_LOOKUP_FAILED",
+    "GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH",
+    "GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH",
+    "GOOGLE_DRIVE_ENCRYPTION_SECRET_MISSING",
+    "GOOGLE_DRIVE_MANAGED_ROOT_CREATE_FAILED",
+    "GOOGLE_DRIVE_MANAGED_ROOT_LOOKUP_FAILED",
+    "GOOGLE_DRIVE_OAUTH_CLIENT_MISSING",
+    "GOOGLE_DRIVE_OAUTH_NOT_CONNECTED",
+    "GOOGLE_DRIVE_RECORDING_SIZE_MISMATCH",
+    "GOOGLE_DRIVE_RECORDING_SOURCE_SIZE_MISMATCH",
+    "GOOGLE_DRIVE_REFRESH_TOKEN_DECRYPT_FAILED",
+    "GOOGLE_DRIVE_REFRESH_TOKEN_INVALID",
+    "GOOGLE_DRIVE_REFRESH_TOKEN_READBACK_MISMATCH",
+    "GOOGLE_DRIVE_RESUMABLE_RANGE_MISMATCH",
+    "GOOGLE_DRIVE_RESUMABLE_UPLOAD_INCOMPLETE",
+    "GOOGLE_DRIVE_ROOT_ID_INVALID",
+    "GOOGLE_DRIVE_ROOT_LOOKUP_FAILED",
+    "GOOGLE_DRIVE_ROOT_MISMATCH",
+    "GOOGLE_DRIVE_ROOT_NOT_WRITABLE",
+    "GOOGLE_DRIVE_ROOT_READBACK_MISMATCH",
+    "GOOGLE_DRIVE_SYNC_ALREADY_RUNNING",
+    "GOOGLE_DRIVE_SYNC_CLAIM_LOST",
+    "GOOGLE_DRIVE_SYNC_DEFERRED",
+    "GOOGLE_DRIVE_SYNC_FAILED",
+    "GOOGLE_DRIVE_TOKEN_REFRESH_RECONNECT_REQUIRED",
+    "GOOGLE_DRIVE_TOKEN_REFRESH_TRANSIENT",
+    "GOOGLE_DRIVE_UPLOAD_CAPABILITY_INVALID",
+    "GOOGLE_DRIVE_UPLOAD_STEP_CONTEXT_INVALID",
+    "GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST",
+    "GOOGLE_DRIVE_UPLOAD_STEP_READBACK_MISMATCH",
+    "INTERVIEW_DATE_INVALID",
+    "INTERVIEW_NOT_FOUND",
+    "INTERVIEW_NOT_READY_FOR_DRIVE_SYNC",
+    "INTERVIEW_RECORDING_ARTIFACT_MISSING",
+    "INTERVIEW_RECORDING_MANIFEST_INVALID",
+    "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC",
+    "INTERVIEW_RECORDING_PART_MISSING",
+    "INTERVIEW_RECORDING_RANGE_INVALID",
+    "INTERVIEW_RECORDING_RANGE_MISMATCH",
+    "INTERVIEW_RECORDING_SIZE_MISMATCH",
+    "INTERVIEW_RECORDING_STORAGE_UNAVAILABLE",
+    "INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC",
+  ]);
+  if (knownCodes.has(value)) return value;
+  return "GOOGLE_DRIVE_SYNC_FAILED";
+}
+
+function safeNonNegativeInteger(value: unknown) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+/**
+ * Returns a fixed, read-only technical projection for machine diagnostics.
+ * The query deliberately does not select candidate identity, transcript text in
+ * the response, Drive folder/file identifiers, URLs, upload capabilities, or
+ * secrets. Persisted free-form errors are reduced to known technical codes.
+ */
+export async function getInterviewRecoveryTechnicalStatus(
+  sessionId: string,
+): Promise<InterviewRecoveryTechnicalStatus | null> {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const row = await db.prepare(`SELECT
+      s.status AS session_status,
+      s.recording_status,
+      s.transcript_json,
+      EXISTS (
+        SELECT 1 FROM interview_audit_events AS ta
+        WHERE ta.session_id = s.id
+          AND ta.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(ta.detail_json)
+            THEN json_extract(ta.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+      ) AS candidate_transcription_failed,
+      (SELECT a.byte_size FROM interview_artifacts AS a
+        WHERE a.session_id = s.id AND a.kind = 'recording'
+        ORDER BY a.created_at DESC LIMIT 1) AS recording_byte_size,
+      d.status AS drive_status,
+      d.manifest_json AS drive_manifest_json,
+      d.error_code AS drive_error_code,
+      u.phase AS drive_step_phase,
+      u.committed_offset AS drive_committed_offset,
+      u.total_bytes AS drive_total_bytes
+    FROM interview_sessions AS s
+    LEFT JOIN interview_external_syncs AS d
+      ON d.session_id = s.id AND d.provider = 'google_drive'
+    LEFT JOIN interview_drive_upload_steps AS u ON u.session_id = s.id
+    WHERE s.id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<InterviewRecoveryTechnicalRow>();
+  if (!row) return null;
+
+  const transcript = recoveryTranscriptForVerification(row.transcript_json);
+  const sourceTranscriptVerified = hasVerifiedCandidateTranscript(
+    transcript,
+    Number(row.candidate_transcription_failed) === 1
+      ? [{ type: "transcription_failed", detail: { code: "TRANSCRIPTION_FAILED" } }]
+      : [],
+  );
+  const parsedManifest = parseJson<unknown>(row.drive_manifest_json, null);
+  const manifest = parsedManifest && typeof parsedManifest === "object" && !Array.isArray(parsedManifest)
+    ? parsedManifest as Record<string, unknown>
+    : null;
+  const phase = row.drive_step_phase === "uploading" || row.drive_step_phase === "finalizing"
+    ? row.drive_step_phase
+    : null;
+  const committedOffset = phase ? safeNonNegativeInteger(row.drive_committed_offset) : null;
+  const totalBytes = phase ? safeNonNegativeInteger(row.drive_total_bytes) : null;
+  const sessionStatuses = new Set([
+    "created", "in_progress", "evaluation_pending", "evaluation_processing", "completed",
+  ]);
+  const recordingStatuses = new Set([
+    "not_started", "uploading", "stored", "failed", "not_applicable",
+  ]);
+  const driveStatuses = new Set(["pending", "running", "completed", "failed"]);
+
+  return {
+    session: {
+      status: sessionStatuses.has(row.session_status) ? row.session_status : "unknown",
+      recordingStatus: recordingStatuses.has(row.recording_status) ? row.recording_status : "unknown",
+    },
+    sourceTranscriptVerified,
+    recording: {
+      byteSize: safeNonNegativeInteger(row.recording_byte_size),
+    },
+    driveSync: {
+      status: row.drive_status && driveStatuses.has(row.drive_status) ? row.drive_status : null,
+      manifest: {
+        present: manifest !== null,
+        recordingIncluded: typeof manifest?.recordingIncluded === "boolean"
+          ? manifest.recordingIncluded
+          : null,
+        transcriptAvailable: typeof manifest?.transcriptAvailable === "boolean"
+          ? manifest.transcriptAvailable
+          : null,
+        transcriptKind: manifest?.transcriptKind === "actual_transcript"
+          ? "actual_transcript"
+          : typeof manifest?.transcriptKind === "string" ? "unknown" : null,
+      },
+    },
+    driveStep: {
+      phase,
+      committedOffset,
+      totalBytes,
+      lastError: recoveryTechnicalLastError(row.drive_error_code),
+    },
+  };
+}
+
 async function ensureSchema(db: D1Database) {
   await db.batch([
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_sessions (
