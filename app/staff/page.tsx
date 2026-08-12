@@ -190,6 +190,7 @@ export default function StaffReviewPage() {
   const [state, setState] = useState<"idle" | "loading" | "ready" | "saving" | "syncing">("idle");
   const [message, setMessage] = useState("");
   const [recentInterviews, setRecentInterviews] = useState<InterviewListItem[] | null>(null);
+  const [nextInterviewCursor, setNextInterviewCursor] = useState<string | null>(null);
   const [archiveHealth, setArchiveHealth] = useState<ArchiveHealth | null>(null);
   const [listFilter, setListFilter] = useState("");
   const [listLoading, setListLoading] = useState(false);
@@ -358,52 +359,78 @@ export default function StaffReviewPage() {
     }
   }
 
-  async function loadInterviewList(options: { silent?: boolean } = {}) {
+  async function loadInterviewList(options: { silent?: boolean; append?: boolean } = {}) {
     if (!options.silent) {
       setListLoading(true);
       setMessage("");
     }
     try {
-      const response = await fetch(options.silent ? "/api/staff/interviews?poll=1" : "/api/staff/interviews", {
+      const searchParams = new URLSearchParams();
+      if (options.silent) searchParams.set("poll", "1");
+      if (options.append && nextInterviewCursor) searchParams.set("cursor", nextInterviewCursor);
+      const response = await fetch(`/api/staff/interviews${searchParams.size ? `?${searchParams}` : ""}`, {
         headers: authHeaders(),
         cache: "no-store",
       });
       const data = (await response.json()) as {
         interviews?: InterviewListItem[];
+        nextCursor?: string | null;
         driveRecoverySessionIds?: string[];
         archiveHealth?: ArchiveHealth;
         error?: string;
       };
       if (!response.ok || !data.interviews) throw new Error(data.error || "候補者一覧を取得できませんでした。");
-      setArchiveHealth(data.archiveHealth ?? null);
+      if (!options.append) setArchiveHealth(data.archiveHealth ?? null);
       setNotificationPermission(typeof Notification === "undefined" ? "unavailable" : Notification.permission);
-      const completedItems = data.interviews.filter((item) => isVerifiedInterviewArchive(item) && item.completedAt);
-      if (!completionMonitorInitializedRef.current) {
-        knownCompletedIdsRef.current = new Set(completedItems.map((item) => item.sessionId));
-        completionMonitorInitializedRef.current = true;
-        setCompletionNotice("完了通知を開始しました。担当者画面を開いている間、15秒ごとに新しい完了面接を確認します。");
-      } else {
-        const newlyCompleted = completedItems.filter((item) => !knownCompletedIdsRef.current.has(item.sessionId));
-        completedItems.forEach((item) => knownCompletedIdsRef.current.add(item.sessionId));
-        if (newlyCompleted.length > 0) {
-          setNewCompletedIds((current) => new Set([...current, ...newlyCompleted.map((item) => item.sessionId)]));
-          const names = newlyCompleted.map((item) => item.candidateName || "氏名未登録").join("、");
-          setCompletionNotice(`保存確認完了：${names}。必要な面接記録をDriveまで再照合済みです。`);
-          showBrowserCompletionNotification(newlyCompleted);
+      if (!options.append) {
+        const completedItems = data.interviews.filter((item) => isVerifiedInterviewArchive(item) && item.completedAt);
+        if (!completionMonitorInitializedRef.current) {
+          knownCompletedIdsRef.current = new Set(completedItems.map((item) => item.sessionId));
+          completionMonitorInitializedRef.current = true;
+          setCompletionNotice("完了通知を開始しました。担当者画面を開いている間、15秒ごとに新しい完了面接を確認します。");
+        } else {
+          const newlyCompleted = completedItems.filter((item) => !knownCompletedIdsRef.current.has(item.sessionId));
+          completedItems.forEach((item) => knownCompletedIdsRef.current.add(item.sessionId));
+          if (newlyCompleted.length > 0) {
+            setNewCompletedIds((current) => new Set([...current, ...newlyCompleted.map((item) => item.sessionId)]));
+            const names = newlyCompleted.map((item) => item.candidateName || "氏名未登録").join("、");
+            setCompletionNotice(`保存確認完了：${names}。必要な面接記録をDriveまで再照合済みです。`);
+            showBrowserCompletionNotification(newlyCompleted);
+          }
         }
       }
-      setRecentInterviews(data.interviews);
+      if (options.silent || options.append) {
+        setRecentInterviews((current) => {
+          const merged = [...(options.silent ? data.interviews ?? [] : current ?? []),
+            ...(options.silent ? current ?? [] : data.interviews ?? [])];
+          const seen = new Set<string>();
+          return merged.filter((item) => {
+            if (seen.has(item.sessionId)) return false;
+            seen.add(item.sessionId);
+            return true;
+          }).sort((left, right) =>
+            right.createdAt.localeCompare(left.createdAt) || right.sessionId.localeCompare(left.sessionId));
+        });
+      } else {
+        setRecentInterviews(data.interviews);
+      }
+      if (!options.silent) setNextInterviewCursor(data.nextCursor ?? null);
       void recoverRecordedTranscriptions();
       if (data.driveRecoverySessionIds?.length) void recoverDriveArchives(data.driveRecoverySessionIds);
       if (!options.silent) {
-        setMessage(data.interviews.length > 0
+        setMessage(options.append
+          ? `過去のオンライン一次面接を${data.interviews.length}件追加しました。`
+          : data.interviews.length > 0
           ? `最近のオンライン一次面接を${data.interviews.length}件表示しました。`
           : "オンライン一次面接の記録はまだありません。");
       }
     } catch (error) {
       if (!options.silent) {
-        setRecentInterviews(null);
-        setArchiveHealth(null);
+        if (!options.append) {
+          setRecentInterviews(null);
+          setArchiveHealth(null);
+          setNextInterviewCursor(null);
+        }
         setMessage(error instanceof Error ? error.message : "候補者一覧を取得できませんでした。");
       } else {
         setCompletionNotice("完了通知の自動確認が一時的に止まりました。「一覧を更新」を押してください。");
@@ -421,6 +448,7 @@ export default function StaffReviewPage() {
     setReview(null);
     setRecordingUrl("");
     setRecentInterviews(null);
+    setNextInterviewCursor(null);
     setArchiveHealth(null);
     completionMonitorInitializedRef.current = false;
     knownCompletedIdsRef.current.clear();
@@ -540,7 +568,7 @@ export default function StaffReviewPage() {
           <img src="/tokyo-dogs-logo.jpg" alt="Tokyo Dogs" />
           <span><strong>TOKYO DOGS</strong><small>OFFICIAL SELECTION REVIEW</small></span>
         </div>
-        <div className="staff-header-actions"><button type="button" onClick={() => void copyCandidateLink()}>候補者用URLをコピー</button><a href="/staff/google-drive">Drive接続設定</a><span className="test-pill">採用担当者専用</span></div>
+        <div className="staff-header-actions"><button type="button" onClick={() => void copyCandidateLink()}>候補者用URLをコピー</button><a href="/staff/invites">個別リンク発行</a><a href="/staff/google-drive">Drive接続設定</a><span className="test-pill">採用担当者専用</span></div>
       </header>
 
       <section className="staff-operation-guide" aria-label="初めての採用担当者向け運用手順">
@@ -591,7 +619,7 @@ export default function StaffReviewPage() {
               </div>
               {archiveHealth.attention > 0 && (
                 <small>{archiveHealth.autoRecoveryScheduled > 0
-                  ? `${archiveHealth.autoRecoveryScheduled}件の復旧処理を、この担当者画面を開いている間に再実行しています。完了表示になるまで画面を開いたまま確認してください。`
+                  ? `${archiveHealth.autoRecoveryScheduled}件を復旧対象として確認しました。サーバーの定期復旧でも処理を継続します。`
                   : `${archiveHealth.attention}件は復旧の待機中または自動再実行の対象外です。「Driveへ再格納」で状態を確認してください。`}</small>
               )}
             </div>
@@ -612,6 +640,7 @@ export default function StaffReviewPage() {
             ))}
             {filteredInterviews.length === 0 && <div className="staff-inbox-empty">該当する候補者はありません。</div>}
           </div>
+          {nextInterviewCursor && <div className="staff-inbox-actions"><button type="button" onClick={() => void loadInterviewList({ append: true })} disabled={listLoading}>{listLoading ? "読込中…" : "過去50件をさらに表示"}</button></div>}
         </section>
       )}
 

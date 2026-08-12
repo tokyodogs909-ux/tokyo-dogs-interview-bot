@@ -12,6 +12,7 @@ const minimumRecordingFixtureDurationSeconds = 60;
 // browser MediaRecorder path has separate coverage logic for live interviews.
 const recordingAudioCoverage = "unverified";
 const maxEvaluationWaitAttempts = 60;
+const archiveWallClockMs = 15 * 60 * 1_000;
 
 if (!/^https:\/\//.test(baseUrl)) {
   throw new Error("INTERVIEW_E2E_BASE_URL must be an https URL");
@@ -460,13 +461,19 @@ for (let attempt = 1; attempt <= maxEvaluationWaitAttempts; attempt += 1) {
   });
   const freshEvaluationReceipt = evaluated.response.status === 200 &&
     evaluated.body.stored === true &&
-    evaluated.body.humanReviewRequired === true;
-  const recoveredEvaluationReceipt = evaluated.response.status === 200 &&
-    evaluated.body.stored === true &&
-    evaluated.body.alreadyStored === true;
-  if (freshEvaluationReceipt || recoveredEvaluationReceipt) {
+    evaluated.body.humanReviewRequired === true &&
+    // Voice-path production proof requires the automatic evaluator itself to
+    // have completed. A service-unavailable fallback is safe for candidates but
+    // is not a passing release gate for this formal E2E.
+    evaluated.body.automaticEvaluationDeferred === false;
+  if (freshEvaluationReceipt) {
     evaluationReceipt = evaluated.body;
     break;
+  }
+  if (evaluated.response.status === 200 && evaluated.body.alreadyStored === true) {
+    // A replay receipt does not expose durable automatic-vs-fallback
+    // provenance. Treat it as unprovable, never as a green formal E2E.
+    stop("EVALUATION_PROVENANCE_UNPROVABLE", { attempt });
   }
   if (evaluated.response.status !== 409 || attempt === maxEvaluationWaitAttempts) {
     stop("EVALUATION_FAILED", { attempt, responseStatus: evaluated.response.status });
@@ -501,7 +508,10 @@ const archiveStartedAt = Date.now();
 const maxArchiveAttempts = totalParts + 24;
 let archived = null;
 let previousCommittedOffset = 0;
-for (let attempt = 1; attempt <= maxArchiveAttempts; attempt += 1) {
+let archiveProgressAttempts = 0;
+let archiveRequestCount = 0;
+while (Date.now() - archiveStartedAt < archiveWallClockMs) {
+  archiveRequestCount += 1;
   const stepStartedAt = Date.now();
   const archive = await archiveStep();
   const step = archive.body;
@@ -509,7 +519,7 @@ for (let attempt = 1; attempt <= maxArchiveAttempts; attempt += 1) {
   const committedOffset = stored ? recording.byteLength : Number(step.committedOffset ?? 0);
   const totalBytes = stored ? recording.byteLength : Number(step.totalBytes ?? 0);
   add("foreground_drive_archive_step", archive.response, {
-    attempt,
+    attempt: archiveRequestCount,
     elapsedMs: Date.now() - stepStartedAt,
     stored,
     recordingIncluded: step.recordingIncluded === true,
@@ -521,35 +531,44 @@ for (let attempt = 1; attempt <= maxArchiveAttempts; attempt += 1) {
     totalBytes,
   });
   if (!archive.response.ok) {
-    stop("DRIVE_ARCHIVE_STEP_FAILED", { attempt, responseStatus: archive.response.status });
+    stop("DRIVE_ARCHIVE_STEP_FAILED", { attempt: archiveRequestCount, responseStatus: archive.response.status });
   }
   if (stored) {
     archived = step;
     break;
   }
   if (step.pending !== true || typeof step.phase !== "string") {
-    stop("DRIVE_ARCHIVE_STEP_RECEIPT_MISSING", { attempt });
+    stop("DRIVE_ARCHIVE_STEP_RECEIPT_MISSING", { attempt: archiveRequestCount });
   }
   if (
     !Number.isInteger(committedOffset) ||
     committedOffset < previousCommittedOffset ||
     committedOffset > recording.byteLength
   ) {
-    stop("DRIVE_ARCHIVE_OFFSET_INVALID", { attempt, previousCommittedOffset, committedOffset });
+    stop("DRIVE_ARCHIVE_OFFSET_INVALID", { attempt: archiveRequestCount, previousCommittedOffset, committedOffset });
   }
   if (totalBytes !== 0 && totalBytes !== recording.byteLength) {
     stop("DRIVE_ARCHIVE_TOTAL_BYTES_MISMATCH", {
-      attempt,
+      attempt: archiveRequestCount,
       expectedBytes: recording.byteLength,
       actualBytes: totalBytes,
     });
   }
+  const waitOnlyPhase = ["busy", "initializing", "retrying"].includes(step.phase);
+  if (!waitOnlyPhase) archiveProgressAttempts += 1;
   previousCommittedOffset = committedOffset;
-  if (attempt === maxArchiveAttempts) {
-    stop("DRIVE_ARCHIVE_STEP_BUDGET_EXHAUSTED", { attempts: maxArchiveAttempts, committedOffset });
+  if (archiveProgressAttempts >= maxArchiveAttempts) {
+    stop("DRIVE_ARCHIVE_STEP_BUDGET_EXHAUSTED", {
+      attempts: archiveProgressAttempts,
+      requests: archiveRequestCount,
+      committedOffset,
+    });
   }
   const retryAfterMs = Number(step.retryAfterMs ?? 250);
   await wait(Number.isFinite(retryAfterMs) ? Math.min(5_000, Math.max(0, retryAfterMs)) : 250);
+}
+if (!archived && Date.now() - archiveStartedAt >= archiveWallClockMs) {
+  stop("DRIVE_ARCHIVE_WALL_CLOCK_EXHAUSTED", { requests: archiveRequestCount, committedOffset: previousCommittedOffset });
 }
 
 if (

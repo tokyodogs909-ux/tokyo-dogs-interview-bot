@@ -17,10 +17,13 @@ export function requireOpenAIApiKey() {
   return apiKey;
 }
 
-type OpenAIHealthCache = {
+type OpenAIModelHealthCache = {
   apiKeyHash: string;
+  model: string;
   checkedAt: number;
   healthy: boolean;
+  lastHealthyAt: number | null;
+  ttlMs: number;
 };
 
 function openAIServiceBinding() {
@@ -29,9 +32,13 @@ function openAIServiceBinding() {
   }).__TOKYO_DOGS_INTERVIEW_BINDINGS__?.OPENAI_API;
 }
 
-let openAIHealthCache: OpenAIHealthCache | null = null;
+const openAIModelHealthCache = new Map<string, OpenAIModelHealthCache>();
+const openAIModelHealthInFlight = new Map<string, Promise<boolean>>();
 const OPENAI_HEALTHY_CACHE_MS = 5 * 60 * 1000;
 const OPENAI_UNHEALTHY_CACHE_MS = 30 * 1000;
+const OPENAI_TRANSIENT_CACHE_MS = 30 * 1000;
+const OPENAI_STALE_GOOD_MS = 30 * 60 * 1000;
+const OPENAI_MODEL_TIMEOUT_MS = 8 * 1000;
 
 function diagnosticToken(value: unknown) {
   if (typeof value !== "string") return null;
@@ -53,6 +60,126 @@ async function safeOpenAIErrorMetadata(response: Response) {
   }
 }
 
+type OpenAIModelProbe = {
+  outcome: "healthy" | "definitive-unhealthy" | "transient";
+  status: number | null;
+  requestId: string;
+  error: { code: string | null; type: string | null };
+};
+
+async function probeOpenAIModel(model: string, apiKey: string): Promise<OpenAIModelProbe> {
+  const controller = new AbortController();
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<OpenAIModelProbe>((resolve) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      resolve({
+        outcome: "transient",
+        status: null,
+        requestId: "unavailable",
+        error: { code: "timeout", type: "transport" },
+      });
+    }, OPENAI_MODEL_TIMEOUT_MS);
+  });
+  const request = new Request(`https://api.openai.com/v1/models/${encodeURIComponent(model)}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: controller.signal,
+  });
+  const service = openAIServiceBinding();
+  const network = (service ? service.fetch(request) : fetch(request)).then(async (response) => {
+    const error = await safeOpenAIErrorMetadata(response);
+    if (response.ok) {
+      return {
+        outcome: "healthy",
+        status: response.status,
+        requestId: diagnosticToken(response.headers.get("x-request-id")) ?? "unavailable",
+        error,
+      } satisfies OpenAIModelProbe;
+    }
+    const transientStatus = response.status === 408 || response.status === 409 ||
+      response.status === 425 || response.status === 429 || response.status >= 500;
+    // A quota rejection is durable operator action, not momentary congestion.
+    const definitiveQuotaFailure = error.code === "insufficient_quota" ||
+      error.code === "credit_balance_exhausted";
+    return {
+      outcome: transientStatus && !definitiveQuotaFailure ? "transient" : "definitive-unhealthy",
+      status: response.status,
+      requestId: diagnosticToken(response.headers.get("x-request-id")) ?? "unavailable",
+      error,
+    } satisfies OpenAIModelProbe;
+  }).catch(() => ({
+    outcome: "transient" as const,
+    status: null,
+    requestId: "unavailable",
+    error: { code: "transport_error", type: "transport" },
+  }));
+  try {
+    return await Promise.race([network, timeout]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+async function verifyOpenAIModel(model: string, apiKey: string, apiKeyHash: string) {
+  const cacheKey = `${apiKeyHash}:${model}`;
+  const now = Date.now();
+  const cached = openAIModelHealthCache.get(cacheKey);
+  if (cached && now - cached.checkedAt < cached.ttlMs) return cached.healthy;
+  const running = openAIModelHealthInFlight.get(cacheKey);
+  if (running) return await running;
+
+  const check = (async () => {
+    const probe = await probeOpenAIModel(model, apiKey);
+    const checkedAt = Date.now();
+    if (probe.outcome === "healthy") {
+      openAIModelHealthCache.set(cacheKey, {
+        apiKeyHash,
+        model,
+        checkedAt,
+        healthy: true,
+        lastHealthyAt: checkedAt,
+        ttlMs: OPENAI_HEALTHY_CACHE_MS,
+      });
+      return true;
+    }
+
+    const knownHealthy = cached?.lastHealthyAt !== null && cached?.lastHealthyAt !== undefined &&
+      checkedAt - cached.lastHealthyAt <= OPENAI_STALE_GOOD_MS;
+    const healthy = probe.outcome === "transient" && knownHealthy;
+    openAIModelHealthCache.set(cacheKey, {
+      apiKeyHash,
+      model,
+      checkedAt,
+      healthy,
+      lastHealthyAt: cached?.lastHealthyAt ?? null,
+      ttlMs: probe.outcome === "transient" ? OPENAI_TRANSIENT_CACHE_MS : OPENAI_UNHEALTHY_CACHE_MS,
+    });
+    // Restrict upstream metadata to short machine-readable tokens. Never log
+    // credentials, human-readable messages, response bodies, or candidate data.
+    console.warn(
+      probe.outcome === "transient" && healthy
+        ? "OPENAI_AUTHENTICATION_CHECK_TRANSIENT"
+        : "OPENAI_AUTHENTICATION_CHECK_FAILED",
+      {
+        model,
+        status: probe.status,
+        requestId: probe.requestId,
+        error: probe.error,
+        staleGood: healthy,
+      },
+    );
+    return healthy;
+  })();
+  openAIModelHealthInFlight.set(cacheKey, check);
+  try {
+    return await check;
+  } finally {
+    if (openAIModelHealthInFlight.get(cacheKey) === check) {
+      openAIModelHealthInFlight.delete(cacheKey);
+    }
+  }
+}
+
 /**
  * The candidate readiness endpoint must not report green merely because a string
  * named OPENAI_API_KEY exists. A revoked, mistyped, or billing-disabled key looks
@@ -64,46 +191,14 @@ async function safeOpenAIErrorMetadata(response: Response) {
 export async function verifyOpenAIAuthentication() {
   const apiKey = requireOpenAIApiKey();
   const apiKeyHash = await privacySafeIdentifier(apiKey);
-  const now = Date.now();
-  if (openAIHealthCache?.apiKeyHash === apiKeyHash) {
-    const ttl = openAIHealthCache.healthy ? OPENAI_HEALTHY_CACHE_MS : OPENAI_UNHEALTHY_CACHE_MS;
-    if (now - openAIHealthCache.checkedAt < ttl) return openAIHealthCache.healthy;
+  // A key rotation invalidates all observations from the previous credential
+  // without allowing the module cache to grow unbounded across rotations.
+  for (const key of openAIModelHealthCache.keys()) {
+    if (!key.startsWith(`${apiKeyHash}:`)) openAIModelHealthCache.delete(key);
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5_000);
-  try {
-    const requests = [REALTIME_MODEL, EVALUATION_MODEL].map((model) => new Request(
-      `https://api.openai.com/v1/models/${encodeURIComponent(model)}`,
-      {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        signal: controller.signal,
-      },
-    ));
-    // The optional Fetcher binding is used by deterministic Worker tests and can
-    // also support a future egress proxy. Production normally takes global fetch.
-    const service = openAIServiceBinding();
-    const responses = await Promise.all(requests.map((request) =>
-      service ? service.fetch(request) : fetch(request)));
-    const healthy = responses.every((response) => response.ok);
-    if (!healthy) {
-      // Restrict upstream metadata to short machine-readable tokens. Never log
-      // credentials, human-readable messages, response bodies, or candidate data.
-      const errors = await Promise.all(responses.map(safeOpenAIErrorMetadata));
-      console.warn("OPENAI_AUTHENTICATION_CHECK_FAILED", {
-        models: [REALTIME_MODEL, EVALUATION_MODEL],
-        statuses: responses.map((response) => response.status),
-        requestIds: responses.map((response) => response.headers.get("x-request-id") ?? "unavailable"),
-        errors,
-      });
-    }
-    openAIHealthCache = { apiKeyHash, checkedAt: now, healthy };
-    return healthy;
-  } catch {
-    openAIHealthCache = { apiKeyHash, checkedAt: now, healthy: false };
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
+  const results = await Promise.all([REALTIME_MODEL, EVALUATION_MODEL].map((model) =>
+    verifyOpenAIModel(model, apiKey, apiKeyHash)));
+  return results.every(Boolean);
 }
 
 export async function privacySafeIdentifier(value: string) {

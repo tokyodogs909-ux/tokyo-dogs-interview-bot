@@ -12,6 +12,7 @@ const minimumRecordingFixtureDurationSeconds = 60;
 const recordingAudioCoverage = "unverified";
 const maxServerRetryAfterSeconds = 300;
 const answerRetryWallClockMs = 10 * 60 * 1_000;
+const archiveWallClockMs = 15 * 60 * 1_000;
 if (!/^https:\/\//.test(baseUrl)) throw new Error("INTERVIEW_E2E_BASE_URL must be an https URL");
 if (!recordingPath) throw new Error("INTERVIEW_E2E_RECORDING_PATH is required");
 if (!answerAudioPath) throw new Error("INTERVIEW_E2E_ANSWER_AUDIO_PATH is required");
@@ -54,7 +55,7 @@ function answerAudioContentType(bytes) {
 
 const answerContentType = answerAudioContentType(answerAudio);
 
-function probeMedia(path, requiredStreams, minimumDurationSeconds = 0.5) {
+function probeMedia(path, requirements, minimumDurationSeconds = 0.5) {
   const probe = spawnSync(
     process.env.INTERVIEW_E2E_FFPROBE_PATH ?? "ffprobe",
     ["-v", "error", "-show_entries", "format=duration,format_name:stream=codec_type,codec_name", "-of", "json", path],
@@ -63,23 +64,46 @@ function probeMedia(path, requiredStreams, minimumDurationSeconds = 0.5) {
   if (probe.status !== 0) throw new Error(`Media fixture is not readable by ffprobe: ${path}`);
   const info = JSON.parse(probe.stdout || "{}");
   const durationSeconds = Number(info?.format?.duration);
-  const streamTypes = Array.isArray(info?.streams) ? info.streams.map((stream) => stream?.codec_type) : [];
+  const formatNames = String(info?.format?.format_name ?? "").split(",");
+  const streams = Array.isArray(info?.streams) ? info.streams : [];
+  const hasRequiredStream = (type, codecs) => streams.some((stream) =>
+    stream?.codec_type === type && codecs.includes(stream?.codec_name));
   if (
     !Number.isFinite(durationSeconds) ||
     durationSeconds < minimumDurationSeconds ||
-    requiredStreams.some((streamType) => !streamTypes.includes(streamType))
+    !formatNames.includes(requirements.format) ||
+    !hasRequiredStream(requirements.video.type, requirements.video.codecs) ||
+    !hasRequiredStream(requirements.audio.type, requirements.audio.codecs)
   ) {
-    throw new Error(`Media fixture is not decodable with the required streams: ${path}`);
+    throw new Error(`Media fixture does not meet the strict WebM codec contract: ${path}`);
   }
   return durationSeconds;
 }
 
 const recordingDurationSeconds = probeMedia(
   recordingPath,
-  ["video", "audio"],
+  {
+    format: "webm",
+    video: { type: "video", codecs: ["vp8", "vp9", "av1"] },
+    audio: { type: "audio", codecs: ["opus", "vorbis"] },
+  },
   minimumRecordingFixtureDurationSeconds,
 );
-const answerAudioDurationSeconds = probeMedia(answerAudioPath, ["audio"]);
+const answerAudioDurationSeconds = (() => {
+  const probe = spawnSync(
+    process.env.INTERVIEW_E2E_FFPROBE_PATH ?? "ffprobe",
+    ["-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json", answerAudioPath],
+    { encoding: "utf8", maxBuffer: 1024 * 1024 },
+  );
+  if (probe.status !== 0) throw new Error(`Media fixture is not readable by ffprobe: ${answerAudioPath}`);
+  const info = JSON.parse(probe.stdout || "{}");
+  const durationSeconds = Number(info?.format?.duration);
+  const hasAudio = Array.isArray(info?.streams) && info.streams.some((stream) => stream?.codec_type === "audio");
+  if (!Number.isFinite(durationSeconds) || durationSeconds < 0.5 || !hasAudio) {
+    throw new Error(`Media fixture is not decodable with the required audio stream: ${answerAudioPath}`);
+  }
+  return durationSeconds;
+})();
 
 function add(step, response, detail = {}) {
   results.push({ step, status: response.status, ok: response.ok, ...detail });
@@ -615,7 +639,10 @@ const archiveStartedAt = Date.now();
 const maxArchiveAttempts = totalParts + 20;
 let archived = null;
 let previousCommittedOffset = 0;
-for (let attempt = 1; attempt <= maxArchiveAttempts; attempt += 1) {
+let archiveProgressAttempts = 0;
+let archiveRequestCount = 0;
+while (Date.now() - archiveStartedAt < archiveWallClockMs) {
+  archiveRequestCount += 1;
   const stepStartedAt = Date.now();
   const archive = await fetch(`${baseUrl}/api/interviews/archive`, {
     method: "POST",
@@ -627,7 +654,7 @@ for (let attempt = 1; attempt <= maxArchiveAttempts; attempt += 1) {
   const committedOffset = isStored ? recording.byteLength : Number(step.committedOffset ?? 0);
   const totalBytes = isStored ? recording.byteLength : Number(step.totalBytes ?? 0);
   add("foreground_drive_archive_step", archive, {
-    attempt,
+    attempt: archiveRequestCount,
     elapsedMs: Date.now() - stepStartedAt,
     stored: step.stored === true,
     recordingIncluded: step.recordingIncluded === true,
@@ -638,17 +665,17 @@ for (let attempt = 1; attempt <= maxArchiveAttempts; attempt += 1) {
   });
 
   if (!archive.ok) {
-    stop("Foreground archive step failed", { attempt, status: archive.status, error: step.error });
+    stop("Foreground archive step failed", { attempt: archiveRequestCount, status: archive.status, error: step.error });
   }
   if (step.stored === true) {
     if (step.recordingIncluded !== true) {
-      stop("Foreground archive completed without the recording", { attempt });
+      stop("Foreground archive completed without the recording", { attempt: archiveRequestCount });
     }
     archived = step;
     break;
   }
   if (step.pending !== true || typeof step.phase !== "string") {
-    stop("Foreground archive returned neither a stored receipt nor a pending step", { attempt });
+    stop("Foreground archive returned neither a stored receipt nor a pending step", { attempt: archiveRequestCount });
   }
   if (
     !Number.isInteger(committedOffset) ||
@@ -656,27 +683,36 @@ for (let attempt = 1; attempt <= maxArchiveAttempts; attempt += 1) {
     committedOffset > recording.byteLength
   ) {
     stop("Foreground archive committed offset was invalid or regressed", {
-      attempt,
+      attempt: archiveRequestCount,
       previousCommittedOffset,
       committedOffset,
     });
   }
   if (totalBytes !== 0 && totalBytes !== recording.byteLength) {
     stop("Foreground archive total byte count did not match the uploaded recording", {
-      attempt,
+      attempt: archiveRequestCount,
       expected: recording.byteLength,
       actual: totalBytes,
     });
   }
+  const waitOnlyPhase = ["busy", "initializing", "retrying"].includes(step.phase);
+  if (!waitOnlyPhase) archiveProgressAttempts += 1;
   previousCommittedOffset = committedOffset;
-  if (attempt === maxArchiveAttempts) {
+  if (archiveProgressAttempts >= maxArchiveAttempts) {
     stop("Foreground archive did not finish within the finite step budget", {
-      attempts: maxArchiveAttempts,
+      attempts: archiveProgressAttempts,
+      requests: archiveRequestCount,
       committedOffset,
     });
   }
   const retryAfterMs = Number(step.retryAfterMs ?? 250);
   await wait(Number.isFinite(retryAfterMs) ? Math.min(5_000, Math.max(0, retryAfterMs)) : 250);
+}
+if (!archived && Date.now() - archiveStartedAt >= archiveWallClockMs) {
+  stop("Foreground archive did not finish within the wall-clock deadline", {
+    requests: archiveRequestCount,
+    committedOffset: previousCommittedOffset,
+  });
 }
 const archiveElapsedMs = Date.now() - archiveStartedAt;
 if (

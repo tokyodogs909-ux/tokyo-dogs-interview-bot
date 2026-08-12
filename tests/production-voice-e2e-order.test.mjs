@@ -94,8 +94,9 @@ test("production voice E2E accepts explicit human review fallback and requires e
   assert.match(source, /finalizeReplay\.body\.alreadyStored !== true/);
 
   assert.match(source, /evaluated\.body\.humanReviewRequired === true/);
-  assert.match(source, /evaluated\.body\.automaticEvaluationDeferred === true/);
+  assert.match(source, /evaluated\.body\.automaticEvaluationDeferred === false/);
   assert.match(source, /evaluated\.body\.alreadyStored === true/);
+  assert.match(source, /EVALUATION_PROVENANCE_UNPROVABLE/);
   assert.match(source, /evaluated\.response\.status !== 409/);
   assert.match(source, /maxEvaluationWaitAttempts = 60/);
   assert.match(source, /evaluationReplay\.body\.alreadyStored !== true/);
@@ -108,6 +109,10 @@ test("production voice E2E accepts explicit human review fallback and requires e
   assert.match(source, /archiveReplay\.body\.transcriptKind !== "actual_transcript"/);
   assert.match(source, /committedOffset < previousCommittedOffset/);
   assert.match(source, /totalBytes !== 0 && totalBytes !== recording\.byteLength/);
+  assert.match(source, /archiveWallClockMs = 15 \* 60 \* 1_000/);
+  assert.match(source, /while \(Date\.now\(\) - archiveStartedAt < archiveWallClockMs\)/);
+  assert.match(source, /\["busy", "initializing", "retrying"\]\.includes\(step\.phase\)/);
+  assert.match(source, /if \(!waitOnlyPhase\) archiveProgressAttempts \+= 1/);
 });
 
 test("production voice E2E emits only readback keys and recording digests, never credentials or transcript text", () => {
@@ -291,7 +296,7 @@ globalThis.fetch = async (input, init = {}) => {
     }
     state.evaluationCalls += 1;
     if (state.evaluationCalls === 1) {
-      return response({ stored: true, humanReviewRequired: true, automaticEvaluationDeferred: true });
+      return response({ stored: true, humanReviewRequired: true, automaticEvaluationDeferred: false });
     }
     return response({ stored: true, alreadyStored: true });
   }
@@ -368,7 +373,7 @@ globalThis.fetch = async (input, init = {}) => {
     assert.match(receipt.recordingMd5, /^[a-f0-9]{32}$/);
     assert.equal(receipt.transcriptTurnCount, 4);
     assert.equal(receipt.candidateTurnCount, 2);
-    assert.equal(receipt.automaticEvaluationDeferred, true);
+    assert.equal(receipt.automaticEvaluationDeferred, false);
     assert.deepEqual(receipt.driveArchiveReceipt, {
       stored: true,
       recordingIncluded: true,

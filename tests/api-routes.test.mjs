@@ -23,6 +23,18 @@ function request(path, init, env = workerEnv) {
   return worker.fetch(new Request(`http://localhost${path}`, init), env, workerContext);
 }
 
+function scheduleInterviewRecovery(env) {
+  let scheduledWork = null;
+  worker.scheduled({ scheduledTime: Date.now(), cron: "* * * * *" }, env, {
+    waitUntil(promise) {
+      scheduledWork = promise;
+    },
+    passThroughOnException() {},
+  });
+  assert.ok(scheduledWork instanceof Promise);
+  return scheduledWork;
+}
+
 function sha256Hex(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -389,6 +401,13 @@ class FakeD1Statement {
         session.updated_at = updatedAt;
         changes = 1;
       }
+    } else if (this.sql.startsWith("UPDATE interview_sessions SET updated_at = ? WHERE id = ? AND recording_status IN ('uploading', 'failed')")) {
+      const [updatedAt, id] = this.values;
+      const session = this.database.sessions.get(id);
+      if (session && ["uploading", "failed"].includes(session.recording_status)) {
+        session.updated_at = updatedAt;
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'stored'")) {
       const [updatedAt, id] = this.values;
       const session = this.database.sessions.get(id);
@@ -712,8 +731,22 @@ class FakeD1Statement {
           ) return false;
           try {
             const transcript = JSON.parse(session.transcript_json);
-            return Array.isArray(transcript) && transcript.some((turn) =>
-              turn?.speaker === "candidate" && typeof turn.text === "string" && turn.text.trim());
+            if (!Array.isArray(transcript)) return false;
+            const candidateTurns = transcript.slice(0, 300).filter((turn) =>
+              turn?.speaker === "candidate" && typeof turn.id === "string" &&
+              typeof turn.text === "string" && turn.text.trim());
+            if (candidateTurns.length === 0 || candidateTurns.some((turn) =>
+              turn.id.startsWith("recorded-fallback-answer-"))) return false;
+            const realtimeGap = this.database.auditEvents.some((event) => {
+              if (event.session_id !== session.id || event.event_type !== "transcription_failed") return false;
+              try {
+                return JSON.parse(event.detail_json ?? "{}").code === "TRANSCRIPTION_FAILED";
+              } catch {
+                return false;
+              }
+            });
+            return !realtimeGap || candidateTurns.every((turn) =>
+              turn.id.startsWith("recorded-transcribed-answer-"));
           } catch {
             return false;
           }
@@ -725,8 +758,8 @@ class FakeD1Statement {
         })
         .map((session) => ({ id: session.id, transcript_json: session.transcript_json }))[0] ?? null;
     }
-    if (this.sql.startsWith("SELECT s.id FROM interview_sessions s WHERE s.status IN")) {
-      const [staleBefore] = this.values;
+    if (this.sql.startsWith("SELECT s.id FROM interview_sessions s WHERE s.recording_status IN")) {
+      const [staleBefore, completedBefore] = this.values;
       return [...this.database.sessions.values()]
         .filter((session) => {
           let transcriptHasCandidate = false;
@@ -742,10 +775,12 @@ class FakeD1Statement {
             event.session_id === session.id && event.event_type === "voice_transcript_sealed");
           const hasSeal = this.database.recordedCompletions.has(session.id) ||
             (voiceSealed && !fallbackStarted && transcriptHasCandidate);
-          return hasSeal &&
-          ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
-          ["uploading", "failed"].includes(session.recording_status) &&
-          session.updated_at <= staleBefore;
+          const recoverableStatus = session.status === "completed"
+            ? typeof session.completed_at === "string" && session.completed_at <= completedBefore
+            : hasSeal && ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status);
+          return recoverableStatus &&
+            ["uploading", "failed"].includes(session.recording_status) &&
+            session.updated_at <= staleBefore;
         })
         .sort((left, right) => left.id.localeCompare(right.id))
         .map((session) => ({ id: session.id }))[0] ?? null;
@@ -854,11 +889,109 @@ class FakeD1Statement {
           .map((event) => ({ event_type: event.event_type, detail_json: event.detail_json })),
       };
     }
-    if (this.sql.startsWith("SELECT s.id, s.candidate_name")) {
-      const limit = this.values[0];
+    if (this.sql.startsWith("SELECT s.id FROM interview_sessions s WHERE s.recording_status IN")) {
+      const [staleBefore, completedBefore] = this.values;
       return {
         results: [...this.database.sessions.values()]
-          .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)))
+          .filter((session) => {
+            let transcriptHasCandidate = false;
+            try {
+              transcriptHasCandidate = JSON.parse(session.transcript_json ?? "[]").some((turn) =>
+                turn?.speaker === "candidate" && typeof turn.text === "string" && turn.text.trim());
+            } catch {
+              transcriptHasCandidate = false;
+            }
+            const fallbackStarted = this.database.auditEvents.some((event) =>
+              event.session_id === session.id && event.event_type === "recorded_fallback_started");
+            const voiceSealed = this.database.auditEvents.some((event) =>
+              event.session_id === session.id && event.event_type === "voice_transcript_sealed");
+            const hasSeal = this.database.recordedCompletions.has(session.id) ||
+              (voiceSealed && !fallbackStarted && transcriptHasCandidate);
+            const recoverableStatus = session.status === "completed"
+              ? typeof session.completed_at === "string" && session.completed_at <= completedBefore
+              : hasSeal && ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status);
+            return recoverableStatus &&
+              ["uploading", "failed"].includes(session.recording_status) &&
+              session.updated_at <= staleBefore;
+          })
+          .sort((left, right) => {
+            const updatedOrder = left.updated_at.localeCompare(right.updated_at);
+            if (updatedOrder !== 0) return updatedOrder;
+            const leftSeal = this.database.recordedCompletions.get(left.id)?.requested_at ??
+              this.database.auditEvents.find((event) =>
+                event.session_id === left.id && event.event_type === "voice_transcript_sealed")?.created_at ?? "";
+            const rightSeal = this.database.recordedCompletions.get(right.id)?.requested_at ??
+              this.database.auditEvents.find((event) =>
+                event.session_id === right.id && event.event_type === "voice_transcript_sealed")?.created_at ?? "";
+            return leftSeal.localeCompare(rightSeal) || left.id.localeCompare(right.id);
+          })
+          .slice(0, 10)
+          .map((session) => ({ id: session.id })),
+      };
+    }
+    if (this.sql.startsWith("SELECT s.id, s.transcript_json, EXISTS")) {
+      const [failedBefore, pendingBefore] = this.values;
+      return {
+        results: [...this.database.sessions.values()]
+          .filter((session) => {
+            if (session.status !== "completed" || !["stored", "not_applicable"].includes(session.recording_status)) return false;
+            let transcript;
+            try {
+              transcript = JSON.parse(session.transcript_json ?? "[]");
+            } catch {
+              return false;
+            }
+            if (!Array.isArray(transcript) || !transcript.some((turn) =>
+              turn?.speaker === "candidate" && typeof turn.text === "string" && turn.text.trim())) return false;
+            if (transcript.some((turn) => turn?.speaker === "candidate" &&
+              String(turn.id ?? "").startsWith("recorded-fallback-answer-"))) return false;
+            const sync = this.database.externalSyncs.get(session.id);
+            if (!sync) return true;
+            if (sync.status === "running") return true;
+            if (sync.status === "failed") return sync.updated_at <= failedBefore;
+            if (sync.status === "pending") return sync.updated_at <= pendingBefore;
+            if (sync.status !== "completed") return false;
+            let manifest;
+            try {
+              manifest = JSON.parse(sync.manifest_json ?? "{}");
+            } catch {
+              manifest = {};
+            }
+            return manifest.transcriptAvailable !== true || manifest.transcriptKind !== "actual_transcript" ||
+              (session.recording_status === "stored" && manifest.recordingIncluded !== true);
+          })
+          .sort((left, right) => {
+            const leftSync = this.database.externalSyncs.get(left.id);
+            const rightSync = this.database.externalSyncs.get(right.id);
+            const leftRunning = leftSync?.status === "running" ? 0 : 1;
+            const rightRunning = rightSync?.status === "running" ? 0 : 1;
+            return leftRunning - rightRunning ||
+              String(leftSync?.updated_at ?? left.completed_at ?? left.created_at).localeCompare(
+                String(rightSync?.updated_at ?? right.completed_at ?? right.created_at),
+              ) || left.id.localeCompare(right.id);
+          })
+          .slice(0, 25)
+          .map((session) => ({
+            id: session.id,
+            transcript_json: session.transcript_json,
+            candidate_transcription_failed: this.database.auditEvents.some((event) =>
+              event.session_id === session.id && event.event_type === "transcription_failed" &&
+              JSON.parse(event.detail_json ?? "{}").code === "TRANSCRIPTION_FAILED") ? 1 : 0,
+          })),
+      };
+    }
+    if (this.sql.startsWith("SELECT s.id, s.candidate_name")) {
+      const cursorProvided = this.values.length === 4;
+      const cursorCreatedAt = cursorProvided ? this.values[0] : null;
+      const cursorSessionId = cursorProvided ? this.values[2] : null;
+      const limit = this.values.at(-1);
+      return {
+        results: [...this.database.sessions.values()]
+          .filter((session) => !cursorProvided ||
+            session.created_at < cursorCreatedAt ||
+            (session.created_at === cursorCreatedAt && session.id < cursorSessionId))
+          .sort((left, right) =>
+            String(right.created_at).localeCompare(String(left.created_at)) || right.id.localeCompare(left.id))
           .slice(0, limit)
           .map((session) => {
             const sync = this.database.externalSyncs.get(session.id);
@@ -1031,11 +1164,24 @@ class FakeR2 {
 
 }
 
-async function createTestInterviewSession(env, employment = "正社員", location = "越谷店") {
+async function createTestInterviewSession(
+  env,
+  employment = "正社員",
+  location = "越谷店",
+  options = {},
+) {
   const response = await request("/api/interviews/session", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ candidateName: "テスト 応募者", employment, location, consent: true }),
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.connectingAddress ? { "CF-Connecting-IP": options.connectingAddress } : {}),
+    },
+    body: JSON.stringify({
+      candidateName: options.candidateName ?? "テスト 応募者",
+      employment,
+      location,
+      consent: true,
+    }),
   }, env);
   assert.equal(response.status, 201);
   return response.json();
@@ -1068,6 +1214,42 @@ async function sealVoiceTranscript(env, session, transcript, transcriptionComple
     }),
   }, env);
 }
+
+test("scheduled recovery runs a bounded global tick without staff browser authentication", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  let scheduledWork = null;
+  const heartbeats = [];
+  const originalInfo = console.info;
+  console.info = (...args) => heartbeats.push(args);
+  try {
+    worker.scheduled({ scheduledTime: Date.now(), cron: "* * * * *" }, {
+      ...workerEnv,
+      DB: database,
+      RECORDINGS: recordings,
+    }, {
+      waitUntil(promise) {
+        scheduledWork = promise;
+      },
+      passThroughOnException() {},
+    });
+    assert.ok(scheduledWork instanceof Promise);
+    await scheduledWork;
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(database.staffAuditEvents.length, 0, "cron recovery must not impersonate or require a reviewer");
+  assert.deepEqual(heartbeats, [["interview_background_recovery", {
+    tick: "completed",
+    states: {
+      recording: "idle",
+      transcription: "idle",
+      completion: "idle",
+      evaluation: "idle",
+      drive: "idle",
+    },
+  }]]);
+});
 
 test("health endpoint verifies server authentication without returning the key", async () => {
   process.env.OPENAI_API_KEY = "test-key-never-returned";
@@ -1129,6 +1311,108 @@ test("health endpoint fails closed when the configured OpenAI key is rejected", 
   assert.equal(JSON.stringify(warnings).includes("rejected-test-key-never-returned"), false);
   assert.match(JSON.stringify(warnings), /invalid_api_key/);
   assert.match(JSON.stringify(warnings), /invalid_request_error/);
+});
+
+test("health checks models independently and keeps a recent known-good model green across a transient timeout", async () => {
+  const originalNow = Date.now;
+  const originalWarn = console.warn;
+  let now = originalNow();
+  let mode = "healthy";
+  const calls = [];
+  const signals = [];
+  const warnings = [];
+  Date.now = () => now;
+  console.warn = (...args) => warnings.push(args);
+  const env = {
+    ...workerEnv,
+    OPENAI_API_KEY: "stale-good-health-test-key",
+    OPENAI_API: {
+      fetch: async (upstreamRequest) => {
+        calls.push(upstreamRequest.url);
+        signals.push(upstreamRequest.signal);
+        if (mode === "partial-timeout" && upstreamRequest.url.includes("gpt-realtime")) {
+          throw new DOMException("simulated timeout", "AbortError");
+        }
+        return Response.json({ data: [] });
+      },
+    },
+  };
+  try {
+    assert.equal((await request("/api/health", {}, env)).status, 200);
+    assert.equal(calls.length, 2);
+    assert.notEqual(signals[0], signals[1], "each model must own an independent abort fence");
+
+    now += 5 * 60 * 1_000 + 1;
+    mode = "partial-timeout";
+    assert.equal((await request("/api/health", {}, env)).status, 200,
+      "a transient timeout must not erase a recent verified success");
+    assert.equal(calls.length, 4);
+    assert.match(JSON.stringify(warnings), /OPENAI_AUTHENTICATION_CHECK_TRANSIENT/);
+
+    assert.equal((await request("/api/health", {}, env)).status, 200);
+    assert.equal(calls.length, 4, "transient results have a short anti-amplification cache");
+
+    now += 30 * 1_000 + 1;
+    mode = "healthy";
+    assert.equal((await request("/api/health", {}, env)).status, 200);
+    assert.equal(calls.length, 5, "only the model whose transient cache expired is re-probed");
+  } finally {
+    Date.now = originalNow;
+    console.warn = originalWarn;
+  }
+});
+
+test("health fails closed and caches a transient partial failure before any known-good readback", async () => {
+  let calls = 0;
+  const originalWarn = console.warn;
+  console.warn = () => undefined;
+  const env = {
+    ...workerEnv,
+    OPENAI_API_KEY: "cold-partial-health-test-key",
+    OPENAI_API: {
+      fetch: async (upstreamRequest) => {
+        calls += 1;
+        return upstreamRequest.url.includes("gpt-realtime")
+          ? Response.json({ error: { type: "server_error" } }, { status: 503 })
+          : Response.json({ data: [] });
+      },
+    },
+  };
+  try {
+    assert.equal((await request("/api/health", {}, env)).status, 503);
+    assert.equal(calls, 2);
+    assert.equal((await request("/api/health", {}, env)).status, 503);
+    assert.equal(calls, 2, "cold transient failure is cached briefly without claiming healthy");
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test("health never hides exhausted credit behind a known-good cache", async () => {
+  const originalNow = Date.now;
+  const originalWarn = console.warn;
+  let now = originalNow();
+  let exhausted = false;
+  Date.now = () => now;
+  console.warn = () => undefined;
+  const env = {
+    ...workerEnv,
+    OPENAI_API_KEY: "credit-exhaustion-health-test-key",
+    OPENAI_API: {
+      fetch: async (upstreamRequest) => exhausted && upstreamRequest.url.includes("gpt-realtime")
+        ? Response.json({ error: { code: "credit_balance_exhausted", type: "insufficient_quota" } }, { status: 429 })
+        : Response.json({ data: [] }),
+    },
+  };
+  try {
+    assert.equal((await request("/api/health", {}, env)).status, 200);
+    now += 5 * 60 * 1_000 + 1;
+    exhausted = true;
+    assert.equal((await request("/api/health", {}, env)).status, 503);
+  } finally {
+    Date.now = originalNow;
+    console.warn = originalWarn;
+  }
 });
 
 test("authenticated production readiness reports missing components without exposing secrets", async () => {
@@ -2308,7 +2592,7 @@ test("interview session stores the candidate name and protects the recording wit
     body: recordingBody,
   }, env);
   assert.equal(unauthorized.status, 401);
-  assert.equal(worker.scheduled, undefined);
+  assert.equal(typeof worker.scheduled, "function");
   assert.equal(recordings.objects.has(storedObjectKey), true);
 
   const protectedRecording = await request(`/api/staff/recording?sessionId=${session.sessionId}`, {}, env);
@@ -2406,6 +2690,53 @@ test("staff inbox lists recent candidates with one shared login and records list
   }, env);
   assert.equal(pollingResponse.status, 200);
   assert.equal(database.staffAuditEvents.length, 1, "15-second completion polling must not flood the audit table");
+});
+
+test("staff inbox cursor exposes all 70 records without making recovery depend on the newest 50", async () => {
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const seed = await createTestInterviewSession(env);
+  const base = database.sessions.get(seed.sessionId);
+  database.sessions.clear();
+  for (let index = 0; index < 70; index += 1) {
+    const id = `TD-PAGE-${String(index).padStart(4, "0")}`;
+    const createdAt = new Date(Date.UTC(2026, 7, 1, 0, 0, 0, index)).toISOString();
+    database.sessions.set(id, {
+      ...base,
+      id,
+      candidate_name: `テスト候補者${index}`,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+  }
+  const headers = {
+    Authorization: "Bearer staff-review-secret",
+    "X-Interview-Reviewer": encodeURIComponent("採用担当C"),
+  };
+  const firstResponse = await request("/api/staff/interviews", { headers }, env);
+  const firstPage = await firstResponse.json();
+  assert.equal(firstResponse.status, 200);
+  assert.equal(firstPage.interviews.length, 50);
+  assert.equal(typeof firstPage.nextCursor, "string");
+
+  const secondResponse = await request(
+    `/api/staff/interviews?cursor=${encodeURIComponent(firstPage.nextCursor)}`,
+    { headers },
+    env,
+  );
+  const secondPage = await secondResponse.json();
+  assert.equal(secondResponse.status, 200);
+  assert.equal(secondPage.interviews.length, 20);
+  assert.equal(secondPage.nextCursor, null);
+  const allIds = new Set([
+    ...firstPage.interviews.map((item) => item.sessionId),
+    ...secondPage.interviews.map((item) => item.sessionId),
+  ]);
+  assert.equal(allIds.size, 70);
+
+  const invalid = await request("/api/staff/interviews?cursor=not-a-valid-cursor", { headers }, env);
+  assert.equal(invalid.status, 400);
 });
 
 test("recording upload survives one transient D1 failure after the R2 object is already stored", async () => {
@@ -3817,6 +4148,57 @@ test("staff evaluation recovery excludes a stale evaluation_pending transcript w
   assert.equal(stored.evaluation_json, undefined);
 });
 
+test("an oldest transcript with a known gap cannot starve the next valid stale evaluation", async () => {
+  const database = new FakeD1();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: new FakeR2(),
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const invalid = await createTestInterviewSession(env);
+  const valid = await createTestInterviewSession(env);
+  const invalidStored = database.sessions.get(invalid.sessionId);
+  const validStored = database.sessions.get(valid.sessionId);
+  invalidStored.status = "evaluation_pending";
+  invalidStored.updated_at = new Date(Date.now() - 20 * 60 * 1_000).toISOString();
+  invalidStored.transcript_json = JSON.stringify([{
+    id: "oldest-partial-answer",
+    speaker: "candidate",
+    text: "途中までの回答です。",
+    createdAt: invalidStored.updated_at,
+  }]);
+  database.auditEvents.push({
+    session_id: invalid.sessionId,
+    event_type: "transcription_failed",
+    detail_json: JSON.stringify({ code: "TRANSCRIPTION_FAILED" }),
+    created_at: invalidStored.updated_at,
+  });
+  validStored.status = "evaluation_pending";
+  validStored.updated_at = new Date(Date.now() - 15 * 60 * 1_000).toISOString();
+  validStored.transcript_json = JSON.stringify([{
+    id: "next-valid-answer",
+    speaker: "candidate",
+    text: "最後まで保存された回答です。",
+    createdAt: validStored.updated_at,
+  }]);
+
+  const response = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.deepEqual(payload.evaluation, { sessionId: valid.sessionId, state: "completed" });
+  assert.equal(invalidStored.status, "evaluation_pending");
+  assert.equal(invalidStored.evaluation_json, undefined);
+  assert.equal(validStored.status, "completed");
+  assert.equal(JSON.parse(validStored.evaluation_json).recommendation, "human_review");
+});
+
 test("recorded-answer transcripts supersede an earlier realtime gap during evaluation recovery", async () => {
   const database = new FakeD1();
   const env = {
@@ -4138,7 +4520,7 @@ test("staff polling finalizes all uploaded recording parts after a sealed candid
   assert.equal(database.artifacts.some((artifact) => artifact[1] === session.sessionId && artifact[2].includes("recording.manifest.json")), true);
 });
 
-test("staff polling finalizes normal voice recording parts only behind the durable actual-transcript seal", async () => {
+test("scheduled recovery finalizes normal voice recording parts and evaluation without a staff tab", async () => {
   const database = new FakeD1();
   const recordings = new FakeR2();
   const env = {
@@ -4191,22 +4573,21 @@ test("staff polling finalizes normal voice recording parts only behind the durab
   // Simulate the exact loss window: the final part was acknowledged, but the
   // candidate closed before /upload/complete. No candidate request follows.
   stored.updated_at = new Date(0).toISOString();
-  const recovered = await request("/api/staff/transcriptions/recover", {
-    method: "POST",
-    headers: {
-      Authorization: "Bearer staff-review-secret",
-      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
-    },
-  }, env);
-  const payload = await recovered.json();
-  assert.equal(recovered.status, 200, JSON.stringify(payload));
-  assert.deepEqual(payload.recording, { sessionId: session.sessionId, state: "stored" });
-  assert.deepEqual(payload.evaluation, { sessionId: session.sessionId, state: "completed" });
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => logs.push(args);
+  try {
+    await scheduleInterviewRecovery(env);
+  } finally {
+    console.info = originalInfo;
+  }
   assert.equal(stored.recording_status, "stored");
   assert.equal(stored.status, "completed");
   assert.deepEqual(JSON.parse(stored.transcript_json), transcript);
   assert.equal(database.artifacts.some((artifact) =>
     artifact[1] === session.sessionId && artifact[2].includes("recording.manifest.json")), true);
+  assert.equal(logs[0][1].states.recording, "advanced");
+  assert.equal(logs[0][1].states.evaluation, "advanced");
 });
 
 test("staff voice recovery leaves an upload with any missing part non-stored", async () => {
@@ -4270,10 +4651,276 @@ test("staff voice recovery leaves an upload with any missing part non-stored", a
   assert.equal(recovered.status, 200, JSON.stringify(payload));
   assert.deepEqual(payload.recording, { sessionId: session.sessionId, state: "incomplete" });
   assert.equal(payload.evaluation, null);
-  assert.equal(stored.recording_status, "failed");
+  assert.equal(stored.recording_status, "uploading");
+  assert.ok(Date.parse(stored.updated_at) > Date.parse(new Date(0).toISOString()),
+    "a missing part must back off without misclassifying the upload as failed");
   assert.equal(stored.status, "in_progress");
   assert.equal(database.artifacts.some((artifact) => artifact[1] === session.sessionId), false);
   assert.deepEqual(JSON.parse(stored.transcript_json), transcript);
+});
+
+test("an accepted recording part heartbeats D1 so active mobile upload is not reclaimed", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  assert.equal((await sealVoiceTranscript(env, session, [{
+    id: "active-upload-answer",
+    speaker: "candidate",
+    text: "録画を送信中です。",
+    createdAt: "2026-08-12T10:00:10.000Z",
+  }])).status, 200);
+  const partSize = 256 * 1024;
+  assert.equal((await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize: partSize + 19,
+      partSize,
+      totalParts: 2,
+      audioCoverage: "both",
+      uploadVersion: 2,
+    }),
+  }, env)).status, 200);
+  stored.updated_at = new Date(0).toISOString();
+  const bytes = new Uint8Array(partSize).fill(41);
+  assert.equal((await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(bytes.byteLength),
+      "X-Recording-Part-Sha256": sha256Hex(bytes),
+      "Content-Type": "application/octet-stream",
+    },
+    body: bytes,
+  }, env)).status, 200);
+  const heartbeatAt = stored.updated_at;
+  assert.ok(Date.parse(heartbeatAt) > Date.parse(new Date(0).toISOString()));
+
+  const recovered = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  assert.equal(recovered.status, 200);
+  assert.equal((await recovered.json()).recording, null);
+  assert.equal(stored.recording_status, "uploading");
+  assert.equal(stored.updated_at, heartbeatAt);
+});
+
+test("ten oldest missing uploads cannot starve an eleventh sealed upload with all parts", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const missingSessions = [];
+  for (let index = 0; index < 10; index += 1) {
+    missingSessions.push(await createTestInterviewSession(env, "正社員", "越谷店", {
+      candidateName: `復旧テスト${index}`,
+      connectingAddress: `192.0.2.${index + 1}`,
+    }));
+  }
+  const ready = await createTestInterviewSession(env, "正社員", "越谷店", {
+    candidateName: "復旧テスト完了",
+    connectingAddress: "192.0.2.99",
+  });
+  for (const [index, session] of [...missingSessions, ready].entries()) {
+    const stored = database.sessions.get(session.sessionId);
+    stored.status = "in_progress";
+    assert.equal((await sealVoiceTranscript(env, session, [{
+      id: `starvation-answer-${index}`,
+      speaker: "candidate",
+      text: `保存済み回答${index}`,
+      createdAt: `2026-08-12T10:00:1${index}.000Z`,
+    }])).status, 200);
+    const seal = database.auditEvents.find((event) =>
+      event.session_id === session.sessionId && event.event_type === "voice_transcript_sealed");
+    seal.created_at = new Date(Date.UTC(2026, 7, 12, 10, 0, index)).toISOString();
+    const partSize = 256 * 1024;
+    const byteSize = session === ready ? partSize : partSize + 7;
+    assert.equal((await request("/api/interviews/recording/upload/start", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        contentType: "video/webm",
+        byteSize,
+        partSize,
+        totalParts: session === ready ? 1 : 2,
+        audioCoverage: "both",
+        uploadVersion: 2,
+      }),
+    }, env)).status, 200);
+    const bytes = new Uint8Array(partSize).fill(50 + index);
+    assert.equal((await request("/api/interviews/recording/upload/part", {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-Interview-Session": session.sessionId,
+        "X-Recording-Part-Index": "0",
+        "X-Recording-Part-Bytes": String(bytes.byteLength),
+        "X-Recording-Part-Sha256": sha256Hex(bytes),
+        "Content-Type": "application/octet-stream",
+      },
+      body: bytes,
+    }, env)).status, 200);
+    stored.updated_at = new Date(0).toISOString();
+  }
+
+  const firstTick = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const firstPayload = await firstTick.json();
+  assert.equal(firstTick.status, 200, JSON.stringify(firstPayload));
+  assert.equal(firstPayload.recording.state, "incomplete");
+  assert.equal(database.sessions.get(ready.sessionId).recording_status, "uploading");
+  for (const session of missingSessions) {
+    assert.equal(database.sessions.get(session.sessionId).recording_status, "uploading");
+  }
+
+  // Advance the simulated next tick. Fair ordering uses the old updated_at on
+  // the never-attempted eleventh row before the ten rows just deferred.
+  const readyStored = database.sessions.get(ready.sessionId);
+  readyStored.updated_at = new Date(0).toISOString();
+  const secondTick = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const secondPayload = await secondTick.json();
+  assert.equal(secondTick.status, 200, JSON.stringify(secondPayload));
+  assert.deepEqual(secondPayload.recording, { sessionId: ready.sessionId, state: "stored" });
+  assert.equal(database.sessions.get(ready.sessionId).recording_status, "stored");
+  assert.equal(database.artifacts.some((artifact) => artifact[1] === ready.sessionId), true);
+});
+
+test("completed recording recovery fairly stores the eleventh full upload and exposes it to Drive next tick", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const missingSessions = [];
+  for (let index = 0; index < 10; index += 1) {
+    missingSessions.push(await createTestInterviewSession(env, "正社員", "越谷店", {
+      candidateName: `完了済み録画復旧${index}`,
+      connectingAddress: `198.51.100.${index + 1}`,
+    }));
+  }
+  const ready = await createTestInterviewSession(env, "正社員", "越谷店", {
+    candidateName: "完了済み録画復旧完了",
+    connectingAddress: "198.51.100.99",
+  });
+  const recent = await createTestInterviewSession(env, "正社員", "越谷店", {
+    candidateName: "完了直後のアクティブ録画",
+    connectingAddress: "198.51.100.100",
+  });
+
+  for (const [index, session] of [...missingSessions, ready, recent].entries()) {
+    const stored = database.sessions.get(session.sessionId);
+    stored.status = "completed";
+    stored.completed_at = session === recent
+      ? new Date().toISOString()
+      : "2026-08-12T09:00:00.000Z";
+    stored.transcript_json = JSON.stringify([{
+      id: `completed-recovery-answer-${index}`,
+      speaker: "candidate",
+      text: `完了済み復旧用回答${index}`,
+      createdAt: "2026-08-12T08:59:00.000Z",
+    }]);
+    stored.evaluation_json = JSON.stringify({
+      recommendation: "human_review",
+      summary: "採用担当者による確認が必要です。",
+      dimensions: [],
+      strengths: [],
+      concerns: [],
+      contradictions: [],
+      missingTopics: [],
+      conditions: [],
+      transcriptProvenance: "candidate_device_unverified",
+      evidenceValidationWarnings: [],
+      humanReviewRequired: true,
+    });
+    const partSize = 256 * 1024;
+    const full = session === ready || session === recent;
+    assert.equal((await request("/api/interviews/recording/upload/start", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        contentType: "video/webm",
+        byteSize: full ? partSize : partSize + 13,
+        partSize,
+        totalParts: full ? 1 : 2,
+        audioCoverage: "both",
+        uploadVersion: 2,
+      }),
+    }, env)).status, 200);
+    const bytes = new Uint8Array(partSize).fill(70 + index);
+    assert.equal((await request("/api/interviews/recording/upload/part", {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-Interview-Session": session.sessionId,
+        "X-Recording-Part-Index": "0",
+        "X-Recording-Part-Bytes": String(bytes.byteLength),
+        "X-Recording-Part-Sha256": sha256Hex(bytes),
+        "Content-Type": "application/octet-stream",
+      },
+      body: bytes,
+    }, env)).status, 200);
+    // Ten incomplete rows sort ahead of the full eleventh row on the first
+    // bounded scan. All are old enough for both the active-upload and completed
+    // grace-period fences.
+    stored.updated_at = new Date(index * 1_000).toISOString();
+  }
+
+  const tickLogs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => tickLogs.push(args);
+  try {
+    await scheduleInterviewRecovery(env);
+    assert.equal(tickLogs.at(-1)[1].states.recording, "attention");
+    assert.equal(database.sessions.get(ready.sessionId).recording_status, "uploading");
+    for (const session of missingSessions) {
+      assert.equal(database.sessions.get(session.sessionId).recording_status, "uploading",
+        "a missing part must remain resumable, not be mislabeled failed");
+    }
+
+    await scheduleInterviewRecovery(env);
+    assert.equal(tickLogs.at(-1)[1].states.recording, "advanced");
+    assert.equal(database.sessions.get(ready.sessionId).recording_status, "stored");
+    assert.equal(database.artifacts.some((artifact) => artifact[1] === ready.sessionId), true);
+
+    await scheduleInterviewRecovery(env);
+    assert.equal(tickLogs.at(-1)[1].states.drive, "attention",
+      "the next tick must select the newly stored completed interview for Drive");
+    assert.equal(database.sessions.get(recent.sessionId).recording_status, "uploading",
+      "the completed-at grace period must protect a just-finished active upload");
+  } finally {
+    console.info = originalInfo;
+  }
 });
 
 test("recording parts compare R2 actual size and never trust only the declared metadata", async () => {
@@ -5067,6 +5714,7 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
   assert.equal(response.status, 200);
   assert.equal(payload.stored, true);
   assert.equal(payload.humanReviewRequired, true);
+  assert.equal(payload.automaticEvaluationDeferred, false);
   assert.equal("evaluation" in payload, false);
 
   const unauthorized = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {}, env);

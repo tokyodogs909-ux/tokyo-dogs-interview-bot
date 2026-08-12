@@ -14,6 +14,10 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 const localBindingConfig = {
   main: "./worker/index.ts",
   compatibility_flags: ["nodejs_compat"],
+  // Cloudflare Cron is the production recovery clock. Each tick is bounded to
+  // one paid transcription and one <=4 MiB Drive chunk; D1 CAS/leases make
+  // overlap with candidate or staff retries safe.
+  triggers: { crons: ["* * * * *"] },
   vars: {
     ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
     ...(process.env.INTERVIEW_STAFF_TOKEN

@@ -47,5 +47,6 @@ test("the candidate and staff pages wire the time limit and completion monitor",
   assert.match(candidatePage, /max_duration_reached/);
   assert.match(staffPage, /setInterval\(\(\) => void pollInterviewListRef\.current\(\), 15_000\)/);
   assert.match(staffPage, /new Notification\("TOKYO DOGS｜オンライン一次面接完了"/);
-  assert.match(staffPage, /\/api\/staff\/interviews\?poll=1/);
+  assert.match(staffPage, /searchParams\.set\("poll", "1"\)/);
+  assert.match(staffPage, /\/api\/staff\/interviews\$\{searchParams\.size/);
 });

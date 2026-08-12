@@ -55,8 +55,9 @@ test("production recording E2E stores the full recording before bodyless transcr
   assert.match(source, /uploadVersion: 2/);
   assert.match(source, /spawnSync\(/);
   assert.match(source, /"ffprobe"/);
-  assert.match(source, /probeMedia\([\s\S]*recordingPath,[\s\S]*\["video", "audio"\],[\s\S]*minimumRecordingFixtureDurationSeconds/);
-  assert.match(source, /probeMedia\(answerAudioPath, \["audio"\]\)/);
+  assert.match(source, /format: "webm"/);
+  assert.match(source, /video: \{ type: "video", codecs: \["vp8", "vp9", "av1"\] \}/);
+  assert.match(source, /audio: \{ type: "audio", codecs: \["opus", "vorbis"\] \}/);
   assert.match(source, /recording\.byteLength < minimumRecordingFixtureBytes/);
   assert.match(source, /recordingPartSha256s = Array\.from/);
   assert.match(source, /"X-Recording-Part-Sha256": recordingPartSha256s\[index\]/);
@@ -81,4 +82,8 @@ test("production recording E2E stores the full recording before bodyless transcr
   assert.match(source, /replay\.body\.alreadyCompleted !== true/);
   assert.match(source, /completed\.humanReviewRequired !== true/);
   assert.match(source, /archived\.transcriptKind !== "actual_transcript"/);
+  assert.match(source, /archiveWallClockMs = 15 \* 60 \* 1_000/);
+  assert.match(source, /while \(Date\.now\(\) - archiveStartedAt < archiveWallClockMs\)/);
+  assert.match(source, /\["busy", "initializing", "retrying"\]\.includes\(step\.phase\)/);
+  assert.match(source, /if \(!waitOnlyPhase\) archiveProgressAttempts \+= 1/);
 });

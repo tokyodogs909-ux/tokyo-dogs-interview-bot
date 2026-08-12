@@ -1,6 +1,7 @@
 import {
   authorizeReviewerRequest,
-  listInterviewSummaries,
+  listInterviewSummaryPage,
+  parseInterviewListCursor,
 } from "@/lib/interview-persistence";
 import { planDriveRecovery, planRecordingRecovery, summarizeDriveArchives } from "@/lib/drive-recovery.js";
 import { scheduleInterruptedInterviewRecovery } from "@/lib/interview-recovery";
@@ -12,13 +13,21 @@ export async function GET(request: Request) {
     if (!reviewer) {
       return noStoreJson({ error: "採用担当者の認証を確認できませんでした。" }, { status: 401 });
     }
-    const polling = new URL(request.url).searchParams.get("poll") === "1";
-    const interviews = await listInterviewSummaries(reviewer, 50, { audit: !polling });
+    const searchParams = new URL(request.url).searchParams;
+    const polling = searchParams.get("poll") === "1";
+    const rawCursor = searchParams.get("cursor");
+    const cursor = parseInterviewListCursor(rawCursor);
+    if (rawCursor && !cursor) {
+      return noStoreJson({ error: "候補者一覧の続き位置を確認できませんでした。" }, { status: 400 });
+    }
+    const page = await listInterviewSummaryPage(reviewer, 50, { audit: !polling, cursor });
+    const interviews = page.items;
     const recordingRecoverySessionIds = planRecordingRecovery(interviews) as string[];
     recordingRecoverySessionIds.forEach((sessionId) => scheduleInterruptedInterviewRecovery(sessionId));
     const recoverySessionIds = planDriveRecovery(interviews) as string[];
     return noStoreJson({
       interviews,
+      nextCursor: page.nextCursor,
       // The authenticated staff browser runs these in foreground requests.
       // A full recording can exceed Cloudflare's 30-second waitUntil window.
       driveRecoverySessionIds: recoverySessionIds,

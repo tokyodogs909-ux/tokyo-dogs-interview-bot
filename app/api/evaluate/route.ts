@@ -185,7 +185,7 @@ ${SOURCE_GROUNDED_EVALUATION_GUIDE}`,
       return noStoreJson({
         stored: true,
         humanReviewRequired: true,
-        ...(automaticEvaluationDeferred ? { automaticEvaluationDeferred: true } : {}),
+        automaticEvaluationDeferred,
       });
     } catch (error) {
       await failInterviewEvaluation(sessionId, evaluationClaimId);

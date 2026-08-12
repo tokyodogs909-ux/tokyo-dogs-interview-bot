@@ -622,6 +622,15 @@ export async function failInterviewRecordingUpload(sessionId: string) {
     .run();
 }
 
+async function heartbeatInterviewRecordingUpload(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await db.prepare(`UPDATE interview_sessions SET updated_at = ?
+    WHERE id = ? AND recording_status IN ('uploading', 'failed')`)
+    .bind(new Date().toISOString(), sessionId)
+    .run();
+}
+
 function reviewerSecret() {
   const bound = bindings();
   const candidates = [
@@ -794,10 +803,43 @@ export async function findNextStaleInterviewEvaluation() {
       )
       AND s.transcript_json IS NOT NULL
       AND json_valid(s.transcript_json)
+      AND json_type(s.transcript_json) = 'array'
       AND EXISTS (
-        SELECT 1 FROM json_each(s.transcript_json)
-        WHERE json_extract(value, '$.speaker') = 'candidate'
-          AND length(trim(coalesce(json_extract(value, '$.text'), ''))) > 0
+        SELECT 1 FROM json_each(s.transcript_json) AS turn
+        WHERE CAST(turn.key AS INTEGER) < 300
+          AND CASE WHEN turn.type = 'object'
+            THEN json_extract(turn.value, '$.speaker') ELSE NULL END = 'candidate'
+          AND CASE WHEN turn.type = 'object'
+            THEN json_type(turn.value, '$.id') ELSE NULL END = 'text'
+          AND CASE WHEN turn.type = 'object'
+            THEN json_type(turn.value, '$.text') ELSE NULL END = 'text'
+          AND length(trim(COALESCE(CASE WHEN turn.type = 'object'
+            THEN json_extract(turn.value, '$.text') ELSE NULL END, ''))) > 0
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(s.transcript_json) AS turn
+        WHERE CAST(turn.key AS INTEGER) < 300
+          AND CASE WHEN turn.type = 'object'
+            THEN json_extract(turn.value, '$.speaker') ELSE NULL END = 'candidate'
+          AND COALESCE(CASE WHEN turn.type = 'object'
+            THEN json_extract(turn.value, '$.id') ELSE NULL END, '') LIKE 'recorded-fallback-answer-%'
+      )
+      AND (
+        NOT EXISTS (
+          SELECT 1 FROM interview_audit_events AS failure
+          WHERE failure.session_id = s.id
+            AND failure.event_type = 'transcription_failed'
+            AND CASE WHEN json_valid(failure.detail_json)
+              THEN json_extract(failure.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+        )
+        OR NOT EXISTS (
+          SELECT 1 FROM json_each(s.transcript_json) AS turn
+          WHERE CAST(turn.key AS INTEGER) < 300
+            AND CASE WHEN turn.type = 'object'
+              THEN json_extract(turn.value, '$.speaker') ELSE NULL END = 'candidate'
+            AND COALESCE(CASE WHEN turn.type = 'object'
+              THEN json_extract(turn.value, '$.id') ELSE NULL END, '') NOT LIKE 'recorded-transcribed-answer-%'
+        )
       )
     ORDER BY coalesce(c.started_at, s.updated_at), s.id
     LIMIT 1`)
@@ -1063,6 +1105,132 @@ export async function getExternalSyncStatus(sessionId: string) {
     FROM interview_external_syncs WHERE session_id = ? AND provider = 'google_drive' LIMIT 1`)
     .bind(sessionId).first<ExternalSyncRow>();
   return safeExternalSyncStatus(row);
+}
+
+const BACKGROUND_DRIVE_FAILED_RETRY_MS = 10 * 60 * 1_000;
+const BACKGROUND_DRIVE_PENDING_RETRY_MS = 5 * 60 * 1_000;
+
+/**
+ * Finds one archive that can be advanced by a server-side scheduled event.
+ *
+ * The query is deliberately global rather than derived from the staff inbox,
+ * so records older than one UI page cannot become invisible to recovery. It
+ * returns only an opaque session ID; candidate identity and transcript text are
+ * never logged by the caller. `stepInterviewToGoogleDrive` supplies the actual
+ * external-sync claim and upload-step lease CAS fences.
+ */
+export async function findNextInterviewDriveRecoverySession() {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = Date.now();
+  const failedBefore = new Date(now - BACKGROUND_DRIVE_FAILED_RETRY_MS).toISOString();
+  const pendingBefore = new Date(now - BACKGROUND_DRIVE_PENDING_RETRY_MS).toISOString();
+  const candidates = await db.prepare(`SELECT
+      s.id, s.transcript_json,
+      EXISTS (
+        SELECT 1 FROM interview_audit_events AS ta
+        WHERE ta.session_id = s.id
+          AND ta.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(ta.detail_json)
+            THEN json_extract(ta.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+      ) AS candidate_transcription_failed
+    FROM interview_sessions AS s
+    LEFT JOIN interview_external_syncs AS d
+      ON d.session_id = s.id AND d.provider = 'google_drive'
+    WHERE s.status = 'completed'
+      AND s.recording_status IN ('stored', 'not_applicable')
+      AND s.transcript_json IS NOT NULL
+      AND json_valid(s.transcript_json)
+      AND json_type(s.transcript_json) = 'array'
+      AND EXISTS (
+        SELECT 1 FROM json_each(s.transcript_json) AS turn
+        WHERE CAST(turn.key AS INTEGER) < 300
+          AND CASE WHEN turn.type = 'object'
+            THEN json_extract(turn.value, '$.speaker') ELSE NULL END = 'candidate'
+          AND CASE WHEN turn.type = 'object'
+            THEN json_type(turn.value, '$.id') ELSE NULL END = 'text'
+          AND CASE WHEN turn.type = 'object'
+            THEN json_type(turn.value, '$.text') ELSE NULL END = 'text'
+          AND length(trim(COALESCE(CASE WHEN turn.type = 'object'
+            THEN json_extract(turn.value, '$.text') ELSE NULL END, ''))) > 0
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(s.transcript_json) AS turn
+        WHERE CAST(turn.key AS INTEGER) < 300
+          AND CASE WHEN turn.type = 'object'
+            THEN json_extract(turn.value, '$.speaker') ELSE NULL END = 'candidate'
+          AND CASE WHEN turn.type = 'object'
+            THEN json_type(turn.value, '$.id') ELSE NULL END = 'text'
+          AND CASE WHEN turn.type = 'object'
+            THEN json_type(turn.value, '$.text') ELSE NULL END = 'text'
+          AND COALESCE(CASE WHEN turn.type = 'object'
+            THEN json_extract(turn.value, '$.id') ELSE NULL END, '') LIKE 'recorded-fallback-answer-%'
+      )
+      AND (
+        NOT EXISTS (
+          SELECT 1 FROM interview_audit_events AS failure
+          WHERE failure.session_id = s.id
+            AND failure.event_type = 'transcription_failed'
+            AND CASE WHEN json_valid(failure.detail_json)
+              THEN json_extract(failure.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+        )
+        OR NOT EXISTS (
+          SELECT 1 FROM json_each(s.transcript_json) AS turn
+          WHERE CAST(turn.key AS INTEGER) < 300
+            AND CASE WHEN turn.type = 'object'
+              THEN json_extract(turn.value, '$.speaker') ELSE NULL END = 'candidate'
+            AND CASE WHEN turn.type = 'object'
+              THEN json_type(turn.value, '$.id') ELSE NULL END = 'text'
+            AND CASE WHEN turn.type = 'object'
+              THEN json_type(turn.value, '$.text') ELSE NULL END = 'text'
+            AND COALESCE(CASE WHEN turn.type = 'object'
+              THEN json_extract(turn.value, '$.id') ELSE NULL END, '') NOT LIKE 'recorded-transcribed-answer-%'
+        )
+      )
+      AND (
+        d.session_id IS NULL
+        OR d.status = 'running'
+        OR (d.status = 'failed' AND d.updated_at <= ?)
+        OR (d.status = 'pending' AND d.updated_at <= ?)
+        OR (d.status = 'completed' AND (
+          COALESCE(json_extract(d.manifest_json, '$.transcriptAvailable'), 0) != 1
+          OR COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') != 'actual_transcript'
+          OR (s.recording_status = 'stored'
+            AND COALESCE(json_extract(d.manifest_json, '$.recordingIncluded'), 0) != 1)
+        ))
+      )
+    ORDER BY CASE WHEN d.status = 'running' THEN 0 ELSE 1 END,
+      COALESCE(d.updated_at, s.completed_at, s.created_at) ASC,
+      s.id ASC
+    LIMIT 25`)
+    .bind(failedBefore, pendingBefore)
+    .all<{ id: string; transcript_json: string; candidate_transcription_failed: number }>();
+
+  for (const candidate of candidates.results ?? []) {
+    const decoded = parseJson<unknown>(candidate.transcript_json, null);
+    if (!Array.isArray(decoded)) continue;
+    const transcript = decoded.slice(0, 300).flatMap((value): TranscriptTurn[] => {
+      if (!value || typeof value !== "object") return [];
+      const turn = value as Partial<TranscriptTurn>;
+      if (
+        typeof turn.id !== "string" ||
+        (turn.speaker !== "candidate" && turn.speaker !== "interviewer") ||
+        typeof turn.text !== "string"
+      ) return [];
+      return [{
+        id: turn.id.slice(0, 120),
+        speaker: turn.speaker,
+        text: turn.text.replace(/\0/g, "").trim().slice(0, 5_000),
+        createdAt: typeof turn.createdAt === "string" ? turn.createdAt.slice(0, 40) : "",
+      }];
+    });
+    const failures = Number(candidate.candidate_transcription_failed ?? 0) === 1
+      ? [{ type: "transcription_failed", detail: { code: "TRANSCRIPTION_FAILED" } }]
+      : [];
+    if (hasVerifiedCandidateTranscript(transcript, failures)) return candidate.id;
+  }
+  return null;
 }
 
 export async function requestExternalSync(sessionId: string) {
@@ -1642,16 +1810,46 @@ export type InterviewListItem = {
   sourceTranscriptVerified: boolean;
 };
 
-export async function listInterviewSummaries(
+export type InterviewListPage = {
+  items: InterviewListItem[];
+  nextCursor: string | null;
+};
+
+type InterviewListCursor = {
+  createdAt: string;
+  sessionId: string;
+};
+
+const INTERVIEW_LIST_CURSOR_SEPARATOR = "|";
+
+export function parseInterviewListCursor(value: string | null): InterviewListCursor | null {
+  if (!value || value.length > 100) return null;
+  const separator = value.indexOf(INTERVIEW_LIST_CURSOR_SEPARATOR);
+  if (separator < 1 || separator !== value.lastIndexOf(INTERVIEW_LIST_CURSOR_SEPARATOR)) return null;
+  const createdAt = value.slice(0, separator);
+  const sessionId = value.slice(separator + 1);
+  if (
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(createdAt) ||
+    !Number.isFinite(Date.parse(createdAt)) ||
+    !/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)
+  ) return null;
+  return { createdAt, sessionId };
+}
+
+function interviewListCursor(item: InterviewListItem) {
+  return `${item.createdAt}${INTERVIEW_LIST_CURSOR_SEPARATOR}${item.sessionId}`;
+}
+
+export async function listInterviewSummaryPage(
   reviewer: AuthorizedReviewer,
   limit = 50,
-  options: { audit?: boolean } = {},
-) {
+  options: { audit?: boolean; cursor?: InterviewListCursor | null } = {},
+): Promise<InterviewListPage> {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
   const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
-  const rows = await db.prepare(`SELECT
+  const select = `SELECT
     s.id, s.candidate_name, s.employment, s.preferred_location,
     s.status, s.recording_status, s.transcript_json, s.created_at, s.completed_at, s.retention_until,
     EXISTS (
@@ -1665,12 +1863,21 @@ export async function listInterviewSummaries(
     d.manifest_json AS drive_manifest_json
     FROM interview_sessions AS s
     LEFT JOIN interview_external_syncs AS d
-      ON d.session_id = s.id AND d.provider = 'google_drive'
-    ORDER BY s.created_at DESC
-    LIMIT ?`)
-    .bind(safeLimit)
-    .all<Record<string, unknown>>();
-  const items: InterviewListItem[] = (rows.results ?? []).map((row) => {
+      ON d.session_id = s.id AND d.provider = 'google_drive'`;
+  const rows = options.cursor
+    ? await db.prepare(`${select}
+        WHERE s.created_at < ? OR (s.created_at = ? AND s.id < ?)
+        ORDER BY s.created_at DESC, s.id DESC
+        LIMIT ?`)
+        .bind(options.cursor.createdAt, options.cursor.createdAt, options.cursor.sessionId, safeLimit + 1)
+        .all<Record<string, unknown>>()
+    : await db.prepare(`${select}
+        ORDER BY s.created_at DESC, s.id DESC
+        LIMIT ?`)
+        .bind(safeLimit + 1)
+        .all<Record<string, unknown>>();
+  const pageRows = (rows.results ?? []).slice(0, safeLimit);
+  const items: InterviewListItem[] = pageRows.map((row) => {
     const driveManifest = parseJson<Record<string, unknown> | null>(row.drive_manifest_json, null);
     const sourceTranscript = parseJson<TranscriptTurn[]>(row.transcript_json, []);
     const sourceTranscriptVerified = hasVerifiedCandidateTranscript(
@@ -1707,7 +1914,12 @@ export async function listInterviewSummaries(
       .bind(crypto.randomUUID(), reviewer, JSON.stringify({ resultCount: items.length, limit: safeLimit }))
       .run();
   }
-  return items;
+  return {
+    items,
+    nextCursor: (rows.results ?? []).length > safeLimit && items.length > 0
+      ? interviewListCursor(items[items.length - 1])
+      : null,
+  };
 }
 
 export async function saveHumanVideoReview(input: {
@@ -2129,7 +2341,13 @@ export async function saveResumableInterviewRecordingPart(input: {
       // the server computed from their exact buffered body.
       legacyExistingMatches
     )
-  ) return { stored: true, duplicate: true };
+  ) {
+    // This receipt is also the durable activity fence used by server recovery.
+    // Long mobile uploads can span several cron ticks; refreshing D1 only after
+    // R2 has proved the exact part prevents an active upload being reclaimed.
+    await heartbeatInterviewRecordingUpload(input.sessionId);
+    return { stored: true, duplicate: true };
+  }
   // A deterministic part key is immutable once present. Replacing an existing
   // object would let a delayed retry silently change a finalized recording.
   if (existing) throw new Error("INTERVIEW_RECORDING_PART_DIGEST_CONFLICT");
@@ -2169,7 +2387,10 @@ export async function saveResumableInterviewRecordingPart(input: {
         (input.sha256 && verifiedRecordingPartSha256(concurrent, input.sha256)) ||
         legacyConcurrentMatches
       )
-    ) return { stored: true, duplicate: true };
+    ) {
+      await heartbeatInterviewRecordingUpload(input.sessionId);
+      return { stored: true, duplicate: true };
+    }
     throw new Error("INTERVIEW_RECORDING_PART_DIGEST_CONFLICT");
   }
   if (
@@ -2178,6 +2399,7 @@ export async function saveResumableInterviewRecordingPart(input: {
   ) {
     throw new Error("INTERVIEW_RECORDING_PART_SIZE_INVALID");
   }
+  await heartbeatInterviewRecordingUpload(input.sessionId);
   return { stored: true, duplicate: false };
 }
 
@@ -2301,55 +2523,77 @@ export async function recoverNextSealedResumableInterviewRecording() {
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
   const staleBefore = new Date(Date.now() - 60 * 1_000).toISOString();
-  const target = await db.prepare(`SELECT s.id
+  // Keep the global selector aligned with the authenticated staff planner: a
+  // completed evaluation gets a five-minute grace period for the candidate's
+  // foreground upload. The shorter updated_at fence still excludes an upload
+  // whose part heartbeat shows current activity.
+  const completedBefore = new Date(Date.now() - 5 * 60 * 1_000).toISOString();
+  const targets = await db.prepare(`SELECT s.id
     FROM interview_sessions s
-    WHERE s.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
-      AND s.recording_status IN ('uploading', 'failed')
+    WHERE s.recording_status IN ('uploading', 'failed')
       AND s.updated_at <= ?
       AND (
-        EXISTS (
-          SELECT 1 FROM recorded_interview_completions c
-          WHERE c.session_id = s.id
+        (
+          s.status = 'completed'
+          AND s.completed_at IS NOT NULL
+          AND s.completed_at <= ?
         )
         OR (
-          EXISTS (
-            SELECT 1 FROM interview_audit_events
-            WHERE session_id = s.id AND event_type = 'voice_transcript_sealed'
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM interview_audit_events
-            WHERE session_id = s.id AND event_type = 'recorded_fallback_started'
-          )
-          AND s.transcript_json IS NOT NULL
-          AND json_valid(s.transcript_json)
-          AND EXISTS (
-            SELECT 1 FROM json_each(s.transcript_json) AS turn
-            WHERE json_extract(turn.value, '$.speaker') = 'candidate'
-              AND length(trim(COALESCE(json_extract(turn.value, '$.text'), ''))) > 0
+          s.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+          AND (
+            EXISTS (
+              SELECT 1 FROM recorded_interview_completions c
+              WHERE c.session_id = s.id
+            )
+            OR (
+              EXISTS (
+                SELECT 1 FROM interview_audit_events
+                WHERE session_id = s.id AND event_type = 'voice_transcript_sealed'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM interview_audit_events
+                WHERE session_id = s.id AND event_type = 'recorded_fallback_started'
+              )
+              AND s.transcript_json IS NOT NULL
+              AND json_valid(s.transcript_json)
+              AND EXISTS (
+                SELECT 1 FROM json_each(s.transcript_json) AS turn
+                WHERE json_extract(turn.value, '$.speaker') = 'candidate'
+                  AND length(trim(COALESCE(json_extract(turn.value, '$.text'), ''))) > 0
+              )
+            )
           )
         )
       )
-    ORDER BY COALESCE(
+    ORDER BY s.updated_at ASC, COALESCE(
       (SELECT c.requested_at FROM recorded_interview_completions c WHERE c.session_id = s.id),
       (SELECT MIN(a.created_at) FROM interview_audit_events a
         WHERE a.session_id = s.id AND a.event_type = 'voice_transcript_sealed')
     ) ASC, s.id ASC
-    LIMIT 1`)
-    .bind(staleBefore)
-    .first<{ id: string }>();
-  if (!target) return { state: "none" } as const;
-  try {
-    const result = await recoverResumableInterviewRecording(target.id);
-    return { state: "stored", sessionId: target.id, result } as const;
-  } catch (error) {
-    const code = error instanceof Error ? error.message : "INTERVIEW_RECORDING_RECOVERY_FAILED";
-    await failInterviewRecordingUpload(target.id);
-    return {
-      state: code.includes("PART_MISSING") ? "incomplete" : "failed",
-      sessionId: target.id,
-      errorCode: code.slice(0, 120),
-    } as const;
+    LIMIT 10`)
+    .bind(staleBefore, completedBefore)
+    .all<{ id: string }>();
+  let firstDeferred: { state: "incomplete" | "failed"; sessionId: string; errorCode: string } | null = null;
+  for (const target of targets.results ?? []) {
+    try {
+      const result = await recoverResumableInterviewRecording(target.id);
+      return { state: "stored", sessionId: target.id, result } as const;
+    } catch (error) {
+      const code = error instanceof Error ? error.message : "INTERVIEW_RECORDING_RECOVERY_FAILED";
+      if (code.includes("PART_MISSING")) {
+        // Missing parts are not a failed upload: the candidate may still be
+        // sending them. Move this row behind the one-minute activity fence and
+        // inspect another bounded candidate in the same tick, avoiding FIFO
+        // starvation when an abandoned upload is the oldest row.
+        await heartbeatInterviewRecordingUpload(target.id);
+        firstDeferred ??= { state: "incomplete", sessionId: target.id, errorCode: code.slice(0, 120) };
+        continue;
+      }
+      await failInterviewRecordingUpload(target.id);
+      firstDeferred ??= { state: "failed", sessionId: target.id, errorCode: code.slice(0, 120) };
+    }
   }
+  return firstDeferred ?? { state: "none" } as const;
 }
 
 async function loadRecordingObject(bucket: R2Bucket, objectKey: string) {
