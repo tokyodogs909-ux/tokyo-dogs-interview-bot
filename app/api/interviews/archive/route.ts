@@ -28,6 +28,8 @@ export async function POST(request: Request) {
     return noStoreJson({ stored: result.status === "completed", recordingIncluded: result.recordingIncluded });
   } catch (error) {
     const code = error instanceof Error ? error.message : "";
+    const safeCode = /^[A-Z0-9_:-]{3,120}$/.test(code) ? code : "INTERVIEW_ARCHIVE_FAILED";
+    console.error("interview_archive_failed", { code: safeCode });
     const archiveNotReady = code === "INTERVIEW_NOT_READY_FOR_DRIVE_SYNC" ||
       code === "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC" ||
       code === "INTERVIEW_RECORDING_ARTIFACT_MISSING";

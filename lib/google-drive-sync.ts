@@ -19,6 +19,11 @@ const FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
 const DRIVE_PROVIDER = "google_drive";
 const TRANSIENT_DRIVE_RETRY_DELAY_MS = 600;
+// Google Drive resumable uploads require every non-final chunk to be a
+// multiple of 256 KiB. Keeping each request bounded avoids the two-minute
+// upstream timeout observed when a 71 MB R2 stream was sent in one PUT.
+const DRIVE_RECORDING_CHUNK_BYTES = 8 * 1024 * 1024;
+const DRIVE_RECORDING_CHUNK_ATTEMPTS = 3;
 
 type DriveFile = {
   id: string;
@@ -373,16 +378,117 @@ async function uploadRecording(input: {
   });
   const location = initResponse.headers.get("Location");
   if (!initResponse.ok || !location) throw new Error(`GOOGLE_DRIVE_RESUMABLE_INIT_${initResponse.status}`);
-  const uploadResponse = await fetch(location, {
-    method: "PUT",
-    headers: {
-      "Content-Type": input.contentType,
-      "Content-Length": String(input.byteSize),
-    },
-    body: input.body,
-  });
-  if (!uploadResponse.ok) throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${uploadResponse.status}`);
-  return await uploadResponse.json() as DriveFile;
+
+  async function queryCommittedBytes() {
+    const response = await fetch(location as string, {
+      method: "PUT",
+      headers: {
+        "Content-Length": "0",
+        "Content-Range": `bytes */${input.byteSize}`,
+      },
+    });
+    if (response.ok) return { complete: true as const, file: await response.json() as DriveFile };
+    if (response.status !== 308) throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${response.status}`);
+    const range = response.headers.get("Range")?.match(/^bytes=0-(\d+)$/);
+    return { complete: false as const, committedBytes: range ? Number(range[1]) + 1 : 0 };
+  }
+
+  async function putChunk(bytes: Uint8Array, start: number) {
+    const end = start + bytes.byteLength - 1;
+    let nextOffset = start;
+    let lastStatus = 0;
+    for (let attempt = 0; attempt < DRIVE_RECORDING_CHUNK_ATTEMPTS; attempt += 1) {
+      try {
+        const remaining = bytes.subarray(nextOffset - start);
+        const response = await fetch(location as string, {
+          method: "PUT",
+          headers: {
+            "Content-Type": input.contentType,
+            "Content-Length": String(remaining.byteLength),
+            "Content-Range": `bytes ${nextOffset}-${end}/${input.byteSize}`,
+          },
+          body: Uint8Array.from(remaining).buffer,
+        });
+        lastStatus = response.status;
+        if (response.ok) return { complete: true as const, file: await response.json() as DriveFile };
+        if (response.status === 308) {
+          const range = response.headers.get("Range")?.match(/^bytes=0-(\d+)$/);
+          const committedBytes = range ? Number(range[1]) + 1 : 0;
+          if (committedBytes >= end + 1) return { complete: false as const };
+          if (committedBytes < nextOffset || committedBytes > end) {
+            throw new Error("GOOGLE_DRIVE_RESUMABLE_RANGE_MISMATCH");
+          }
+          nextOffset = committedBytes;
+          continue;
+        }
+        if (![429, 500, 502, 503, 504].includes(response.status)) {
+          throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${response.status}`);
+        }
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "";
+        if (code === "GOOGLE_DRIVE_RESUMABLE_RANGE_MISMATCH" || /^GOOGLE_DRIVE_RESUMABLE_UPLOAD_(?!429|500|502|503|504)/.test(code)) {
+          throw error;
+        }
+      }
+
+      await wait(TRANSIENT_DRIVE_RETRY_DELAY_MS * (attempt + 1));
+      try {
+        const status = await queryCommittedBytes();
+        if (status.complete) return status;
+        if (status.committedBytes >= end + 1) return { complete: false as const };
+        if (status.committedBytes < start || status.committedBytes > end) {
+          throw new Error("GOOGLE_DRIVE_RESUMABLE_RANGE_MISMATCH");
+        }
+        nextOffset = status.committedBytes;
+      } catch (error) {
+        if (attempt === DRIVE_RECORDING_CHUNK_ATTEMPTS - 1) throw error;
+      }
+    }
+    throw new Error(`GOOGLE_DRIVE_RESUMABLE_UPLOAD_${lastStatus || 503}`);
+  }
+
+  async function* chunks(body: ReadableStream) {
+    const reader = body.getReader();
+    let buffer = new Uint8Array(DRIVE_RECORDING_CHUNK_BYTES);
+    let used = 0;
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        const value = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
+        let valueOffset = 0;
+        while (valueOffset < value.byteLength) {
+          const copied = Math.min(buffer.byteLength - used, value.byteLength - valueOffset);
+          buffer.set(value.subarray(valueOffset, valueOffset + copied), used);
+          used += copied;
+          valueOffset += copied;
+          if (used === buffer.byteLength) {
+            yield buffer;
+            buffer = new Uint8Array(DRIVE_RECORDING_CHUNK_BYTES);
+            used = 0;
+          }
+        }
+      }
+      if (used > 0) yield buffer.slice(0, used);
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  let uploadedBytes = 0;
+  let completedFile: DriveFile | null = null;
+  for await (const chunk of chunks(input.body)) {
+    const uploaded = await putChunk(chunk, uploadedBytes);
+    uploadedBytes += chunk.byteLength;
+    if (uploaded.complete) completedFile = uploaded.file;
+  }
+  if (uploadedBytes !== input.byteSize) throw new Error("GOOGLE_DRIVE_RECORDING_SOURCE_SIZE_MISMATCH");
+  if (!completedFile) {
+    const status = await queryCommittedBytes();
+    if (status.complete) completedFile = status.file;
+  }
+  if (!completedFile) throw new Error("GOOGLE_DRIVE_RESUMABLE_UPLOAD_INCOMPLETE");
+  return completedFile;
 }
 
 function fileSummary(file: DriveFile, fallbackName: string) {

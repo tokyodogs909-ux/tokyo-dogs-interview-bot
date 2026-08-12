@@ -1014,7 +1014,7 @@ test("candidate foreground archive waits for Drive readback and stores all six a
   });
   stored.summary = "採用担当者による確認が必要です。";
   const recordingKey = `interviews/${session.sessionId}/recording.webm`;
-  const recordingBytes = new TextEncoder().encode("test-recording-with-both-audio-tracks");
+  const recordingBytes = new Uint8Array(20 * 1024 * 1024 + 123).fill(90);
   recordings.objects.set(recordingKey, {
     body: new Blob([recordingBytes], { type: "video/webm" }).stream(),
     options: { httpMetadata: { contentType: "video/webm" } },
@@ -1046,6 +1046,9 @@ test("candidate foreground archive waits for Drive readback and stores all six a
   const createdFolders = [];
   const uploadedDriveFiles = [];
   let recordingUploadFinished = false;
+  const recordingUploadRanges = [];
+  let recordingMetadata = null;
+  let injectFirstRecordingChunkFailure = true;
   try {
     globalThis.fetch = async (url, init = {}) => {
       const href = String(url);
@@ -1100,14 +1103,8 @@ test("candidate foreground archive waits for Drive readback and stores all six a
       }
       if (href.includes("uploadType=resumable")) {
         const metadata = JSON.parse(String(init.body));
+        recordingMetadata = metadata;
         uploadedNames.push(metadata.name);
-        uploadedDriveFiles.push({
-          id: `file-${nextFile + 1}`,
-          name: metadata.name,
-          size: String(recordingBytes.byteLength),
-          parents: metadata.parents,
-          appProperties: metadata.appProperties,
-        });
         return new Response(null, {
           status: 200,
           headers: { Location: "https://upload.example.test/recording-session" },
@@ -1115,14 +1112,35 @@ test("candidate foreground archive waits for Drive readback and stores all six a
       }
       if (href === "https://upload.example.test/recording-session") {
         assert.equal(init.method, "PUT");
-        assert.equal(init.headers["Content-Length"], String(recordingBytes.byteLength));
+        const contentRange = init.headers["Content-Range"];
+        if (contentRange === `bytes */${recordingBytes.byteLength}`) {
+          return new Response(null, { status: 308 });
+        }
+        assert.match(contentRange, /^bytes \d+-\d+\/\d+$/);
+        recordingUploadRanges.push(contentRange);
+        const match = contentRange.match(/^bytes (\d+)-(\d+)\/(\d+)$/);
+        const end = Number(match[2]);
+        const total = Number(match[3]);
+        assert.equal(Number(init.headers["Content-Length"]), end - Number(match[1]) + 1);
+        if (injectFirstRecordingChunkFailure) {
+          injectFirstRecordingChunkFailure = false;
+          return new Response(null, { status: 503 });
+        }
+        if (end + 1 < total) {
+          return new Response(null, { status: 308, headers: { Range: `bytes=0-${end}` } });
+        }
         await new Promise((resolve) => setTimeout(resolve, 75));
         recordingUploadFinished = true;
-        return Response.json({
+        const recordingFile = {
           id: `file-${++nextFile}`,
-          name: `${session.sessionId}_面接録画.webm`,
+          name: recordingMetadata.name,
+          mimeType: "video/webm",
           size: String(recordingBytes.byteLength),
-        });
+          parents: recordingMetadata.parents,
+          appProperties: recordingMetadata.appProperties,
+        };
+        uploadedDriveFiles.push(recordingFile);
+        return Response.json(recordingFile);
       }
       if (href.includes("uploadType=multipart")) {
         const metadataBlob = init.body.get("metadata");
@@ -1164,6 +1182,12 @@ test("candidate foreground archive waits for Drive readback and stores all six a
     assert.equal(payload.stored, true);
     assert.equal(payload.recordingIncluded, true);
     assert.equal(recordingUploadFinished, true, "the API must not respond before the recording upload finishes");
+    assert.deepEqual(recordingUploadRanges, [
+      `bytes 0-8388607/${recordingBytes.byteLength}`,
+      `bytes 0-8388607/${recordingBytes.byteLength}`,
+      `bytes 8388608-16777215/${recordingBytes.byteLength}`,
+      `bytes 16777216-${recordingBytes.byteLength - 1}/${recordingBytes.byteLength}`,
+    ]);
     assert.ok(Date.now() - archiveStartedAt >= 70, "the foreground archive response must await Drive readback");
     assert.match(database.externalSyncs.get(session.sessionId).folder_url, /^https:\/\/drive\.google\.com\/drive\/folders\/folder-/);
     assert.deepEqual(createdFolders, ["2026", "07", `テスト 応募者_${session.sessionId}`]);
