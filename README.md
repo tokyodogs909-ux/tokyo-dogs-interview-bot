@@ -96,47 +96,11 @@ OPENAI_API_KEY="$(security find-generic-password -a "$USER" -s "TOKYODOGS_AI_INT
 
 音声接続に失敗する場合は、最初の画面にある「接続確認（選考対象外）」を押します。外部サービス、録画、採用評価を使わず、文字入力フローと完了画面を確認できます。
 
-### 旧録画の文字起こし下書き（人手確認必須）
+### 旧録画の文字起こし下書き（閉鎖済み）
 
-旧方式の録画から実議事録を復旧するときは、Drive原本を変更せず、権限制限端末へ取得したローカルコピーだけを入力にする。次のCLIは`ffmpeg`で音声を抽出し、OpenAIの`gpt-4o-transcribe-diarize`で話者ラベル付きの**下書き**を作る。D1、Google Drive、評価には一切書き込まない。
+旧3件の人手確認用下書き生成は2026-08-13に完了した。一時専用endpoint、Worker binding、短期secret、実行用npm commandは同日中に削除し、本番pathが404であることを確認済み。このリポジトリに残るCLI／server helper／試験は監査記録であり、現在の本番では実行できない。再利用やendpointの再公開は禁止する。
 
-CLIが受け付けるのは、秘密環境変数`INTERVIEW_MANUAL_REPAIR_SESSION_IDS`へカンマ区切りで設定した、正規形式・重複なし・ちょうど3件の承認済み面接IDだけである。この許可リストはリポジトリやコマンド履歴へ保存しない。
-
-```bash
-npm run manual:transcript-draft -- \
-  --dry-run \
-  --session-id TD-XXXXXXXX-XXXXXXX \
-  --input /secure/video.webm \
-  --output /secure/transcript-draft.json
-
-npm run manual:transcript-draft -- \
-  --yes-paid-api \
-  --session-id TD-XXXXXXXX-XXXXXXX \
-  --input /secure/video.webm \
-  --output /secure/transcript-draft.json
-
-# 失敗後、`.partial`の読戻しと人の再送判断を完了した場合だけ使用
-npm run manual:transcript-draft -- \
-  --yes-paid-api \
-  --resume-confirmed \
-  --session-id TD-XXXXXXXX-XXXXXXX \
-  --input /secure/video.webm \
-  --output /secure/transcript-draft.json
-
-npm run manual:transcript-draft -- \
-  --readback /secure/transcript-draft.json
-```
-
-- 実行にはローカルの`ffmpeg`／`ffprobe`、HTTPSの`INTERVIEW_MANUAL_DRAFT_ENDPOINT`、短期の`INTERVIEW_MANUAL_REPAIR_TOKEN`が必要。ローカル端末へOpenAI APIキーは出さない。
-- 一時ディレクトリは`0700`、一時音声と下書きは`0600`。入力／出力パス、修復token、音声、発言本文、API応答本文はログに出さない。
-- 音声は32kbps mono MP3へ圧縮し、サイズにかかわらず4分単位（最大6分割）で処理する。各音声は24MB以下を強制し、APIの25MB上限に余裕を持たせる。`gpt-4o-transcribe-diarize`では`diarized_json`と`chunking_strategy=auto`を使用する（[OpenAI公式File transcription](https://developers.openai.com/api/docs/guides/speech-to-text)）。分割間で話者ラベルが変わり得るため、人が全区間を再同定する。
-- 抽出音声をraw `audio/mpeg` bodyで専用HTTPS endpointへ送り、session IDと音声SHA-256をheadersで照合する。dry-runはendpoint／tokenを参照せず送信0件。
-- 各4分区間の送信は必ず1回だけで、自動再試行しない。HTTP 408／409／425／429／5xx、通信切断、timeoutのいずれでも停止し、実行結果と下書きの読戻しを人が確認してから再実行可否を判断する。
-- 各成功区間は`${output}.partial`へ`0600`で直ちに保存し、fsync・SHA読戻しする。通常の再実行は`PARTIAL_CHECKPOINT_REQUIRES_EXPLICIT_RESUME`で拒否される。担当者が`--readback /secure/transcript-draft.json.partial`で保存済み区間数を確認し、失敗区間の再送を明示判断した場合だけ`--resume-confirmed`を使用する。
-- 再開時はsession hash、元動画SHA／サイズ／時間、分割数、再抽出した各音声SHA／サイズ／時間が完全一致する保存済み区間だけを再送せずに使用する。最終下書きを排他的作成・読戻しできた後だけ`.partial`を削除する。
-- 出力は`human_verification_required`かつ`safeToWriteProduction:false`で固定。人が元動画と突合して候補者／面接官、質問／回答区間、欠落、誤認識を確定するまで、採用判断・D1修復・Drive再生成・評価へ使用しない。
-- CLIは質問を再構築しない。旧3件の質問正本は各sessionの既存D1 `recorded-fallback-question-N`であり、人はその質問に対応する回答だけを確定する。
-- このCLIには本番書込機能を実装していない。人手確定後の反映は、監査付き専用修復経路を別途レビューしてから行う。
+確認用Googleドキュメントを原本動画と照合し、話者、旧15問との対応、回答区間、誤認識を人が全件確定するまでは、D1、既存Drive正本、評価、採用判断へ反映しない。確定後の反映には、既存質問・録画・Drive file IDを固定し、監査付きCASとreadbackを備えた別の専用修復経路を新規設計・試験・承認する。
 
 ## 検証
 
