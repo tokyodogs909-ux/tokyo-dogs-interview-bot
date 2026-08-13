@@ -185,6 +185,28 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(source, /attachRemoteAudioToRecording/);
   assert.match(source, /remoteAnalyser/);
   assert.match(source, /REMOTE_AUDIO_SILENT/);
+  // Recording coverage is a full-session, fail-closed signal. Mobile Safari can
+  // expose the non-standard AudioContext state "interrupted", so production
+  // code deliberately treats every non-running/non-closed state alike.
+  assert.match(source, /recordingContext\.state !== "running" && recordingContext\.state !== "closed"/);
+  assert.match(source, /REMOTE_AUDIO_CONTEXT_INTERRUPTED/);
+  assert.match(source, /addEventListener\("statechange", handleContextState\)/);
+  assert.match(source, /addEventListener\("mute", handleMute\)/);
+  assert.match(source, /addEventListener\("unmute", handleUnmute\)/);
+  assert.match(source, /addEventListener\("ended", handleEnded\)/);
+  assert.match(source, /addEventListener\("pagehide", markPageHidden\)/);
+  assert.match(source, /addEventListener\("pageshow", resumeInterviewAudio\)/);
+  assert.match(source, /addEventListener\("touchend", resumeInterviewAudio\)/);
+  assert.match(source, /reduceRecordingAudioCoverage/);
+  const remoteMonitorBody = source.slice(
+    source.indexOf("mix.remoteMonitorTimer = window.setInterval"),
+    source.indexOf("}, 250);", source.indexOf("mix.remoteMonitorTimer = window.setInterval")),
+  );
+  assert.match(remoteMonitorBody, /remoteCoverageInvalid/);
+  assert.match(remoteMonitorBody, /reduceRecordingAudioCoverage/);
+  assert.doesNotMatch(remoteMonitorBody, /clearInterval/);
+  assert.match(source, /mix\.remoteCoverageInvalid[\s\S]*?updateRecordingAudioCoverage\(false\)/);
+  assert.match(source, /recordingHasBothAudioRef\.current === true[\s\S]*?"both"[\s\S]*?"candidate-only"[\s\S]*?"unverified"/);
   assert.match(recordingUploadSource, /X-Recording-Part-Index/);
   assert.match(recordingUploadSource, /X-Recording-Part-Sha256/);
   assert.match(recordingUploadSource, /crypto\.subtle\.digest\("SHA-256"/);

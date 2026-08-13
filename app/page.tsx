@@ -35,6 +35,7 @@ import {
   splitRecordedAnswerUpload,
 } from "@/lib/recorded-answer-upload";
 import { uploadRecordingResumably } from "@/lib/recording-upload";
+import { initialRecordingAudioCoverageState, reduceRecordingAudioCoverage } from "@/lib/recording-audio-coverage";
 import { InterviewerStage } from "./interviewer-stage";
 
 type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
@@ -80,9 +81,18 @@ type RecordingAudioMix = {
   remoteSource: MediaStreamAudioSourceNode | null;
   remoteAnalyser: AnalyserNode | null;
   remoteMonitorTimer: number | null;
-  remoteEnergyDetected: boolean;
-  remoteQuietSamples: number;
+  remoteTrack: MediaStreamTrack | null;
+  remoteTrackMuteHandler: (() => void) | null;
+  remoteTrackUnmuteHandler: (() => void) | null;
+  remoteTrackEndedHandler: (() => void) | null;
+  contextStateHandler: (() => void) | null;
+  remoteEnergySamples: number;
+  remoteExpectedQuietSamples: number;
+  remoteExpectedWindowSeen: boolean;
+  remoteCoverageInvalid: boolean;
+  remoteCoverageReported: boolean;
 };
+
 type RemotePlaybackGraph = {
   context: AudioContext;
   source: MediaStreamAudioSourceNode;
@@ -300,6 +310,8 @@ export default function Home() {
   const recordingAudioContextRef = useRef<AudioContext | null>(null);
   const recordingAudioMixRef = useRef<RecordingAudioMix | null>(null);
   const recordingHasBothAudioRef = useRef<boolean | null>(null);
+  const assistantAudioExpectedRef = useRef(false);
+  const assistantAudioExpectedUntilRef = useRef(0);
   const retryRecordedAnswersOnFinalizationRef = useRef(false);
   const playbackAudioContextRef = useRef<AudioContext | null>(null);
   const remotePlaybackGraphRef = useRef<RemotePlaybackGraph | null>(null);
@@ -325,6 +337,8 @@ export default function Home() {
   const statsTimerRef = useRef<number | null>(null);
   const playbackRetryTimersRef = useRef<number[]>([]);
   const resumeRemoteAudioActionRef = useRef<(showNotice: boolean) => Promise<boolean>>(async () => false);
+  const resumeRecordingAudioContextActionRef = useRef<() => Promise<boolean>>(async () => false);
+  const invalidateRecordingRemoteCoverageActionRef = useRef<(code: string, reportNow?: boolean) => void>(() => undefined);
   const previousAudioStatsRef = useRef({ sent: 0, received: 0 });
   const turnStateRef = useRef(initialTurnTakingState());
   const pendingCancelEventsRef = useRef(new Map<string, number>());
@@ -442,21 +456,39 @@ export default function Home() {
 
   useEffect(() => {
     if (stage !== "interview" || mode !== "voice") return;
-    const resumePlayback = () => {
-      if (document.visibilityState === "visible") void resumeRemoteAudioActionRef.current(false);
+    const resumeInterviewAudio = () => {
+      if (document.visibilityState !== "visible") return;
+      void resumeRemoteAudioActionRef.current(false);
+      void resumeRecordingAudioContextActionRef.current();
     };
-    document.addEventListener("visibilitychange", resumePlayback);
-    window.addEventListener("pageshow", resumePlayback);
-    window.addEventListener("online", resumePlayback);
+    const markHidden = () => {
+      if (document.visibilityState === "hidden") invalidateRecordingRemoteCoverageActionRef.current("REMOTE_AUDIO_PAGE_HIDDEN", false);
+    };
+    const markPageHidden = () => invalidateRecordingRemoteCoverageActionRef.current("REMOTE_AUDIO_PAGE_HIDDEN", false);
+    document.addEventListener("visibilitychange", markHidden);
+    document.addEventListener("visibilitychange", resumeInterviewAudio);
+    window.addEventListener("pageshow", resumeInterviewAudio);
+    window.addEventListener("pagehide", markPageHidden);
+    window.addEventListener("online", resumeInterviewAudio);
+    window.addEventListener("pointerdown", resumeInterviewAudio);
+    window.addEventListener("keydown", resumeInterviewAudio);
+    window.addEventListener("touchend", resumeInterviewAudio);
     return () => {
-      document.removeEventListener("visibilitychange", resumePlayback);
-      window.removeEventListener("pageshow", resumePlayback);
-      window.removeEventListener("online", resumePlayback);
+      document.removeEventListener("visibilitychange", markHidden);
+      document.removeEventListener("visibilitychange", resumeInterviewAudio);
+      window.removeEventListener("pageshow", resumeInterviewAudio);
+      window.removeEventListener("pagehide", markPageHidden);
+      window.removeEventListener("online", resumeInterviewAudio);
+      window.removeEventListener("pointerdown", resumeInterviewAudio);
+      window.removeEventListener("keydown", resumeInterviewAudio);
+      window.removeEventListener("touchend", resumeInterviewAudio);
     };
   }, [stage, mode]);
 
   useEffect(() => {
     resumeRemoteAudioActionRef.current = resumeRemoteAudio;
+    resumeRecordingAudioContextActionRef.current = resumeRecordingAudioContext;
+    invalidateRecordingRemoteCoverageActionRef.current = invalidateRecordingRemoteCoverage;
   });
 
   useEffect(() => {
@@ -1094,7 +1126,9 @@ export default function Home() {
       const speakerConnected = await attachRemoteAudioToSpeaker(remoteStream);
       audio.muted = speakerConnected;
       const recordingContext = recordingAudioContextRef.current;
-      if (recordingContext?.state === "suspended") await recordingContext.resume();
+      if (recordingContext && recordingContext.state !== "running" && recordingContext.state !== "closed") {
+        await resumeRecordingAudioContext();
+      }
       try {
         await audio.play();
       } catch (error) {
@@ -1196,6 +1230,12 @@ export default function Home() {
     const mix = recordingAudioMixRef.current;
     if (!mix) return;
     if (mix.remoteMonitorTimer !== null) window.clearInterval(mix.remoteMonitorTimer);
+    if (mix.remoteTrack) {
+      if (mix.remoteTrackMuteHandler) mix.remoteTrack.removeEventListener("mute", mix.remoteTrackMuteHandler);
+      if (mix.remoteTrackUnmuteHandler) mix.remoteTrack.removeEventListener("unmute", mix.remoteTrackUnmuteHandler);
+      if (mix.remoteTrackEndedHandler) mix.remoteTrack.removeEventListener("ended", mix.remoteTrackEndedHandler);
+    }
+    if (mix.contextStateHandler) mix.context.removeEventListener("statechange", mix.contextStateHandler);
     try {
       mix.localSource.disconnect();
       mix.remoteSource?.disconnect();
@@ -1209,8 +1249,91 @@ export default function Home() {
   }
 
   function updateRecordingAudioCoverage(value: boolean | null) {
+    if (value === true && recordingAudioMixRef.current?.remoteCoverageInvalid) value = false;
     recordingHasBothAudioRef.current = value;
     setRecordingHasBothAudio(value);
+  }
+
+  function isAssistantRecordingAudioExpected() {
+    return (
+      !isCandidateSpeaking() &&
+      (assistantAudioExpectedRef.current || Date.now() < assistantAudioExpectedUntilRef.current)
+    );
+  }
+
+  function markAssistantRecordingAudioExpected(expected: boolean) {
+    assistantAudioExpectedRef.current = expected;
+    assistantAudioExpectedUntilRef.current = expected ? 0 : Date.now() + 1_500;
+  }
+
+  function reportRecordingRemoteCoverageIssue(code: string) {
+    reportCandidateEvent("recording_unavailable", code);
+    setAudioNotice("録画内の茂木の音声を確認できません。面接は継続し、採用担当者が記録状態を確認します。");
+  }
+
+  function invalidateRecordingRemoteCoverage(code: string, reportNow = true) {
+    const mix = recordingAudioMixRef.current;
+    if (!mix || recorderRef.current?.state !== "recording" || endingRef.current) return;
+    commitRecordingAudioCoverage(mix, reduceRecordingAudioCoverage(readRecordingAudioCoverage(mix), {
+      type: code === "REMOTE_AUDIO_PAGE_HIDDEN" ? "hidden" : code === "REMOTE_AUDIO_CONTEXT_INTERRUPTED" ? "interrupted" : "track_unavailable",
+    }));
+    updateRecordingAudioCoverage(false);
+    if (reportNow && isAssistantRecordingAudioExpected() && !mix.remoteCoverageReported) {
+      mix.remoteCoverageReported = true;
+      reportRecordingRemoteCoverageIssue(code);
+    }
+  }
+
+  async function resumeRecordingAudioContext() {
+    const mix = recordingAudioMixRef.current;
+    const context = mix?.context ?? recordingAudioContextRef.current;
+    if (!context || context.state === "closed") return false;
+    const recovering = context.state !== "running";
+    if (recovering) {
+      invalidateRecordingRemoteCoverage("REMOTE_AUDIO_CONTEXT_INTERRUPTED");
+      try {
+        await context.resume();
+      } catch {
+        return false;
+      }
+    }
+    if (mix && recovering && String(context.state) === "running") {
+      commitRecordingAudioCoverage(mix, reduceRecordingAudioCoverage(readRecordingAudioCoverage(mix), { type: "recovered" }));
+    }
+    return context.state === "running";
+  }
+
+  function readRecordingAudioCoverage(mix: RecordingAudioMix) {
+    return {
+      energySamples: mix.remoteEnergySamples,
+      quietSamples: mix.remoteExpectedQuietSamples,
+      expectedWindowSeen: mix.remoteExpectedWindowSeen,
+      invalid: mix.remoteCoverageInvalid,
+      verified: recordingHasBothAudioRef.current === true,
+    };
+  }
+
+  function commitRecordingAudioCoverage(mix: RecordingAudioMix, state: ReturnType<typeof initialRecordingAudioCoverageState>) {
+    mix.remoteEnergySamples = state.energySamples;
+    mix.remoteExpectedQuietSamples = state.quietSamples;
+    mix.remoteExpectedWindowSeen = state.expectedWindowSeen;
+    mix.remoteCoverageInvalid = state.invalid;
+    updateRecordingAudioCoverage(state.verified);
+  }
+
+  function verifyRecordingRemoteCoverageAtCompletion() {
+    const mix = recordingAudioMixRef.current;
+    if (
+      !mix ||
+      mix.remoteCoverageInvalid ||
+      !mix.remoteExpectedWindowSeen ||
+      !mix.remoteTrack ||
+      mix.remoteTrack.readyState !== "live" ||
+      mix.remoteTrack.muted ||
+      mix.context.state !== "running"
+    ) {
+      updateRecordingAudioCoverage(false);
+    }
   }
 
   function attachRemoteAudioToRecording(remoteStream: MediaStream) {
@@ -1223,6 +1346,12 @@ export default function Home() {
     }
     try {
       if (mix.remoteMonitorTimer !== null) window.clearInterval(mix.remoteMonitorTimer);
+      if (mix.remoteTrack) {
+        if (mix.remoteTrackMuteHandler) mix.remoteTrack.removeEventListener("mute", mix.remoteTrackMuteHandler);
+        if (mix.remoteTrackUnmuteHandler) mix.remoteTrack.removeEventListener("unmute", mix.remoteTrackUnmuteHandler);
+        if (mix.remoteTrackEndedHandler) mix.remoteTrack.removeEventListener("ended", mix.remoteTrackEndedHandler);
+        if (mix.remoteTrack !== remoteTracks[0]) invalidateRecordingRemoteCoverage("REMOTE_AUDIO_TRACK_REPLACED");
+      }
       mix.remoteSource?.disconnect();
       mix.remoteAnalyser?.disconnect();
       const remoteSource = mix.context.createMediaStreamSource(new MediaStream(remoteTracks));
@@ -1233,32 +1362,51 @@ export default function Home() {
       analyser.connect(mix.destination);
       mix.remoteSource = remoteSource;
       mix.remoteAnalyser = analyser;
-      mix.remoteEnergyDetected = false;
-      mix.remoteQuietSamples = 0;
-      if (mix.context.state === "suspended") void mix.context.resume().catch(() => undefined);
+      mix.remoteTrack = remoteTracks[0];
+      mix.remoteEnergySamples = 0;
+      mix.remoteExpectedQuietSamples = 0;
+      const handleMute = () => invalidateRecordingRemoteCoverage("REMOTE_AUDIO_TRACK_MUTED");
+      const handleUnmute = () => {
+        mix.remoteEnergySamples = 0;
+        mix.remoteExpectedQuietSamples = 0;
+        void resumeRecordingAudioContext();
+      };
+      const handleEnded = () => invalidateRecordingRemoteCoverage("REMOTE_AUDIO_TRACK_ENDED");
+      mix.remoteTrackMuteHandler = handleMute;
+      mix.remoteTrackUnmuteHandler = handleUnmute;
+      mix.remoteTrackEndedHandler = handleEnded;
+      mix.remoteTrack.addEventListener("mute", handleMute);
+      mix.remoteTrack.addEventListener("unmute", handleUnmute);
+      mix.remoteTrack.addEventListener("ended", handleEnded);
+      if (mix.context.state !== "running" && mix.context.state !== "closed") void resumeRecordingAudioContext();
       updateRecordingAudioCoverage(false);
       const samples = new Uint8Array(analyser.fftSize);
       mix.remoteMonitorTimer = window.setInterval(() => {
-        if (recordingAudioMixRef.current !== mix || mix.remoteEnergyDetected) return;
+        if (recordingAudioMixRef.current !== mix || recorderRef.current?.state !== "recording") return;
+        if (mix.context.state !== "running" || mix.remoteTrack?.readyState !== "live" || mix.remoteTrack.muted) {
+          invalidateRecordingRemoteCoverage("REMOTE_AUDIO_MIX_NOT_RUNNING");
+          return;
+        }
         analyser.getByteTimeDomainData(samples);
         let sum = 0;
         for (const sample of samples) {
           const normalized = (sample - 128) / 128;
           sum += normalized * normalized;
         }
-        if (Math.sqrt(sum / samples.length) >= 0.004) {
-          mix.remoteEnergyDetected = true;
-          updateRecordingAudioCoverage(true);
-          if (mix.remoteMonitorTimer !== null) window.clearInterval(mix.remoteMonitorTimer);
-          mix.remoteMonitorTimer = null;
-          return;
-        }
-        if (turnStateRef.current.awaitingResponse) mix.remoteQuietSamples += 1;
-        if (mix.remoteQuietSamples >= 40) {
-          reportCandidateEvent("recording_unavailable", "REMOTE_AUDIO_SILENT");
-          setAudioNotice("録画内の茂木の音声を確認できません。面接は継続し、採用担当者が記録状態を確認します。");
-          if (mix.remoteMonitorTimer !== null) window.clearInterval(mix.remoteMonitorTimer);
-          mix.remoteMonitorTimer = null;
+        const previousInvalid = mix.remoteCoverageInvalid;
+        const nextCoverage = reduceRecordingAudioCoverage(readRecordingAudioCoverage(mix), {
+          type: "sample",
+          expected: isAssistantRecordingAudioExpected(),
+          candidateSpeaking: isCandidateSpeaking(),
+          contextRunning: mix.context.state === "running",
+          trackLive: mix.remoteTrack?.readyState === "live",
+          trackMuted: Boolean(mix.remoteTrack?.muted),
+          rms: Math.sqrt(sum / samples.length),
+        });
+        commitRecordingAudioCoverage(mix, nextCoverage);
+        if (nextCoverage.invalid && (!previousInvalid || !mix.remoteCoverageReported) && isAssistantRecordingAudioExpected()) {
+          mix.remoteCoverageReported = true;
+          reportRecordingRemoteCoverageIssue(previousInvalid ? "REMOTE_AUDIO_COVERAGE_INVALID" : "REMOTE_AUDIO_SILENT");
         }
       }, 250);
       return false;
@@ -1393,6 +1541,7 @@ export default function Home() {
         const destination = audioContext.createMediaStreamDestination();
         const localSource = audioContext.createMediaStreamSource(new MediaStream(audioTracks));
         localSource.connect(destination);
+        const initialCoverage = initialRecordingAudioCoverageState();
         recordingAudioMixRef.current = {
           context: audioContext,
           destination,
@@ -1400,9 +1549,26 @@ export default function Home() {
           remoteSource: null,
           remoteAnalyser: null,
           remoteMonitorTimer: null,
-          remoteEnergyDetected: false,
-          remoteQuietSamples: 0,
+          remoteTrack: null,
+          remoteTrackMuteHandler: null,
+          remoteTrackUnmuteHandler: null,
+          remoteTrackEndedHandler: null,
+          contextStateHandler: null,
+          remoteEnergySamples: initialCoverage.energySamples,
+          remoteExpectedQuietSamples: initialCoverage.quietSamples,
+          remoteExpectedWindowSeen: initialCoverage.expectedWindowSeen,
+          remoteCoverageInvalid: initialCoverage.invalid,
+          remoteCoverageReported: false,
         };
+        const mix = recordingAudioMixRef.current;
+        const handleContextState = () => {
+          if (mix.context.state !== "running" && mix.context.state !== "closed") {
+            invalidateRecordingRemoteCoverage("REMOTE_AUDIO_CONTEXT_INTERRUPTED");
+            void resumeRecordingAudioContext();
+          }
+        };
+        mix.contextStateHandler = handleContextState;
+        mix.context.addEventListener("statechange", handleContextState);
         audioTracks = destination.stream.getAudioTracks();
       } catch {
         updateRecordingAudioCoverage(false);
@@ -2276,6 +2442,8 @@ export default function Home() {
   }
 
   function stopRealtime(options: { keepLocalStream?: boolean; keepRecorder?: boolean } = {}) {
+    assistantAudioExpectedRef.current = false;
+    assistantAudioExpectedUntilRef.current = 0;
     clearResponseWatchdog();
     clearCandidateResponseDelay();
     clearTimedActionTimer();
@@ -2754,6 +2922,7 @@ export default function Home() {
     if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
     pendingCompletionTimerRef.current = null;
     pendingCompletionReasonRef.current = null;
+    if (mode === "voice") verifyRecordingRemoteCoverageAtCompletion();
     endingRef.current = true;
     // From this point until the verified Drive receipt, leaving the page can
     // abandon bytes or finalization requests that no server has received yet.
@@ -2856,6 +3025,8 @@ export default function Home() {
   function handleRealtimeEvent(event: RealtimeEvent) {
     const type = event.type ?? "";
     if (type === "input_audio_buffer.speech_started") {
+      assistantAudioExpectedRef.current = false;
+      assistantAudioExpectedUntilRef.current = 0;
       applyTurnTaking("candidate_speech_started");
       setConnectionState("candidate-speaking");
       setCandidateAudioState("detected");
@@ -2882,6 +3053,7 @@ export default function Home() {
       return;
     }
     if (type === "response.output_audio.delta" || type === "response.audio.delta") {
+      markAssistantRecordingAudioExpected(true);
       if (event.item_id && !currentAssistantAudioItemRef.current) {
         currentAssistantAudioItemRef.current = event.item_id;
       }
@@ -2890,6 +3062,7 @@ export default function Home() {
       return;
     }
     if (type === "response.done") {
+      markAssistantRecordingAudioExpected(false);
       const timedResponse = timedResponseRef.current;
       const completionPending = Boolean(pendingCompletionReasonRef.current);
       const { scheduledNextQuestion } = applyTurnTaking("response_done", {
@@ -2940,6 +3113,7 @@ export default function Home() {
       type === "response.audio_transcript.done" ||
       type === "response.output_text.done";
     if (isAssistantDelta || isAssistantDone) {
+      if (isAssistantDelta) markAssistantRecordingAudioExpected(true);
       // A barge-in (input_audio_buffer.speech_started) already cancelled the response.
       // Late-arriving deltas/done events for that cancelled response must not re-arm
       // the watchdog while the candidate is still answering.
