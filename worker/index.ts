@@ -9,6 +9,7 @@ interface Env {
   RECORDINGS?: R2Bucket;
   OPENAI_API_KEY?: string;
   OPENAI_API?: Fetcher;
+  OPENAI_HEALTH_API?: Fetcher;
   INTERVIEW_STAFF_TOKEN?: string;
   INTERVIEW_ADMIN_TOKEN?: string;
   GOOGLE_DRIVE_CLIENT_ID?: string;
@@ -42,6 +43,7 @@ type InterviewBindings = Pick<Env,
   | "RECORDINGS"
   | "OPENAI_API_KEY"
   | "OPENAI_API"
+  | "OPENAI_HEALTH_API"
   | "INTERVIEW_STAFF_TOKEN"
   | "INTERVIEW_ADMIN_TOKEN"
   | "GOOGLE_DRIVE_CLIENT_ID"
@@ -66,6 +68,7 @@ function installInterviewBindings(bindings: Env) {
     RECORDINGS: bindings.RECORDINGS,
     OPENAI_API_KEY: bindings.OPENAI_API_KEY,
     OPENAI_API: bindings.OPENAI_API,
+    OPENAI_HEALTH_API: bindings.OPENAI_HEALTH_API,
     INTERVIEW_STAFF_TOKEN: bindings.INTERVIEW_STAFF_TOKEN,
     INTERVIEW_ADMIN_TOKEN: bindings.INTERVIEW_ADMIN_TOKEN,
     GOOGLE_DRIVE_CLIENT_ID: bindings.GOOGLE_DRIVE_CLIENT_ID,

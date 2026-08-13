@@ -1628,17 +1628,19 @@ test("health endpoint verifies server authentication without returning the key",
   process.env.OPENAI_API_KEY = "test-key-never-returned";
   const healthUrls = [];
   const healthAuthorizations = [];
-  const openAIService = {
-    fetch: async (upstreamRequest) => {
-      healthUrls.push(upstreamRequest.url);
-      healthAuthorizations.push(upstreamRequest.headers.get("Authorization") ?? "");
-      return Response.json({ data: [] });
-    },
-  };
+  let serviceBindingCalls = 0;
   const response = await request("/api/health", {}, {
     ...workerEnv,
     OPENAI_API_KEY: "test-key-never-returned",
-    OPENAI_API: openAIService,
+    OPENAI_HEALTH_API: { fetch: async (upstreamRequest) => {
+      healthUrls.push(upstreamRequest.url);
+      healthAuthorizations.push(upstreamRequest.headers.get("Authorization") ?? "");
+      return Response.json({ data: [] });
+    } },
+    OPENAI_API: { fetch: async () => {
+      serviceBindingCalls += 1;
+      return new Promise(() => undefined);
+    } },
   });
   assert.deepEqual(healthUrls.sort(), [
     "https://api.openai.com/v1/models/gpt-5.6-sol",
@@ -1648,6 +1650,8 @@ test("health endpoint verifies server authentication without returning the key",
     "Bearer test-key-never-returned",
     "Bearer test-key-never-returned",
   ]);
+  assert.equal(serviceBindingCalls, 0,
+    "readiness must not use a hosted Fetcher that can outlive its abort fence");
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { configured: true });
   assert.equal(response.headers.get("permissions-policy"), "camera=(self), microphone=(self), display-capture=(self)");
@@ -1666,7 +1670,7 @@ test("health endpoint fails closed when the configured OpenAI key is rejected", 
     response = await request("/api/health", {}, {
       ...workerEnv,
       OPENAI_API_KEY: "rejected-test-key-never-returned",
-      OPENAI_API: { fetch: async () => {
+      OPENAI_HEALTH_API: { fetch: async () => {
         upstreamCalls += 1;
         return Response.json(
           { error: {
@@ -1698,15 +1702,13 @@ test("a cold isolate retries each transient model probe once and turns green on 
   const env = {
     ...workerEnv,
     OPENAI_API_KEY: "cold-transient-recovery-health-test-key",
-    OPENAI_API: {
-      fetch: async (upstreamRequest) => {
-        const attempt = (attempts.get(upstreamRequest.url) ?? 0) + 1;
-        attempts.set(upstreamRequest.url, attempt);
-        return attempt === 1
-          ? Response.json({ error: { type: "server_error" } }, { status: 500 })
-          : Response.json({ data: [] });
-      },
-    },
+    OPENAI_HEALTH_API: { fetch: async (upstreamRequest) => {
+      const attempt = (attempts.get(upstreamRequest.url) ?? 0) + 1;
+      attempts.set(upstreamRequest.url, attempt);
+      return attempt === 1
+        ? Response.json({ error: { type: "server_error" } }, { status: 500 })
+        : Response.json({ data: [] });
+    } },
   };
   try {
     assert.equal((await request("/api/health", {}, env)).status, 200);
@@ -1732,16 +1734,14 @@ test("health checks models independently and keeps a recent known-good model gre
   const env = {
     ...workerEnv,
     OPENAI_API_KEY: "stale-good-health-test-key",
-    OPENAI_API: {
-      fetch: async (upstreamRequest) => {
-        calls.push(upstreamRequest.url);
-        signals.push(upstreamRequest.signal);
-        if (mode === "partial-timeout" && upstreamRequest.url.includes("gpt-realtime")) {
-          throw new DOMException("simulated timeout", "AbortError");
-        }
-        return Response.json({ data: [] });
-      },
-    },
+    OPENAI_HEALTH_API: { fetch: async (upstreamRequest) => {
+      calls.push(upstreamRequest.url);
+      signals.push(upstreamRequest.signal);
+      if (mode === "partial-timeout" && upstreamRequest.url.includes("gpt-realtime")) {
+        throw new DOMException("simulated timeout", "AbortError");
+      }
+      return Response.json({ data: [] });
+    } },
   };
   try {
     assert.equal((await request("/api/health", {}, env)).status, 200);
@@ -1775,14 +1775,12 @@ test("health fails closed and caches a transient partial failure before any know
   const env = {
     ...workerEnv,
     OPENAI_API_KEY: "cold-partial-health-test-key",
-    OPENAI_API: {
-      fetch: async (upstreamRequest) => {
-        calls += 1;
-        return upstreamRequest.url.includes("gpt-realtime")
-          ? Response.json({ error: { type: "server_error" } }, { status: 503 })
-          : Response.json({ data: [] });
-      },
-    },
+    OPENAI_HEALTH_API: { fetch: async (upstreamRequest) => {
+      calls += 1;
+      return upstreamRequest.url.includes("gpt-realtime")
+        ? Response.json({ error: { type: "server_error" } }, { status: 503 })
+        : Response.json({ data: [] });
+    } },
   };
   try {
     assert.equal((await request("/api/health", {}, env)).status, 503);
@@ -1790,6 +1788,43 @@ test("health fails closed and caches a transient partial failure before any know
     assert.equal((await request("/api/health", {}, env)).status, 503);
     assert.equal(calls, 3, "two cold transient failures are cached briefly without claiming healthy");
   } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test("health aborts a hung native probe and stops after one bounded retry per model", async () => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const originalWarn = console.warn;
+  const signals = [];
+  let timerId = 0;
+  globalThis.setTimeout = (callback) => {
+    const id = ++timerId;
+    queueMicrotask(callback);
+    return id;
+  };
+  globalThis.clearTimeout = () => undefined;
+  console.warn = () => undefined;
+  try {
+    const response = await request("/api/health", {}, {
+      ...workerEnv,
+      OPENAI_API_KEY: "hung-native-health-probe-test-key",
+      OPENAI_HEALTH_API: { fetch: async (upstreamRequest) => {
+        signals.push(upstreamRequest.signal);
+        return await new Promise((_, reject) => {
+          upstreamRequest.signal.addEventListener("abort", () => {
+            reject(new DOMException("simulated hung fetch abort", "AbortError"));
+          }, { once: true });
+        });
+      } },
+    });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { configured: false });
+    assert.equal(signals.length, 4, "two models receive one initial attempt and one retry each");
+    assert.equal(signals.every((signal) => signal.aborted), true);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
     console.warn = originalWarn;
   }
 });
@@ -1805,22 +1840,20 @@ test("health clears known-good evidence after exhausted credit and cannot resurr
   const env = {
     ...workerEnv,
     OPENAI_API_KEY: "credit-exhaustion-health-test-key",
-    OPENAI_API: {
-      fetch: async (upstreamRequest) => {
-        calls += 1;
-        if (!upstreamRequest.url.includes("gpt-realtime")) return Response.json({ data: [] });
-        if (mode === "quota") {
-          return Response.json(
-            { error: { code: "credit_balance_exhausted", type: "insufficient_quota" } },
-            { status: 429 },
-          );
-        }
-        if (mode === "transient") {
-          return Response.json({ error: { type: "server_error" } }, { status: 503 });
-        }
-        return Response.json({ data: [] });
-      },
-    },
+    OPENAI_HEALTH_API: { fetch: async (upstreamRequest) => {
+      calls += 1;
+      if (!upstreamRequest.url.includes("gpt-realtime")) return Response.json({ data: [] });
+      if (mode === "quota") {
+        return Response.json(
+          { error: { code: "credit_balance_exhausted", type: "insufficient_quota" } },
+          { status: 429 },
+        );
+      }
+      if (mode === "transient") {
+        return Response.json({ error: { type: "server_error" } }, { status: 503 });
+      }
+      return Response.json({ data: [] });
+    } },
   };
   try {
     assert.equal((await request("/api/health", {}, env)).status, 200);
@@ -1857,7 +1890,7 @@ test("authenticated production readiness reports missing components without expo
     ...workerEnv,
     INTERVIEW_ADMIN_TOKEN: "readiness-admin-secret",
     OPENAI_API_KEY: "readiness-rejected-openai-key",
-    OPENAI_API: {
+    OPENAI_HEALTH_API: {
       fetch: async () => Response.json({ error: { type: "invalid_request_error" } }, { status: 401 }),
     },
   });

@@ -26,12 +26,6 @@ type OpenAIModelHealthCache = {
   ttlMs: number;
 };
 
-function openAIServiceBinding() {
-  return (globalThis as typeof globalThis & {
-    __TOKYO_DOGS_INTERVIEW_BINDINGS__?: { OPENAI_API?: Fetcher };
-  }).__TOKYO_DOGS_INTERVIEW_BINDINGS__?.OPENAI_API;
-}
-
 const openAIModelHealthCache = new Map<string, OpenAIModelHealthCache>();
 const openAIModelHealthInFlight = new Map<string, Promise<boolean>>();
 const OPENAI_HEALTHY_CACHE_MS = 5 * 60 * 1000;
@@ -39,6 +33,16 @@ const OPENAI_UNHEALTHY_CACHE_MS = 30 * 1000;
 const OPENAI_TRANSIENT_CACHE_MS = 30 * 1000;
 const OPENAI_STALE_GOOD_MS = 30 * 60 * 1000;
 const OPENAI_MODEL_TIMEOUT_MS = 8 * 1000;
+
+function healthProbeFetch(request: Request) {
+  // This optional binding is only a dependency-injection seam for the compiled
+  // route tests. Sites production does not define it, so health uses the native
+  // Cloudflare fetch path below.
+  const testFetcher = (globalThis as typeof globalThis & {
+    __TOKYO_DOGS_INTERVIEW_BINDINGS__?: { OPENAI_HEALTH_API?: Fetcher };
+  }).__TOKYO_DOGS_INTERVIEW_BINDINGS__?.OPENAI_HEALTH_API;
+  return testFetcher ? testFetcher.fetch(request) : fetch(request);
+}
 
 function diagnosticToken(value: unknown) {
   if (typeof value !== "string") return null;
@@ -69,24 +73,20 @@ type OpenAIModelProbe = {
 
 async function probeOpenAIModel(model: string, apiKey: string): Promise<OpenAIModelProbe> {
   const controller = new AbortController();
-  let timeoutId: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<OpenAIModelProbe>((resolve) => {
-    timeoutId = setTimeout(() => {
-      controller.abort();
-      resolve({
-        outcome: "transient",
-        status: null,
-        requestId: "unavailable",
-        error: { code: "timeout", type: "transport" },
-      });
-    }, OPENAI_MODEL_TIMEOUT_MS);
-  });
+  const timeoutId = setTimeout(() => controller.abort(), OPENAI_MODEL_TIMEOUT_MS);
   const request = new Request(`https://api.openai.com/v1/models/${encodeURIComponent(model)}`, {
     headers: { Authorization: `Bearer ${apiKey}` },
     signal: controller.signal,
   });
-  const service = openAIServiceBinding();
-  const network = (service ? service.fetch(request) : fetch(request)).then(async (response) => {
+  try {
+    // Readiness must follow the same native Cloudflare outbound path as the
+    // production Realtime and evaluation routes. The optional OPENAI_API
+    // Fetcher is retained for recorded-answer transcription, but some hosted
+    // Fetcher implementations can leave a timed-out subrequest attached to the
+    // incoming request even after Promise.race resolves. That made /api/health
+    // hang until the caller disconnected. Native fetch observes AbortSignal and
+    // gives this public readiness request a real wall-clock fence.
+    const response = await healthProbeFetch(request);
     const error = await safeOpenAIErrorMetadata(response);
     if (response.ok) {
       return {
@@ -107,16 +107,20 @@ async function probeOpenAIModel(model: string, apiKey: string): Promise<OpenAIMo
       requestId: diagnosticToken(response.headers.get("x-request-id")) ?? "unavailable",
       error,
     } satisfies OpenAIModelProbe;
-  }).catch(() => ({
-    outcome: "transient" as const,
-    status: null,
-    requestId: "unavailable",
-    error: { code: "transport_error", type: "transport" },
-  }));
-  try {
-    return await Promise.race([network, timeout]);
+  } catch (error) {
+    return {
+      outcome: "transient",
+      status: null,
+      requestId: "unavailable",
+      error: {
+        code: error instanceof DOMException && error.name === "AbortError"
+          ? "timeout"
+          : "transport_error",
+        type: "transport",
+      },
+    };
   } finally {
-    if (timeoutId) clearTimeout(timeoutId);
+    clearTimeout(timeoutId);
   }
 }
 
