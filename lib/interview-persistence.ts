@@ -1666,6 +1666,58 @@ export async function getDriveUploadStep(sessionId: string) {
   return safeDriveUploadStep(row);
 }
 
+/**
+ * Re-fences an already completed resumable upload to the new external-sync
+ * claim without changing its durable recording receipt. This is the only safe
+ * recovery path after finalization failed: starting a new upload could POST a
+ * third recording, while overwriting the existing recording could destroy the
+ * evidence needed to prove an exact duplicate.
+ */
+export async function adoptFinalizingDriveUploadStep(input: {
+  sessionId: string;
+  previousStartedAt: string;
+  nextStartedAt: string;
+  expectedTotalBytes: number;
+  expectedContentType: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
+  const result = await db.prepare(`UPDATE interview_drive_upload_steps SET
+    started_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+    WHERE session_id = ? AND started_at = ? AND phase = 'finalizing'
+      AND committed_offset = total_bytes AND total_bytes = ? AND content_type = ?
+      AND recording_file_json IS NOT NULL
+      AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+      AND EXISTS (
+        SELECT 1 FROM interview_external_syncs
+        WHERE session_id = ? AND provider = 'google_drive'
+          AND status = 'running' AND started_at = ?
+      )`)
+    .bind(
+      input.nextStartedAt,
+      now,
+      input.sessionId,
+      input.previousStartedAt,
+      input.expectedTotalBytes,
+      input.expectedContentType,
+      now,
+      input.sessionId,
+      input.nextStartedAt,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return null;
+  const stored = await getDriveUploadStep(input.sessionId);
+  if (
+    !stored || stored.startedAt !== input.nextStartedAt || stored.phase !== "finalizing" ||
+    stored.committedOffset !== stored.totalBytes || stored.totalBytes !== input.expectedTotalBytes ||
+    stored.contentType !== input.expectedContentType ||
+    !stored.recordingFile || typeof stored.recordingFile.id !== "string"
+  ) {
+    throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_READBACK_MISMATCH");
+  }
+  return stored;
+}
+
 export async function initializeDriveUploadStep(input: {
   sessionId: string;
   startedAt: string;
@@ -1781,6 +1833,30 @@ export async function updateDriveUploadStep(input: {
       input.leaseToken,
     ).run();
   if (Number(result.meta?.changes ?? 0) !== 1) throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST");
+}
+
+export async function updateDriveUploadStepContext(input: {
+  sessionId: string;
+  startedAt: string;
+  leaseToken: string;
+  context: Record<string, unknown>;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
+  const contextJson = JSON.stringify(input.context);
+  const result = await db.prepare(`UPDATE interview_drive_upload_steps SET
+    context_json = ?, updated_at = ?
+    WHERE session_id = ? AND started_at = ? AND lease_token = ?`)
+    .bind(contextJson, now, input.sessionId, input.startedAt, input.leaseToken).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST");
+  const stored = await getDriveUploadStep(input.sessionId);
+  if (
+    !stored || stored.startedAt !== input.startedAt ||
+    JSON.stringify(stored.context) !== contextJson
+  ) {
+    throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_READBACK_MISMATCH");
+  }
 }
 
 export async function releaseDriveUploadStepLease(input: {

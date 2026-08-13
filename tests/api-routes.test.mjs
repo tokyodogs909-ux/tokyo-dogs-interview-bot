@@ -351,6 +351,26 @@ class FakeD1Statement {
         Object.assign(step, { lease_token: leaseToken, lease_expires_at: leaseExpiresAt, updated_at: updatedAt });
         changes = 1;
       }
+    } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET started_at = ?, lease_token = NULL")) {
+      const [nextStartedAt, updatedAt, sessionId, previousStartedAt, expectedTotalBytes,
+        expectedContentType, now, syncSessionId, syncStartedAt] = this.values;
+      const step = this.database.driveUploadSteps.get(sessionId);
+      const sync = this.database.externalSyncs.get(syncSessionId);
+      if (
+        step?.started_at === previousStartedAt && step.phase === "finalizing" &&
+        step.committed_offset === step.total_bytes && step.total_bytes === expectedTotalBytes &&
+        step.content_type === expectedContentType && step.recording_file_json !== null &&
+        (!step.lease_token || !step.lease_expires_at || step.lease_expires_at <= now) &&
+        sync?.status === "running" && sync.started_at === syncStartedAt
+      ) {
+        Object.assign(step, {
+          started_at: nextStartedAt,
+          lease_token: null,
+          lease_expires_at: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET committed_offset")) {
       const [committedOffset, phase, replaceMarker, recordingFileJson,
         uploadUrlCiphertext, uploadUrlIv, releaseLease, , updatedAt,
@@ -366,6 +386,14 @@ class FakeD1Statement {
           step.lease_token = null;
           step.lease_expires_at = null;
         }
+        step.updated_at = updatedAt;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET context_json")) {
+      const [contextJson, updatedAt, sessionId, startedAt, leaseToken] = this.values;
+      const step = this.database.driveUploadSteps.get(sessionId);
+      if (step?.started_at === startedAt && step.lease_token === leaseToken) {
+        step.context_json = contextJson;
         step.updated_at = updatedAt;
         changes = 1;
       }
@@ -2896,6 +2924,403 @@ test("candidate archive fails closed before writes for a mismatched transcript d
       "a completed receipt must be an exact D1 readback, not another Drive write");
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("failed finalization adopts the trusted 83 MB recording and quarantines only its exact Drive duplicate", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const rootFolderId = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+    GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+    GOOGLE_DRIVE_REFRESH_TOKEN: "google-refresh-token",
+    GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: "test-only-drive-step-encryption-secret-at-least-32-characters",
+    GOOGLE_DRIVE_ROOT_FOLDER_ID: rootFolderId,
+    GOOGLE_DRIVE_EXPECTED_ROOT_NAME: "オンライン一次面接_自動格納",
+  };
+  const session = await createTestInterviewSession(env, "正社員", "越谷店");
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "completed";
+  stored.recording_status = "stored";
+  stored.completed_at = "2026-08-13T04:00:00.000Z";
+  stored.transcript_json = JSON.stringify([
+    { id: "turn-1", speaker: "interviewer", text: "自己紹介をお願いします。", createdAt: "2026-08-13T03:50:00.000Z" },
+    { id: "turn-2", speaker: "candidate", text: "トリマー経験があります。", createdAt: "2026-08-13T03:50:10.000Z" },
+  ]);
+  stored.evaluation_json = JSON.stringify({
+    recommendation: "human_review", summary: "人が確認します。", dimensions: [],
+    strengths: [], concerns: [], contradictions: [], missingTopics: [], conditions: [],
+    evidenceValidationWarnings: [], humanReviewRequired: true,
+  });
+  const recordingByteSize = 83_173_387;
+  const recordingKey = `interviews/${session.sessionId}/recording.webm`;
+  recordings.objects.set(recordingKey, {
+    body: new Uint8Array([1]),
+    options: { httpMetadata: { contentType: "video/webm" } },
+  });
+  database.artifacts.push([
+    "artifact-id", session.sessionId, recordingKey, "video/webm", recordingByteSize,
+    "source-etag", "2027-08-13T04:00:00.000Z",
+  ]);
+
+  const oldStartedAt = "2026-08-13T04:01:00.000Z";
+  const folderId = "folder-session";
+  const expectedName = `${session.sessionId}_面接録画.webm`;
+  const sha256Checksum = "a".repeat(64);
+  const canonical = {
+    id: "trusted-recording-id",
+    name: expectedName,
+    mimeType: "video/webm",
+    size: String(recordingByteSize),
+    sha256Checksum,
+    trashed: false,
+    parents: [folderId],
+    appProperties: { tokyoDogsArtifact: "recording", tokyoDogsProvider: "google_drive" },
+  };
+  const duplicate = {
+    ...canonical,
+    id: "duplicate-recording-id",
+    appProperties: { ...canonical.appProperties },
+  };
+  const uploaded = {
+    transcript: { id: "transcript-id", name: "transcript.txt", size: 10 },
+    evaluation: { id: "evaluation-id", name: "evaluation.json", size: 10 },
+    reportDocument: { id: "report-doc-id", name: "report", size: null },
+    reportPdf: { id: "report-pdf-id", name: "report.pdf", size: 10 },
+  };
+  const preparedContext = {
+    rootFolderId,
+    expectedParentId: "folder-month",
+    candidateFolder: {
+      id: folderId,
+      name: `候補者_${session.sessionId}`,
+      mimeType: "application/vnd.google-apps.folder",
+      parents: ["folder-month"],
+      appProperties: {
+        tokyoDogsKind: "tokyoDogsInterviewSession",
+        tokyoDogsInterviewSession: session.sessionId,
+      },
+      webViewLink: `https://drive.google.com/drive/folders/${folderId}`,
+    },
+    folderUrl: `https://drive.google.com/drive/folders/${folderId}`,
+    uploaded,
+    artifactTargetIds: {
+      transcript: "transcript-id", evaluation_json: "evaluation-id",
+      report_doc: "report-doc-id", report_pdf: "report-pdf-id",
+      manifest: null, recording: null,
+    },
+    transcriptDuplicateId: null,
+    recordingDuplicateProof: null,
+    transcriptAvailable: true,
+    transcriptKind: "actual_transcript",
+  };
+  database.externalSyncs.set(session.sessionId, {
+    provider: "google_drive", status: "failed", requested_at: oldStartedAt,
+    started_at: oldStartedAt, completed_at: null, folder_id: folderId,
+    folder_url: preparedContext.folderUrl, manifest_json: null,
+    error_code: "GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH", updated_at: oldStartedAt,
+  });
+  database.driveUploadSteps.set(session.sessionId, {
+    session_id: session.sessionId,
+    started_at: oldStartedAt,
+    phase: "finalizing",
+    upload_url_ciphertext: "ciphertext",
+    upload_url_iv: "iv",
+    committed_offset: recordingByteSize,
+    total_bytes: recordingByteSize,
+    content_type: "video/webm",
+    recording_name: expectedName,
+    folder_id: folderId,
+    folder_url: preparedContext.folderUrl,
+    context_json: JSON.stringify(preparedContext),
+    recording_file_json: JSON.stringify(canonical),
+    lease_token: null,
+    lease_expires_at: null,
+    created_at: oldStartedAt,
+    updated_at: oldStartedAt,
+  });
+
+  const activeSmallFiles = [
+    { id: "transcript-id", name: "transcript.txt", mimeType: "text/plain", size: "10", trashed: false, parents: [folderId], appProperties: { tokyoDogsArtifact: "transcript", tokyoDogsProvider: "google_drive" } },
+    { id: "evaluation-id", name: "evaluation.json", mimeType: "application/json", size: "10", trashed: false, parents: [folderId], appProperties: { tokyoDogsArtifact: "evaluation_json", tokyoDogsProvider: "google_drive" } },
+    { id: "report-doc-id", name: "report", mimeType: "application/vnd.google-apps.document", trashed: false, parents: [folderId], appProperties: { tokyoDogsArtifact: "report_doc", tokyoDogsProvider: "google_drive" } },
+    { id: "report-pdf-id", name: "report.pdf", mimeType: "application/pdf", size: "10", trashed: false, parents: [folderId], appProperties: { tokyoDogsArtifact: "report_pdf", tokyoDogsProvider: "google_drive" } },
+  ];
+  let manifest = null;
+  let recordingInitiations = 0;
+  let recordingContentPuts = 0;
+  let deleteCalls = 0;
+  let quarantinePatches = 0;
+  const quarantinePatchBodies = [];
+  let loseFirstQuarantineResponse = true;
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      if (href.includes(`/drive/v3/files/${folderId}?`) && !href.includes("alt=media")) {
+        return Response.json(preparedContext.candidateFolder);
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
+        const query = new URL(href).searchParams.get("q") ?? "";
+        if (query !== `'${folderId}' in parents and trashed = false`) return Response.json({ files: [] });
+        return Response.json({ files: [
+          ...activeSmallFiles,
+          canonical,
+          duplicate,
+          ...(manifest ? [manifest] : []),
+        ] });
+      }
+      if (href.includes(`/drive/v3/files/${duplicate.id}?`) && init.method === "PATCH") {
+        quarantinePatches += 1;
+        const metadata = JSON.parse(String(init.body));
+        quarantinePatchBodies.push(metadata);
+        duplicate.appProperties = { ...duplicate.appProperties, ...metadata.appProperties };
+        if (loseFirstQuarantineResponse) {
+          loseFirstQuarantineResponse = false;
+          return new Response(null, { status: 503 });
+        }
+        return Response.json(duplicate);
+      }
+      if (init.method === "DELETE") {
+        deleteCalls += 1;
+        return new Response(null, { status: 204 });
+      }
+      if (href.includes("uploadType=resumable")) {
+        recordingInitiations += 1;
+        return new Response(null, { status: 500 });
+      }
+      if (href.includes("uploadType=multipart")) {
+        const metadata = JSON.parse(await init.body.get("metadata").text());
+        const media = init.body.get("media");
+        if (metadata.appProperties?.tokyoDogsArtifact === "recording") recordingContentPuts += 1;
+        const target = [...activeSmallFiles, manifest].find((file) =>
+          file && href.includes(`/files/${encodeURIComponent(file.id)}?`));
+        const result = {
+          id: target?.id ?? "manifest-id",
+          name: metadata.name,
+          mimeType: metadata.mimeType || media.type,
+          size: String(media.size),
+          trashed: false,
+          parents: target?.parents ?? metadata.parents ?? [folderId],
+          appProperties: metadata.appProperties,
+        };
+        if (metadata.appProperties?.tokyoDogsArtifact === "manifest") manifest = result;
+        return Response.json(result);
+      }
+      throw new Error(`Unexpected Drive request: ${href}`);
+    };
+
+    let payload = null;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const response = await request("/api/interviews/archive", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: session.sessionId }),
+      }, env);
+      payload = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(payload));
+      if (payload.pending && payload.phase === "retrying") {
+        const durablePlan = JSON.parse(database.driveUploadSteps.get(session.sessionId).context_json)
+          .recordingDuplicateProof;
+        assert.deepEqual(durablePlan, {
+          canonicalId: canonical.id,
+          duplicateId: duplicate.id,
+          byteSize: recordingByteSize,
+          fingerprintAlgorithm: "sha256Checksum",
+          fingerprint: sha256Checksum,
+        }, "duplicate plan must be durable before retrying a lost metadata PATCH response");
+      }
+      if (payload.stored) break;
+    }
+    assert.equal(payload.stored, true);
+    assert.equal(recordingInitiations, 0, "trusted finalizing receipt must be adopted without a new upload session");
+    assert.equal(recordingContentPuts, 0, "recording content must never be PATCHed or reuploaded");
+    assert.equal(deleteCalls, 0);
+    assert.equal(quarantinePatches, 1, "lost PATCH response must converge from exact legacy readback");
+    assert.equal(quarantinePatchBodies[0].parents, undefined);
+    assert.equal(quarantinePatchBodies[0].addParents, undefined);
+    assert.equal(quarantinePatchBodies[0].removeParents, undefined);
+    assert.equal(canonical.id, "trusted-recording-id");
+    assert.equal(canonical.size, String(recordingByteSize));
+    assert.equal(canonical.sha256Checksum, sha256Checksum);
+    assert.equal(duplicate.appProperties.tokyoDogsArtifact, "legacy_duplicate_recording");
+    assert.equal(duplicate.appProperties.tokyoDogsLegacyArtifact, "recording");
+    assert.equal(duplicate.appProperties.tokyoDogsCanonicalFileId, canonical.id);
+    assert.equal(duplicate.appProperties.tokyoDogsDuplicateSha256, sha256Checksum);
+    assert.equal(duplicate.id, "duplicate-recording-id");
+    assert.equal(duplicate.name, expectedName);
+    assert.equal(duplicate.size, String(recordingByteSize));
+    assert.deepEqual(duplicate.parents, [folderId]);
+    assert.equal(manifest.id, "manifest-id");
+    assert.equal(database.driveUploadSteps.has(session.sessionId), false);
+    const receipt = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    assert.equal(receipt.files.recording.id, canonical.id);
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("83 MB duplicate-recording anomalies fail before metadata or content mutation", async (t) => {
+  const recordingByteSize = 83_173_387;
+  const checksum = "b".repeat(64);
+  for (const scenario of [
+    "sha-mismatch", "sha-absent", "missing-canonical", "three-active",
+    "wrong-parent", "wrong-tag", "wrong-name", "wrong-mime", "wrong-size",
+  ]) {
+    await t.test(scenario, async () => {
+      const originalFetch = globalThis.fetch;
+      const database = new FakeD1();
+      const recordings = new FakeR2();
+      const rootFolderId = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
+      const env = {
+        ...workerEnv, DB: database, RECORDINGS: recordings,
+        GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
+        GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
+        GOOGLE_DRIVE_REFRESH_TOKEN: "google-refresh-token",
+        GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: "test-only-drive-step-encryption-secret-at-least-32-characters",
+        GOOGLE_DRIVE_ROOT_FOLDER_ID: rootFolderId,
+        GOOGLE_DRIVE_EXPECTED_ROOT_NAME: "オンライン一次面接_自動格納",
+      };
+      const session = await createTestInterviewSession(env, "正社員", "越谷店");
+      const stored = database.sessions.get(session.sessionId);
+      Object.assign(stored, {
+        status: "completed", recording_status: "stored",
+        completed_at: "2026-08-13T04:00:00.000Z",
+        transcript_json: JSON.stringify([
+          { id: "q", speaker: "interviewer", text: "質問", createdAt: "2026-08-13T03:50:00.000Z" },
+          { id: "a", speaker: "candidate", text: "回答", createdAt: "2026-08-13T03:50:10.000Z" },
+        ]),
+        evaluation_json: JSON.stringify({
+          recommendation: "human_review", summary: "人が確認", dimensions: [], strengths: [],
+          concerns: [], contradictions: [], missingTopics: [], conditions: [],
+          evidenceValidationWarnings: [], humanReviewRequired: true,
+        }),
+      });
+      const recordingKey = `interviews/${session.sessionId}/recording.webm`;
+      recordings.objects.set(recordingKey, { body: new Uint8Array([1]), options: {} });
+      database.artifacts.push(["artifact", session.sessionId, recordingKey, "video/webm", recordingByteSize, "etag", "2027-08-13"]);
+      const folderId = "folder-session";
+      const oldStartedAt = "2026-08-13T04:01:00.000Z";
+      const expectedName = `${session.sessionId}_面接録画.webm`;
+      const canonical = {
+        id: "trusted-recording-id", name: expectedName, mimeType: "video/webm",
+        size: String(recordingByteSize), sha256Checksum: checksum, trashed: false,
+        parents: [folderId],
+        appProperties: { tokyoDogsArtifact: "recording", tokyoDogsProvider: "google_drive" },
+      };
+      const duplicate = { ...canonical, id: "duplicate-recording-id", appProperties: { ...canonical.appProperties } };
+      if (scenario === "sha-mismatch") duplicate.sha256Checksum = "c".repeat(64);
+      if (scenario === "sha-absent") delete duplicate.sha256Checksum;
+      if (scenario === "wrong-parent") duplicate.parents = ["other-folder"];
+      if (scenario === "wrong-tag") duplicate.appProperties.tokyoDogsArtifact = "unexpected_recording";
+      if (scenario === "wrong-name") duplicate.name = "different.webm";
+      if (scenario === "wrong-mime") duplicate.mimeType = "video/mp4";
+      if (scenario === "wrong-size") duplicate.size = String(recordingByteSize - 1);
+      const uploaded = {
+        transcript: { id: "transcript-id", name: "t", size: 1 },
+        evaluation: { id: "evaluation-id", name: "e", size: 1 },
+        reportDocument: { id: "doc-id", name: "d", size: null },
+        reportPdf: { id: "pdf-id", name: "p", size: 1 },
+      };
+      const context = {
+        rootFolderId, expectedParentId: "month-folder",
+        candidateFolder: {
+          id: folderId, mimeType: "application/vnd.google-apps.folder", parents: ["month-folder"],
+          appProperties: { tokyoDogsInterviewSession: session.sessionId },
+        },
+        folderUrl: `https://drive.google.com/drive/folders/${folderId}`,
+        uploaded,
+        artifactTargetIds: {
+          transcript: "transcript-id", evaluation_json: "evaluation-id",
+          report_doc: "doc-id", report_pdf: "pdf-id", manifest: null, recording: null,
+        },
+        transcriptDuplicateId: null, recordingDuplicateProof: null,
+        transcriptAvailable: true, transcriptKind: "actual_transcript",
+      };
+      database.externalSyncs.set(session.sessionId, {
+        provider: "google_drive", status: "failed", requested_at: oldStartedAt,
+        started_at: oldStartedAt, completed_at: null, folder_id: folderId,
+        folder_url: context.folderUrl, manifest_json: null,
+        error_code: "GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH", updated_at: oldStartedAt,
+      });
+      const persistedRecording = scenario === "missing-canonical"
+        ? { ...canonical, id: "unlisted-trusted-id" }
+        : canonical;
+      database.driveUploadSteps.set(session.sessionId, {
+        session_id: session.sessionId, started_at: oldStartedAt, phase: "finalizing",
+        upload_url_ciphertext: "cipher", upload_url_iv: "iv",
+        committed_offset: recordingByteSize, total_bytes: recordingByteSize,
+        content_type: "video/webm", recording_name: expectedName,
+        folder_id: folderId, folder_url: context.folderUrl,
+        context_json: JSON.stringify(context), recording_file_json: JSON.stringify(persistedRecording),
+        lease_token: null, lease_expires_at: null, created_at: oldStartedAt, updated_at: oldStartedAt,
+      });
+      const smallFiles = [
+        ["transcript-id", "transcript"], ["evaluation-id", "evaluation_json"],
+        ["doc-id", "report_doc"], ["pdf-id", "report_pdf"],
+      ].map(([id, artifact]) => ({
+        id, name: id, mimeType: artifact === "report_doc" ? "application/vnd.google-apps.document" : "application/octet-stream",
+        size: "1", trashed: false, parents: [folderId],
+        appProperties: { tokyoDogsArtifact: artifact, tokyoDogsProvider: "google_drive" },
+      }));
+      let mutations = 0;
+      let rangeReads = 0;
+      try {
+        globalThis.fetch = async (url, init = {}) => {
+          const href = String(url);
+          if (href === "https://oauth2.googleapis.com/token") return Response.json({ access_token: "token" });
+          if (href.includes(`/drive/v3/files/${folderId}?`) && !href.includes("alt=media")) {
+            return Response.json({
+              id: folderId, mimeType: "application/vnd.google-apps.folder", parents: ["month-folder"],
+              appProperties: { tokyoDogsInterviewSession: session.sessionId }, trashed: false,
+            });
+          }
+          if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
+            const query = new URL(href).searchParams.get("q") ?? "";
+            const files = query === `'${folderId}' in parents and trashed = false`
+              ? [...smallFiles, canonical, duplicate,
+                ...(scenario === "three-active" ? [{ ...duplicate, id: "third-recording-id" }] : [])]
+              : [];
+            return Response.json({ files });
+          }
+          if (init.method === "PATCH" || init.method === "POST" || init.method === "DELETE" || href.includes("uploadType=")) {
+            mutations += 1;
+            return new Response(null, { status: 500 });
+          }
+          if (href.includes("alt=media")) {
+            rangeReads += 1;
+            return new Response(null, { status: 500 });
+          }
+          throw new Error(`Unexpected Drive request: ${href}`);
+        };
+        const first = await request("/api/interviews/archive", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: session.sessionId }),
+        }, env);
+        assert.equal(first.status, 200);
+        assert.equal((await first.json()).phase, "finalizing");
+        const second = await request("/api/interviews/archive", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: session.sessionId }),
+        }, env);
+        assert.equal(second.status, 502);
+        assert.equal(mutations, 0, `${scenario} must fail before any Drive mutation`);
+        assert.equal(rangeReads, 0, `${scenario} must not stream an 83 MB checksum-less recording`);
+        assert.equal(database.driveUploadSteps.has(session.sessionId), true);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
   }
 });
 

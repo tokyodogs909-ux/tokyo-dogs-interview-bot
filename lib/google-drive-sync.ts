@@ -10,6 +10,7 @@ import {
   encryptGoogleDriveUploadCapability,
 } from "@/lib/google-drive-connection";
 import {
+  adoptFinalizingDriveUploadStep,
   acquireDriveUploadStepLease,
   claimExternalSync,
   completeExternalSync,
@@ -23,6 +24,7 @@ import {
   initializeDriveUploadStep,
   releaseDriveUploadStepLease,
   requestExternalSync,
+  updateDriveUploadStepContext,
   updateDriveUploadStep,
 } from "@/lib/interview-persistence";
 import { hasVerifiedCandidateTranscript } from "@/lib/interview-transcript-verification";
@@ -37,12 +39,21 @@ const TRANSIENT_DRIVE_RETRY_DELAY_MS = 600;
 const DRIVE_RECORDING_CHUNK_BYTES = 4 * 1024 * 1024;
 const DRIVE_RECORDING_CHUNK_ATTEMPTS = 4;
 const DRIVE_RECORDING_REQUEST_TIMEOUT_MS = 25_000;
+// Drive normally supplies a whole-file checksum for binary uploads. If it
+// does not, only a genuinely small duplicate is safe to prove by bounded
+// range reads inside one Worker request. Large checksum-less recordings stay
+// fail-closed instead of risking an unbounded download or partial comparison.
+const DRIVE_DUPLICATE_RECORDING_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
+const DRIVE_DUPLICATE_RECORDING_RANGE_BYTES = 4 * 1024 * 1024;
 
 type DriveFile = {
   id: string;
   name?: string;
   mimeType?: string;
   size?: string;
+  md5Checksum?: string;
+  sha1Checksum?: string;
+  sha256Checksum?: string;
   trashed?: boolean;
   webViewLink?: string;
   parents?: string[];
@@ -56,6 +67,14 @@ type DriveFilePage = {
 
 type ArchiveSource = NonNullable<Awaited<ReturnType<typeof getInterviewArchiveSource>>>;
 
+type RecordingDuplicateProof = {
+  canonicalId: string;
+  duplicateId: string;
+  byteSize: number;
+  fingerprintAlgorithm: "sha256Checksum" | "bounded-range-sha256";
+  fingerprint: string;
+};
+
 type PreparedDriveArchive = {
   rootFolderId: string;
   expectedParentId: string;
@@ -64,6 +83,7 @@ type PreparedDriveArchive = {
   uploaded: GoogleDriveSyncResult["uploaded"];
   artifactTargetIds: Record<string, string | null | undefined>;
   transcriptDuplicateId: string | null;
+  recordingDuplicateProof: RecordingDuplicateProof | null;
   transcriptAvailable: boolean;
   transcriptKind: string;
 };
@@ -313,7 +333,7 @@ async function listFolderChildren(accessToken: string, parentId: string) {
     spaces: "drive",
     supportsAllDrives: "true",
     includeItemsFromAllDrives: "true",
-    fields: "nextPageToken,files(id,name,mimeType,size,trashed,webViewLink,parents,appProperties)",
+    fields: "nextPageToken,files(id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,trashed,webViewLink,parents,appProperties)",
   });
   const result = await driveJson<DriveFilePage>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
   if (result.nextPageToken) throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
@@ -324,13 +344,22 @@ async function markLegacyDuplicateArtifact(input: {
   accessToken: string;
   fileId: string;
   artifactKey: string;
+  canonicalFileId?: string;
+  duplicateSha256?: string;
 }) {
   const legacyArtifactKey = `legacy_duplicate_${input.artifactKey}`;
   if (legacyArtifactKey.length > 124 || input.artifactKey.length > 124) {
     throw new Error("GOOGLE_DRIVE_ARCHIVE_CANONICAL_ID_INVALID");
   }
+  if (
+    input.canonicalFileId !== undefined &&
+    (!/^[A-Za-z0-9_-]{1,124}$/.test(input.canonicalFileId) ||
+      !/^[a-f0-9]{64}$/.test(input.duplicateSha256 ?? ""))
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_CANONICAL_ID_INVALID");
+  }
   const response = await fetchWithTimeout(
-    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.fileId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,size,trashed,webViewLink,parents,appProperties")}`,
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.fileId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,trashed,webViewLink,parents,appProperties")}`,
     {
       method: "PATCH",
       headers: {
@@ -341,6 +370,10 @@ async function markLegacyDuplicateArtifact(input: {
         appProperties: {
           tokyoDogsArtifact: legacyArtifactKey,
           tokyoDogsLegacyArtifact: input.artifactKey,
+          ...(input.canonicalFileId ? {
+            tokyoDogsCanonicalFileId: input.canonicalFileId,
+            tokyoDogsDuplicateSha256: input.duplicateSha256,
+          } : {}),
         },
       }),
     },
@@ -396,6 +429,245 @@ async function sha256Bytes(bytes: Uint8Array) {
   return Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
+function exactDriveParent(file: DriveFile, folderId: string) {
+  return file.parents?.length === 1 && file.parents[0] === folderId;
+}
+
+function safeDriveFileSize(file: DriveFile) {
+  if (typeof file.size !== "string" || !/^\d+$/.test(file.size)) return null;
+  const size = Number(file.size);
+  return Number.isSafeInteger(size) && size >= 0 ? size : null;
+}
+
+function recordingFileMatchesTrustedUpload(input: {
+  file: DriveFile;
+  folderId: string;
+  name: string;
+  contentType: string;
+  byteSize: number;
+}) {
+  return Boolean(
+    input.file.id && input.file.name === input.name &&
+    input.file.mimeType === input.contentType &&
+    safeDriveFileSize(input.file) === input.byteSize &&
+    exactDriveParent(input.file, input.folderId) &&
+    input.file.trashed !== true &&
+    input.file.appProperties?.tokyoDogsArtifact === "recording" &&
+    input.file.appProperties?.tokyoDogsProvider === DRIVE_PROVIDER,
+  );
+}
+
+function validatedDriveChecksums(file: DriveFile) {
+  const result = new Map<"sha256Checksum" | "sha1Checksum" | "md5Checksum", string>();
+  for (const [field, length] of [
+    ["sha256Checksum", 64],
+    ["sha1Checksum", 40],
+    ["md5Checksum", 32],
+  ] as const) {
+    const raw = file[field];
+    if (raw === undefined) continue;
+    const normalized = raw.toLowerCase();
+    if (!new RegExp(`^[a-f0-9]{${length}}$`).test(normalized)) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    result.set(field, normalized);
+  }
+  return result;
+}
+
+async function readDriveRecordingRange(input: {
+  accessToken: string;
+  fileId: string;
+  start: number;
+  end: number;
+  totalBytes: number;
+}) {
+  const expectedBytes = input.end - input.start + 1;
+  const response = await fetchWithTimeout(
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.fileId)}?alt=media&supportsAllDrives=true`,
+    {
+      headers: {
+        Authorization: `Bearer ${input.accessToken}`,
+        Range: `bytes=${input.start}-${input.end}`,
+      },
+    },
+    DRIVE_RECORDING_REQUEST_TIMEOUT_MS,
+  );
+  if ([429, 500, 502, 503, 504].includes(response.status)) {
+    await response.body?.cancel();
+    throw new Error(`GOOGLE_DRIVE_API_${response.status}`);
+  }
+  const completeSingleRange = input.start === 0 && expectedBytes === input.totalBytes;
+  if (response.status !== 206 && !(completeSingleRange && response.status === 200)) {
+    await response.body?.cancel();
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  if (response.status === 206) {
+    const contentRange = response.headers.get("Content-Range");
+    if (contentRange !== `bytes ${input.start}-${input.end}/${input.totalBytes}`) {
+      await response.body?.cancel();
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+  }
+  const contentLength = response.headers.get("Content-Length");
+  if (contentLength !== null && (!/^\d+$/.test(contentLength) || Number(contentLength) !== expectedBytes)) {
+    await response.body?.cancel();
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength !== expectedBytes || bytes.byteLength > DRIVE_DUPLICATE_RECORDING_RANGE_BYTES) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return await sha256Bytes(bytes);
+}
+
+async function boundedRecordingPairFingerprint(input: {
+  accessToken: string;
+  canonicalId: string;
+  duplicateId: string;
+  byteSize: number;
+}) {
+  if (
+    input.byteSize < 1 ||
+    input.byteSize > DRIVE_DUPLICATE_RECORDING_FALLBACK_MAX_BYTES
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const chunkHashes: string[] = [];
+  for (let start = 0; start < input.byteSize; start += DRIVE_DUPLICATE_RECORDING_RANGE_BYTES) {
+    const end = Math.min(start + DRIVE_DUPLICATE_RECORDING_RANGE_BYTES, input.byteSize) - 1;
+    const [canonicalHash, duplicateHash] = await Promise.all([
+      readDriveRecordingRange({
+        accessToken: input.accessToken,
+        fileId: input.canonicalId,
+        start,
+        end,
+        totalBytes: input.byteSize,
+      }),
+      readDriveRecordingRange({
+        accessToken: input.accessToken,
+        fileId: input.duplicateId,
+        start,
+        end,
+        totalBytes: input.byteSize,
+      }),
+    ]);
+    if (canonicalHash !== duplicateHash) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    chunkHashes.push(canonicalHash);
+  }
+  return await sha256Bytes(new TextEncoder().encode(
+    `${input.byteSize}:${DRIVE_DUPLICATE_RECORDING_RANGE_BYTES}:${chunkHashes.join(":")}`,
+  ));
+}
+
+async function proveRecordingDuplicate(input: {
+  accessToken: string;
+  folderId: string;
+  canonical: DriveFile;
+  duplicate: DriveFile;
+  expectedByteSize: number;
+  expectedName: string;
+  expectedContentType: string;
+}) : Promise<RecordingDuplicateProof> {
+  if (
+    !input.canonical.id || !input.duplicate.id || input.canonical.id === input.duplicate.id ||
+    input.canonical.trashed === true || input.duplicate.trashed === true ||
+    !exactDriveParent(input.canonical, input.folderId) ||
+    !exactDriveParent(input.duplicate, input.folderId) ||
+    input.canonical.appProperties?.tokyoDogsArtifact !== "recording" ||
+    !["recording", "legacy_duplicate_recording"].includes(
+      input.duplicate.appProperties?.tokyoDogsArtifact ?? "",
+    ) ||
+    (input.duplicate.appProperties?.tokyoDogsArtifact === "legacy_duplicate_recording" &&
+      (
+        input.duplicate.appProperties?.tokyoDogsLegacyArtifact !== "recording" ||
+        input.duplicate.appProperties?.tokyoDogsCanonicalFileId !== input.canonical.id ||
+        !/^[a-f0-9]{64}$/.test(input.duplicate.appProperties?.tokyoDogsDuplicateSha256 ?? "")
+      )) ||
+    input.canonical.appProperties?.tokyoDogsProvider !== DRIVE_PROVIDER ||
+    input.duplicate.appProperties?.tokyoDogsProvider !== DRIVE_PROVIDER ||
+    input.canonical.name !== input.expectedName || input.duplicate.name !== input.expectedName ||
+    input.canonical.mimeType !== input.expectedContentType ||
+    input.duplicate.mimeType !== input.expectedContentType
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const canonicalSize = safeDriveFileSize(input.canonical);
+  const duplicateSize = safeDriveFileSize(input.duplicate);
+  if (
+    !Number.isSafeInteger(input.expectedByteSize) || input.expectedByteSize < 1 ||
+    canonicalSize !== input.expectedByteSize || duplicateSize !== input.expectedByteSize
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const canonicalChecksums = validatedDriveChecksums(input.canonical);
+  const duplicateChecksums = validatedDriveChecksums(input.duplicate);
+  const canonicalChecksum = canonicalChecksums.get("sha256Checksum");
+  const duplicateChecksum = duplicateChecksums.get("sha256Checksum");
+  // Production recordings are far larger than the bounded read fallback. For
+  // those files Drive must provide SHA-256 on both exact file IDs; weaker
+  // digests and equal size/name alone are never content identity.
+  if (input.expectedByteSize > DRIVE_DUPLICATE_RECORDING_FALLBACK_MAX_BYTES) {
+    if (!canonicalChecksum || !duplicateChecksum || canonicalChecksum !== duplicateChecksum) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    if (
+      input.duplicate.appProperties?.tokyoDogsArtifact === "legacy_duplicate_recording" &&
+      input.duplicate.appProperties?.tokyoDogsDuplicateSha256 !== canonicalChecksum
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    return {
+      canonicalId: input.canonical.id,
+      duplicateId: input.duplicate.id,
+      byteSize: input.expectedByteSize,
+      fingerprintAlgorithm: "sha256Checksum",
+      fingerprint: canonicalChecksum,
+    };
+  }
+  if (canonicalChecksum || duplicateChecksum) {
+    if (!canonicalChecksum || !duplicateChecksum || canonicalChecksum !== duplicateChecksum) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    return {
+      canonicalId: input.canonical.id,
+      duplicateId: input.duplicate.id,
+      byteSize: input.expectedByteSize,
+      fingerprintAlgorithm: "sha256Checksum",
+      fingerprint: canonicalChecksum,
+    };
+  }
+  const fingerprint = await boundedRecordingPairFingerprint({
+    accessToken: input.accessToken,
+    canonicalId: input.canonical.id,
+    duplicateId: input.duplicate.id,
+    byteSize: input.expectedByteSize,
+  });
+  if (
+    input.duplicate.appProperties?.tokyoDogsArtifact === "legacy_duplicate_recording" &&
+    input.duplicate.appProperties?.tokyoDogsDuplicateSha256 !== fingerprint
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return {
+    canonicalId: input.canonical.id,
+    duplicateId: input.duplicate.id,
+    byteSize: input.expectedByteSize,
+    fingerprintAlgorithm: "bounded-range-sha256",
+    fingerprint,
+  };
+}
+
+function sameRecordingDuplicateProof(left: RecordingDuplicateProof, right: RecordingDuplicateProof) {
+  return left.canonicalId === right.canonicalId &&
+    left.duplicateId === right.duplicateId &&
+    left.byteSize === right.byteSize &&
+    left.fingerprintAlgorithm === right.fingerprintAlgorithm &&
+    left.fingerprint === right.fingerprint;
+}
+
 function indexDriveArtifacts(files: DriveFile[]) {
   const byArtifact = new Map<string, DriveFile[]>();
   for (const file of files) {
@@ -410,6 +682,9 @@ async function preflightDriveArchive(input: {
   accessToken: string;
   folderId: string;
   recordingIncluded: boolean;
+  expectedRecordingByteSize: number | null;
+  expectedRecordingName: string | null;
+  expectedRecordingContentType: string | null;
   expectedTranscript: Uint8Array;
   trustedTargetIds?: Record<string, string | null | undefined>;
   expectedDuplicateId?: string | null;
@@ -420,10 +695,33 @@ async function preflightDriveArchive(input: {
   const byArtifact = indexDriveArtifacts(files);
   const artifactTargetIds: Record<string, string | null | undefined> = {};
   let transcriptDuplicateId: string | null = null;
+  let recordingDuplicateProof: RecordingDuplicateProof | null = null;
+  const legacyRecordingFiles = byArtifact.get("legacy_duplicate_recording") ?? [];
+  const recordingNamedFiles = input.expectedRecordingName
+    ? files.filter((file) => file.name === input.expectedRecordingName)
+    : [];
+  if (
+    legacyRecordingFiles.length > 1 ||
+    legacyRecordingFiles.some((file) =>
+      file.appProperties?.tokyoDogsLegacyArtifact !== "recording" ||
+      file.trashed === true ||
+      !exactDriveParent(file, input.folderId)) ||
+    (!input.recordingIncluded && legacyRecordingFiles.length > 0)
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  if (
+    input.recordingIncluded &&
+    recordingNamedFiles.some((file) => !["recording", "legacy_duplicate_recording"].includes(
+      file.appProperties?.tokyoDogsArtifact ?? "",
+    ))
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
   if (input.expectedDuplicateId) {
     const knownDuplicate = files.find((file) => file.id === input.expectedDuplicateId);
     if (
-      !knownDuplicate || knownDuplicate.trashed === true || !knownDuplicate.parents?.includes(input.folderId) ||
+      !knownDuplicate || knownDuplicate.trashed === true || !exactDriveParent(knownDuplicate, input.folderId) ||
       !["transcript", "legacy_duplicate_transcript"].includes(knownDuplicate.appProperties?.tokyoDogsArtifact ?? "") ||
       (knownDuplicate.appProperties?.tokyoDogsArtifact === "legacy_duplicate_transcript" &&
         knownDuplicate.appProperties?.tokyoDogsLegacyArtifact !== "transcript")
@@ -436,8 +734,59 @@ async function preflightDriveArchive(input: {
   for (const artifactKey of required) {
     const taggedFiles = byArtifact.get(artifactKey) ?? [];
     const trustedId = input.trustedTargetIds?.[artifactKey];
-    if (taggedFiles.some((file) => file.trashed === true || !file.parents?.includes(input.folderId))) {
+    if (taggedFiles.some((file) => file.trashed === true || !exactDriveParent(file, input.folderId))) {
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    if (artifactKey === "recording") {
+      if (taggedFiles.length <= 1 && legacyRecordingFiles.length === 0) {
+        if (trustedId && taggedFiles[0]?.id !== trustedId) {
+          throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+        }
+        const onlyRecording = taggedFiles[0];
+        if (onlyRecording && (
+          !input.expectedRecordingName || !input.expectedRecordingContentType ||
+          input.expectedRecordingByteSize === null ||
+          onlyRecording.name !== input.expectedRecordingName ||
+          onlyRecording.mimeType !== input.expectedRecordingContentType ||
+          safeDriveFileSize(onlyRecording) !== input.expectedRecordingByteSize ||
+          onlyRecording.appProperties?.tokyoDogsProvider !== DRIVE_PROVIDER
+        )) {
+          throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+        }
+        artifactTargetIds.recording = taggedFiles[0]?.id ?? null;
+        continue;
+      }
+      // A duplicate recording is repairable only after the current resumable
+      // upload has supplied its exact canonical ID. Never choose by Drive list
+      // order, filename, timestamp, or lexicographic ID.
+      if (
+        !trustedId || input.expectedRecordingByteSize === null ||
+        !input.expectedRecordingName || !input.expectedRecordingContentType ||
+        !(
+          (taggedFiles.length === 2 && legacyRecordingFiles.length === 0) ||
+          (taggedFiles.length === 1 && legacyRecordingFiles.length === 1)
+        )
+      ) {
+        throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+      }
+      const canonical = taggedFiles.find((file) => file.id === trustedId);
+      const duplicate = taggedFiles.length === 2
+        ? taggedFiles.find((file) => file.id !== trustedId)
+        : legacyRecordingFiles[0];
+      if (!canonical || !duplicate) {
+        throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+      }
+      recordingDuplicateProof = await proveRecordingDuplicate({
+        accessToken: input.accessToken,
+        folderId: input.folderId,
+        canonical,
+        duplicate,
+        expectedByteSize: input.expectedRecordingByteSize,
+        expectedName: input.expectedRecordingName,
+        expectedContentType: input.expectedRecordingContentType,
+      });
+      artifactTargetIds.recording = canonical.id;
+      continue;
     }
     if (taggedFiles.length <= 1) {
       if (trustedId && taggedFiles[0]?.id !== trustedId) {
@@ -476,7 +825,12 @@ async function preflightDriveArchive(input: {
     transcriptDuplicateId = duplicate?.id ?? null;
     if (!transcriptDuplicateId) throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
   }
-  return { artifactTargetIds, transcriptDuplicateId };
+  if (recordingDuplicateProof && transcriptDuplicateId) {
+    // Keep this P1 repair deliberately single-purpose. A folder containing a
+    // second active duplicate class requires separate manual review.
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return { artifactTargetIds, transcriptDuplicateId, recordingDuplicateProof };
 }
 
 async function createFolder(
@@ -601,8 +955,8 @@ async function uploadRecording(input: {
   };
   if (!targetFileId) metadata.parents = [input.folderId];
   const initUrl = targetFileId
-    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(targetFileId)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`
-    : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`;
+    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(targetFileId)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,sha256Checksum,trashed,webViewLink,parents,appProperties`
+    : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,sha256Checksum,trashed,webViewLink,parents,appProperties`;
   const initResponse = await fetchWithTimeout(initUrl, {
     method: targetFileId ? "PATCH" : "POST",
     headers: {
@@ -741,8 +1095,8 @@ async function initiateRecordingUpload(input: {
   };
   if (!targetFileId) metadata.parents = [input.folderId];
   const initUrl = targetFileId
-    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(targetFileId)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink,parents,appProperties`
-    : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink,parents,appProperties`;
+    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(targetFileId)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,sha256Checksum,trashed,webViewLink,parents,appProperties`
+    : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,sha256Checksum,trashed,webViewLink,parents,appProperties`;
   const response = await fetchWithTimeout(initUrl, {
     method: targetFileId ? "PATCH" : "POST",
     headers: {
@@ -838,10 +1192,13 @@ async function verifyDriveArchive(input: {
   expectedParentId: string;
   sessionId: string;
   recordingByteSize: number | null;
+  recordingName: string | null;
+  recordingContentType: string | null;
   canonicalFileIds: Record<string, string>;
   expectedTranscript: Uint8Array;
   reportProgress: DriveSyncProgress;
   transcriptDuplicateId: string | null;
+  recordingDuplicateProof: RecordingDuplicateProof | null;
 }) {
   const fields = "id,name,mimeType,trashed,parents,appProperties,webViewLink";
   const folder = await driveJson<DriveFile & { trashed?: boolean }>(
@@ -863,6 +1220,7 @@ async function verifyDriveArchive(input: {
   const firstFiles = await listFolderChildren(input.accessToken, folder.id);
   const firstByArtifact = indexDriveArtifacts(firstFiles);
   let transcriptDuplicate: DriveFile | null = null;
+  let recordingDuplicate: DriveFile | null = null;
   for (const artifactKey of required) {
     const canonicalFileId = input.canonicalFileIds[artifactKey];
     const taggedFiles = firstByArtifact.get(artifactKey) ?? [];
@@ -871,7 +1229,7 @@ async function verifyDriveArchive(input: {
       !canonicalFileId ||
       canonicalFiles.length !== 1 ||
       canonicalFiles[0].trashed === true ||
-      !canonicalFiles[0].parents?.includes(folder.id)
+      !exactDriveParent(canonicalFiles[0], folder.id)
     ) {
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
     }
@@ -880,10 +1238,22 @@ async function verifyDriveArchive(input: {
       // Only one exact duplicate of the small transcript can be proven safe to
       // quarantine. Other Drive artifact types may encode different content or
       // be expensive to download, so they remain fail-closed for manual review.
+      if (artifactKey === "recording") {
+        if (
+          taggedFiles.length !== 2 || extras.length !== 1 ||
+          !input.recordingDuplicateProof ||
+          input.recordingDuplicateProof.canonicalId !== canonicalFileId ||
+          input.recordingDuplicateProof.duplicateId !== extras[0].id
+        ) {
+          throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+        }
+        recordingDuplicate = extras[0];
+        continue;
+      }
       if (artifactKey !== "transcript" || taggedFiles.length !== 2 || extras.length !== 1) {
         throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
       }
-      if (extras[0].trashed === true || !extras[0].parents?.includes(folder.id)) {
+      if (extras[0].trashed === true || !exactDriveParent(extras[0], folder.id)) {
         throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
       }
       if (!input.transcriptDuplicateId || extras[0].id !== input.transcriptDuplicateId) {
@@ -906,9 +1276,22 @@ async function verifyDriveArchive(input: {
       file.id === input.transcriptDuplicateId &&
       file.appProperties?.tokyoDogsArtifact === "legacy_duplicate_transcript" &&
       file.appProperties?.tokyoDogsLegacyArtifact === "transcript" &&
-      file.trashed !== true && file.parents?.includes(folder.id))
+      file.trashed !== true && exactDriveParent(file, folder.id))
     : null;
   if (input.transcriptDuplicateId && !transcriptDuplicate && !plannedDuplicateAlreadyQuarantined) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const plannedRecordingAlreadyQuarantined = input.recordingDuplicateProof
+    ? firstFiles.find((file) =>
+      file.id === input.recordingDuplicateProof?.duplicateId &&
+      file.appProperties?.tokyoDogsArtifact === "legacy_duplicate_recording" &&
+      file.appProperties?.tokyoDogsLegacyArtifact === "recording" &&
+      file.trashed !== true && exactDriveParent(file, folder.id))
+    : null;
+  if (
+    input.recordingDuplicateProof && !recordingDuplicate &&
+    !plannedRecordingAlreadyQuarantined
+  ) {
     throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
   }
 
@@ -963,7 +1346,57 @@ async function verifyDriveArchive(input: {
     }
   }
 
-  const verifiedFiles = transcriptDuplicate
+  if (recordingDuplicate) {
+    const canonicalRecording = firstByArtifact.get("recording")?.find((file) =>
+      file.id === input.canonicalFileIds.recording);
+    if (
+      !canonicalRecording || input.recordingByteSize === null ||
+      !input.recordingName || !input.recordingContentType
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    // Re-prove the complete recording pair immediately before the sole
+    // metadata mutation. This detects bytes/size/tag/parent changes since the
+    // finalizing preflight and makes the PATCH plan bound to immutable facts.
+    const currentProof = await proveRecordingDuplicate({
+      accessToken: input.accessToken,
+      folderId: folder.id,
+      canonical: canonicalRecording,
+      duplicate: recordingDuplicate,
+      expectedByteSize: input.recordingByteSize,
+      expectedName: input.recordingName,
+      expectedContentType: input.recordingContentType,
+    });
+    if (!sameRecordingDuplicateProof(currentProof, input.recordingDuplicateProof as RecordingDuplicateProof)) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    await input.reportProgress();
+    const quarantined = await markLegacyDuplicateArtifact({
+      accessToken: input.accessToken,
+      fileId: recordingDuplicate.id,
+      artifactKey: "recording",
+      canonicalFileId: currentProof.canonicalId,
+      duplicateSha256: currentProof.fingerprint,
+    });
+    if (
+      quarantined.id !== recordingDuplicate.id ||
+      quarantined.trashed === true ||
+      !exactDriveParent(quarantined, folder.id) ||
+      quarantined.appProperties?.tokyoDogsArtifact !== "legacy_duplicate_recording" ||
+      quarantined.appProperties?.tokyoDogsLegacyArtifact !== "recording" ||
+      quarantined.appProperties?.tokyoDogsCanonicalFileId !== currentProof.canonicalId ||
+      quarantined.appProperties?.tokyoDogsDuplicateSha256 !== currentProof.fingerprint ||
+      quarantined.appProperties?.tokyoDogsProvider !== DRIVE_PROVIDER ||
+      quarantined.name !== recordingDuplicate.name ||
+      quarantined.mimeType !== recordingDuplicate.mimeType ||
+      safeDriveFileSize(quarantined) !== input.recordingByteSize ||
+      quarantined.sha256Checksum !== recordingDuplicate.sha256Checksum
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+  }
+
+  const verifiedFiles = transcriptDuplicate || recordingDuplicate
     ? await listFolderChildren(input.accessToken, folder.id)
     : firstFiles;
   const byArtifact = indexDriveArtifacts(verifiedFiles);
@@ -972,7 +1405,7 @@ async function verifyDriveArchive(input: {
     if (files.length !== 1 || files[0].id !== input.canonicalFileIds[artifactKey]) {
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
     }
-    if (files[0].trashed === true || !files[0].parents?.includes(folder.id)) {
+    if (files[0].trashed === true || !exactDriveParent(files[0], folder.id)) {
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
     }
   }
@@ -980,9 +1413,28 @@ async function verifyDriveArchive(input: {
     const quarantined = verifiedFiles.find((file) => file.id === input.transcriptDuplicateId);
     if (
       !quarantined || quarantined.trashed === true ||
-      !quarantined.parents?.includes(folder.id) ||
+      !exactDriveParent(quarantined, folder.id) ||
       quarantined.appProperties?.tokyoDogsArtifact !== "legacy_duplicate_transcript" ||
       quarantined.appProperties?.tokyoDogsLegacyArtifact !== "transcript"
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+  }
+  if (input.recordingDuplicateProof) {
+    const quarantined = verifiedFiles.find((file) =>
+      file.id === input.recordingDuplicateProof?.duplicateId);
+    const canonical = (byArtifact.get("recording") ?? []).find((file) =>
+      file.id === input.recordingDuplicateProof?.canonicalId);
+    if (
+      !quarantined || !canonical || quarantined.trashed === true || canonical.trashed === true ||
+      !exactDriveParent(quarantined, folder.id) || !exactDriveParent(canonical, folder.id) ||
+      quarantined.appProperties?.tokyoDogsArtifact !== "legacy_duplicate_recording" ||
+      quarantined.appProperties?.tokyoDogsLegacyArtifact !== "recording" ||
+      quarantined.appProperties?.tokyoDogsCanonicalFileId !== input.recordingDuplicateProof.canonicalId ||
+      quarantined.appProperties?.tokyoDogsDuplicateSha256 !== input.recordingDuplicateProof.fingerprint ||
+      safeDriveFileSize(quarantined) !== input.recordingDuplicateProof.byteSize ||
+      safeDriveFileSize(canonical) !== input.recordingDuplicateProof.byteSize ||
+      quarantined.sha256Checksum !== canonical.sha256Checksum
     ) {
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
     }
@@ -1116,6 +1568,10 @@ async function prepareDriveArchive(
   const resultJson = buildResultJson(source);
   const reportHtml = buildReportHtml(source);
   const filePrefix = source.sessionId;
+  const recordingExtension = source.recording?.contentType.includes("mp4") ? "mp4" : "webm";
+  const expectedRecordingName = source.recording
+    ? `${source.sessionId}_面接録画.${recordingExtension}`
+    : null;
   const uploaded: GoogleDriveSyncResult["uploaded"] = {};
   // Resolve every existing artifact before the first content upload. This
   // prevents an unordered Drive search from overwriting an arbitrary duplicate
@@ -1125,6 +1581,9 @@ async function prepareDriveArchive(
     accessToken,
     folderId: candidateFolder.id,
     recordingIncluded: Boolean(source.recording),
+    expectedRecordingByteSize: source.recording?.byteSize ?? null,
+    expectedRecordingName,
+    expectedRecordingContentType: source.recording?.contentType ?? null,
     expectedTranscript: new TextEncoder().encode(transcript),
   });
   await reportProgress();
@@ -1189,6 +1648,7 @@ async function prepareDriveArchive(
     uploaded,
     artifactTargetIds: preflight.artifactTargetIds,
     transcriptDuplicateId: preflight.transcriptDuplicateId,
+    recordingDuplicateProof: preflight.recordingDuplicateProof,
     transcriptAvailable,
     transcriptKind,
   };
@@ -1200,16 +1660,27 @@ async function finalizeDriveArchive(
   prepared: PreparedDriveArchive,
   recordingFile: DriveFile | null,
   reportProgress: DriveSyncProgress,
+  persistPreparedContext?: (prepared: PreparedDriveArchive) => Promise<void>,
 ): Promise<GoogleDriveSyncResult> {
   const uploaded = { ...prepared.uploaded };
   const filePrefix = source.sessionId;
   if (source.recording) {
     if (!recordingFile) throw new Error("GOOGLE_DRIVE_RESUMABLE_UPLOAD_INCOMPLETE");
+    const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
+    const expectedRecordingName = `${filePrefix}_面接録画.${extension}`;
+    if (!recordingFileMatchesTrustedUpload({
+      file: recordingFile,
+      folderId: prepared.candidateFolder.id,
+      name: expectedRecordingName,
+      contentType: source.recording.contentType,
+      byteSize: source.recording.byteSize,
+    })) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
     if (prepared.artifactTargetIds.recording && recordingFile.id !== prepared.artifactTargetIds.recording) {
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
     }
-    const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
-    uploaded.recording = fileSummary(recordingFile, `${filePrefix}_面接録画.${extension}`);
+    uploaded.recording = fileSummary(recordingFile, expectedRecordingName);
   }
   // A stored upload step may predate artifact-target persistence, and the
   // folder can change while a multi-request recording upload is in flight.
@@ -1220,6 +1691,11 @@ async function finalizeDriveArchive(
     accessToken,
     folderId: prepared.candidateFolder.id,
     recordingIncluded: Boolean(source.recording),
+    expectedRecordingByteSize: source.recording?.byteSize ?? null,
+    expectedRecordingName: source.recording
+      ? `${source.sessionId}_面接録画.${source.recording.contentType.includes("mp4") ? "mp4" : "webm"}`
+      : null,
+    expectedRecordingContentType: source.recording?.contentType ?? null,
     expectedTranscript: new TextEncoder().encode(buildTranscriptText(source)),
     trustedTargetIds: {
       transcript: uploaded.transcript.id,
@@ -1233,6 +1709,16 @@ async function finalizeDriveArchive(
   });
   prepared.artifactTargetIds = refreshed.artifactTargetIds;
   prepared.transcriptDuplicateId = refreshed.transcriptDuplicateId;
+  prepared.recordingDuplicateProof = refreshed.recordingDuplicateProof;
+  if (prepared.recordingDuplicateProof) {
+    if (!persistPreparedContext) {
+      throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_CONTEXT_INVALID");
+    }
+    // The exact canonical/duplicate IDs, byte size, and full-content proof must
+    // survive a lost Drive PATCH response. Persist this plan under the current
+    // D1 lease before the manifest or duplicate metadata can be written.
+    await persistPreparedContext(prepared);
+  }
   const manifest = {
     schemaVersion: "2026-07-29-v1",
     generatedAt: new Date().toISOString(),
@@ -1275,10 +1761,15 @@ async function finalizeDriveArchive(
     expectedParentId: prepared.expectedParentId,
     sessionId: source.sessionId,
     recordingByteSize: source.recording?.byteSize ?? null,
+    recordingName: source.recording
+      ? `${source.sessionId}_面接録画.${source.recording.contentType.includes("mp4") ? "mp4" : "webm"}`
+      : null,
+    recordingContentType: source.recording?.contentType ?? null,
     canonicalFileIds,
     expectedTranscript: new TextEncoder().encode(buildTranscriptText(source)),
     reportProgress,
     transcriptDuplicateId: prepared.transcriptDuplicateId,
+    recordingDuplicateProof: prepared.recordingDuplicateProof,
   });
   return {
     status: "completed",
@@ -1431,6 +1922,20 @@ function preparedArchiveFromContext(value: Record<string, unknown>): PreparedDri
       ? typeof storedTargets.recording === "string" ? storedTargets.recording : null
       : undefined,
   };
+  const storedRecordingDuplicate = value.recordingDuplicateProof &&
+    typeof value.recordingDuplicateProof === "object"
+    ? value.recordingDuplicateProof as Record<string, unknown>
+    : null;
+  const recordingDuplicateProof: RecordingDuplicateProof | null = storedRecordingDuplicate &&
+    typeof storedRecordingDuplicate.canonicalId === "string" &&
+    typeof storedRecordingDuplicate.duplicateId === "string" &&
+    typeof storedRecordingDuplicate.byteSize === "number" &&
+    ["sha256Checksum", "bounded-range-sha256"].includes(
+      String(storedRecordingDuplicate.fingerprintAlgorithm),
+    ) &&
+    typeof storedRecordingDuplicate.fingerprint === "string"
+    ? storedRecordingDuplicate as unknown as RecordingDuplicateProof
+    : null;
   return {
     rootFolderId: value.rootFolderId,
     expectedParentId: value.expectedParentId,
@@ -1441,6 +1946,7 @@ function preparedArchiveFromContext(value: Record<string, unknown>): PreparedDri
     transcriptDuplicateId: typeof value.transcriptDuplicateId === "string"
       ? value.transcriptDuplicateId
       : null,
+    recordingDuplicateProof,
     transcriptAvailable: value.transcriptAvailable,
     transcriptKind: value.transcriptKind,
   };
@@ -1455,6 +1961,7 @@ function preparedArchiveContext(prepared: PreparedDriveArchive): Record<string, 
     uploaded: prepared.uploaded,
     artifactTargetIds: prepared.artifactTargetIds,
     transcriptDuplicateId: prepared.transcriptDuplicateId,
+    recordingDuplicateProof: prepared.recordingDuplicateProof,
     transcriptAvailable: prepared.transcriptAvailable,
     transcriptKind: prepared.transcriptKind,
   };
@@ -1468,6 +1975,7 @@ async function completeSteppedArchive(input: {
   prepared: PreparedDriveArchive;
   recordingFile: DriveFile;
   reportProgress: DriveSyncProgress;
+  leaseToken: string;
 }) {
   const result = await finalizeDriveArchive(
     input.source,
@@ -1475,6 +1983,14 @@ async function completeSteppedArchive(input: {
     input.prepared,
     input.recordingFile,
     input.reportProgress,
+    async (prepared) => {
+      await updateDriveUploadStepContext({
+        sessionId: input.sessionId,
+        startedAt: input.startedAt,
+        leaseToken: input.leaseToken,
+        context: preparedArchiveContext(prepared),
+      });
+    },
   );
   const retryRequested = await completeExternalSync({
     sessionId: input.sessionId,
@@ -1566,6 +2082,40 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
       if (!source) throw new Error("INTERVIEW_NOT_FOUND");
       assertArchiveReady(source);
       await reportProgress();
+      // A previous upload may already have reached Drive and persisted the
+      // returned file ID before finalization failed. Adopt that exact receipt
+      // into this new claim before any folder/content write. Reinitializing the
+      // row would clear recording_file_json and could POST a third recording.
+      if (
+        step?.phase === "finalizing" && source.recording &&
+        step.totalBytes === source.recording.byteSize &&
+        step.contentType === source.recording.contentType &&
+        step.recordingName === `${source.sessionId}_面接録画.${source.recording.contentType.includes("mp4") ? "mp4" : "webm"}` &&
+        step.recordingFile && typeof step.recordingFile.id === "string" &&
+        recordingFileMatchesTrustedUpload({
+          file: step.recordingFile as DriveFile,
+          folderId: step.folderId,
+          name: step.recordingName,
+          contentType: step.contentType,
+          byteSize: step.totalBytes,
+        })
+      ) {
+        const adopted = await adoptFinalizingDriveUploadStep({
+          sessionId,
+          previousStartedAt: step.startedAt,
+          nextStartedAt: startedAt,
+          expectedTotalBytes: source.recording.byteSize,
+          expectedContentType: source.recording.contentType,
+        });
+        if (!adopted) throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_ADOPTION_FAILED");
+        return pendingStep({
+          phase: "finalizing",
+          folderId: adopted.folderId,
+          folderUrl: adopted.folderUrl,
+          committedOffset: adopted.committedOffset,
+          totalBytes: adopted.totalBytes,
+        });
+      }
       const accessToken = await fetchGoogleDriveAccessToken();
       const prepared = await prepareDriveArchive(source, accessToken, reportProgress);
       if (!source.recording) {
@@ -1662,6 +2212,7 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
         prepared,
         recordingFile: step.recordingFile as DriveFile,
         reportProgress,
+        leaseToken,
       });
       leaseHeld = false;
       return result;
@@ -1697,6 +2248,7 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
         prepared,
         recordingFile: remote.file,
         reportProgress,
+        leaseToken,
       });
       leaseHeld = false;
       return result;
@@ -1753,6 +2305,7 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
         prepared,
         recordingFile: uploaded.file,
         reportProgress,
+        leaseToken,
       });
       leaseHeld = false;
       return result;
