@@ -1402,6 +1402,286 @@ test("internal recovery rejects the wrong bearer and returns only aggregate stat
   assert.equal(oversized.status, 413);
 });
 
+test("manual transcript draft uses only its dedicated strong URL-safe bearer token", async () => {
+  const syntheticSessionIds = [
+    "TD-TEST0001-SESS001",
+    "TD-TEST0002-SESS002",
+    "TD-TEST0003-SESS003",
+  ];
+  const sessionAllowlist = syntheticSessionIds.join(",");
+  const audio = new Uint8Array([1, 2, 3]);
+  const requestHeaders = {
+    "Content-Type": "audio/mpeg",
+    "Content-Length": String(audio.byteLength),
+    "X-Interview-Session-Id": syntheticSessionIds[0],
+    "X-Interview-Audio-Sha256": sha256Hex(audio),
+    "X-Interview-Audio-Index": "1",
+  };
+
+  for (const token of [undefined, "x".repeat(42), `${"x".repeat(42)}.`]) {
+    const response = await request("/api/internal/manual-transcript-draft", {
+      method: "POST",
+      headers: {
+        ...requestHeaders,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: audio,
+    }, {
+      ...workerEnv,
+      INTERVIEW_RECOVERY_TOKEN: "recovery-token-must-not-authorize-this-route-0123456789",
+      INTERVIEW_MANUAL_REPAIR_SESSION_IDS: sessionAllowlist,
+      ...(token ? { INTERVIEW_MANUAL_REPAIR_TOKEN: token } : {}),
+    });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      error: { code: "manual_repair_authentication_unconfigured" },
+    });
+  }
+
+  const repairToken = "manual_repair_token_never_returned_0123456789abcdef";
+  let paidCalls = 0;
+  for (const invalidAllowlist of [
+    undefined,
+    syntheticSessionIds.slice(0, 2).join(","),
+    [syntheticSessionIds[0], syntheticSessionIds[0], syntheticSessionIds[2]].join(","),
+    [syntheticSessionIds[0], "INVALID", syntheticSessionIds[2]].join(","),
+  ]) {
+    const response = await request("/api/internal/manual-transcript-draft", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${repairToken}` },
+    }, {
+      ...workerEnv,
+      INTERVIEW_MANUAL_REPAIR_TOKEN: repairToken,
+      ...(invalidAllowlist ? { INTERVIEW_MANUAL_REPAIR_SESSION_IDS: invalidAllowlist } : {}),
+      OPENAI_API: { fetch: async () => {
+        paidCalls += 1;
+        throw new Error("MUST_NOT_RUN");
+      } },
+    });
+    assert.equal(response.status, 503);
+    const responseText = await response.text();
+    assert.deepEqual(JSON.parse(responseText), {
+      error: { code: "manual_repair_authentication_unconfigured" },
+    });
+    assert.equal(responseText.includes(syntheticSessionIds[0]), false);
+  }
+  assert.equal(paidCalls, 0);
+
+  const wrongBearer = await request("/api/internal/manual-transcript-draft", {
+    method: "POST",
+    headers: {
+      ...requestHeaders,
+      Authorization: `Bearer ${"z".repeat(43)}`,
+    },
+    body: audio,
+  }, {
+    ...workerEnv,
+    INTERVIEW_MANUAL_REPAIR_TOKEN: repairToken,
+    INTERVIEW_MANUAL_REPAIR_SESSION_IDS: sessionAllowlist,
+  });
+  assert.equal(wrongBearer.status, 401);
+  assert.equal((await wrongBearer.text()).includes(repairToken), false);
+});
+
+test("manual transcript draft validates the exact session, audio headers, body size, and digest before paid work", async () => {
+  const syntheticSessionIds = [
+    "TD-TEST0001-SESS001",
+    "TD-TEST0002-SESS002",
+    "TD-TEST0003-SESS003",
+  ];
+  const repairToken = "manual_repair_token_validation_0123456789abcdef";
+  const audio = new Uint8Array([0x49, 0x44, 0x33, 1, 2, 3, 4]);
+  let paidCalls = 0;
+  const env = {
+    ...workerEnv,
+    OPENAI_API_KEY: "test-key-never-returned",
+    INTERVIEW_MANUAL_REPAIR_TOKEN: repairToken,
+    INTERVIEW_MANUAL_REPAIR_SESSION_IDS: syntheticSessionIds.join(","),
+    OPENAI_API: { fetch: async () => {
+      paidCalls += 1;
+      return Response.json({
+        segments: [{ speaker: "A", start: 0, end: 1, text: "must not run" }],
+      });
+    } },
+  };
+  const validHeaders = {
+    Authorization: `Bearer ${repairToken}`,
+    "Content-Type": "audio/mpeg",
+    "Content-Length": String(audio.byteLength),
+    "X-Interview-Session-Id": syntheticSessionIds[0],
+    "X-Interview-Audio-Sha256": sha256Hex(audio),
+    "X-Interview-Audio-Index": "1",
+  };
+  const cases = [
+    { header: "Content-Type", value: "audio/webm", expectedStatus: 415 },
+    { header: "Content-Length", value: "", expectedStatus: 411 },
+    { header: "Content-Length", value: "24000001", expectedStatus: 413 },
+    { header: "X-Interview-Session-Id", value: "TD-UNKNOWN1-UNKNOWN", expectedStatus: 400 },
+    { header: "X-Interview-Audio-Sha256", value: "a".repeat(64), expectedStatus: 400 },
+    { header: "X-Interview-Audio-Index", value: "0", expectedStatus: 400 },
+    { header: "X-Interview-Audio-Index", value: "7", expectedStatus: 400 },
+  ];
+  for (const validationCase of cases) {
+    const headers = { ...validHeaders };
+    if (validationCase.value) headers[validationCase.header] = validationCase.value;
+    else delete headers[validationCase.header];
+    const response = await request("/api/internal/manual-transcript-draft", {
+      method: "POST",
+      headers,
+      body: audio,
+    }, env);
+    assert.equal(response.status, validationCase.expectedStatus, validationCase.header);
+    assert.match(response.headers.get("cache-control") ?? "", /no-store/);
+    assert.equal((await response.text()).includes(syntheticSessionIds[0]), false);
+  }
+
+  const sizeMismatch = await request("/api/internal/manual-transcript-draft", {
+    method: "POST",
+    headers: { ...validHeaders, "Content-Length": String(audio.byteLength + 1) },
+    body: audio,
+  }, env);
+  assert.equal(sizeMismatch.status, 400);
+
+  const bodyless = await request("/api/internal/manual-transcript-draft", {
+    method: "POST",
+    headers: { ...validHeaders, "Content-Length": "1" },
+  }, env);
+  assert.equal(bodyless.status, 400);
+  assert.equal(paidCalls, 0);
+});
+
+test("manual transcript draft makes one diarization request and returns only bounded segments", async () => {
+  const repairToken = "manual_repair_token_success_0123456789abcdef";
+  const audio = new Uint8Array([0x49, 0x44, 0x33, 7, 8, 9]);
+  const sessionId = "TD-TEST0001-SESS001";
+  const sessionAllowlist = [sessionId, "TD-TEST0002-SESS002", "TD-TEST0003-SESS003"].join(",");
+  let paidCalls = 0;
+  let persistenceCalls = 0;
+  const openAI = { fetch: async (upstreamRequest) => {
+    paidCalls += 1;
+    assert.equal(upstreamRequest.method, "POST");
+    assert.equal(new URL(upstreamRequest.url).pathname, "/v1/audio/transcriptions");
+    assert.equal(upstreamRequest.headers.get("authorization"), "Bearer test-key-never-returned");
+    assert.notEqual(upstreamRequest.headers.get("openai-safety-identifier"), sessionId);
+    const form = await upstreamRequest.formData();
+    assert.equal(form.get("model"), "gpt-4o-transcribe-diarize");
+    assert.equal(form.get("language"), "ja");
+    assert.equal(form.get("response_format"), "diarized_json");
+    assert.equal(form.get("chunking_strategy"), "auto");
+    const file = form.get("file");
+    assert.ok(file instanceof File);
+    assert.equal(file.name, "manual-audio-01.mp3");
+    assert.equal(file.type, "audio/mpeg");
+    assert.deepEqual(new Uint8Array(await file.arrayBuffer()), audio);
+    return Response.json({
+      task: "transcribe",
+      duration: 2.5,
+      text: "private full transcript must not be duplicated",
+      segments: [
+        { id: "segment-1", speaker: "A", start: 0, end: 1.2, text: " 質問です。 " },
+        { id: "segment-2", speaker: "B", start: 1.3, end: 2.5, text: "回答です。" },
+      ],
+    });
+  } };
+  const response = await request("/api/internal/manual-transcript-draft", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${repairToken}`,
+      "Content-Type": "audio/mpeg",
+      "Content-Length": String(audio.byteLength),
+      "X-Interview-Session-Id": sessionId,
+      "X-Interview-Audio-Sha256": sha256Hex(audio),
+      "X-Interview-Audio-Index": "1",
+    },
+    body: audio,
+  }, {
+    ...workerEnv,
+    OPENAI_API_KEY: "test-key-never-returned",
+    INTERVIEW_MANUAL_REPAIR_TOKEN: repairToken,
+    INTERVIEW_MANUAL_REPAIR_SESSION_IDS: sessionAllowlist,
+    OPENAI_API: openAI,
+    DB: { prepare() { persistenceCalls += 1; throw new Error("D1_MUST_NOT_BE_USED"); } },
+    RECORDINGS: { put() { persistenceCalls += 1; throw new Error("R2_MUST_NOT_BE_USED"); } },
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("cache-control") ?? "", /no-store/);
+  assert.equal(response.headers.get("x-accel-buffering"), "no");
+  assert.deepEqual(await response.json(), {
+    model: "gpt-4o-transcribe-diarize",
+    segments: [
+      { speaker: "A", start: 0, end: 1.2, text: "質問です。" },
+      { speaker: "B", start: 1.3, end: 2.5, text: "回答です。" },
+    ],
+  });
+  assert.equal(paidCalls, 1);
+  assert.equal(persistenceCalls, 0);
+});
+
+test("manual transcript draft never retries ambiguous upstream failures or logs private request data", async () => {
+  const repairToken = "manual_repair_token_failure_0123456789abcdef";
+  const sessionId = "TD-TEST0001-SESS001";
+  const sessionAllowlist = [sessionId, "TD-TEST0002-SESS002", "TD-TEST0003-SESS003"].join(",");
+  const privateMarker = new TextEncoder().encode("PRIVATE-AUDIO-MARKER");
+  const logs = [];
+  const originals = { info: console.info, warn: console.warn, error: console.error };
+  console.info = (...args) => logs.push(args);
+  console.warn = (...args) => logs.push(args);
+  console.error = (...args) => logs.push(args);
+  try {
+    for (const fakeFetch of [
+      async () => new Response(JSON.stringify({ error: { message: "PRIVATE-UPSTREAM-MARKER" } }), {
+        status: 503,
+        headers: { "x-request-id": "PRIVATE-REQUEST-ID-MARKER" },
+      }),
+      async () => { throw new Error("PRIVATE-TRANSPORT-MARKER"); },
+      async () => Response.json({ segments: [{ speaker: "A", start: "0", end: 1, text: "bad" }] }),
+    ]) {
+      let paidCalls = 0;
+      const response = await request("/api/internal/manual-transcript-draft", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${repairToken}`,
+          "Content-Type": "audio/mpeg",
+          "Content-Length": String(privateMarker.byteLength),
+          "X-Interview-Session-Id": sessionId,
+          "X-Interview-Audio-Sha256": sha256Hex(privateMarker),
+          "X-Interview-Audio-Index": "1",
+        },
+        body: privateMarker,
+      }, {
+        ...workerEnv,
+        OPENAI_API_KEY: "test-key-never-returned",
+        INTERVIEW_MANUAL_REPAIR_TOKEN: repairToken,
+        INTERVIEW_MANUAL_REPAIR_SESSION_IDS: sessionAllowlist,
+        OPENAI_API: { fetch: async (upstreamRequest) => {
+          paidCalls += 1;
+          return await fakeFetch(upstreamRequest);
+        } },
+      });
+      assert.equal(response.status, 200, "streaming starts before the long upstream request");
+      const responseText = await response.text();
+      assert.equal(paidCalls, 1);
+      assert.equal(responseText.includes(sessionId), false);
+      assert.equal(responseText.includes(repairToken), false);
+      assert.equal(responseText.includes("PRIVATE-UPSTREAM-MARKER"), false);
+      assert.equal(responseText.includes("PRIVATE-TRANSPORT-MARKER"), false);
+      assert.equal(responseText.includes("PRIVATE-REQUEST-ID-MARKER"), false);
+      assert.match(responseText, /manual_repair_(?:upstream_unavailable|upstream_response_invalid)/);
+    }
+  } finally {
+    console.info = originals.info;
+    console.warn = originals.warn;
+    console.error = originals.error;
+  }
+  const output = JSON.stringify(logs);
+  assert.equal(output.includes(sessionId), false);
+  assert.equal(output.includes(repairToken), false);
+  assert.equal(output.includes("PRIVATE-AUDIO-MARKER"), false);
+  assert.equal(output.includes("PRIVATE-UPSTREAM-MARKER"), false);
+  assert.equal(output.includes("PRIVATE-TRANSPORT-MARKER"), false);
+  assert.equal(output.includes("PRIVATE-REQUEST-ID-MARKER"), false);
+});
+
 test("internal recovery status returns only the fixed technical projection", async () => {
   const recoveryToken = "status-recovery-token-never-returned-0123456789abcdef";
   const sessionId = "TD-STATUS-123456";
