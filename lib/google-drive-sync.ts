@@ -43,9 +43,15 @@ type DriveFile = {
   name?: string;
   mimeType?: string;
   size?: string;
+  trashed?: boolean;
   webViewLink?: string;
   parents?: string[];
   appProperties?: Record<string, string>;
+};
+
+type DriveFilePage = {
+  files?: DriveFile[];
+  nextPageToken?: string;
 };
 
 type ArchiveSource = NonNullable<Awaited<ReturnType<typeof getInterviewArchiveSource>>>;
@@ -56,6 +62,8 @@ type PreparedDriveArchive = {
   candidateFolder: DriveFile;
   folderUrl: string;
   uploaded: GoogleDriveSyncResult["uploaded"];
+  artifactTargetIds: Record<string, string | null | undefined>;
+  transcriptDuplicateId: string | null;
   transcriptAvailable: boolean;
   transcriptKind: string;
 };
@@ -305,10 +313,170 @@ async function listFolderChildren(accessToken: string, parentId: string) {
     spaces: "drive",
     supportsAllDrives: "true",
     includeItemsFromAllDrives: "true",
-    fields: "files(id,name,mimeType,size,webViewLink,parents,appProperties)",
+    fields: "nextPageToken,files(id,name,mimeType,size,trashed,webViewLink,parents,appProperties)",
   });
-  const result = await driveJson<{ files?: DriveFile[] }>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
+  const result = await driveJson<DriveFilePage>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
+  if (result.nextPageToken) throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
   return result.files ?? [];
+}
+
+async function markLegacyDuplicateArtifact(input: {
+  accessToken: string;
+  fileId: string;
+  artifactKey: string;
+}) {
+  const legacyArtifactKey = `legacy_duplicate_${input.artifactKey}`;
+  if (legacyArtifactKey.length > 124 || input.artifactKey.length > 124) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_CANONICAL_ID_INVALID");
+  }
+  const response = await fetchWithTimeout(
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.fileId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,size,trashed,webViewLink,parents,appProperties")}`,
+    {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${input.accessToken}`,
+        "Content-Type": "application/json; charset=UTF-8",
+      },
+      body: JSON.stringify({
+        appProperties: {
+          tokyoDogsArtifact: legacyArtifactKey,
+          tokyoDogsLegacyArtifact: input.artifactKey,
+        },
+      }),
+    },
+    DRIVE_RECORDING_REQUEST_TIMEOUT_MS,
+  );
+  if (!response.ok) throw new Error(`GOOGLE_DRIVE_API_${response.status}`);
+  return await response.json() as DriveFile;
+}
+
+
+async function readSmallDriveFile(input: {
+  accessToken: string;
+  file: DriveFile;
+  maximumBytes: number;
+}) {
+  const declaredSize = typeof input.file.size === "string" && /^\d+$/.test(input.file.size)
+    ? Number(input.file.size)
+    : Number.NaN;
+  if (
+    !Number.isSafeInteger(declaredSize) ||
+    declaredSize < 0 ||
+    declaredSize > input.maximumBytes
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const response = await fetchWithTimeout(
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.file.id)}?alt=media&supportsAllDrives=true`,
+    { headers: { Authorization: `Bearer ${input.accessToken}` } },
+    DRIVE_RECORDING_REQUEST_TIMEOUT_MS,
+  );
+  if (!response.ok) {
+    throw new Error([429, 500, 502, 503, 504].includes(response.status)
+      ? `GOOGLE_DRIVE_API_${response.status}`
+      : "GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const contentLength = response.headers.get("Content-Length");
+  if (
+    contentLength !== null &&
+    (!/^\d+$/.test(contentLength) || Number(contentLength) > input.maximumBytes)
+  ) {
+    await response.body?.cancel();
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength !== declaredSize || bytes.byteLength > input.maximumBytes) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return bytes;
+}
+
+async function sha256Bytes(bytes: Uint8Array) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes).buffer));
+  return Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function indexDriveArtifacts(files: DriveFile[]) {
+  const byArtifact = new Map<string, DriveFile[]>();
+  for (const file of files) {
+    const key = file.appProperties?.tokyoDogsArtifact;
+    if (!key) continue;
+    byArtifact.set(key, [...(byArtifact.get(key) ?? []), file]);
+  }
+  return byArtifact;
+}
+
+async function preflightDriveArchive(input: {
+  accessToken: string;
+  folderId: string;
+  recordingIncluded: boolean;
+  expectedTranscript: Uint8Array;
+  trustedTargetIds?: Record<string, string | null | undefined>;
+  expectedDuplicateId?: string | null;
+}) {
+  const required = ["transcript", "evaluation_json", "report_doc", "report_pdf", "manifest"];
+  if (input.recordingIncluded) required.push("recording");
+  const files = await listFolderChildren(input.accessToken, input.folderId);
+  const byArtifact = indexDriveArtifacts(files);
+  const artifactTargetIds: Record<string, string | null | undefined> = {};
+  let transcriptDuplicateId: string | null = null;
+  if (input.expectedDuplicateId) {
+    const knownDuplicate = files.find((file) => file.id === input.expectedDuplicateId);
+    if (
+      !knownDuplicate || knownDuplicate.trashed === true || !knownDuplicate.parents?.includes(input.folderId) ||
+      !["transcript", "legacy_duplicate_transcript"].includes(knownDuplicate.appProperties?.tokyoDogsArtifact ?? "") ||
+      (knownDuplicate.appProperties?.tokyoDogsArtifact === "legacy_duplicate_transcript" &&
+        knownDuplicate.appProperties?.tokyoDogsLegacyArtifact !== "transcript")
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    transcriptDuplicateId = knownDuplicate.id;
+  }
+
+  for (const artifactKey of required) {
+    const taggedFiles = byArtifact.get(artifactKey) ?? [];
+    const trustedId = input.trustedTargetIds?.[artifactKey];
+    if (taggedFiles.some((file) => file.trashed === true || !file.parents?.includes(input.folderId))) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    if (taggedFiles.length <= 1) {
+      if (trustedId && taggedFiles[0]?.id !== trustedId) {
+        throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+      }
+      artifactTargetIds[artifactKey] = taggedFiles[0]?.id ?? null;
+      continue;
+    }
+    if (artifactKey !== "transcript" || taggedFiles.length !== 2) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    if (input.expectedTranscript.byteLength > 1024 * 1024) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    const transcriptBytes = await Promise.all(taggedFiles.map((file) => readSmallDriveFile({
+      accessToken: input.accessToken,
+      file,
+      maximumBytes: 1024 * 1024,
+    })));
+    const expectedHash = await sha256Bytes(input.expectedTranscript);
+    const transcriptHashes = await Promise.all(transcriptBytes.map(sha256Bytes));
+    if (transcriptBytes.some((bytes, index) =>
+      bytes.byteLength !== input.expectedTranscript.byteLength || transcriptHashes[index] !== expectedHash)) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    const canonical = (trustedId && taggedFiles.find((file) => file.id === trustedId)) ||
+      [...taggedFiles].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)[0];
+    if (trustedId && canonical.id !== trustedId) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    artifactTargetIds.transcript = canonical.id;
+    const duplicate = taggedFiles.find((file) => file.id !== canonical.id);
+    if (input.expectedDuplicateId && duplicate?.id !== input.expectedDuplicateId) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    transcriptDuplicateId = duplicate?.id ?? null;
+    if (!transcriptDuplicateId) throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return { artifactTargetIds, transcriptDuplicateId };
 }
 
 async function createFolder(
@@ -345,11 +513,19 @@ async function ensureFolder(
 }
 
 async function findArtifact(accessToken: string, folderId: string, artifactKey: string) {
-  return await findChild(
-    accessToken,
-    folderId,
-    `appProperties has { key='tokyoDogsArtifact' and value='${driveQueryValue(artifactKey)}' }`,
-  );
+  const params = new URLSearchParams({
+    q: `'${driveQueryValue(folderId)}' in parents and trashed = false and appProperties has { key='tokyoDogsArtifact' and value='${driveQueryValue(artifactKey)}' }`,
+    pageSize: "3",
+    spaces: "drive",
+    supportsAllDrives: "true",
+    includeItemsFromAllDrives: "true",
+    fields: "nextPageToken,files(id,name,mimeType,size,trashed,webViewLink,parents,appProperties)",
+  });
+  const result = await driveJson<DriveFilePage>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
+  if (result.nextPageToken || (result.files?.length ?? 0) > 1) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return result.files?.[0] ?? null;
 }
 
 async function uploadSmallFile(input: {
@@ -360,8 +536,11 @@ async function uploadSmallFile(input: {
   contentType: string;
   body: string | Uint8Array;
   googleMimeType?: string;
+  targetFileId?: string | null;
 }) {
-  const existing = await findArtifact(input.accessToken, input.folderId, input.artifactKey);
+  const targetFileId = input.targetFileId === undefined
+    ? (await findArtifact(input.accessToken, input.folderId, input.artifactKey))?.id ?? null
+    : input.targetFileId;
   const metadata: Record<string, unknown> = {
     name: input.name,
     appProperties: {
@@ -369,7 +548,7 @@ async function uploadSmallFile(input: {
       tokyoDogsProvider: DRIVE_PROVIDER,
     },
   };
-  if (!existing) metadata.parents = [input.folderId];
+  if (!targetFileId) metadata.parents = [input.folderId];
   if (input.googleMimeType) metadata.mimeType = input.googleMimeType;
   const formData = new FormData();
   formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json; charset=UTF-8" }));
@@ -379,13 +558,17 @@ async function uploadSmallFile(input: {
   // ArrayBuffer-backed BlobPart under strict TypeScript checking.
   const blobBytes = Uint8Array.from(bytes);
   formData.append("media", new Blob([blobBytes.buffer], { type: input.contentType }));
-  const url = existing
-    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(existing.id)}?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`
+  const url = targetFileId
+    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(targetFileId)}?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`
     : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`;
-  return await driveJson<DriveFile>(url, input.accessToken, {
-    method: existing ? "PATCH" : "POST",
+  const uploaded = await driveJson<DriveFile>(url, input.accessToken, {
+    method: targetFileId ? "PATCH" : "POST",
     body: formData,
   });
+  if (targetFileId && uploaded.id !== targetFileId) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return uploaded;
 }
 
 async function exportGoogleDocToPdf(accessToken: string, fileId: string) {
@@ -404,8 +587,11 @@ async function uploadRecording(input: {
   contentType: string;
   byteSize: number;
   sessionId: string;
+  targetFileId?: string | null;
 }) {
-  const existing = await findArtifact(input.accessToken, input.folderId, "recording");
+  const targetFileId = input.targetFileId === undefined
+    ? (await findArtifact(input.accessToken, input.folderId, "recording"))?.id ?? null
+    : input.targetFileId;
   const metadata: Record<string, unknown> = {
     name: input.name,
     appProperties: {
@@ -413,12 +599,12 @@ async function uploadRecording(input: {
       tokyoDogsProvider: DRIVE_PROVIDER,
     },
   };
-  if (!existing) metadata.parents = [input.folderId];
-  const initUrl = existing
-    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(existing.id)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`
+  if (!targetFileId) metadata.parents = [input.folderId];
+  const initUrl = targetFileId
+    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(targetFileId)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`
     : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink`;
   const initResponse = await fetchWithTimeout(initUrl, {
-    method: existing ? "PATCH" : "POST",
+    method: targetFileId ? "PATCH" : "POST",
     headers: {
       Authorization: `Bearer ${input.accessToken}`,
       "Content-Type": "application/json; charset=UTF-8",
@@ -541,8 +727,11 @@ async function initiateRecordingUpload(input: {
   name: string;
   contentType: string;
   byteSize: number;
+  targetFileId?: string | null;
 }) {
-  const existing = await findArtifact(input.accessToken, input.folderId, "recording");
+  const targetFileId = input.targetFileId === undefined
+    ? (await findArtifact(input.accessToken, input.folderId, "recording"))?.id ?? null
+    : input.targetFileId;
   const metadata: Record<string, unknown> = {
     name: input.name,
     appProperties: {
@@ -550,12 +739,12 @@ async function initiateRecordingUpload(input: {
       tokyoDogsProvider: DRIVE_PROVIDER,
     },
   };
-  if (!existing) metadata.parents = [input.folderId];
-  const initUrl = existing
-    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(existing.id)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink,parents,appProperties`
+  if (!targetFileId) metadata.parents = [input.folderId];
+  const initUrl = targetFileId
+    ? `${DRIVE_UPLOAD_ENDPOINT}/files/${encodeURIComponent(targetFileId)}?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink,parents,appProperties`
     : `${DRIVE_UPLOAD_ENDPOINT}/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink,parents,appProperties`;
   const response = await fetchWithTimeout(initUrl, {
-    method: existing ? "PATCH" : "POST",
+    method: targetFileId ? "PATCH" : "POST",
     headers: {
       Authorization: `Bearer ${input.accessToken}`,
       "Content-Type": "application/json; charset=UTF-8",
@@ -649,6 +838,10 @@ async function verifyDriveArchive(input: {
   expectedParentId: string;
   sessionId: string;
   recordingByteSize: number | null;
+  canonicalFileIds: Record<string, string>;
+  expectedTranscript: Uint8Array;
+  reportProgress: DriveSyncProgress;
+  transcriptDuplicateId: string | null;
 }) {
   const fields = "id,name,mimeType,trashed,parents,appProperties,webViewLink";
   const folder = await driveJson<DriveFile & { trashed?: boolean }>(
@@ -664,24 +857,135 @@ async function verifyDriveArchive(input: {
   ) {
     throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
   }
-  const files = await listFolderChildren(input.accessToken, folder.id);
-  const byArtifact = new Map<string, DriveFile[]>();
-  for (const file of files) {
-    const key = file.appProperties?.tokyoDogsArtifact;
-    if (!key) continue;
-    byArtifact.set(key, [...(byArtifact.get(key) ?? []), file]);
-  }
   const required = ["transcript", "evaluation_json", "report_doc", "report_pdf", "manifest"];
   if (input.recordingByteSize !== null) required.push("recording");
-  if (required.some((key) => byArtifact.get(key)?.length !== 1)) {
-    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+
+  const firstFiles = await listFolderChildren(input.accessToken, folder.id);
+  const firstByArtifact = indexDriveArtifacts(firstFiles);
+  let transcriptDuplicate: DriveFile | null = null;
+  for (const artifactKey of required) {
+    const canonicalFileId = input.canonicalFileIds[artifactKey];
+    const taggedFiles = firstByArtifact.get(artifactKey) ?? [];
+    const canonicalFiles = taggedFiles.filter((file) => file.id === canonicalFileId);
+    if (
+      !canonicalFileId ||
+      canonicalFiles.length !== 1 ||
+      canonicalFiles[0].trashed === true ||
+      !canonicalFiles[0].parents?.includes(folder.id)
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    const extras = taggedFiles.filter((file) => file.id !== canonicalFileId);
+    if (extras.length > 0) {
+      // Only one exact duplicate of the small transcript can be proven safe to
+      // quarantine. Other Drive artifact types may encode different content or
+      // be expensive to download, so they remain fail-closed for manual review.
+      if (artifactKey !== "transcript" || taggedFiles.length !== 2 || extras.length !== 1) {
+        throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+      }
+      if (extras[0].trashed === true || !extras[0].parents?.includes(folder.id)) {
+        throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+      }
+      if (!input.transcriptDuplicateId || extras[0].id !== input.transcriptDuplicateId) {
+        throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+      }
+      transcriptDuplicate = extras[0];
+    }
   }
-  const recording = byArtifact.get("recording")?.[0];
+
+  const recording = firstByArtifact.get("recording")?.find((file) =>
+    file.id === input.canonicalFileIds.recording);
   if (
     input.recordingByteSize !== null &&
     (!recording?.size || Number(recording.size) !== input.recordingByteSize)
   ) {
     throw new Error("GOOGLE_DRIVE_RECORDING_SIZE_MISMATCH");
+  }
+  const plannedDuplicateAlreadyQuarantined = input.transcriptDuplicateId
+    ? firstFiles.find((file) =>
+      file.id === input.transcriptDuplicateId &&
+      file.appProperties?.tokyoDogsArtifact === "legacy_duplicate_transcript" &&
+      file.appProperties?.tokyoDogsLegacyArtifact === "transcript" &&
+      file.trashed !== true && file.parents?.includes(folder.id))
+    : null;
+  if (input.transcriptDuplicateId && !transcriptDuplicate && !plannedDuplicateAlreadyQuarantined) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+
+  if (transcriptDuplicate) {
+    const canonicalTranscript = firstByArtifact.get("transcript")?.find((file) =>
+      file.id === input.canonicalFileIds.transcript);
+    if (!canonicalTranscript || input.expectedTranscript.byteLength > 1024 * 1024) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    const [canonicalBytes, duplicateBytes] = await Promise.all([
+      readSmallDriveFile({
+        accessToken: input.accessToken,
+        file: canonicalTranscript,
+        maximumBytes: 1024 * 1024,
+      }),
+      readSmallDriveFile({
+        accessToken: input.accessToken,
+        file: transcriptDuplicate,
+        maximumBytes: 1024 * 1024,
+      }),
+    ]);
+    const [expectedHash, canonicalHash, duplicateHash] = await Promise.all([
+      sha256Bytes(input.expectedTranscript),
+      sha256Bytes(canonicalBytes),
+      sha256Bytes(duplicateBytes),
+    ]);
+    if (
+      canonicalBytes.byteLength !== input.expectedTranscript.byteLength ||
+      duplicateBytes.byteLength !== input.expectedTranscript.byteLength ||
+      canonicalHash !== expectedHash ||
+      duplicateHash !== expectedHash
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    // Never delete an unexpected Drive file. Remove only its current artifact
+    // identity so the canonical file remains the sole active receipt, while
+    // retaining the original key and canonical ID as auditable appProperties.
+    await input.reportProgress();
+    const quarantined = await markLegacyDuplicateArtifact({
+      accessToken: input.accessToken,
+      fileId: transcriptDuplicate.id,
+      artifactKey: "transcript",
+    });
+    if (
+      quarantined.id !== transcriptDuplicate.id ||
+      quarantined.trashed === true ||
+      !quarantined.parents?.includes(folder.id) ||
+      quarantined.appProperties?.tokyoDogsArtifact !== "legacy_duplicate_transcript" ||
+      quarantined.appProperties?.tokyoDogsLegacyArtifact !== "transcript"
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+  }
+
+  const verifiedFiles = transcriptDuplicate
+    ? await listFolderChildren(input.accessToken, folder.id)
+    : firstFiles;
+  const byArtifact = indexDriveArtifacts(verifiedFiles);
+  for (const artifactKey of required) {
+    const files = byArtifact.get(artifactKey) ?? [];
+    if (files.length !== 1 || files[0].id !== input.canonicalFileIds[artifactKey]) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    if (files[0].trashed === true || !files[0].parents?.includes(folder.id)) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+  }
+  if (input.transcriptDuplicateId) {
+    const quarantined = verifiedFiles.find((file) => file.id === input.transcriptDuplicateId);
+    if (
+      !quarantined || quarantined.trashed === true ||
+      !quarantined.parents?.includes(folder.id) ||
+      quarantined.appProperties?.tokyoDogsArtifact !== "legacy_duplicate_transcript" ||
+      quarantined.appProperties?.tokyoDogsLegacyArtifact !== "transcript"
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
   }
   return Object.fromEntries(required.map((key) => {
     const file = byArtifact.get(key)?.[0] as DriveFile;
@@ -752,6 +1056,7 @@ async function performDriveSync(
       contentType: source.recording.contentType,
       byteSize: source.recording.byteSize,
       sessionId: source.sessionId,
+      targetFileId: prepared.artifactTargetIds.recording,
     });
   }
   return finalizeDriveArchive(source, accessToken, prepared, recordingFile, reportProgress);
@@ -812,6 +1117,16 @@ async function prepareDriveArchive(
   const reportHtml = buildReportHtml(source);
   const filePrefix = source.sessionId;
   const uploaded: GoogleDriveSyncResult["uploaded"] = {};
+  // Resolve every existing artifact before the first content upload. This
+  // prevents an unordered Drive search from overwriting an arbitrary duplicate
+  // before we have proved that the folder is safe to repair.
+  await reportProgress();
+  const preflight = await preflightDriveArchive({
+    accessToken,
+    folderId: candidateFolder.id,
+    recordingIncluded: Boolean(source.recording),
+    expectedTranscript: new TextEncoder().encode(transcript),
+  });
   await reportProgress();
   const transcriptFileName = transcriptAvailable
     ? `${filePrefix}_文字起こし.txt`
@@ -823,8 +1138,10 @@ async function prepareDriveArchive(
     artifactKey: "transcript",
     contentType: "text/plain; charset=utf-8",
     body: transcript,
+    targetFileId: preflight.artifactTargetIds.transcript,
   });
   uploaded.transcript = fileSummary(transcriptFile, transcriptFileName);
+  preflight.artifactTargetIds.transcript = transcriptFile.id;
   await reportProgress();
   const resultFile = await uploadSmallFile({
     accessToken,
@@ -833,8 +1150,10 @@ async function prepareDriveArchive(
     artifactKey: "evaluation_json",
     contentType: "application/json; charset=utf-8",
     body: resultJson,
+    targetFileId: preflight.artifactTargetIds.evaluation_json,
   });
   uploaded.evaluation = fileSummary(resultFile, `${filePrefix}_評価データ.json`);
+  preflight.artifactTargetIds.evaluation_json = resultFile.id;
   await reportProgress();
   const reportDoc = await uploadSmallFile({
     accessToken,
@@ -844,8 +1163,10 @@ async function prepareDriveArchive(
     contentType: "text/html; charset=utf-8",
     body: reportHtml,
     googleMimeType: GOOGLE_DOC_MIME_TYPE,
+    targetFileId: preflight.artifactTargetIds.report_doc,
   });
   uploaded.reportDocument = fileSummary(reportDoc, `${filePrefix}_オンライン一次面接レポート`);
+  preflight.artifactTargetIds.report_doc = reportDoc.id;
   await reportProgress();
   const pdf = await exportGoogleDocToPdf(accessToken, reportDoc.id);
   await reportProgress();
@@ -856,14 +1177,18 @@ async function prepareDriveArchive(
     artifactKey: "report_pdf",
     contentType: "application/pdf",
     body: pdf,
+    targetFileId: preflight.artifactTargetIds.report_pdf,
   });
   uploaded.reportPdf = fileSummary(reportPdf, `${filePrefix}_オンライン一次面接レポート.pdf`);
+  preflight.artifactTargetIds.report_pdf = reportPdf.id;
   return {
     rootFolderId: root.id,
     expectedParentId: monthFolder.id,
     candidateFolder,
     folderUrl: candidateFolder.webViewLink || `https://drive.google.com/drive/folders/${candidateFolder.id}`,
     uploaded,
+    artifactTargetIds: preflight.artifactTargetIds,
+    transcriptDuplicateId: preflight.transcriptDuplicateId,
     transcriptAvailable,
     transcriptKind,
   };
@@ -880,9 +1205,34 @@ async function finalizeDriveArchive(
   const filePrefix = source.sessionId;
   if (source.recording) {
     if (!recordingFile) throw new Error("GOOGLE_DRIVE_RESUMABLE_UPLOAD_INCOMPLETE");
+    if (prepared.artifactTargetIds.recording && recordingFile.id !== prepared.artifactTargetIds.recording) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
     const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
     uploaded.recording = fileSummary(recordingFile, `${filePrefix}_面接録画.${extension}`);
   }
+  // A stored upload step may predate artifact-target persistence, and the
+  // folder can change while a multi-request recording upload is in flight.
+  // Re-run the read-only preflight before the manifest write and trust only the
+  // exact file IDs already returned by Drive for this run.
+  await reportProgress();
+  const refreshed = await preflightDriveArchive({
+    accessToken,
+    folderId: prepared.candidateFolder.id,
+    recordingIncluded: Boolean(source.recording),
+    expectedTranscript: new TextEncoder().encode(buildTranscriptText(source)),
+    trustedTargetIds: {
+      transcript: uploaded.transcript.id,
+      evaluation_json: uploaded.evaluation.id,
+      report_doc: uploaded.reportDocument.id,
+      report_pdf: uploaded.reportPdf.id,
+      recording: uploaded.recording?.id,
+      manifest: prepared.artifactTargetIds.manifest,
+    },
+    expectedDuplicateId: prepared.transcriptDuplicateId,
+  });
+  prepared.artifactTargetIds = refreshed.artifactTargetIds;
+  prepared.transcriptDuplicateId = refreshed.transcriptDuplicateId;
   const manifest = {
     schemaVersion: "2026-07-29-v1",
     generatedAt: new Date().toISOString(),
@@ -902,8 +1252,22 @@ async function finalizeDriveArchive(
     artifactKey: "manifest",
     contentType: "application/json; charset=utf-8",
     body: JSON.stringify(manifest, null, 2),
+    // `null` means the preflight saw no manifest. If a previous finalization
+    // POST reached Drive but its response was lost, re-resolve a single exact
+    // artifact instead of blindly POSTing a duplicate. findArtifact fails
+    // closed when more than one active manifest exists.
+    targetFileId: prepared.artifactTargetIds.manifest ?? undefined,
   });
   uploaded.manifest = fileSummary(manifestFile, `${filePrefix}_格納結果.json`);
+  prepared.artifactTargetIds.manifest = manifestFile.id;
+  const canonicalFileIds: Record<string, string> = {
+    transcript: uploaded.transcript.id,
+    evaluation_json: uploaded.evaluation.id,
+    report_doc: uploaded.reportDocument.id,
+    report_pdf: uploaded.reportPdf.id,
+    manifest: uploaded.manifest.id,
+  };
+  if (uploaded.recording) canonicalFileIds.recording = uploaded.recording.id;
   await reportProgress();
   const verifiedFiles = await verifyDriveArchive({
     accessToken,
@@ -911,6 +1275,10 @@ async function finalizeDriveArchive(
     expectedParentId: prepared.expectedParentId,
     sessionId: source.sessionId,
     recordingByteSize: source.recording?.byteSize ?? null,
+    canonicalFileIds,
+    expectedTranscript: new TextEncoder().encode(buildTranscriptText(source)),
+    reportProgress,
+    transcriptDuplicateId: prepared.transcriptDuplicateId,
   });
   return {
     status: "completed",
@@ -1040,12 +1408,39 @@ function preparedArchiveFromContext(value: Record<string, unknown>): PreparedDri
   ) {
     throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_CONTEXT_INVALID");
   }
+  const storedTargets = value.artifactTargetIds && typeof value.artifactTargetIds === "object"
+    ? value.artifactTargetIds as Record<string, unknown>
+    : {};
+  const artifactTargetIds: Record<string, string | null | undefined> = {
+    transcript: typeof storedTargets.transcript === "string"
+      ? storedTargets.transcript
+      : typeof uploaded.transcript?.id === "string" ? uploaded.transcript.id : null,
+    evaluation_json: typeof storedTargets.evaluation_json === "string"
+      ? storedTargets.evaluation_json
+      : typeof uploaded.evaluation?.id === "string" ? uploaded.evaluation.id : null,
+    report_doc: typeof storedTargets.report_doc === "string"
+      ? storedTargets.report_doc
+      : typeof uploaded.reportDocument?.id === "string" ? uploaded.reportDocument.id : null,
+    report_pdf: typeof storedTargets.report_pdf === "string"
+      ? storedTargets.report_pdf
+      : typeof uploaded.reportPdf?.id === "string" ? uploaded.reportPdf.id : null,
+    manifest: Object.prototype.hasOwnProperty.call(storedTargets, "manifest")
+      ? typeof storedTargets.manifest === "string" ? storedTargets.manifest : null
+      : undefined,
+    recording: Object.prototype.hasOwnProperty.call(storedTargets, "recording")
+      ? typeof storedTargets.recording === "string" ? storedTargets.recording : null
+      : undefined,
+  };
   return {
     rootFolderId: value.rootFolderId,
     expectedParentId: value.expectedParentId,
     candidateFolder,
     folderUrl: value.folderUrl,
     uploaded,
+    artifactTargetIds,
+    transcriptDuplicateId: typeof value.transcriptDuplicateId === "string"
+      ? value.transcriptDuplicateId
+      : null,
     transcriptAvailable: value.transcriptAvailable,
     transcriptKind: value.transcriptKind,
   };
@@ -1058,6 +1453,8 @@ function preparedArchiveContext(prepared: PreparedDriveArchive): Record<string, 
     candidateFolder: prepared.candidateFolder,
     folderUrl: prepared.folderUrl,
     uploaded: prepared.uploaded,
+    artifactTargetIds: prepared.artifactTargetIds,
+    transcriptDuplicateId: prepared.transcriptDuplicateId,
     transcriptAvailable: prepared.transcriptAvailable,
     transcriptKind: prepared.transcriptKind,
   };
@@ -1195,6 +1592,7 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
         name: recordingName,
         contentType: source.recording.contentType,
         byteSize: source.recording.byteSize,
+        targetFileId: prepared.artifactTargetIds.recording,
       });
       const encrypted = await encryptGoogleDriveUploadCapability(uploadLocation, sessionId);
       step = await initializeDriveUploadStep({

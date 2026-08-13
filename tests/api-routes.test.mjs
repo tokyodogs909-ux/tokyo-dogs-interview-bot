@@ -2245,7 +2245,7 @@ test("Google Drive setup creates and reuses an app-managed root when drive.file 
   }
 });
 
-test("candidate archive repairs a completed video-less receipt and sends at most one recording chunk per API call", async () => {
+test("candidate archive fails closed before writes for a mismatched transcript duplicate, then repairs an exact duplicate", async () => {
   const originalFetch = globalThis.fetch;
   const database = new FakeD1();
   const recordings = new FakeR2();
@@ -2342,8 +2342,58 @@ test("candidate archive repairs a completed video-less receipt and sends at most
 
   let nextFile = 0;
   const uploadedNames = [];
+  const artifactUploadRequests = [];
   const createdFolders = [];
-  const uploadedDriveFiles = [];
+  const expectedTranscriptText = [
+    "TOKYO DOGS オンライン一次面接 文字起こし",
+    `面接ID: ${session.sessionId}`,
+    "応募者氏名: テスト 応募者",
+    "雇用形態: 正社員",
+    "入職希望対象店舗: 越谷店・相談可",
+    "面接完了日時: 2026/07/29 12:00",
+    "確認区分: 応募者端末で生成された文字起こし（録画との照合が必要）",
+    "",
+    "[2026/07/29 11:50] オンライン採用担当者 茂木",
+    "自己紹介をお願いします。",
+    "",
+    "[2026/07/29 11:50] 応募者",
+    "接客経験があります。",
+    "",
+  ].join("\n");
+  let uploadedTranscriptBytes = new TextEncoder().encode(expectedTranscriptText);
+  const uploadedDriveFiles = [{
+    id: "existing-transcript-a",
+    name: `${session.sessionId}_文字起こし.txt`,
+    mimeType: "text/plain; charset=utf-8",
+    size: String(uploadedTranscriptBytes.byteLength),
+    trashed: false,
+    parents: ["folder-3"],
+    appProperties: {
+      tokyoDogsArtifact: "transcript",
+      tokyoDogsProvider: "google_drive",
+    },
+  }];
+  const legacyDuplicateFile = {
+    id: "legacy-duplicate-transcript",
+    name: `${session.sessionId}_旧文字起こし_同内容.txt`,
+    mimeType: "text/plain",
+    size: String(uploadedTranscriptBytes.byteLength),
+    trashed: false,
+    parents: ["folder-3"],
+    appProperties: {
+      tokyoDogsArtifact: "transcript",
+      tokyoDogsProvider: "google_drive",
+    },
+  };
+  const legacyDuplicatePatches = [];
+  const duplicateRepairReads = [];
+  const folderListDebug = [];
+  const blockingDriveFiles = [];
+  let duplicateTranscriptMatches = false;
+  let deleteCalls = 0;
+  let injectQuarantineTransientFailure = true;
+  let simulateLostQuarantineResponse = true;
+  let manifestPostCount = 0;
   let recordingUploadFinished = false;
   const recordingUploadRanges = [];
   let recordingMetadata = null;
@@ -2383,7 +2433,73 @@ test("candidate archive repairs a completed video-less receipt and sends at most
         });
       }
       if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
-        return Response.json({ files: uploadedDriveFiles.length === 6 ? uploadedDriveFiles : [] });
+        const query = new URL(href).searchParams.get("q") ?? "";
+        const isFolderChildrenReadback = query === "'folder-3' in parents and trashed = false";
+        folderListDebug.push({ query, uploadedCount: uploadedDriveFiles.length, isFolderChildrenReadback });
+        return Response.json({
+          files: isFolderChildrenReadback
+            ? [...uploadedDriveFiles, legacyDuplicateFile, ...blockingDriveFiles]
+            : [],
+        });
+      }
+      if (
+        blockingDriveFiles.some((file) => href.includes(`/drive/v3/files/${file.id}?`)) &&
+        href.includes("alt=media")
+      ) {
+        return new Response(uploadedTranscriptBytes, {
+          status: 200,
+          headers: { "Content-Length": String(uploadedTranscriptBytes.byteLength) },
+        });
+      }
+      if (
+        href.includes("/drive/v3/files/legacy-duplicate-transcript?") &&
+        init.method !== "PATCH"
+      ) {
+        duplicateRepairReads.push("legacy");
+        const duplicateBytes = duplicateTranscriptMatches
+          ? uploadedTranscriptBytes
+          : Uint8Array.from(uploadedTranscriptBytes, (value, index) => index === 0 ? value ^ 1 : value);
+        return new Response(duplicateBytes, {
+          status: 200,
+          headers: { "Content-Length": String(duplicateBytes.byteLength) },
+        });
+      }
+      if (
+        uploadedDriveFiles.some((file) => href.includes(`/drive/v3/files/${file.id}?`)) &&
+        href.includes("alt=media")
+      ) {
+        const file = uploadedDriveFiles.find((item) => href.includes(`/drive/v3/files/${item.id}?`));
+        if (file?.appProperties?.tokyoDogsArtifact !== "transcript") {
+          throw new Error("only the bounded transcript may be fetched for duplicate repair");
+        }
+        duplicateRepairReads.push("canonical");
+        return new Response(uploadedTranscriptBytes, {
+          status: 200,
+          // A proxy may report the transferred representation length rather
+          // than Drive's logical file size. The bounded final bytes remain the
+          // authoritative size/hash receipt.
+          headers: { "Content-Length": String(uploadedTranscriptBytes.byteLength + 1) },
+        });
+      }
+      if (href.includes("/drive/v3/files/legacy-duplicate-transcript?") && init.method === "PATCH") {
+        const metadata = JSON.parse(String(init.body));
+        legacyDuplicatePatches.push(metadata);
+        legacyDuplicateFile.appProperties = {
+          ...legacyDuplicateFile.appProperties,
+          ...metadata.appProperties,
+        };
+        if (injectQuarantineTransientFailure) {
+          injectQuarantineTransientFailure = false;
+          if (simulateLostQuarantineResponse) {
+            simulateLostQuarantineResponse = false;
+            return new Response(null, { status: 503 });
+          }
+        }
+        return Response.json(legacyDuplicateFile);
+      }
+      if (init.method === "DELETE") {
+        deleteCalls += 1;
+        return new Response(null, { status: 204 });
       }
       if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method === "POST") {
         const metadata = JSON.parse(String(init.body));
@@ -2463,18 +2579,30 @@ test("candidate archive repairs a completed video-less receipt and sends at most
         const metadata = JSON.parse(await metadataBlob.text());
         uploadedNames.push(metadata.name);
         const mediaBlob = init.body.get("media");
+        artifactUploadRequests.push({
+          artifact: metadata.appProperties?.tokyoDogsArtifact,
+          method: init.method,
+          href,
+        });
         if (metadata.appProperties?.tokyoDogsArtifact === "transcript") {
           uploadedTranscriptText = await mediaBlob.text();
+          uploadedTranscriptBytes = new TextEncoder().encode(uploadedTranscriptText);
+          legacyDuplicateFile.size = String(uploadedTranscriptBytes.byteLength);
         }
+        const target = uploadedDriveFiles.find((file) =>
+          href.includes(`/files/${encodeURIComponent(file.id)}?`));
+        if (metadata.appProperties?.tokyoDogsArtifact === "manifest" && !target) manifestPostCount += 1;
         const uploadedFile = {
-          id: `file-${++nextFile}`,
+          id: target?.id ?? `file-${++nextFile}`,
           name: metadata.name,
           mimeType: metadata.mimeType || mediaBlob.type,
           size: String(mediaBlob.size),
-          parents: metadata.parents,
+          parents: metadata.parents ?? target?.parents,
+          trashed: target?.trashed ?? false,
           appProperties: metadata.appProperties,
         };
-        uploadedDriveFiles.push(uploadedFile);
+        if (target) Object.assign(target, uploadedFile);
+        else uploadedDriveFiles.push(uploadedFile);
         return Response.json(uploadedFile);
       }
       throw new Error(`Unexpected Drive request: ${href}`);
@@ -2487,9 +2615,96 @@ test("candidate archive repairs a completed video-less receipt and sends at most
     }, env);
     assert.equal(unauthorized.status, 401);
 
+    const mismatched = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.equal(mismatched.status, 502);
+    assert.equal(uploadedNames.length, 0, "mismatched duplicate content must fail before any content upload");
+    assert.equal(legacyDuplicatePatches.length, 0, "mismatched duplicate content must not be retagged");
+    assert.equal(deleteCalls, 0, "mismatched duplicate content must never be deleted");
+    assert.equal(uploadedDriveFiles[0].appProperties.tokyoDogsArtifact, "transcript");
+    assert.equal(legacyDuplicateFile.appProperties.tokyoDogsArtifact, "transcript");
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "failed");
+    assert.equal(database.externalSyncs.get(session.sessionId).completed_at, null);
+
+    // Retry only after the fixture proves that both bounded transcripts are the
+    // exact current source bytes. Reuse the same folder ID for this in-memory
+    // Drive fixture; the failed preflight performed no artifact mutation.
+    duplicateTranscriptMatches = true;
+    nextFile = 0;
+    createdFolders.length = 0;
+
+    legacyDuplicateFile.size = String(uploadedTranscriptBytes.byteLength - 1);
+    const differentDeclaredSize = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.equal(differentDeclaredSize.status, 502);
+    assert.equal(uploadedNames.length, 0);
+    assert.equal(legacyDuplicatePatches.length, 0);
+    assert.equal(deleteCalls, 0);
+    legacyDuplicateFile.size = String(uploadedTranscriptBytes.byteLength);
+    nextFile = 0;
+    createdFolders.length = 0;
+
+    blockingDriveFiles.push({
+      ...legacyDuplicateFile,
+      id: "third-transcript",
+      name: `${session.sessionId}_3件目文字起こし.txt`,
+      appProperties: { ...legacyDuplicateFile.appProperties },
+    });
+    const threeTranscripts = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.equal(threeTranscripts.status, 502);
+    assert.equal(uploadedNames.length, 0);
+    assert.equal(legacyDuplicatePatches.length, 0);
+    assert.equal(deleteCalls, 0);
+    blockingDriveFiles.length = 0;
+    nextFile = 0;
+    createdFolders.length = 0;
+
+    blockingDriveFiles.push({
+      id: "duplicate-evaluation",
+      name: `${session.sessionId}_重複評価.json`,
+      mimeType: "application/json",
+      size: "2",
+      trashed: false,
+      parents: ["folder-3"],
+      appProperties: { tokyoDogsArtifact: "evaluation_json", tokyoDogsProvider: "google_drive" },
+    }, {
+      id: "canonical-evaluation",
+      name: `${session.sessionId}_評価.json`,
+      mimeType: "application/json",
+      size: "2",
+      trashed: false,
+      parents: ["folder-3"],
+      appProperties: { tokyoDogsArtifact: "evaluation_json", tokyoDogsProvider: "google_drive" },
+    });
+    const duplicatedOtherArtifact = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.equal(duplicatedOtherArtifact.status, 502);
+    assert.equal(uploadedNames.length, 0);
+    assert.equal(legacyDuplicatePatches.length, 0);
+    assert.equal(deleteCalls, 0);
+    blockingDriveFiles.length = 0;
+    nextFile = 0;
+    createdFolders.length = 0;
+
     let payload = null;
     let archiveApiCalls = 0;
-    for (; archiveApiCalls < 20; archiveApiCalls += 1) {
+    for (; archiveApiCalls < 22; archiveApiCalls += 1) {
       recordingDataPutsThisApiCall = 0;
       const response = await request("/api/interviews/archive", {
         method: "POST",
@@ -2500,8 +2715,21 @@ test("candidate archive repairs a completed video-less receipt and sends at most
         body: JSON.stringify({ sessionId: session.sessionId }),
       }, env);
       payload = await response.json();
-      assert.equal(response.status, 200, JSON.stringify({ payload, sync: database.externalSyncs.get(session.sessionId), uploadedNames, createdFolders }));
+      assert.equal(response.status, 200, JSON.stringify({
+        payload,
+        sync: database.externalSyncs.get(session.sessionId),
+        uploadedNames,
+        createdFolders,
+        uploadedDriveFiles,
+        legacyDuplicatePatches,
+        duplicateRepairReads,
+        folderListDebug,
+      }));
       assert.ok(recordingDataPutsThisApiCall <= 1);
+      if (payload.pending && payload.phase === "retrying" && manifestPostCount > 0) {
+        assert.equal(manifestPostCount, 1,
+          "a transient quarantine failure may not create a second manifest before retry");
+      }
       if (payload.stored) break;
       assert.equal(payload.pending, true);
       assert.ok(["initializing", "uploading", "finalizing", "busy", "retrying"].includes(payload.phase));
@@ -2517,7 +2745,7 @@ test("candidate archive repairs a completed video-less receipt and sends at most
           "the bearer-like Drive upload URI must never be stored in plaintext");
       }
     }
-    assert.ok(archiveApiCalls < 20, JSON.stringify({ payload, sync: database.externalSyncs.get(session.sessionId) }));
+    assert.ok(archiveApiCalls < 22, JSON.stringify({ payload, sync: database.externalSyncs.get(session.sessionId) }));
     assert.equal(payload.stored, true);
     assert.equal(payload.recordingIncluded, true);
     assert.equal(payload.transcriptAvailable, true);
@@ -2546,7 +2774,38 @@ test("candidate archive repairs a completed video-less receipt and sends at most
       `${session.sessionId}_格納結果.json`,
     ]));
     assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
+    assert.equal(manifestPostCount, 1, "manifest response-loss retry must converge on the first uploaded ID");
+    assert.equal(artifactUploadRequests.filter((call) => call.artifact === "manifest" && call.method === "POST").length, 1);
+    assert.equal(artifactUploadRequests.filter((call) => call.artifact === "manifest" && call.method === "PATCH").length, 1);
+    assert.equal(legacyDuplicatePatches.length, 1,
+      "a lost quarantine response must be recognized from exact legacy readback without another PATCH");
     assert.notEqual(database.externalSyncs.get(session.sessionId).started_at, "2026-07-29T02:00:00.000Z");
+    const canonicalTranscript = uploadedDriveFiles.find((file) =>
+      file.appProperties?.tokyoDogsArtifact === "transcript");
+    assert.ok(canonicalTranscript);
+    assert.equal(canonicalTranscript.id, "existing-transcript-a");
+    assert.equal(artifactUploadRequests.filter((call) => call.artifact === "transcript").length, 1);
+    assert.equal(artifactUploadRequests.find((call) => call.artifact === "transcript").method, "PATCH");
+    assert.match(
+      artifactUploadRequests.find((call) => call.artifact === "transcript").href,
+      /\/upload\/drive\/v3\/files\/existing-transcript-a\?/,
+      "the exact deterministic preflight target must be updated",
+    );
+    assert.deepEqual(legacyDuplicatePatches, [{
+      appProperties: {
+        tokyoDogsArtifact: "legacy_duplicate_transcript",
+        tokyoDogsLegacyArtifact: "transcript",
+      },
+    }]);
+    assert.equal(deleteCalls, 0, "legacy Drive artifacts must be quarantined without deletion");
+    assert.equal(legacyDuplicateFile.id, "legacy-duplicate-transcript");
+    assert.equal(legacyDuplicateFile.name, `${session.sessionId}_旧文字起こし_同内容.txt`);
+    assert.equal(legacyDuplicateFile.size, String(uploadedTranscriptBytes.byteLength));
+    assert.equal(legacyDuplicateFile.appProperties.tokyoDogsArtifact, "legacy_duplicate_transcript");
+    assert.equal(legacyDuplicateFile.appProperties.tokyoDogsLegacyArtifact, "transcript");
+    const completedManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    assert.equal(completedManifest.files.transcript.id, canonicalTranscript.id,
+      "the current-run canonical file must remain the durable receipt");
     const responseText = JSON.stringify(payload);
     assert.equal(responseText.includes("google-client-secret"), false);
     assert.equal(responseText.includes("google-refresh-token"), false);
