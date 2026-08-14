@@ -51,6 +51,69 @@ async function captureConsoleWarnings(callback) {
   }
 }
 
+function auditDetail(event) {
+  try {
+    return JSON.parse(event.detail_json ?? "{}");
+  } catch {
+    return {};
+  }
+}
+
+function hasLegacyAudit(database, sessionId, eventType, predicate = () => true) {
+  return database.auditEvents.some((event) =>
+    event.session_id === sessionId && event.event_type === eventType && predicate(auditDetail(event)));
+}
+
+function legacyOrphanEligible(database, session, expiredBefore = null) {
+  if (!session || session.status !== "in_progress" ||
+    !["uploading", "failed"].includes(session.recording_status) ||
+    (expiredBefore && session.expires_at > expiredBefore) ||
+    session.completed_at != null || session.transcript_json != null ||
+    session.evaluation_json != null || session.summary != null ||
+    database.artifacts.some((artifact) => artifact[1] === session.id) ||
+    database.externalSyncs.has(session.id) ||
+    database.recordedCompletions.has(session.id) ||
+    [...database.recordedAnswers.values()].some((answer) => answer.session_id === session.id) ||
+    database.evaluationClaims.has(session.id)) return false;
+  if (!hasLegacyAudit(database, session.id, "consent_recorded",
+    (detail) => detail.interviewMode === "camera") ||
+    !hasLegacyAudit(database, session.id, "interview_started") ||
+    !hasLegacyAudit(database, session.id, "recording_unavailable",
+      (detail) => detail.code === "UPLOAD_FAILED")) return false;
+  const blockedEvents = new Set([
+    "recorded_fallback_started", "voice_transcript_sealed", "evaluation_started",
+    "evaluation_saved", "recording_stored", "candidate_requested_stop",
+    "legacy_recording_recovered", "legacy_recording_recovery_manual_attention",
+  ]);
+  if (database.auditEvents.some((event) =>
+    event.session_id === session.id && blockedEvents.has(event.event_type))) return false;
+  const fatalCodes = new Set([
+    "NO_RECORDING_AT_COMPLETION", "FORMAT_UNAVAILABLE", "RECORDER_ERROR",
+    "CLIENT_RECORDING_SIZE_LIMIT",
+  ]);
+  return !hasLegacyAudit(database, session.id, "recording_unavailable",
+    (detail) => fatalCodes.has(detail.code));
+}
+
+function currentLegacyClaim(database, input) {
+  const claim = database.auditEvents.find((event) =>
+    event.session_id === input.sessionId &&
+    event.event_type === "legacy_recording_recovery_claimed" &&
+    event.created_at === input.claimedAt &&
+    auditDetail(event).claimId === input.claimId &&
+    auditDetail(event).leaseExpiresAt === input.leaseExpiresAt);
+  if (!claim || input.leaseExpiresAt <= input.now) return false;
+  const newer = database.auditEvents.some((event) =>
+    event.session_id === input.sessionId &&
+    event.event_type === "legacy_recording_recovery_claimed" &&
+    event.created_at > input.newerThan);
+  const terminal = database.auditEvents.some((event) =>
+    event.session_id === input.sessionId && [
+      "legacy_recording_recovered", "legacy_recording_recovery_manual_attention",
+    ].includes(event.event_type));
+  return !newer && !terminal;
+}
+
 class FakeD1Statement {
   constructor(database, sql) {
     this.database = database;
@@ -135,6 +198,95 @@ class FakeD1Statement {
       const invite = this.database.invites.get(nonceHash);
       if (invite?.used_at) {
         invite.session_id = sessionId;
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'legacy_recording_recovery_claimed'")
+    ) {
+      const [id, sessionId, detailJson, claimedAt, checkedSessionId, expectedUpdatedAt,
+        terminalSessionId, activeSessionId, staleBefore] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const terminal = this.database.auditEvents.some((event) =>
+        event.session_id === terminalSessionId && [
+          "legacy_recording_recovered", "legacy_recording_recovery_manual_attention",
+        ].includes(event.event_type));
+      const active = this.database.auditEvents.some((event) =>
+        event.session_id === activeSessionId &&
+        event.event_type === "legacy_recording_recovery_claimed" &&
+        event.created_at > staleBefore);
+      if (sessionId === checkedSessionId && session?.status === "in_progress" &&
+        ["uploading", "failed"].includes(session.recording_status) &&
+        session.updated_at === expectedUpdatedAt && session.completed_at == null &&
+        session.transcript_json == null && session.evaluation_json == null &&
+        session.summary == null && !terminal && !active) {
+        this.database.auditEvents.push({
+          id,
+          session_id: sessionId,
+          event_type: "legacy_recording_recovery_claimed",
+          actor_type: "system",
+          detail_json: detailJson,
+          created_at: claimedAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'legacy_recording_recovery_manual_attention'")
+    ) {
+      const [id, sessionId, detailJson, createdAt, checkedSessionId, expectedUpdatedAt,
+        claimSessionId, claimedAt, claimId, leaseExpiresAt, now,
+        newerSessionId, newerThan, terminalSessionId] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const claimIsCurrent = sessionId === claimSessionId && sessionId === newerSessionId &&
+        sessionId === terminalSessionId && currentLegacyClaim(this.database, {
+          sessionId,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        });
+      if (sessionId === checkedSessionId && session?.status === "in_progress" &&
+        ["uploading", "failed"].includes(session.recording_status) &&
+        session.updated_at === expectedUpdatedAt && session.completed_at == null &&
+        session.transcript_json == null && session.evaluation_json == null &&
+        session.summary == null && claimIsCurrent) {
+        this.database.auditEvents.push({
+          id,
+          session_id: sessionId,
+          event_type: "legacy_recording_recovery_manual_attention",
+          actor_type: "system",
+          detail_json: detailJson,
+          created_at: createdAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_artifacts") &&
+      this.sql.includes("legacy_recording_recovery_claimed")
+    ) {
+      const [id, sessionId, objectKey, contentType, byteSize, etag, retentionUntil,
+        createdAt, checkedSessionId, expectedUpdatedAt, claimSessionId, claimedAt,
+        claimId, leaseExpiresAt, now, newerSessionId, newerThan, artifactSessionId] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const claimIsCurrent = sessionId === claimSessionId && sessionId === newerSessionId &&
+        sessionId === artifactSessionId && currentLegacyClaim(this.database, {
+          sessionId,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        });
+      if (sessionId === checkedSessionId && session?.status === "in_progress" &&
+        session.recording_status === "stored" && session.updated_at === expectedUpdatedAt &&
+        session.completed_at == null && session.transcript_json == null &&
+        session.evaluation_json == null && session.summary == null && claimIsCurrent &&
+        !this.database.artifacts.some((artifact) => artifact[1] === sessionId)) {
+        this.database.artifacts.push([
+          id, sessionId, objectKey, contentType, byteSize, etag, retentionUntil, createdAt,
+        ]);
         changes = 1;
       }
     } else if (this.sql.startsWith("INSERT INTO interview_artifacts")) {
@@ -575,6 +727,28 @@ class FakeD1Statement {
         session.updated_at = updatedAt;
         changes = 1;
       }
+    } else if (
+      this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'stored'") &&
+      this.sql.includes("legacy_recording_recovery_claimed")
+    ) {
+      const [storedAt, id, expectedUpdatedAt, expiresAt, retentionUntil, createdAt,
+        claimedAt, claimId, leaseExpiresAt, now, newerThan] = this.values;
+      const session = this.database.sessions.get(id);
+      if (legacyOrphanEligible(this.database, session) &&
+        session.updated_at === expectedUpdatedAt && session.expires_at === expiresAt &&
+        session.retention_until === retentionUntil && session.created_at === createdAt &&
+        currentLegacyClaim(this.database, {
+          sessionId: id,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        })) {
+        session.recording_status = "stored";
+        session.updated_at = storedAt;
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'stored'")) {
       const [updatedAt, id] = this.values;
       const session = this.database.sessions.get(id);
@@ -705,6 +879,43 @@ class FakeD1Statement {
         overall_note: overallNote,
         updated_at: updatedAt,
       });
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'legacy_recording_recovered'")
+    ) {
+      const [id, sessionId, detailJson, createdAt, checkedSessionId, expectedUpdatedAt,
+        claimSessionId, claimedAt, claimId, leaseExpiresAt, now,
+        newerSessionId, newerThan, artifactSessionId, objectKey, contentType,
+        byteSize, retentionUntil, recoveredSessionId] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const artifact = this.database.artifacts.find((item) =>
+        item[1] === artifactSessionId && item[2] === objectKey &&
+        item[3] === contentType && item[4] === byteSize && item[6] === retentionUntil);
+      const claimIsCurrent = sessionId === claimSessionId && sessionId === newerSessionId &&
+        sessionId === artifactSessionId && sessionId === recoveredSessionId &&
+        currentLegacyClaim(this.database, {
+          sessionId,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        });
+      if (sessionId === checkedSessionId && session?.status === "in_progress" &&
+        session.recording_status === "stored" && session.updated_at === expectedUpdatedAt &&
+        session.completed_at == null && session.transcript_json == null &&
+        session.evaluation_json == null && session.summary == null && artifact && claimIsCurrent &&
+        !hasLegacyAudit(this.database, sessionId, "legacy_recording_recovered")) {
+        this.database.auditEvents.push({
+          id,
+          session_id: sessionId,
+          event_type: "legacy_recording_recovered",
+          actor_type: "system",
+          detail_json: detailJson,
+          created_at: createdAt,
+        });
+        changes = 1;
+      }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("'recording_recovery_part_missing'")
@@ -918,6 +1129,62 @@ class FakeD1Statement {
   }
 
   async first() {
+    if (this.sql.startsWith("SELECT s.id, s.status, s.recording_status") &&
+      this.sql.includes("legacy_recording_recovery_manual_attention")) {
+      const expiredBefore = this.values[0];
+      return [...this.database.sessions.values()]
+        .filter((session) => legacyOrphanEligible(this.database, session, expiredBefore))
+        .sort((left, right) =>
+          left.updated_at.localeCompare(right.updated_at) || left.id.localeCompare(right.id))[0] ?? null;
+    }
+    if (this.sql.startsWith("SELECT 1 AS current_claim")) {
+      const [sessionId, expectedUpdatedAt, claimedAt, claimId, leaseExpiresAt, now, newerThan] = this.values;
+      const session = this.database.sessions.get(sessionId);
+      return session?.status === "in_progress" &&
+        ["uploading", "failed"].includes(session.recording_status) &&
+        session.updated_at === expectedUpdatedAt && session.completed_at == null &&
+        session.transcript_json == null && session.evaluation_json == null &&
+        session.summary == null && currentLegacyClaim(this.database, {
+          sessionId,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        }) ? { current_claim: 1 } : null;
+    }
+    if (this.sql.startsWith("SELECT 1 AS present") &&
+      this.sql.includes("legacy_recording_recovery_manual_attention")) {
+      const [id, sessionId] = this.values;
+      return this.database.auditEvents.some((event) =>
+        event.id === id && event.session_id === sessionId &&
+        event.event_type === "legacy_recording_recovery_manual_attention")
+        ? { present: 1 }
+        : null;
+    }
+    if (this.sql.startsWith("SELECT s.status, s.recording_status, s.transcript_json")) {
+      const sessionId = this.values[0];
+      const session = this.database.sessions.get(sessionId);
+      if (!session) return null;
+      const artifact = this.database.artifacts.find((item) => item[1] === sessionId);
+      return {
+        status: session.status,
+        recording_status: session.recording_status,
+        transcript_json: session.transcript_json ?? null,
+        evaluation_json: session.evaluation_json ?? null,
+        summary: session.summary ?? null,
+        completed_at: session.completed_at ?? null,
+        object_key: artifact?.[2] ?? null,
+        content_type: artifact?.[3] ?? null,
+        byte_size: artifact?.[4] ?? null,
+        retention_until: artifact?.[6] ?? null,
+        recovery_audit_present: hasLegacyAudit(
+          this.database,
+          sessionId,
+          "legacy_recording_recovered",
+        ) ? 1 : 0,
+      };
+    }
     if (this.sql.startsWith("SELECT status, (SELECT COUNT(*) FROM interview_audit_events")) {
       const [totalSessionId, typeSessionId, eventType, sealSessionId, sessionId] = this.values;
       const session = this.database.sessions.get(sessionId);
@@ -1418,6 +1685,7 @@ class FakeR2 {
     this.putCount = 0;
     this.getCount = 0;
     this.headCount = 0;
+    this.afterGet = null;
   }
 
   async put(key, body, options) {
@@ -1435,11 +1703,13 @@ class FakeR2 {
     if (options?.sha256 && sha256Hex(bytes) !== options.sha256) {
       throw new Error("R2_SHA256_MISMATCH");
     }
-    this.objects.set(key, { body: bytes, options });
+    const etag = `test-etag-${this.putCount}-${sha256Hex(bytes).slice(0, 16)}`;
+    this.objects.set(key, { body: bytes, options, etag });
     return {
-      etag: "test-etag",
+      etag,
       size: bytes.byteLength,
       customMetadata: options?.customMetadata ?? {},
+      httpMetadata: options?.httpMetadata ?? {},
       checksums: options?.sha256
         ? { sha256: Uint8Array.from(Buffer.from(options.sha256, "hex")).buffer }
         : {},
@@ -1457,13 +1727,16 @@ class FakeR2 {
     const offset = options.range?.offset ?? 0;
     const length = options.range?.length ?? (storedBytes.byteLength - offset);
     const bytes = storedBytes.slice(offset, offset + length);
-    return {
+    const result = {
       body: new Blob([bytes]).stream(),
       arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-      etag: "test-etag",
+      etag: object.etag ?? "test-etag",
       size: bytes.byteLength,
       customMetadata: object.options?.customMetadata ?? {},
+      httpMetadata: object.options?.httpMetadata ?? {},
     };
+    if (this.afterGet) await this.afterGet({ key, object, result });
+    return result;
   }
 
   async head(key) {
@@ -1471,15 +1744,108 @@ class FakeR2 {
     const object = this.objects.get(key);
     if (!object) return null;
     return {
-      etag: "test-etag",
+      etag: object.etag ?? "test-etag",
       size: object.body.byteLength,
       customMetadata: object.options?.customMetadata ?? {},
+      httpMetadata: object.options?.httpMetadata ?? {},
       checksums: object.options?.sha256
         ? { sha256: Uint8Array.from(Buffer.from(object.options.sha256, "hex")).buffer }
         : {},
     };
   }
 
+}
+
+async function addLegacyV1OrphanFixture(database, recordings, options = {}) {
+  const index = options.index ?? 0;
+  const sessionId = options.sessionId ?? `TD-LEGACY-V1-${String(index).padStart(2, "0")}`;
+  const createdAtMs = Date.parse("2026-08-10T08:10:00.000Z") + index * 60_000;
+  const createdAt = new Date(createdAtMs).toISOString();
+  const expiresAt = new Date(createdAtMs + 2 * 60 * 60_000).toISOString();
+  const retentionUntil = new Date(createdAtMs + 365 * 24 * 60 * 60_000).toISOString();
+  const updatedAt = new Date(createdAtMs + 60 * 60_000).toISOString();
+  const byteSize = options.byteSize ?? (64 + index);
+  const session = {
+    id: sessionId,
+    access_token_hash: `legacy-token-hash-${index}`,
+    candidate_name: `Legacy fixture ${index}`,
+    employment: "fixture",
+    preferred_location: "fixture",
+    status: "in_progress",
+    recording_status: options.recordingStatus ?? "uploading",
+    expires_at: expiresAt,
+    retention_until: retentionUntil,
+    created_at: createdAt,
+    updated_at: updatedAt,
+    transcript_json: null,
+    evaluation_json: null,
+    summary: null,
+    completed_at: null,
+  };
+  database.sessions.set(sessionId, session);
+  database.auditEvents.push(
+    {
+      id: `legacy-consent-${index}`,
+      session_id: sessionId,
+      event_type: "consent_recorded",
+      actor_type: "candidate",
+      detail_json: JSON.stringify({ interviewMode: "camera" }),
+      created_at: createdAt,
+    },
+    {
+      id: `legacy-start-${index}`,
+      session_id: sessionId,
+      event_type: "interview_started",
+      actor_type: "candidate",
+      detail_json: "{}",
+      created_at: createdAt,
+    },
+    {
+      id: `legacy-upload-failed-${index}`,
+      session_id: sessionId,
+      event_type: "recording_unavailable",
+      actor_type: "candidate",
+      detail_json: JSON.stringify({ code: "UPLOAD_FAILED" }),
+      created_at: updatedAt,
+    },
+  );
+  if (options.candidateRequestedStop) {
+    database.auditEvents.push({
+      id: `legacy-stop-${index}`,
+      session_id: sessionId,
+      event_type: "candidate_requested_stop",
+      actor_type: "candidate",
+      detail_json: "{}",
+      created_at: updatedAt,
+    });
+  }
+
+  const stateKey = `interviews/${sessionId}/recording-parts/upload.json`;
+  const partKey = `interviews/${sessionId}/recording-parts/part-000`;
+  const manifestKey = `interviews/${sessionId}/recording.recovered-v1.manifest.json`;
+  const state = {
+    version: 1,
+    sessionId,
+    contentType: "video/webm",
+    byteSize,
+    partSize: 4 * 1024 * 1024,
+    totalParts: 1,
+    audioCoverage: "both",
+    retentionUntil,
+    createdAt: new Date(Date.parse(createdAt) + 60_000).toISOString(),
+  };
+  await recordings.put(stateKey, JSON.stringify(state), {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: { sessionId, retentionUntil },
+  });
+  const partBytes = new Uint8Array(byteSize).fill(80 + index);
+  if (!options.missingPart) {
+    await recordings.put(partKey, partBytes, {
+      httpMetadata: { contentType: "application/octet-stream" },
+      customMetadata: { sessionId, byteSize: String(byteSize), retentionUntil },
+    });
+  }
+  return { session, state, stateKey, partKey, partBytes, manifestKey };
 }
 
 async function createTestInterviewSession(
@@ -1567,6 +1933,255 @@ test("scheduled recovery runs a bounded global tick without staff browser authen
       drive: "idle",
     },
   }]]);
+});
+
+test("scheduled recovery stores one exact legacy v1 orphan per tick without completing or syncing it", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixtures = [];
+  for (let index = 0; index < 4; index += 1) {
+    fixtures.push(await addLegacyV1OrphanFixture(database, recordings, {
+      index,
+      recordingStatus: index % 2 === 0 ? "uploading" : "failed",
+    }));
+  }
+
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => logs.push(args);
+  try {
+    for (let tick = 0; tick < fixtures.length; tick += 1) {
+      await scheduleInterviewRecovery(env);
+      assert.equal(logs.at(-1)[1].states.recording, "advanced", JSON.stringify({
+        tick,
+        sessions: fixtures.map(({ session }) => ({
+          id: session.id,
+          status: session.status,
+          recordingStatus: session.recording_status,
+        })),
+        events: database.auditEvents.map((event) => ({
+          sessionId: event.session_id,
+          type: event.event_type,
+          detail: event.detail_json,
+        })),
+        artifacts: database.artifacts,
+      }));
+      assert.deepEqual(
+        fixtures.map(({ session }) => session.recording_status),
+        fixtures.map((_, index) => index <= tick ? "stored" : index % 2 === 0 ? "uploading" : "failed"),
+        "each scheduled tick must recover only the oldest eligible v1 row",
+      );
+    }
+  } finally {
+    console.info = originalInfo;
+  }
+
+  assert.equal(database.artifacts.length, 4);
+  assert.equal(database.externalSyncs.size, 0);
+  assert.equal(database.recordedCompletions.size, 0);
+  assert.equal(database.recordedAnswers.size, 0);
+  assert.equal(database.evaluationClaims.size, 0);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.event_type === "legacy_recording_recovered").length, 4);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.event_type === "recording_stored").length, 0);
+  for (const fixture of fixtures) {
+    assert.equal(fixture.session.status, "in_progress");
+    assert.equal(fixture.session.transcript_json, null);
+    assert.equal(fixture.session.evaluation_json, null);
+    assert.equal(fixture.session.summary, null);
+    assert.equal(fixture.session.completed_at, null);
+    const storedManifest = recordings.objects.get(fixture.manifestKey);
+    assert.ok(storedManifest, "the recovery manifest must be durably created");
+    assert.equal(storedManifest.options.httpMetadata.contentType, "application/json");
+    assert.equal(storedManifest.options.customMetadata.recoveryMode, "legacy-v1-body-sha256");
+    const manifest = JSON.parse(new TextDecoder().decode(storedManifest.body));
+    assert.deepEqual(manifest.recovery, { mode: "legacy-v1-body-sha256" });
+    assert.deepEqual(manifest.parts, [{
+      key: fixture.partKey,
+      byteSize: fixture.partBytes.byteLength,
+      sha256: sha256Hex(fixture.partBytes),
+    }]);
+  }
+});
+
+test("missing legacy v1 parts create one manual-attention marker and never mutate interview state", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixture = await addLegacyV1OrphanFixture(database, recordings, {
+    index: 10,
+    missingPart: true,
+  });
+  const originalUpdatedAt = fixture.session.updated_at;
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => logs.push(args);
+  try {
+    await scheduleInterviewRecovery(env);
+    assert.equal(logs.at(-1)[1].states.recording, "attention");
+    await scheduleInterviewRecovery(env);
+    assert.equal(logs.at(-1)[1].states.recording, "idle");
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(fixture.session.status, "in_progress");
+  assert.equal(fixture.session.recording_status, "uploading");
+  assert.equal(fixture.session.updated_at, originalUpdatedAt);
+  assert.equal(fixture.session.transcript_json, null);
+  assert.equal(fixture.session.evaluation_json, null);
+  assert.equal(fixture.session.completed_at, null);
+  assert.equal(database.artifacts.length, 0);
+  assert.equal(database.externalSyncs.size, 0);
+  assert.equal(recordings.objects.has(fixture.manifestKey), false);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id &&
+    event.event_type === "legacy_recording_recovery_manual_attention").length, 1);
+});
+
+test("legacy v1 recovery rejects an existing conflicting manifest and preserves every D1 output field", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixture = await addLegacyV1OrphanFixture(database, recordings, { index: 20 });
+  const conflictingBody = JSON.stringify({ version: 1, conflict: true });
+  const conflicting = await recordings.put(fixture.manifestKey, conflictingBody, {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: {
+      sessionId: fixture.session.id,
+      retentionUntil: fixture.session.retention_until,
+      audioCoverage: "both",
+      recordingContentType: "video/webm",
+      recoveryMode: "legacy-v1-body-sha256",
+    },
+  });
+
+  const originalInfo = console.info;
+  console.info = () => {};
+  try {
+    await scheduleInterviewRecovery(env);
+    await scheduleInterviewRecovery(env);
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(fixture.session.status, "in_progress");
+  assert.equal(fixture.session.recording_status, "uploading");
+  assert.equal(fixture.session.transcript_json, null);
+  assert.equal(fixture.session.evaluation_json, null);
+  assert.equal(fixture.session.summary, null);
+  assert.equal(fixture.session.completed_at, null);
+  assert.equal(database.artifacts.length, 0);
+  assert.equal(database.externalSyncs.size, 0);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id &&
+    event.event_type === "legacy_recording_recovery_manual_attention").length, 1);
+  const readback = await recordings.get(fixture.manifestKey);
+  assert.equal(readback.etag, conflicting.etag);
+  assert.equal(new TextDecoder().decode(await readback.arrayBuffer()), conflictingBody);
+});
+
+test("overlapping legacy v1 recovery ticks share a single claim and create one artifact", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixture = await addLegacyV1OrphanFixture(database, recordings, { index: 30 });
+  const originalInfo = console.info;
+  console.info = () => {};
+  try {
+    await Promise.all([
+      scheduleInterviewRecovery(env),
+      scheduleInterviewRecovery(env),
+    ]);
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(fixture.session.recording_status, "stored");
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id &&
+    event.event_type === "legacy_recording_recovery_claimed").length, 1);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id &&
+    event.event_type === "legacy_recording_recovered").length, 1);
+  assert.equal(database.artifacts.filter((artifact) => artifact[1] === fixture.session.id).length, 1);
+});
+
+test("an expired legacy recovery lease and a changed part generation cannot finalize recording", async () => {
+  for (const mode of ["expired-lease", "changed-part"]) {
+    const database = new FakeD1();
+    const recordings = new FakeR2();
+    const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+    const fixture = await addLegacyV1OrphanFixture(database, recordings, {
+      index: mode === "expired-lease" ? 40 : 41,
+    });
+    let injected = false;
+    recordings.afterGet = async ({ key }) => {
+      if (injected || key !== fixture.partKey) return;
+      injected = true;
+      if (mode === "expired-lease") {
+        const claim = database.auditEvents.find((event) =>
+          event.session_id === fixture.session.id &&
+          event.event_type === "legacy_recording_recovery_claimed");
+        const detail = auditDetail(claim);
+        claim.detail_json = JSON.stringify({
+          ...detail,
+          leaseExpiresAt: "2026-08-10T00:00:00.000Z",
+        });
+      } else {
+        await recordings.put(fixture.partKey, new Uint8Array(fixture.partBytes.byteLength).fill(7), {
+          httpMetadata: { contentType: "application/octet-stream" },
+          customMetadata: {
+            sessionId: fixture.session.id,
+            byteSize: String(fixture.partBytes.byteLength),
+            retentionUntil: fixture.session.retention_until,
+          },
+        });
+      }
+    };
+    const originalInfo = console.info;
+    console.info = () => {};
+    try {
+      await scheduleInterviewRecovery(env);
+    } finally {
+      console.info = originalInfo;
+    }
+    assert.equal(fixture.session.status, "in_progress", mode);
+    assert.equal(fixture.session.recording_status, "uploading", mode);
+    assert.equal(fixture.session.transcript_json, null, mode);
+    assert.equal(fixture.session.evaluation_json, null, mode);
+    assert.equal(fixture.session.completed_at, null, mode);
+    assert.equal(database.artifacts.length, 0, mode);
+    assert.equal(database.externalSyncs.size, 0, mode);
+    assert.equal(recordings.objects.has(fixture.manifestKey), false, mode);
+    assert.equal(database.auditEvents.filter((event) =>
+      event.session_id === fixture.session.id &&
+      event.event_type === "legacy_recording_recovered").length, 0, mode);
+    assert.equal(database.auditEvents.filter((event) =>
+      event.session_id === fixture.session.id &&
+      event.event_type === "legacy_recording_recovery_manual_attention").length,
+    mode === "changed-part" ? 1 : 0, mode);
+  }
+});
+
+test("candidate stop permanently excludes a legacy v1 orphan from unattended recovery", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixture = await addLegacyV1OrphanFixture(database, recordings, {
+    index: 50,
+    candidateRequestedStop: true,
+  });
+  const originalInfo = console.info;
+  console.info = () => {};
+  try {
+    await scheduleInterviewRecovery(env);
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(fixture.session.recording_status, "uploading");
+  assert.equal(database.artifacts.length, 0);
+  assert.equal(database.auditEvents.some((event) =>
+    event.event_type === "legacy_recording_recovery_claimed"), false);
 });
 
 test("internal recovery fails closed without a dedicated strong bearer token", async () => {

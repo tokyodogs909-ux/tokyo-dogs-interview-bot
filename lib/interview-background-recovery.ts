@@ -1,6 +1,7 @@
 import { recoverNextStaleInterviewEvaluation } from "@/lib/interview-evaluation-recovery";
 import {
   findNextInterviewDriveRecoverySession,
+  recoverNextLegacyV1RecordingOrphan,
   recoverNextSealedResumableInterviewRecording,
 } from "@/lib/interview-persistence";
 import { finalizeRecordedInterview } from "@/lib/recorded-interview-completion";
@@ -87,14 +88,41 @@ export type InterviewBackgroundRecoverySummary = {
 };
 
 async function recoverRecording(): Promise<RecoveryStageState> {
+  let legacyState: RecoveryStageState;
   try {
-    const result = await recoverNextSealedResumableInterviewRecording();
-    if (result.state === "none") return "idle";
-    if (result.state === "stored") return "advanced";
-    return result.state === "waiting" ? "waiting" : "attention";
+    const legacy = await recoverNextLegacyV1RecordingOrphan();
+    legacyState = legacy.state === "none"
+      ? "idle"
+      : legacy.state === "stored"
+        ? "advanced"
+        : legacy.state === "waiting"
+          ? "waiting"
+          : "attention";
   } catch {
-    return "attention";
+    legacyState = "attention";
   }
+
+  // A damaged legacy object must not starve the normal sealed-upload queue,
+  // and a repeatedly waiting sealed upload must not starve the legacy queue.
+  // Each helper remains independently bounded to at most one successful store.
+  let sealedState: RecoveryStageState;
+  try {
+    const sealed = await recoverNextSealedResumableInterviewRecording();
+    sealedState = sealed.state === "none"
+      ? "idle"
+      : sealed.state === "stored"
+        ? "advanced"
+        : sealed.state === "waiting"
+          ? "waiting"
+          : "attention";
+  } catch {
+    sealedState = "attention";
+  }
+
+  if (legacyState === "advanced" || sealedState === "advanced") return "advanced";
+  if (legacyState === "attention" || sealedState === "attention") return "attention";
+  if (legacyState === "waiting" || sealedState === "waiting") return "waiting";
+  return "idle";
 }
 
 async function recoverTranscription(): Promise<RecoveryStageState> {

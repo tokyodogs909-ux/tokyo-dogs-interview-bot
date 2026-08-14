@@ -56,6 +56,15 @@ const RECORDING_RECOVERY_ABSOLUTE_DEADLINE_MS = 6 * 60 * 60 * 1_000;
 const RECORDING_RECOVERY_MISSING_ATTEMPT_LIMIT = 12;
 const RECORDING_RECOVERY_MISSING_EVENT = "recording_recovery_part_missing";
 const RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT = "recording_recovery_manual_attention";
+const LEGACY_RECORDING_RECOVERY_CLAIM_EVENT = "legacy_recording_recovery_claimed";
+const LEGACY_RECORDING_RECOVERED_EVENT = "legacy_recording_recovered";
+const LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT =
+  "legacy_recording_recovery_manual_attention";
+const LEGACY_RECORDING_RECOVERY_LEASE_MS = 4 * 60 * 1_000;
+const LEGACY_RECORDING_RECOVERY_EXPIRY_GRACE_MS = 30 * 60 * 1_000;
+const LEGACY_V1_MAX_RECORDING_BYTES = 90 * 1024 * 1024;
+const LEGACY_V1_MAX_PARTS = Math.ceil(LEGACY_V1_MAX_RECORDING_BYTES / RECORDING_UPLOAD_PART_BYTES);
+const LEGACY_V1_STATE_MAX_BYTES = 4 * 1024;
 
 function retentionUntil(from: Date) {
   return new Date(from.getTime() + INTERVIEW_RETENTION_DAYS * 24 * 60 * 60 * 1_000).toISOString();
@@ -2627,6 +2636,9 @@ type RecordingPartManifest = {
   byteSize: number;
   audioCoverage: "both" | "candidate-only" | "unverified";
   parts: Array<{ key: string; byteSize: number; sha256?: string }>;
+  recovery?: {
+    mode: "legacy-v1-body-sha256";
+  };
 };
 
 function recordingUploadStateKey(sessionId: string) {
@@ -2696,6 +2708,197 @@ function parseRecordingUploadState(value: string): RecordingUploadState {
     throw new Error("INTERVIEW_RECORDING_UPLOAD_STATE_INVALID");
   }
   return parsed as RecordingUploadState;
+}
+
+type LegacyRecordingOrphanTarget = {
+  id: string;
+  status: "in_progress";
+  recording_status: "uploading" | "failed";
+  expires_at: string;
+  retention_until: string;
+  created_at: string;
+  updated_at: string;
+  transcript_json: null;
+  evaluation_json: null;
+  summary: null;
+  completed_at: null;
+};
+
+type LegacyV1VerifiedRecording = {
+  state: RecordingUploadState & { version: 1 };
+  manifestJson: string;
+  objectKey: string;
+};
+
+type LegacyV1Inspection =
+  | { state: "verified"; recording: LegacyV1VerifiedRecording }
+  | { state: "manual_attention"; errorCode: string };
+
+function legacyRecoveryAttention(errorCode: string): LegacyV1Inspection {
+  return { state: "manual_attention", errorCode };
+}
+
+function exactObjectKeys(value: Record<string, unknown>, expected: readonly string[]) {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length &&
+    actual.every((key, index) => key === sortedExpected[index]);
+}
+
+function exactCustomMetadata(
+  value: Record<string, string> | undefined,
+  expected: Record<string, string>,
+) {
+  return Boolean(value) && exactObjectKeys(value as Record<string, unknown>, Object.keys(expected)) &&
+    Object.entries(expected).every(([key, expectedValue]) => value?.[key] === expectedValue);
+}
+
+function isExactLegacyV1State(
+  value: unknown,
+  target: LegacyRecordingOrphanTarget,
+): value is RecordingUploadState & { version: 1 } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Partial<RecordingUploadState> & Record<string, unknown>;
+  if (!exactObjectKeys(state, [
+    "version",
+    "sessionId",
+    "contentType",
+    "byteSize",
+    "partSize",
+    "totalParts",
+    "audioCoverage",
+    "retentionUntil",
+    "createdAt",
+  ])) return false;
+  const stateCreatedAt = Date.parse(String(state.createdAt ?? ""));
+  const sessionCreatedAt = Date.parse(target.created_at);
+  const expiresAt = Date.parse(target.expires_at);
+  const contentType = typeof state.contentType === "string"
+    ? state.contentType.split(";")[0].toLowerCase()
+    : "";
+  return state.version === 1 &&
+    state.sessionId === target.id &&
+    state.retentionUntil === target.retention_until &&
+    ["video/webm", "audio/webm", "video/mp4", "audio/mp4"].includes(contentType) &&
+    state.contentType === contentType &&
+    Number.isInteger(state.byteSize) &&
+    Number(state.byteSize) > 0 &&
+    Number(state.byteSize) <= LEGACY_V1_MAX_RECORDING_BYTES &&
+    state.partSize === RECORDING_UPLOAD_PART_BYTES &&
+    Number.isInteger(state.totalParts) &&
+    Number(state.totalParts) > 0 &&
+    Number(state.totalParts) <= LEGACY_V1_MAX_PARTS &&
+    Math.ceil(Number(state.byteSize) / RECORDING_UPLOAD_PART_BYTES) === state.totalParts &&
+    ["both", "candidate-only", "unverified"].includes(String(state.audioCoverage ?? "")) &&
+    Number.isFinite(stateCreatedAt) &&
+    Number.isFinite(sessionCreatedAt) &&
+    Number.isFinite(expiresAt) &&
+    stateCreatedAt >= sessionCreatedAt &&
+    stateCreatedAt <= expiresAt;
+}
+
+async function readR2ObjectBytesBounded(object: R2ObjectBody, maximumBytes: number) {
+  if (!Number.isInteger(object.size) || object.size <= 0 || object.size > maximumBytes) {
+    throw new Error("LEGACY_RECORDING_OBJECT_SIZE_INVALID");
+  }
+  const bytes = new Uint8Array(await object.arrayBuffer());
+  if (bytes.byteLength !== object.size || bytes.byteLength > maximumBytes) {
+    throw new Error("LEGACY_RECORDING_OBJECT_SIZE_INVALID");
+  }
+  return bytes;
+}
+
+async function inspectLegacyV1Recording(
+  bucket: R2Bucket,
+  target: LegacyRecordingOrphanTarget,
+): Promise<LegacyV1Inspection> {
+  const stateObject = await bucket.get(recordingUploadStateKey(target.id));
+  if (!stateObject) return legacyRecoveryAttention("LEGACY_V1_UPLOAD_STATE_MISSING");
+  if (
+    stateObject.httpMetadata?.contentType !== "application/json" ||
+    !exactCustomMetadata(stateObject.customMetadata, {
+      sessionId: target.id,
+      retentionUntil: target.retention_until,
+    })
+  ) return legacyRecoveryAttention("LEGACY_V1_UPLOAD_STATE_METADATA_INVALID");
+
+  let statePayload: unknown;
+  try {
+    const stateBytes = await readR2ObjectBytesBounded(stateObject, LEGACY_V1_STATE_MAX_BYTES);
+    statePayload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(stateBytes));
+  } catch {
+    return legacyRecoveryAttention("LEGACY_V1_UPLOAD_STATE_INVALID");
+  }
+  if (!isExactLegacyV1State(statePayload, target)) {
+    return legacyRecoveryAttention("LEGACY_V1_UPLOAD_STATE_INVALID");
+  }
+  const state = statePayload;
+  const parts: RecordingPartManifest["parts"] = [];
+  let totalBytes = 0;
+  for (let index = 0; index < state.totalParts; index += 1) {
+    const key = recordingPartKey(target.id, index);
+    const expectedSize = index === state.totalParts - 1
+      ? state.byteSize - state.partSize * (state.totalParts - 1)
+      : state.partSize;
+    const part = await bucket.get(key);
+    if (!part) return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_MISSING");
+    if (
+      part.size !== expectedSize ||
+      part.httpMetadata?.contentType !== "application/octet-stream" ||
+      !exactCustomMetadata(part.customMetadata, {
+        sessionId: target.id,
+        byteSize: String(expectedSize),
+        retentionUntil: target.retention_until,
+      })
+    ) return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_METADATA_INVALID");
+    let bytes: Uint8Array;
+    try {
+      bytes = await readR2ObjectBytesBounded(part, expectedSize);
+    } catch {
+      return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_BODY_INVALID");
+    }
+    const exact = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    const sha256 = bufferHex(await crypto.subtle.digest("SHA-256", exact));
+    if (!/^[a-f0-9]{64}$/.test(sha256)) {
+      return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_DIGEST_INVALID");
+    }
+    // Version 1 keys were overwriteable while the candidate token was valid.
+    // Re-read metadata after hashing and require the same object generation so
+    // a concurrent replacement can never be finalized under the old digest.
+    const readback = await bucket.head(key);
+    if (
+      !readback ||
+      readback.etag !== part.etag ||
+      readback.size !== expectedSize ||
+      readback.httpMetadata?.contentType !== "application/octet-stream" ||
+      !exactCustomMetadata(readback.customMetadata, {
+        sessionId: target.id,
+        byteSize: String(expectedSize),
+        retentionUntil: target.retention_until,
+      })
+    ) return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_CHANGED");
+    totalBytes += bytes.byteLength;
+    parts.push({ key, byteSize: bytes.byteLength, sha256 });
+  }
+  if (totalBytes !== state.byteSize) {
+    return legacyRecoveryAttention("LEGACY_V1_RECORDING_SIZE_MISMATCH");
+  }
+  const manifest: RecordingPartManifest = {
+    version: 1,
+    contentType: state.contentType,
+    byteSize: state.byteSize,
+    audioCoverage: state.audioCoverage,
+    parts,
+    recovery: { mode: "legacy-v1-body-sha256" },
+  };
+  return {
+    state: "verified",
+    recording: {
+      state,
+      manifestJson: JSON.stringify(manifest),
+      objectKey: `interviews/${target.id}/recording.recovered-v1.manifest.json`,
+    },
+  };
 }
 
 export function validateRecordingUploadShape(input: {
@@ -3234,6 +3437,708 @@ export async function recoverNextSealedResumableInterviewRecording() {
     }
   }
   return firstDeferred ?? { state: "none" } as const;
+}
+
+async function findNextLegacyV1RecordingOrphan() {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const expiredBefore = new Date(
+    Date.now() - LEGACY_RECORDING_RECOVERY_EXPIRY_GRACE_MS,
+  ).toISOString();
+  return await db.prepare(`SELECT
+      s.id, s.status, s.recording_status, s.expires_at, s.retention_until,
+      s.created_at, s.updated_at, s.transcript_json, s.evaluation_json,
+      s.summary, s.completed_at
+    FROM interview_sessions AS s
+    WHERE s.status = 'in_progress'
+      AND s.recording_status IN ('uploading', 'failed')
+      AND s.expires_at <= ?
+      AND s.completed_at IS NULL
+      AND s.transcript_json IS NULL
+      AND s.evaluation_json IS NULL
+      AND s.summary IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = s.id AND artifact.kind = 'recording'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_external_syncs sync
+        WHERE sync.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM recorded_interview_completions completion
+        WHERE completion.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM recorded_answer_transcriptions answer
+        WHERE answer.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_evaluation_claims evaluation_claim
+        WHERE evaluation_claim.session_id = s.id
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events consent
+        WHERE consent.session_id = s.id
+          AND consent.event_type = 'consent_recorded'
+          AND json_valid(consent.detail_json)
+          AND json_extract(consent.detail_json, '$.interviewMode') = 'camera'
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events started
+        WHERE started.session_id = s.id
+          AND started.event_type = 'interview_started'
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events failed_upload
+        WHERE failed_upload.session_id = s.id
+          AND failed_upload.event_type = 'recording_unavailable'
+          AND json_valid(failed_upload.detail_json)
+          AND json_extract(failed_upload.detail_json, '$.code') = 'UPLOAD_FAILED'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events local_capture_failure
+        WHERE local_capture_failure.session_id = s.id
+          AND local_capture_failure.event_type = 'recording_unavailable'
+          AND json_valid(local_capture_failure.detail_json)
+          AND json_extract(local_capture_failure.detail_json, '$.code') IN (
+            'NO_RECORDING_AT_COMPLETION', 'FORMAT_UNAVAILABLE', 'RECORDER_ERROR',
+            'CLIENT_RECORDING_SIZE_LIMIT'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events incompatible
+        WHERE incompatible.session_id = s.id
+          AND incompatible.event_type IN (
+            'recorded_fallback_started', 'voice_transcript_sealed',
+            'evaluation_started', 'evaluation_saved', 'recording_stored',
+            'candidate_requested_stop',
+            '${LEGACY_RECORDING_RECOVERED_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+    ORDER BY s.updated_at ASC, s.id ASC
+    LIMIT 1`)
+    .bind(expiredBefore)
+    .first<LegacyRecordingOrphanTarget>();
+}
+
+async function claimLegacyV1RecordingOrphan(
+  target: LegacyRecordingOrphanTarget,
+) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date();
+  const claimedAt = now.toISOString();
+  const staleBefore = new Date(now.getTime() - LEGACY_RECORDING_RECOVERY_LEASE_MS).toISOString();
+  const leaseExpiresAt = new Date(now.getTime() + LEGACY_RECORDING_RECOVERY_LEASE_MS).toISOString();
+  const claimId = crypto.randomUUID();
+  const result = await db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json, created_at
+    ) SELECT ?, ?, '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ?
+          AND s.status = 'in_progress'
+          AND s.recording_status IN ('uploading', 'failed')
+          AND s.updated_at = ?
+          AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL
+          AND s.evaluation_json IS NULL
+          AND s.summary IS NULL
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = ?
+          AND terminal.event_type IN (
+            '${LEGACY_RECORDING_RECOVERED_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events active_claim
+        WHERE active_claim.session_id = ?
+          AND active_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND active_claim.created_at > ?
+      )`)
+    .bind(
+      crypto.randomUUID(),
+      target.id,
+      JSON.stringify({ claimId, leaseExpiresAt }),
+      claimedAt,
+      target.id,
+      target.updated_at,
+      target.id,
+      target.id,
+      staleBefore,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return null;
+  return { claimId, claimedAt, leaseExpiresAt };
+}
+
+async function legacyV1RecoveryClaimIsCurrent(input: {
+  target: LegacyRecordingOrphanTarget;
+  claimId: string;
+  claimedAt: string;
+  leaseExpiresAt: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const row = await db.prepare(`SELECT 1 AS current_claim
+    FROM interview_sessions s
+    WHERE s.id = ?
+      AND s.status = 'in_progress'
+      AND s.recording_status IN ('uploading', 'failed')
+      AND s.updated_at = ?
+      AND s.completed_at IS NULL
+      AND s.transcript_json IS NULL
+      AND s.evaluation_json IS NULL
+      AND s.summary IS NULL
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = s.id
+          AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ?
+          AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = s.id
+          AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = s.id
+          AND terminal.event_type IN (
+            '${LEGACY_RECORDING_RECOVERED_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+    LIMIT 1`)
+    .bind(
+      input.target.id,
+      input.target.updated_at,
+      input.claimedAt,
+      input.claimId,
+      input.leaseExpiresAt,
+      new Date().toISOString(),
+      input.claimedAt,
+    ).first<{ current_claim: number }>();
+  return Number(row?.current_claim ?? 0) === 1;
+}
+
+async function markLegacyV1RecordingManualAttention(input: {
+  target: LegacyRecordingOrphanTarget;
+  claimId: string;
+  claimedAt: string;
+  leaseExpiresAt: string;
+  errorCode: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const createdAt = new Date().toISOString();
+  const attentionEventId = crypto.randomUUID();
+  const result = await db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json, created_at
+    ) SELECT ?, ?, '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ?
+          AND s.status = 'in_progress'
+          AND s.recording_status IN ('uploading', 'failed')
+          AND s.updated_at = ?
+          AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL
+          AND s.evaluation_json IS NULL
+          AND s.summary IS NULL
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = ?
+          AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ?
+          AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = ?
+          AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = ?
+          AND terminal.event_type IN (
+            '${LEGACY_RECORDING_RECOVERED_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )`)
+    .bind(
+      attentionEventId,
+      input.target.id,
+      JSON.stringify({ errorCode: input.errorCode.slice(0, 120) }),
+      createdAt,
+      input.target.id,
+      input.target.updated_at,
+      input.target.id,
+      input.claimedAt,
+      input.claimId,
+      input.leaseExpiresAt,
+      createdAt,
+      input.target.id,
+      input.claimedAt,
+      input.target.id,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return false;
+  const readback = await db.prepare(`SELECT 1 AS present
+    FROM interview_audit_events
+    WHERE id = ? AND session_id = ?
+      AND event_type = '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+    LIMIT 1`)
+    .bind(attentionEventId, input.target.id)
+    .first<{ present: number }>();
+  return Number(readback?.present ?? 0) === 1;
+}
+
+async function createLegacyV1RecoveryManifest(input: {
+  bucket: R2Bucket;
+  target: LegacyRecordingOrphanTarget;
+  recording: LegacyV1VerifiedRecording;
+}) {
+  const expectedCustomMetadata = {
+    sessionId: input.target.id,
+    retentionUntil: input.target.retention_until,
+    audioCoverage: input.recording.state.audioCoverage,
+    recordingContentType: input.recording.state.contentType,
+    recoveryMode: "legacy-v1-body-sha256",
+  };
+  const created = await input.bucket.put(
+    input.recording.objectKey,
+    input.recording.manifestJson,
+    {
+      onlyIf: { etagDoesNotMatch: "*" },
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: expectedCustomMetadata,
+    },
+  );
+  const existing = await input.bucket.get(input.recording.objectKey);
+  const expectedByteSize = new TextEncoder().encode(input.recording.manifestJson).byteLength;
+  if (
+    !existing ||
+    existing.size !== expectedByteSize ||
+    expectedByteSize > LEGACY_V1_STATE_MAX_BYTES * 8 ||
+    (created && existing.etag !== created.etag) ||
+    existing.httpMetadata?.contentType !== "application/json" ||
+    !exactCustomMetadata(existing.customMetadata, expectedCustomMetadata)
+  ) {
+    return { errorCode: "LEGACY_V1_RECOVERY_MANIFEST_CONFLICT" } as const;
+  }
+  let existingJson = "";
+  try {
+    existingJson = new TextDecoder("utf-8", { fatal: true }).decode(
+      await readR2ObjectBytesBounded(existing, LEGACY_V1_STATE_MAX_BYTES * 8),
+    );
+  } catch {
+    return { errorCode: "LEGACY_V1_RECOVERY_MANIFEST_CONFLICT" } as const;
+  }
+  if (existingJson !== input.recording.manifestJson) {
+    return { errorCode: "LEGACY_V1_RECOVERY_MANIFEST_CONFLICT" } as const;
+  }
+  return { etag: existing.etag };
+}
+
+async function finalizeLegacyV1RecordingOrphan(input: {
+  target: LegacyRecordingOrphanTarget;
+  recording: LegacyV1VerifiedRecording;
+  manifestEtag: string | undefined;
+  claimId: string;
+  claimedAt: string;
+  leaseExpiresAt: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const storedAt = new Date().toISOString();
+  const auditDetail = JSON.stringify({
+    sourceVersion: 1,
+    byteSize: input.recording.state.byteSize,
+    contentType: input.recording.state.contentType,
+    audioCoverage: input.recording.state.audioCoverage,
+    partCount: input.recording.state.totalParts,
+    verificationMode: "legacy-v1-body-sha256",
+  });
+  await db.batch([
+    db.prepare(`UPDATE interview_sessions SET recording_status = 'stored', updated_at = ?
+      WHERE id = ?
+        AND status = 'in_progress'
+        AND recording_status IN ('uploading', 'failed')
+        AND updated_at = ?
+        AND expires_at = ?
+        AND retention_until = ?
+        AND created_at = ?
+        AND completed_at IS NULL
+        AND transcript_json IS NULL
+        AND evaluation_json IS NULL
+        AND summary IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_artifacts artifact
+          WHERE artifact.session_id = interview_sessions.id
+            AND artifact.kind = 'recording'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_external_syncs sync
+          WHERE sync.session_id = interview_sessions.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM recorded_interview_completions completion
+          WHERE completion.session_id = interview_sessions.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM recorded_answer_transcriptions answer
+          WHERE answer.session_id = interview_sessions.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_evaluation_claims evaluation_claim
+          WHERE evaluation_claim.session_id = interview_sessions.id
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events consent
+          WHERE consent.session_id = interview_sessions.id
+            AND consent.event_type = 'consent_recorded'
+            AND json_valid(consent.detail_json)
+            AND json_extract(consent.detail_json, '$.interviewMode') = 'camera'
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events started
+          WHERE started.session_id = interview_sessions.id
+            AND started.event_type = 'interview_started'
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events failed_upload
+          WHERE failed_upload.session_id = interview_sessions.id
+            AND failed_upload.event_type = 'recording_unavailable'
+            AND json_valid(failed_upload.detail_json)
+            AND json_extract(failed_upload.detail_json, '$.code') = 'UPLOAD_FAILED'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events incompatible
+          WHERE incompatible.session_id = interview_sessions.id
+            AND (
+              incompatible.event_type IN (
+                'recorded_fallback_started', 'voice_transcript_sealed',
+                'evaluation_started', 'evaluation_saved', 'recording_stored',
+                'candidate_requested_stop'
+              )
+              OR (
+                incompatible.event_type = 'recording_unavailable'
+                AND json_valid(incompatible.detail_json)
+                AND json_extract(incompatible.detail_json, '$.code') IN (
+                  'NO_RECORDING_AT_COMPLETION', 'FORMAT_UNAVAILABLE',
+                  'RECORDER_ERROR', 'CLIENT_RECORDING_SIZE_LIMIT'
+                )
+              )
+            )
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events claim
+          WHERE claim.session_id = interview_sessions.id
+            AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+            AND claim.created_at = ?
+            AND json_valid(claim.detail_json)
+            AND json_extract(claim.detail_json, '$.claimId') = ?
+            AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+            AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events newer_claim
+          WHERE newer_claim.session_id = interview_sessions.id
+            AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+            AND newer_claim.created_at > ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events terminal
+          WHERE terminal.session_id = interview_sessions.id
+            AND terminal.event_type IN (
+              '${LEGACY_RECORDING_RECOVERED_EVENT}',
+              '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+            )
+        )`)
+      .bind(
+        storedAt,
+        input.target.id,
+        input.target.updated_at,
+        input.target.expires_at,
+        input.target.retention_until,
+        input.target.created_at,
+        input.claimedAt,
+        input.claimId,
+        input.leaseExpiresAt,
+        storedAt,
+        input.claimedAt,
+      ),
+    db.prepare(`INSERT INTO interview_artifacts (
+        id, session_id, kind, object_key, content_type, byte_size, etag,
+        retention_until, created_at
+      ) SELECT ?, ?, 'recording', ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ?
+          AND s.status = 'in_progress'
+          AND s.recording_status = 'stored'
+          AND s.updated_at = ?
+          AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL
+          AND s.evaluation_json IS NULL
+          AND s.summary IS NULL
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = ?
+          AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ?
+          AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = ?
+          AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = ? AND artifact.kind = 'recording'
+      )`)
+      .bind(
+        crypto.randomUUID(),
+        input.target.id,
+        input.recording.objectKey,
+        input.recording.state.contentType,
+        input.recording.state.byteSize,
+        input.manifestEtag ?? null,
+        input.target.retention_until,
+        storedAt,
+        input.target.id,
+        storedAt,
+        input.target.id,
+        input.claimedAt,
+        input.claimId,
+        input.leaseExpiresAt,
+        storedAt,
+        input.target.id,
+        input.claimedAt,
+        input.target.id,
+      ),
+    db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json, created_at
+      ) SELECT ?, ?, '${LEGACY_RECORDING_RECOVERED_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ?
+          AND s.status = 'in_progress'
+          AND s.recording_status = 'stored'
+          AND s.updated_at = ?
+          AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL
+          AND s.evaluation_json IS NULL
+          AND s.summary IS NULL
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = ?
+          AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ?
+          AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = ?
+          AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = ?
+          AND artifact.kind = 'recording'
+          AND artifact.object_key = ?
+          AND artifact.content_type = ?
+          AND artifact.byte_size = ?
+          AND artifact.retention_until = ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events recovered
+        WHERE recovered.session_id = ?
+          AND recovered.event_type = '${LEGACY_RECORDING_RECOVERED_EVENT}'
+      )`)
+      .bind(
+        crypto.randomUUID(),
+        input.target.id,
+        auditDetail,
+        storedAt,
+        input.target.id,
+        storedAt,
+        input.target.id,
+        input.claimedAt,
+        input.claimId,
+        input.leaseExpiresAt,
+        storedAt,
+        input.target.id,
+        input.claimedAt,
+        input.target.id,
+        input.recording.objectKey,
+        input.recording.state.contentType,
+        input.recording.state.byteSize,
+        input.target.retention_until,
+        input.target.id,
+      ),
+  ]);
+
+  const readback = await db.prepare(`SELECT
+      s.status, s.recording_status, s.transcript_json, s.evaluation_json,
+      s.summary, s.completed_at, artifact.object_key, artifact.content_type,
+      artifact.byte_size, artifact.retention_until,
+      EXISTS (
+        SELECT 1 FROM interview_audit_events recovered
+        WHERE recovered.session_id = s.id
+          AND recovered.event_type = '${LEGACY_RECORDING_RECOVERED_EVENT}'
+      ) AS recovery_audit_present
+    FROM interview_sessions s
+    LEFT JOIN interview_artifacts artifact
+      ON artifact.session_id = s.id AND artifact.kind = 'recording'
+    WHERE s.id = ? LIMIT 1`)
+    .bind(input.target.id)
+    .first<{
+      status: string;
+      recording_status: string;
+      transcript_json: string | null;
+      evaluation_json: string | null;
+      summary: string | null;
+      completed_at: string | null;
+      object_key: string | null;
+      content_type: string | null;
+      byte_size: number | null;
+      retention_until: string | null;
+      recovery_audit_present: number;
+    }>();
+  if (
+    readback?.status !== "in_progress" ||
+    readback.recording_status !== "stored" ||
+    readback.transcript_json !== null ||
+    readback.evaluation_json !== null ||
+    readback.summary !== null ||
+    readback.completed_at !== null ||
+    readback.object_key !== input.recording.objectKey ||
+    readback.content_type !== input.recording.state.contentType ||
+    readback.byte_size !== input.recording.state.byteSize ||
+    readback.retention_until !== input.target.retention_until ||
+    Number(readback.recovery_audit_present) !== 1
+  ) throw new Error("LEGACY_V1_RECORDING_RECOVERY_READBACK_MISMATCH");
+}
+
+/**
+ * Recovers exactly one expired Version 1 upload that reached the old client
+ * completion path but never created a D1 artifact. The legacy protocol did not
+ * persist browser-provided digests, so every bounded part body is re-read and
+ * hashed before a new immutable recovery manifest is created. This operation
+ * deliberately changes only recording storage state; interview completion,
+ * transcripts, evaluation, and Google Drive remain untouched.
+ */
+export async function recoverNextLegacyV1RecordingOrphan() {
+  const db = database();
+  const bucket = bindings().RECORDINGS;
+  if (!db || !bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
+  const target = await findNextLegacyV1RecordingOrphan();
+  if (!target) return { state: "none" } as const;
+  const claim = await claimLegacyV1RecordingOrphan(target);
+  if (!claim) return { state: "waiting", sessionId: target.id } as const;
+
+  let inspection: LegacyV1Inspection;
+  try {
+    inspection = await inspectLegacyV1Recording(bucket, target);
+  } catch {
+    return {
+      state: "waiting",
+      sessionId: target.id,
+      errorCode: "LEGACY_V1_RECORDING_STORAGE_RETRY",
+    } as const;
+  }
+  if (inspection.state === "manual_attention") {
+    const marked = await markLegacyV1RecordingManualAttention({
+      target,
+      claimId: claim.claimId,
+      claimedAt: claim.claimedAt,
+      leaseExpiresAt: claim.leaseExpiresAt,
+      errorCode: inspection.errorCode,
+    });
+    if (!marked) return { state: "waiting", sessionId: target.id } as const;
+    return {
+      state: "manual_attention",
+      sessionId: target.id,
+      errorCode: inspection.errorCode,
+    } as const;
+  }
+  if (!await legacyV1RecoveryClaimIsCurrent({
+    target,
+    claimId: claim.claimId,
+    claimedAt: claim.claimedAt,
+    leaseExpiresAt: claim.leaseExpiresAt,
+  })) return { state: "waiting", sessionId: target.id } as const;
+
+  let manifest: { etag: string | undefined } | { errorCode: string };
+  try {
+    manifest = await createLegacyV1RecoveryManifest({
+      bucket,
+      target,
+      recording: inspection.recording,
+    });
+  } catch {
+    return {
+      state: "waiting",
+      sessionId: target.id,
+      errorCode: "LEGACY_V1_RECORDING_STORAGE_RETRY",
+    } as const;
+  }
+  if ("errorCode" in manifest) {
+    const marked = await markLegacyV1RecordingManualAttention({
+      target,
+      claimId: claim.claimId,
+      claimedAt: claim.claimedAt,
+      leaseExpiresAt: claim.leaseExpiresAt,
+      errorCode: manifest.errorCode,
+    });
+    if (!marked) return { state: "waiting", sessionId: target.id } as const;
+    return {
+      state: "manual_attention",
+      sessionId: target.id,
+      errorCode: manifest.errorCode,
+    } as const;
+  }
+  await finalizeLegacyV1RecordingOrphan({
+    target,
+    recording: inspection.recording,
+    manifestEtag: manifest.etag,
+    claimId: claim.claimId,
+    claimedAt: claim.claimedAt,
+    leaseExpiresAt: claim.leaseExpiresAt,
+  });
+  return {
+    state: "stored",
+    sessionId: target.id,
+    byteSize: inspection.recording.state.byteSize,
+    totalParts: inspection.recording.state.totalParts,
+  } as const;
 }
 
 async function loadRecordingObject(bucket: R2Bucket, objectKey: string) {
