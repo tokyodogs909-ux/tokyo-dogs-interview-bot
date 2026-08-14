@@ -372,7 +372,7 @@ export async function getInterviewRecoveryTechnicalStatus(
   const committedOffset = phase ? safeNonNegativeInteger(row.drive_committed_offset) : null;
   const totalBytes = phase ? safeNonNegativeInteger(row.drive_total_bytes) : null;
   const sessionStatuses = new Set([
-    "created", "in_progress", "evaluation_pending", "evaluation_processing", "completed",
+    "created", "in_progress", "interrupted", "evaluation_pending", "evaluation_processing", "completed",
   ]);
   const recordingStatuses = new Set([
     "not_started", "uploading", "stored", "failed", "not_applicable",
@@ -454,6 +454,14 @@ async function ensureSchema(db: D1Database) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_transcript_drafts_sealed_idx ON interview_transcript_drafts (sealed_at)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_session_replacements (
+      source_session_id TEXT PRIMARY KEY NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+      replacement_session_id TEXT NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+      replacement_mode TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS interview_session_replacements_replacement_unique ON interview_session_replacements (replacement_session_id)"),
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_artifacts (
       id TEXT PRIMARY KEY NOT NULL,
       session_id TEXT NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
@@ -798,12 +806,9 @@ export async function describeInterviewInvite(
   return { status: "ok", nonceHash: inspected.nonceHash };
 }
 
-export async function authorizeInterviewRequest(request: Request, sessionId: string) {
+export async function authorizeInterviewToken(sessionId: string, token: string) {
   const db = database();
   if (!db) return null;
-
-  const authorization = request.headers.get("Authorization") ?? "";
-  const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
   if (!token) return null;
   const session = await db.prepare(`SELECT s.id, s.access_token_hash, s.candidate_name,
       s.employment, s.preferred_location, s.status, s.recording_status,
@@ -829,6 +834,225 @@ export async function authorizeInterviewRequest(request: Request, sessionId: str
   if (!session || !constantTimeEqualText(session.access_token_hash, await sha256(token))) return null;
   if (Date.parse(session.expires_at) <= Date.now()) return null;
   return { session };
+}
+
+export async function authorizeInterviewRequest(request: Request, sessionId: string) {
+  const authorization = request.headers.get("Authorization") ?? "";
+  const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
+  return await authorizeInterviewToken(sessionId, token);
+}
+
+export type InterviewContinuitySnapshot = {
+  sessionId: string;
+  candidateName: string;
+  employment: string;
+  location: string;
+  status: string;
+  recordingStatus: string;
+  expiresAt: string;
+  createdAt: string;
+  mode: "voice" | "text" | "recorded-fallback";
+  action: "resume_text" | "replace_with_text" | "processing" | "completed" | "held";
+  transcript: TranscriptTurn[];
+};
+
+type InterviewContinuityRow = {
+  id: string;
+  candidate_name: string;
+  employment: string;
+  preferred_location: string;
+  status: string;
+  recording_status: string;
+  expires_at: string;
+  created_at: string;
+  draft_mode: string | null;
+  draft_json: string | null;
+  draft_sealed_at: string | null;
+  text_started: number;
+  recorded_fallback_started: number;
+  completion_hold: number;
+};
+
+function candidateContinuityTranscript(value: string | null): TranscriptTurn[] {
+  const parsed = parseJson<unknown>(value, null);
+  if (!Array.isArray(parsed) || parsed.length > 300) return [];
+  const turns: TranscriptTurn[] = [];
+  for (const turn of parsed) {
+    if (
+      !turn || typeof turn !== "object" || Array.isArray(turn) ||
+      typeof (turn as { id?: unknown }).id !== "string" ||
+      !["candidate", "interviewer"].includes(String((turn as { speaker?: unknown }).speaker)) ||
+      typeof (turn as { text?: unknown }).text !== "string" ||
+      !(turn as { text: string }).text.trim() ||
+      typeof (turn as { createdAt?: unknown }).createdAt !== "string"
+    ) return [];
+    turns.push(turn as TranscriptTurn);
+  }
+  return turns;
+}
+
+async function continuitySnapshotForSession(
+  db: D1Database,
+  sessionId: string,
+): Promise<InterviewContinuitySnapshot | null> {
+  const row = await db.prepare(`SELECT s.id, s.candidate_name, s.employment,
+      s.preferred_location, s.status, s.recording_status, s.expires_at, s.created_at,
+      draft.mode AS draft_mode, draft.transcript_json AS draft_json,
+      draft.sealed_at AS draft_sealed_at,
+      EXISTS (SELECT 1 FROM interview_audit_events mode
+        WHERE mode.session_id = s.id
+          AND mode.event_type = 'reasonable_accommodation_text_selected') AS text_started,
+      EXISTS (SELECT 1 FROM interview_audit_events mode
+        WHERE mode.session_id = s.id
+          AND mode.event_type = 'recorded_fallback_started') AS recorded_fallback_started,
+      EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id AND hold.event_type IN (
+          'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+        )) AS completion_hold
+    FROM interview_sessions s
+    LEFT JOIN interview_transcript_drafts draft ON draft.session_id = s.id
+    WHERE s.id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<InterviewContinuityRow>();
+  if (!row) return null;
+  const mode = Number(row.text_started) === 1 || row.draft_mode === "text"
+    ? "text"
+    : Number(row.recorded_fallback_started) === 1 ? "recorded-fallback" : "voice";
+  let action: InterviewContinuitySnapshot["action"];
+  if (row.status === "completed") action = "completed";
+  else if (Number(row.completion_hold) === 1 || row.status === "interrupted") action = "held";
+  else if (
+    ["evaluation_pending", "evaluation_processing"].includes(row.status) ||
+    row.recording_status === "stored" ||
+    Boolean(row.draft_sealed_at)
+  ) {
+    action = "processing";
+  } else if (mode === "text" && ["created", "in_progress"].includes(row.status) && !row.draft_sealed_at) {
+    action = "resume_text";
+  } else if (
+    ["created", "in_progress"].includes(row.status) &&
+    ["not_started", "uploading", "failed", "not_applicable"].includes(row.recording_status)
+  ) action = "replace_with_text";
+  else action = "held";
+  return {
+    sessionId: row.id,
+    candidateName: row.candidate_name,
+    employment: row.employment,
+    location: row.preferred_location,
+    status: row.status,
+    recordingStatus: row.recording_status,
+    expiresAt: row.expires_at,
+    createdAt: row.created_at,
+    mode,
+    action,
+    transcript: mode === "text" ? candidateContinuityTranscript(row.draft_json) : [],
+  };
+}
+
+/** Returns only data owned by the already-authenticated candidate session. */
+export async function getInterviewContinuitySnapshot(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const mapped = await db.prepare(`SELECT replacement_session_id
+    FROM interview_session_replacements WHERE source_session_id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<{ replacement_session_id: string }>();
+  return await continuitySnapshotForSession(db, mapped?.replacement_session_id ?? sessionId);
+}
+
+/**
+ * A restarted MediaRecorder cannot be concatenated onto an existing WebM/MP4
+ * stream. Freeze that source as technical evidence and atomically create one
+ * text-only replacement that reuses the already-authenticated token hash.
+ */
+export async function replaceInterruptedInterviewWithText(sourceSessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const prior = await db.prepare(`SELECT replacement_session_id
+    FROM interview_session_replacements WHERE source_session_id = ? LIMIT 1`)
+    .bind(sourceSessionId)
+    .first<{ replacement_session_id: string }>();
+  if (prior) return await continuitySnapshotForSession(db, prior.replacement_session_id);
+
+  const replacementSessionId = publicSessionId();
+  const now = new Date().toISOString();
+  const results = await db.batch([
+    db.prepare(`INSERT INTO interview_sessions (
+        id, access_token_hash, candidate_name, employment, preferred_location,
+        consent_version, consented_at, status, recording_status, expires_at,
+        retention_until, created_at, updated_at
+      ) SELECT ?, source.access_token_hash, source.candidate_name, source.employment,
+        source.preferred_location, source.consent_version, source.consented_at,
+        'in_progress', 'not_applicable', source.expires_at, source.retention_until, ?, ?
+      FROM interview_sessions source
+      WHERE source.id = ? AND source.status IN ('created', 'in_progress')
+        AND source.completed_at IS NULL
+        AND source.recording_status IN ('not_started', 'uploading', 'failed', 'not_applicable')
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events mode
+          WHERE mode.session_id = source.id
+            AND mode.event_type = 'reasonable_accommodation_text_selected')
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = source.id AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          ))
+        AND NOT EXISTS (SELECT 1 FROM interview_session_replacements replacement
+          WHERE replacement.source_session_id = source.id)`)
+      .bind(replacementSessionId, now, now, sourceSessionId),
+    db.prepare(`INSERT INTO interview_session_replacements (
+        source_session_id, replacement_session_id, replacement_mode, reason, created_at
+      ) SELECT ?, ?, 'text', 'device_continuity', ?
+      WHERE EXISTS (SELECT 1 FROM interview_sessions WHERE id = ?)
+        AND NOT EXISTS (SELECT 1 FROM interview_session_replacements WHERE source_session_id = ?)`)
+      .bind(sourceSessionId, replacementSessionId, now, replacementSessionId, sourceSessionId),
+    db.prepare(`UPDATE interview_sessions SET status = 'interrupted', updated_at = ?
+      WHERE id = ? AND status IN ('created', 'in_progress')
+        AND EXISTS (SELECT 1 FROM interview_session_replacements replacement
+          WHERE replacement.source_session_id = interview_sessions.id
+            AND replacement.replacement_session_id = ?)`)
+      .bind(now, sourceSessionId, replacementSessionId),
+    db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json, created_at
+      ) SELECT ?, ?, 'device_session_replaced', 'system', ?, ?
+      WHERE EXISTS (SELECT 1 FROM interview_session_replacements
+        WHERE source_session_id = ? AND replacement_session_id = ?)`)
+      .bind(crypto.randomUUID(), sourceSessionId, JSON.stringify({
+        replacementMode: "text",
+        replacementSessionId,
+      }), now,
+        sourceSessionId, replacementSessionId),
+    db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json, created_at
+      ) SELECT ?, ?, 'reasonable_accommodation_text_selected', 'system', ?, ?
+      WHERE EXISTS (SELECT 1 FROM interview_session_replacements
+        WHERE source_session_id = ? AND replacement_session_id = ?)`)
+      .bind(crypto.randomUUID(), replacementSessionId,
+        JSON.stringify({ selectionImpact: "none", continuityRecovery: true, sourceSessionId }), now,
+        sourceSessionId, replacementSessionId),
+    db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json, created_at
+      ) SELECT ?, ?, 'interview_started', 'system', ?, ?
+      WHERE EXISTS (SELECT 1 FROM interview_session_replacements
+        WHERE source_session_id = ? AND replacement_session_id = ?)`)
+      .bind(crypto.randomUUID(), replacementSessionId,
+        JSON.stringify({ continuityRecovery: true, sourceSessionId }), now,
+        sourceSessionId, replacementSessionId),
+  ]);
+  if (Number((results[0] as { meta?: { changes?: number } }).meta?.changes ?? 0) !== 1) {
+    const raced = await db.prepare(`SELECT replacement_session_id
+      FROM interview_session_replacements WHERE source_session_id = ? LIMIT 1`)
+      .bind(sourceSessionId)
+      .first<{ replacement_session_id: string }>();
+    if (!raced) throw new Error("INTERVIEW_CONTINUITY_NOT_REPLACEABLE");
+    return await continuitySnapshotForSession(db, raced.replacement_session_id);
+  }
+
+  const snapshot = await continuitySnapshotForSession(db, replacementSessionId);
+  if (!snapshot || snapshot.action !== "resume_text") {
+    throw new Error("INTERVIEW_CONTINUITY_READBACK_MISMATCH");
+  }
+  return snapshot;
 }
 
 export type InterviewTranscriptDraftMode = "voice" | "text";
@@ -2999,7 +3223,8 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
       'connection_failed', 'candidate_requested_stop', 'safety_escalation',
       'completion_reason_invalid', 'time_limit_reached',
       'reasonable_accommodation_text_selected', 'recording_recovery_part_missing',
-      'recording_recovery_manual_attention', 'legacy_recording_recovery_manual_attention'
+      'recording_recovery_manual_attention', 'legacy_recording_recovery_manual_attention',
+      'device_session_replaced'
     ) ORDER BY created_at`)
     .bind(sessionId)
     .all<Record<string, unknown>>();

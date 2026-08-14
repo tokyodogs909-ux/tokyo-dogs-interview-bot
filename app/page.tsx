@@ -62,6 +62,23 @@ type InviteGate = "checking" | InterviewAccessState;
 type InterviewMode = "voice" | "text" | "recorded-fallback" | "internal-test";
 type InterviewFormat = "camera" | "text";
 type InterviewCredentials = { sessionId: string; accessToken: string };
+type InterviewContinuitySnapshot = {
+  sessionId: string;
+  candidateName: string;
+  employment: string;
+  location: string;
+  status: string;
+  recordingStatus: string;
+  expiresAt: string;
+  createdAt: string;
+  mode: "voice" | "text" | "recorded-fallback";
+  action: "resume_text" | "replace_with_text" | "processing" | "completed" | "held";
+  transcript: TranscriptTurn[];
+};
+type InterviewContinuity = {
+  accessToken: string;
+  snapshot: InterviewContinuitySnapshot;
+};
 type RecordedAnswerReceipt = {
   state: "completed" | "pending";
   retryAfterSeconds: number;
@@ -314,6 +331,9 @@ export default function Home() {
   const [recordedQuestionReady, setRecordedQuestionReady] = useState(false);
   const [timeControlNotice, setTimeControlNotice] = useState("");
   const [completionHold, setCompletionHold] = useState<CompletionHold>("none");
+  const [continuity, setContinuity] = useState<InterviewContinuity | null>(null);
+  const [continuityChecking, setContinuityChecking] = useState(true);
+  const [networkAvailable, setNetworkAvailable] = useState(true);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const preparedAudioRef = useRef<HTMLAudioElement>(null);
@@ -463,6 +483,53 @@ export default function Home() {
       if (!cancelled) setInviteGate(state);
     });
     return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 8_000);
+    void fetch("/api/interviews/resume", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+      signal: controller.signal,
+    }).then(async (response) => {
+      const data = await response.json().catch(() => null) as {
+        available?: boolean;
+        accessToken?: string;
+        snapshot?: InterviewContinuitySnapshot;
+      } | null;
+      if (
+        !cancelled && response.ok && data?.available === true &&
+        typeof data.accessToken === "string" && data.snapshot?.sessionId
+      ) setContinuity({ accessToken: data.accessToken, snapshot: data.snapshot });
+    }).catch(() => undefined).finally(() => {
+      window.clearTimeout(timeout);
+      if (!cancelled) setContinuityChecking(false);
+    });
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    const updateNetwork = () => {
+      const online = navigator.onLine;
+      setNetworkAvailable(online);
+      if (!online) return;
+      void recordingLiveUploaderRef.current?.retry().catch(() => undefined);
+      const completed = completedTranscriptRef.current;
+      if (completed.length > 0) enqueueCompletedTranscriptSnapshot(completed);
+    };
+    updateNetwork();
+    window.addEventListener("online", updateNetwork);
+    window.addEventListener("offline", updateNetwork);
+    return () => {
+      window.removeEventListener("online", updateNetwork);
+      window.removeEventListener("offline", updateNetwork);
+    };
   }, []);
 
   useEffect(() => {
@@ -2229,6 +2296,7 @@ export default function Home() {
         accessTokenRef.current = activeAccessToken;
         sessionIdRef.current = activeSessionId;
         setSessionId(activeSessionId);
+        setContinuity(null);
       }
       if (recordedInterviewSessionRef.current !== activeSessionId || !transcriptDraftWriterRef.current) {
         initializeTranscriptDraftWriter(
@@ -2877,6 +2945,7 @@ export default function Home() {
       accessTokenRef.current = data.accessToken;
       sessionIdRef.current = data.sessionId;
       setSessionId(data.sessionId);
+      setContinuity(null);
       resetRealtimeTranscriptIntegrity();
       updateCompletionHold("none");
       const started = await fetch("/api/interviews/text/start", {
@@ -2926,6 +2995,100 @@ export default function Home() {
       setStage("interview");
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "文字入力によるオンライン一次面接を開始できませんでした。");
+    } finally {
+      setSessionStarting(false);
+    }
+  }
+
+  async function openTextContinuity(next: InterviewContinuity) {
+    const { snapshot, accessToken } = next;
+    if (!(EMPLOYMENT_OPTIONS as readonly string[]).includes(snapshot.employment)) {
+      throw new Error("保存済みの雇用形態を確認できませんでした。");
+    }
+    const firstTurn: TranscriptTurn = {
+      id: "text-interview-question-1",
+      speaker: "interviewer",
+      text: `TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。カメラとマイクを使用せず、文字入力で進めます。入力方法の違いは評価に使用しません。${TEXT_INTERVIEW_QUESTIONS[0]}`,
+      createdAt: new Date().toISOString(),
+    };
+    const resumedTurns = snapshot.transcript.length > 0 ? [...snapshot.transcript] : [firstTurn];
+    const answered = resumedTurns.filter((turn) => turn.speaker === "candidate").length;
+    const last = resumedTurns.at(-1);
+    if (last?.speaker === "candidate" && answered < TEXT_INTERVIEW_QUESTIONS.length) {
+      resumedTurns.push({
+        id: `text-interview-question-${answered + 1}`,
+        speaker: "interviewer",
+        text: TEXT_INTERVIEW_QUESTIONS[answered],
+        createdAt: new Date().toISOString(),
+      });
+    }
+
+    accessTokenRef.current = accessToken;
+    sessionIdRef.current = snapshot.sessionId;
+    setSessionId(snapshot.sessionId);
+    setCandidateName(snapshot.candidateName);
+    setEmployment(snapshot.employment as (typeof EMPLOYMENT_OPTIONS)[number]);
+    setLocation(snapshot.location);
+    setConsent(true);
+    setInterviewFormat("text");
+    modeRef.current = "text";
+    setMode("text");
+    resetRealtimeTranscriptIntegrity();
+    updateCompletionHold("none");
+    startInterviewClock();
+    transcriptRef.current = resumedTurns;
+    setTranscript(resumedTurns);
+    completedTranscriptRef.current = resumedTurns;
+    initializeTranscriptDraftWriter(
+      { sessionId: snapshot.sessionId, accessToken },
+      "text",
+    );
+    await transcriptDraftWriterRef.current!.enqueue(resumedTurns);
+    setTextDraft("");
+    setProcessingWarning("途中保存済みの回答から再開しました。参加方法の変更は選考上の不利益に扱いません。");
+    setErrorMessage("");
+    setConnectionState("ready");
+    setConnectionStep("ready");
+    setRecordingUploadState("idle");
+    setArchiveSyncState("idle");
+    setCompletionSavePending(false);
+    interviewFinalizationStoredRef.current = false;
+    voiceTranscriptSealedRef.current = false;
+    setContinuity(null);
+    setStage("interview");
+    if (last?.speaker === "candidate" && answered >= TEXT_INTERVIEW_QUESTIONS.length) {
+      window.setTimeout(() => void completeInterview("text_interview_completed"), 0);
+    }
+  }
+
+  async function resumeSavedInterview() {
+    if (!continuity || sessionStarting || !networkAvailable) return;
+    setSessionStarting(true);
+    setErrorMessage("");
+    try {
+      let next = continuity;
+      if (continuity.snapshot.action === "replace_with_text") {
+        const response = await fetch("/api/interviews/resume", {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        const data = await response.json().catch(() => null) as {
+          resumed?: boolean;
+          accessToken?: string;
+          snapshot?: InterviewContinuitySnapshot;
+          error?: string;
+        } | null;
+        if (!response.ok || data?.resumed !== true || !data.accessToken || !data.snapshot) {
+          throw new Error(data?.error || "保存済みの面接を文字入力へ切り替えられませんでした。");
+        }
+        next = { accessToken: data.accessToken, snapshot: data.snapshot };
+      }
+      if (next.snapshot.action !== "resume_text") {
+        throw new Error("この面接は自動再開できません。受付番号を採用担当者へお伝えください。");
+      }
+      await openTextContinuity(next);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "途中保存した面接を再開できませんでした。");
     } finally {
       setSessionStarting(false);
     }
@@ -4446,6 +4609,13 @@ export default function Home() {
         </div>
       </header>
 
+      {!networkAvailable && (
+        <div className="network-continuity-banner" role="status">
+          <strong>通信が切れています</strong>
+          <span>この画面は閉じずにお待ちください。通信が戻ると、保存済みの受付番号で途中保存を再確認します。</span>
+        </div>
+      )}
+
       {stage === "intro" && (
         <section className="intro-layout">
           <div className="intro-copy">
@@ -4468,6 +4638,37 @@ export default function Home() {
             <div className="start-panel">
               <div className="panel-number">01</div>
               <div className="panel-title"><p>選考情報</p><h2>オンライン一次面接を開始</h2></div>
+            {continuityChecking && <p className="continuity-checking" role="status">この端末の途中保存を確認しています…</p>}
+            {continuity && (
+              <div className={`continuity-card ${continuity.snapshot.action}`} role="status">
+                <strong>
+                  {continuity.snapshot.action === "completed"
+                    ? "この端末の面接は受付済みです"
+                    : continuity.snapshot.action === "processing"
+                      ? "面接記録をサーバーで整理中です"
+                      : continuity.snapshot.action === "held"
+                        ? "採用担当者による確認が必要です"
+                        : "途中保存した面接があります"}
+                </strong>
+                <span>受付番号 {continuity.snapshot.sessionId}</span>
+                <p>
+                  {continuity.snapshot.action === "resume_text"
+                    ? "保存済みの質問・回答から、文字入力でそのまま再開できます。"
+                    : continuity.snapshot.action === "replace_with_text"
+                      ? "音声・録画の保存済み部分は上書きせず保全し、文字入力へ安全に切り替えて続けられます。"
+                      : continuity.snapshot.action === "processing"
+                        ? "新しい面接を作らず、この受付番号の処理完了をお待ちください。"
+                        : continuity.snapshot.action === "completed"
+                          ? "新しい面接を重複作成する必要はありません。"
+                          : "自動で上書きせず停止しています。受付番号を採用担当者へお伝えください。"}
+                </p>
+                {(continuity.snapshot.action === "resume_text" || continuity.snapshot.action === "replace_with_text") && (
+                  <button type="button" disabled={sessionStarting || !networkAvailable} onClick={() => void resumeSavedInterview()}>
+                    {sessionStarting ? "途中保存を確認中…" : !networkAvailable ? "通信の復帰を待っています" : "保存済みの面接を再開"}
+                  </button>
+                )}
+              </div>
+            )}
             <label htmlFor="candidate-name">氏名</label>
             <input id="candidate-name" className="candidate-name-input" type="text" value={candidateName} onChange={(event) => setCandidateName(event.target.value)} maxLength={60} autoComplete="name" required aria-required="true" placeholder="例：山田 花子" />
             <p className="field-help">採用記録の照合と保存管理に使用します。応募時の氏名を入力してください。</p>
@@ -4529,7 +4730,7 @@ export default function Home() {
               </div>
             )}
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
-            <button className="primary-action" aria-label={interviewFormat === "camera" ? "カメラ・マイクを確認して開始" : "文字入力で開始"} disabled={inviteGate !== "ok" || !candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting || (interviewFormat === "camera" && embeddedBrowser)} onClick={() => void (interviewFormat === "camera" ? prepareInterview() : startTextInterview())}>
+            <button className="primary-action" aria-label={interviewFormat === "camera" ? "カメラ・マイクを確認して開始" : "文字入力で開始"} disabled={!networkAvailable || inviteGate !== "ok" || !candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting || (interviewFormat === "camera" && embeddedBrowser)} onClick={() => void (interviewFormat === "camera" ? prepareInterview() : startTextInterview())}>
               {inviteGate === "checking" ? "専用リンクを確認中…" : sessionStarting ? "オンライン一次面接を準備中…" : interviewFormat === "camera" && embeddedBrowser ? "SafariまたはChromeで開いてください" : interviewFormat === "camera" ? "カメラ・マイクを確認して開始" : "文字入力でオンライン一次面接を開始"} <span>→</span>
             </button>
             <button className="internal-test-button" onClick={startInternalTest}>接続確認（選考対象外）</button>

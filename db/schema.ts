@@ -103,6 +103,16 @@ export const interviewPublicEntries = sqliteTable("interview_public_entries", {
   index("interview_public_entries_candidate_idx").on(table.candidateHash, table.createdAt),
 ]);
 
+export const interviewSessionReplacements = sqliteTable("interview_session_replacements", {
+  sourceSessionId: text("source_session_id").primaryKey().references(() => interviewSessions.id, { onDelete: "cascade" }),
+  replacementSessionId: text("replacement_session_id").notNull().references(() => interviewSessions.id, { onDelete: "cascade" }),
+  replacementMode: text("replacement_mode").notNull(),
+  reason: text("reason").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  uniqueIndex("interview_session_replacements_replacement_unique").on(table.replacementSessionId),
+]);
+
 export const interviewExternalSyncs = sqliteTable("interview_external_syncs", {
   sessionId: text("session_id").notNull().references(() => interviewSessions.id, { onDelete: "cascade" }),
   provider: text("provider").notNull(),

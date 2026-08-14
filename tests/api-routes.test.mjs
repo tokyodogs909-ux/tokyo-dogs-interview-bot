@@ -146,7 +146,54 @@ class FakeD1Statement {
 
   async run() {
     let changes = 0;
-    if (this.sql.startsWith("INSERT INTO interview_sessions")) {
+    if (this.sql.startsWith("INSERT INTO interview_sessions") &&
+      this.sql.includes("FROM interview_sessions source")) {
+      const [replacementId, createdAt, updatedAt, sourceId] = this.values;
+      const source = this.database.sessions.get(sourceId);
+      const textStarted = this.database.auditEvents.some((event) =>
+        event.session_id === sourceId && event.event_type === "reasonable_accommodation_text_selected");
+      const held = hasCompletionHold(this.database, sourceId);
+      if (source && ["created", "in_progress"].includes(source.status) &&
+        source.completed_at == null &&
+        ["not_started", "uploading", "failed", "not_applicable"].includes(source.recording_status) &&
+        !textStarted && !held && !this.database.sessionReplacements.has(sourceId)) {
+        this.database.sessions.set(replacementId, {
+          ...source,
+          id: replacementId,
+          status: "in_progress",
+          recording_status: "not_applicable",
+          transcript_json: null,
+          evaluation_json: null,
+          summary: null,
+          completed_at: null,
+          created_at: createdAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("INSERT INTO interview_session_replacements")) {
+      const [sourceId, replacementId, replacementMode, reason, createdAt] = this.values;
+      if (this.database.sessions.has(replacementId) && !this.database.sessionReplacements.has(sourceId)) {
+        this.database.sessionReplacements.set(sourceId, {
+          source_session_id: sourceId,
+          replacement_session_id: replacementId,
+          replacement_mode: replacementMode,
+          reason,
+          created_at: createdAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'interrupted'")) {
+      const [updatedAt, sourceId, replacementId] = this.values;
+      const source = this.database.sessions.get(sourceId);
+      const mapping = this.database.sessionReplacements.get(sourceId);
+      if (source && ["created", "in_progress"].includes(source.status) &&
+        mapping?.replacement_session_id === replacementId) {
+        source.status = "interrupted";
+        source.updated_at = updatedAt;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("INSERT INTO interview_sessions")) {
       const [id, accessTokenHash, candidateName, employment, preferredLocation, consentVersion,
         consentedAt, expiresAt, retentionUntil, createdAt, updatedAt] = this.values;
       if (this.sql.includes("WHERE EXISTS")) {
@@ -1285,6 +1332,33 @@ class FakeD1Statement {
         transcription_gap: transcriptionGap ? 1 : 0,
       } : null;
     }
+    if (this.sql.startsWith("SELECT replacement_session_id FROM interview_session_replacements")) {
+      return this.database.sessionReplacements.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT s.id, s.candidate_name, s.employment") &&
+      this.sql.includes("draft.mode AS draft_mode")) {
+      const session = this.database.sessions.get(this.values[0]);
+      if (!session) return null;
+      const draft = this.database.transcriptDrafts.get(session.id);
+      return {
+        id: session.id,
+        candidate_name: session.candidate_name,
+        employment: session.employment,
+        preferred_location: session.preferred_location,
+        status: session.status,
+        recording_status: session.recording_status,
+        expires_at: session.expires_at,
+        created_at: session.created_at,
+        draft_mode: draft?.mode ?? null,
+        draft_json: draft?.transcript_json ?? null,
+        draft_sealed_at: draft?.sealed_at ?? null,
+        text_started: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && event.event_type === "reasonable_accommodation_text_selected") ? 1 : 0,
+        recorded_fallback_started: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && event.event_type === "recorded_fallback_started") ? 1 : 0,
+        completion_hold: hasCompletionHold(this.database, session.id) ? 1 : 0,
+      };
+    }
     if (this.sql.startsWith("SELECT s.id, s.status, s.recording_status") &&
       this.sql.includes("legacy_recording_recovery_manual_attention")) {
       const expiredBefore = this.values[0];
@@ -1900,6 +1974,7 @@ class FakeD1Statement {
         "completion_reason_invalid", "time_limit_reached",
         "reasonable_accommodation_text_selected", "recording_recovery_part_missing",
         "recording_recovery_manual_attention", "legacy_recording_recovery_manual_attention",
+        "device_session_replaced",
       ]);
       return {
         results: this.database.auditEvents.filter((event) =>
@@ -1959,6 +2034,7 @@ class FakeD1 {
     this.driveHierarchyNodes = new Map();
     this.evaluationClaims = new Map();
     this.transcriptDrafts = new Map();
+    this.sessionReplacements = new Map();
     this.recordedAnswers = new Map();
     this.recordedCompletions = new Map();
     this.driveConnection = null;
@@ -4975,6 +5051,92 @@ test("text interview starts without camera or recording and is visible as a tech
   assert.equal(database.auditEvents.some((event) =>
     event.session_id === session.sessionId &&
     event.event_type === "reasonable_accommodation_text_selected"), true);
+});
+
+test("candidate continuity cookie resumes text and replaces interrupted media exactly once", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const created = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "継続 テスト",
+      employment: "正社員",
+      location: "越谷店",
+      consent: true,
+      interviewMode: "camera",
+    }),
+  }, env);
+  assert.equal(created.status, 201);
+  const createdPayload = await created.json();
+  const setCookie = created.headers.get("set-cookie");
+  assert.match(setCookie, /^__Host-td-interview-continuity=/);
+  assert.match(setCookie, /HttpOnly/);
+  assert.match(setCookie, /Secure/);
+  assert.match(setCookie, /SameSite=Strict/);
+  const cookie = setCookie.split(";", 1)[0];
+  const source = database.sessions.get(createdPayload.sessionId);
+  source.status = "in_progress";
+  source.recording_status = "uploading";
+
+  const inspected = await request("/api/interviews/resume", {
+    headers: { Cookie: cookie },
+  }, env);
+  assert.equal(inspected.status, 200);
+  const inspectedPayload = await inspected.json();
+  assert.equal(inspectedPayload.available, true);
+  assert.equal(inspectedPayload.accessToken, createdPayload.accessToken);
+  assert.equal(inspectedPayload.snapshot.sessionId, createdPayload.sessionId);
+  assert.equal(inspectedPayload.snapshot.action, "replace_with_text");
+  assert.equal(inspectedPayload.snapshot.transcript.length, 0);
+
+  const [replaced, concurrentReplay] = await Promise.all([
+    request("/api/interviews/resume", {
+      method: "POST",
+      headers: { Cookie: cookie },
+    }, env),
+    request("/api/interviews/resume", {
+      method: "POST",
+      headers: { Cookie: cookie },
+    }, env),
+  ]);
+  assert.equal(replaced.status, 200, await replaced.clone().text());
+  const replacedPayload = await replaced.json();
+  assert.equal(concurrentReplay.status, 200, await concurrentReplay.clone().text());
+  const concurrentReplayPayload = await concurrentReplay.json();
+  assert.equal(replacedPayload.resumed, true);
+  assert.equal(concurrentReplayPayload.resumed, true);
+  assert.equal(replacedPayload.accessToken, createdPayload.accessToken);
+  assert.equal(concurrentReplayPayload.snapshot.sessionId, replacedPayload.snapshot.sessionId);
+  assert.notEqual(replacedPayload.snapshot.sessionId, createdPayload.sessionId);
+  assert.equal(replacedPayload.snapshot.mode, "text");
+  assert.equal(replacedPayload.snapshot.action, "resume_text");
+  assert.equal(database.sessions.get(createdPayload.sessionId).status, "interrupted");
+  assert.equal(database.sessions.get(replacedPayload.snapshot.sessionId).recording_status, "not_applicable");
+  assert.equal(
+    database.sessions.get(replacedPayload.snapshot.sessionId).access_token_hash,
+    database.sessions.get(createdPayload.sessionId).access_token_hash,
+  );
+  assert.equal(database.sessionReplacements.size, 1);
+
+  const replay = await request("/api/interviews/resume", {
+    method: "POST",
+    headers: { Cookie: cookie },
+  }, env);
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).snapshot.sessionId, replacedPayload.snapshot.sessionId);
+  assert.equal(database.sessionReplacements.size, 1);
+  assert.equal(database.sessions.size, 2);
+
+  const followed = await request("/api/interviews/resume", {
+    headers: { Cookie: cookie },
+  }, env);
+  assert.equal(followed.status, 200);
+  assert.equal((await followed.json()).snapshot.sessionId, replacedPayload.snapshot.sessionId);
+
+  const absent = await request("/api/interviews/resume", undefined, env);
+  assert.equal(absent.status, 200);
+  assert.deepEqual(await absent.json(), { available: false });
 });
 
 test("interview session stores the candidate name and protects the recording with a scoped bearer token", async () => {

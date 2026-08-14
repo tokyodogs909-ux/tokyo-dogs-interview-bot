@@ -96,6 +96,7 @@ const technicalEventLabels: Record<string, string> = {
   recording_recovery_part_missing: "録画パート不足——応募者の再開または人手確認待ち",
   recording_recovery_manual_attention: "録画復旧を自動終了し人手確認へ移行",
   legacy_recording_recovery_manual_attention: "旧式録画の不足パートを検出——人手確認が必要",
+  device_session_replaced: "端末中断のため元記録を保全し、文字入力の新受付へ継続",
 };
 
 const recommendationLabels = {
@@ -107,6 +108,7 @@ const recommendationLabels = {
 const interviewStatusLabels: Record<string, string> = {
   created: "未開始",
   in_progress: "面接中",
+  interrupted: "端末中断・継続先あり",
   evaluation_processing: "評価処理中",
   evaluation_pending: "評価待ち",
   completed: "面接完了",

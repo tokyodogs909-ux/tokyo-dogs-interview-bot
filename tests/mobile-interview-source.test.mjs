@@ -215,3 +215,22 @@ test("unsealed version 3 uploads cannot exceed the final recording byte cap", ()
     /isSealedRecordingUploadState\(state\)[\s\S]*MAX_PROVISIONAL_RECORDING_FULL_PARTS/,
   );
 });
+
+test("device loss resumes from server receipts without joining media containers", () => {
+  assert.match(source, /fetch\("\/api\/interviews\/resume"/);
+  assert.match(source, /action === "resume_text"/);
+  assert.match(source, /action === "replace_with_text"/);
+  assert.match(source, /recordingLiveUploaderRef\.current\?\.retry\(\)/);
+  assert.match(source, /transcriptDraftWriterRef\.current!\.enqueue\(resumedTurns\)/);
+  assert.match(source, /保存済みの質問・回答から、文字入力でそのまま再開できます/);
+  assert.match(source, /音声・録画の保存済み部分は上書きせず保全/);
+  assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB|IndexedDB/);
+  assert.match(
+    persistenceSource,
+    /UPDATE interview_sessions SET status = 'interrupted'/,
+  );
+  assert.match(
+    persistenceSource,
+    /NOT EXISTS \(SELECT 1 FROM interview_session_replacements replacement/,
+  );
+});

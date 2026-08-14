@@ -110,6 +110,17 @@ button:disabled { opacity: .4; cursor: not-allowed; }
   box-shadow: var(--shadow);
 }
 .start-panel { padding: clamp(28px, 4vw, 48px); border-radius: 30px; position: relative; }
+.network-continuity-banner { width: min(1120px, calc(100% - 48px)); margin: 14px auto 0; border: 1px solid #e6b85f; border-radius: 14px; background: #fffaf0; color: #744b08; padding: 12px 16px; display: flex; justify-content: center; gap: 10px; font-size: 10px; line-height: 1.55; }
+.network-continuity-banner strong { white-space: nowrap; }
+.continuity-checking { margin: -12px 0 18px; color: var(--muted); font-size: 10px; }
+.continuity-card { margin: -8px 0 22px; border: 1px solid #9bc9bd; border-radius: 16px; background: #edf8f6; padding: 15px; display: grid; gap: 6px; }
+.continuity-card strong { color: #184f48; font-size: 12px; }
+.continuity-card > span { color: #356b64; font: 700 9px var(--font-geist-mono), monospace; }
+.continuity-card p { margin: 0; color: #365f5b; font-size: 10px; line-height: 1.65; }
+.continuity-card button { margin-top: 5px; border: 0; border-radius: 11px; background: var(--brand-navy); color: white; padding: 12px 14px; font-weight: 800; }
+.continuity-card button:disabled { opacity: .55; }
+.continuity-card.processing, .continuity-card.completed { border-color: #a9c6d8; background: #f1f8fc; }
+.continuity-card.held { border-color: #e2b7b7; background: #fff5f5; }
 .panel-number { position: absolute; right: 32px; top: 28px; color: var(--brand-blue); font: 850 34px var(--font-geist-mono), monospace; }
 .panel-title p { margin: 0; color: var(--muted); font-size: 11px; letter-spacing: .14em; }
 .panel-title h2 { margin: 6px 0 26px; color: var(--brand-navy); font-size: 29px; letter-spacing: -.03em; }
@@ -638,6 +649,7 @@ select, .candidate-name-input { padding: 13px 14px; }
   .feature-row { grid-template-columns: 1fr; }
   .feature-row div + div { border-left: 0; border-top: 1px solid var(--line); padding-left: 0; }
   .start-panel { padding: 25px 20px; }
+  .network-continuity-banner { width: min(100% - 28px, 520px); align-items: flex-start; flex-direction: column; }
   .connection-guide li { grid-template-columns: 1fr; gap: 3px; }
   .embedded-browser-notice { align-items: stretch; flex-direction: column; }
   .embedded-browser-notice button { width: 100%; }

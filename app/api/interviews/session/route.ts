@@ -12,6 +12,7 @@ import {
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 import { readBoundedJsonBody } from "@/lib/http-body";
+import { serializeInterviewContinuityCookie } from "@/lib/interview-continuity";
 
 export async function POST(request: Request) {
   try {
@@ -74,7 +75,13 @@ export async function POST(request: Request) {
       interviewMode,
       inviteNonceHash: invite.nonceHash,
     });
-    return noStoreJson(session, { status: 201 });
+    const response = noStoreJson(session, { status: 201 });
+    response.headers.append("Set-Cookie", serializeInterviewContinuityCookie({
+      sessionId: session.sessionId,
+      accessToken: session.accessToken,
+      maxAgeSeconds: Math.max(1, Math.floor((Date.parse(session.expiresAt) - Date.now()) / 1_000)),
+    }));
+    return response;
   } catch (error) {
     const unavailable = error instanceof Error && error.message === "INTERVIEW_DATABASE_UNAVAILABLE";
     const signingUnavailable = error instanceof Error && error.message === "INTERVIEW_INVITE_SIGNING_UNCONFIGURED";
