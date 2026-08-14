@@ -40,6 +40,10 @@ function sha256Hex(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function normalizedFetchRequest(input, init) {
+  return input instanceof Request ? input : new Request(input, init);
+}
+
 async function captureConsoleWarnings(callback) {
   const warnings = [];
   const originalWarn = console.warn;
@@ -49,6 +53,83 @@ async function captureConsoleWarnings(callback) {
   } finally {
     console.warn = originalWarn;
   }
+}
+
+function auditDetail(event) {
+  try {
+    return JSON.parse(event.detail_json ?? "{}");
+  } catch {
+    return {};
+  }
+}
+
+function hasLegacyAudit(database, sessionId, eventType, predicate = () => true) {
+  return database.auditEvents.some((event) =>
+    event.session_id === sessionId && event.event_type === eventType && predicate(auditDetail(event)));
+}
+
+function hasCompletionHold(database, sessionId) {
+  return database.auditEvents.some((event) =>
+    event.session_id === sessionId && [
+      "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+    ].includes(event.event_type));
+}
+
+function isRealtimeTranscriptionGapEvent(event) {
+  return event.event_type === "transcription_failed" && [
+    "TRANSCRIPTION_FAILED", "TRANSCRIPTION_EMPTY", "TRANSCRIPTION_ID_MISSING",
+  ].includes(auditDetail(event).code);
+}
+
+function legacyOrphanEligible(database, session, expiredBefore = null) {
+  if (!session || session.status !== "in_progress" ||
+    !["uploading", "failed"].includes(session.recording_status) ||
+    (expiredBefore && session.expires_at > expiredBefore) ||
+    session.completed_at != null || session.transcript_json != null ||
+    session.evaluation_json != null || session.summary != null ||
+    database.artifacts.some((artifact) => artifact[1] === session.id) ||
+    database.externalSyncs.has(session.id) ||
+    database.recordedCompletions.has(session.id) ||
+    [...database.recordedAnswers.values()].some((answer) => answer.session_id === session.id) ||
+    database.evaluationClaims.has(session.id)) return false;
+  if (!hasLegacyAudit(database, session.id, "consent_recorded",
+    (detail) => detail.interviewMode === "camera") ||
+    !hasLegacyAudit(database, session.id, "interview_started") ||
+    !hasLegacyAudit(database, session.id, "recording_unavailable",
+      (detail) => detail.code === "UPLOAD_FAILED")) return false;
+  const blockedEvents = new Set([
+    "recorded_fallback_started", "voice_transcript_sealed", "evaluation_started",
+    "evaluation_saved", "recording_stored", "candidate_requested_stop",
+    "safety_escalation", "completion_reason_invalid",
+    "legacy_recording_recovered", "legacy_recording_recovery_manual_attention",
+  ]);
+  if (database.auditEvents.some((event) =>
+    event.session_id === session.id && blockedEvents.has(event.event_type))) return false;
+  const fatalCodes = new Set([
+    "NO_RECORDING_AT_COMPLETION", "FORMAT_UNAVAILABLE", "RECORDER_ERROR",
+    "CLIENT_RECORDING_SIZE_LIMIT",
+  ]);
+  return !hasLegacyAudit(database, session.id, "recording_unavailable",
+    (detail) => fatalCodes.has(detail.code));
+}
+
+function currentLegacyClaim(database, input) {
+  const claim = database.auditEvents.find((event) =>
+    event.session_id === input.sessionId &&
+    event.event_type === "legacy_recording_recovery_claimed" &&
+    event.created_at === input.claimedAt &&
+    auditDetail(event).claimId === input.claimId &&
+    auditDetail(event).leaseExpiresAt === input.leaseExpiresAt);
+  if (!claim || input.leaseExpiresAt <= input.now) return false;
+  const newer = database.auditEvents.some((event) =>
+    event.session_id === input.sessionId &&
+    event.event_type === "legacy_recording_recovery_claimed" &&
+    event.created_at > input.newerThan);
+  const terminal = database.auditEvents.some((event) =>
+    event.session_id === input.sessionId && [
+      "legacy_recording_recovered", "legacy_recording_recovery_manual_attention",
+    ].includes(event.event_type));
+  return !newer && !terminal;
 }
 
 class FakeD1Statement {
@@ -137,14 +218,105 @@ class FakeD1Statement {
         invite.session_id = sessionId;
         changes = 1;
       }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'legacy_recording_recovery_claimed'")
+    ) {
+      const [id, sessionId, detailJson, claimedAt, checkedSessionId, expectedUpdatedAt,
+        terminalSessionId, activeSessionId, staleBefore] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const terminal = this.database.auditEvents.some((event) =>
+        event.session_id === terminalSessionId && [
+          "legacy_recording_recovered", "legacy_recording_recovery_manual_attention",
+        ].includes(event.event_type));
+      const active = this.database.auditEvents.some((event) =>
+        event.session_id === activeSessionId &&
+        event.event_type === "legacy_recording_recovery_claimed" &&
+        event.created_at > staleBefore);
+      if (sessionId === checkedSessionId && session?.status === "in_progress" &&
+        ["uploading", "failed"].includes(session.recording_status) &&
+        session.updated_at === expectedUpdatedAt && session.completed_at == null &&
+        session.transcript_json == null && session.evaluation_json == null &&
+        session.summary == null && !terminal && !active) {
+        this.database.auditEvents.push({
+          id,
+          session_id: sessionId,
+          event_type: "legacy_recording_recovery_claimed",
+          actor_type: "system",
+          detail_json: detailJson,
+          created_at: claimedAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'legacy_recording_recovery_manual_attention'")
+    ) {
+      const [id, sessionId, detailJson, createdAt, checkedSessionId, expectedUpdatedAt,
+        claimSessionId, claimedAt, claimId, leaseExpiresAt, now,
+        newerSessionId, newerThan, terminalSessionId] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const claimIsCurrent = sessionId === claimSessionId && sessionId === newerSessionId &&
+        sessionId === terminalSessionId && currentLegacyClaim(this.database, {
+          sessionId,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        });
+      if (sessionId === checkedSessionId && session?.status === "in_progress" &&
+        ["uploading", "failed"].includes(session.recording_status) &&
+        session.updated_at === expectedUpdatedAt && session.completed_at == null &&
+        session.transcript_json == null && session.evaluation_json == null &&
+        session.summary == null && claimIsCurrent) {
+        this.database.auditEvents.push({
+          id,
+          session_id: sessionId,
+          event_type: "legacy_recording_recovery_manual_attention",
+          actor_type: "system",
+          detail_json: detailJson,
+          created_at: createdAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_artifacts") &&
+      this.sql.includes("legacy_recording_recovery_claimed")
+    ) {
+      const [id, sessionId, objectKey, contentType, byteSize, etag, retentionUntil,
+        createdAt, checkedSessionId, expectedUpdatedAt, claimSessionId, claimedAt,
+        claimId, leaseExpiresAt, now, newerSessionId, newerThan, artifactSessionId] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const claimIsCurrent = sessionId === claimSessionId && sessionId === newerSessionId &&
+        sessionId === artifactSessionId && currentLegacyClaim(this.database, {
+          sessionId,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        });
+      if (sessionId === checkedSessionId && session?.status === "in_progress" &&
+        session.recording_status === "stored" && session.updated_at === expectedUpdatedAt &&
+        session.completed_at == null && session.transcript_json == null &&
+        session.evaluation_json == null && session.summary == null && claimIsCurrent &&
+        !this.database.artifacts.some((artifact) => artifact[1] === sessionId)) {
+        this.database.artifacts.push([
+          id, sessionId, objectKey, contentType, byteSize, etag, retentionUntil, createdAt,
+        ]);
+        changes = 1;
+      }
     } else if (this.sql.startsWith("INSERT INTO interview_artifacts")) {
       this.database.artifacts.push(this.values);
       changes = 1;
     } else if (this.sql.startsWith("INSERT OR IGNORE INTO recorded_answer_transcriptions")) {
       const [sessionId, answerIndex, objectKey, contentType, byteSize, audioSha256,
-        createdAt, updatedAt] = this.values;
+        createdAt, updatedAt, checkedSessionId] = this.values;
       const key = `${sessionId}:${answerIndex}`;
-      if (!this.database.recordedAnswers.has(key)) {
+      if ((!this.sql.includes("completion_reason_invalid") ||
+          (checkedSessionId === sessionId && !hasCompletionHold(this.database, checkedSessionId))) &&
+        !this.database.recordedAnswers.has(key)) {
         this.database.recordedAnswers.set(key, {
           session_id: sessionId,
           answer_index: answerIndex,
@@ -166,8 +338,10 @@ class FakeD1Statement {
         changes = 1;
       }
     } else if (this.sql.startsWith("INSERT OR IGNORE INTO recorded_interview_completions")) {
-      const [sessionId, expectedAnswerCount, requestedAt, createdAt, updatedAt] = this.values;
-      if (!this.database.recordedCompletions.has(sessionId)) {
+      const [sessionId, expectedAnswerCount, requestedAt, createdAt, updatedAt, checkedSessionId] = this.values;
+      if ((!this.sql.includes("completion_reason_invalid") ||
+          (checkedSessionId === sessionId && !hasCompletionHold(this.database, checkedSessionId))) &&
+        !this.database.recordedCompletions.has(sessionId)) {
         this.database.recordedCompletions.set(sessionId, {
           session_id: sessionId,
           expected_answer_count: expectedAnswerCount,
@@ -180,7 +354,8 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET etag")) {
       const [etag, updatedAt, sessionId, answerIndex, audioSha256] = this.values;
       const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
-      if (answer?.audio_sha256 === audioSha256) {
+      if (answer?.audio_sha256 === audioSha256 &&
+        (!this.sql.includes("completion_reason_invalid") || !hasCompletionHold(this.database, sessionId))) {
         answer.etag = etag;
         answer.updated_at = updatedAt;
         changes = 1;
@@ -188,7 +363,7 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET status = 'processing'")) {
       const [claimId, claimedAt, updatedAt, sessionId, answerIndex, staleBefore] = this.values;
       const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
-      if (answer && (
+      if (answer && !hasCompletionHold(this.database, sessionId) && (
         answer.status === "pending" ||
         (answer.status === "processing" && answer.claimed_at < staleBefore)
       )) {
@@ -206,7 +381,8 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET status = 'pending'")) {
       const [errorCode, nextRetryAt, updatedAt, sessionId, answerIndex, claimId] = this.values;
       const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
-      if (answer?.status === "processing" && answer.claim_id === claimId) {
+      if (answer?.status === "processing" && answer.claim_id === claimId &&
+        !hasCompletionHold(this.database, sessionId)) {
         Object.assign(answer, {
           status: "pending",
           claim_id: null,
@@ -220,7 +396,8 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET status = 'failed'")) {
       const [errorCode, updatedAt, sessionId, answerIndex, claimId] = this.values;
       const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
-      if (answer?.status === "processing" && answer.claim_id === claimId) {
+      if (answer?.status === "processing" && answer.claim_id === claimId &&
+        !hasCompletionHold(this.database, sessionId)) {
         Object.assign(answer, {
           status: "failed",
           claim_id: null,
@@ -234,7 +411,8 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE recorded_answer_transcriptions SET status = 'completed'")) {
       const [transcriptText, updatedAt, sessionId, answerIndex, claimId] = this.values;
       const answer = this.database.recordedAnswers.get(`${sessionId}:${answerIndex}`);
-      if (answer?.status === "processing" && answer.claim_id === claimId) {
+      if (answer?.status === "processing" && answer.claim_id === claimId &&
+        !hasCompletionHold(this.database, sessionId)) {
         Object.assign(answer, {
           status: "completed",
           transcript_text: transcriptText,
@@ -251,18 +429,23 @@ class FakeD1Statement {
       this.sql.includes("SELECT ?, ?, ?, 'candidate'")
     ) {
       const [id, sessionId, eventType, detailJson, statusSessionId, guardedEventType,
-        totalSessionId, totalLimit, typeSessionId, countedEventType, typeLimit] = this.values;
+        repeatedGuardedEventType, totalSessionId, totalLimit, typeSessionId, countedEventType, typeLimit] = this.values;
       const session = this.database.sessions.get(statusSessionId);
       const allowedStatus = ["created", "in_progress", "evaluation_pending", "evaluation_processing", "completed"]
         .includes(session?.status);
-      const harmfulClosed = guardedEventType === "transcription_failed" && (
-        !["created", "in_progress"].includes(session?.status) ||
-        this.database.auditEvents.some((event) =>
-          event.session_id === statusSessionId && event.event_type === "voice_transcript_sealed")
-      );
+      const harmfulClosed = [
+        "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+      ].includes(guardedEventType)
+        ? !["created", "in_progress"].includes(session?.status)
+        : guardedEventType === "transcription_failed" && (
+          !["created", "in_progress"].includes(session?.status) ||
+          this.database.auditEvents.some((event) =>
+            event.session_id === statusSessionId && event.event_type === "voice_transcript_sealed")
+        );
       const candidateTypes = new Set([
         "audio_playback_blocked", "transcription_failed", "recording_unavailable", "connection_failed",
-        "candidate_requested_stop", "time_limit_reached", "reasonable_accommodation_text_selected",
+        "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+        "time_limit_reached", "reasonable_accommodation_text_selected",
       ]);
       const totalCount = this.database.auditEvents.filter((event) =>
         event.session_id === totalSessionId && event.actor_type === "candidate" &&
@@ -270,7 +453,8 @@ class FakeD1Statement {
       const typeCount = this.database.auditEvents.filter((event) =>
         event.session_id === typeSessionId && event.actor_type === "candidate" &&
         event.event_type === countedEventType).length;
-      if (sessionId === statusSessionId && eventType === countedEventType && allowedStatus && !harmfulClosed &&
+      if (guardedEventType === repeatedGuardedEventType && sessionId === statusSessionId &&
+        eventType === countedEventType && allowedStatus && !harmfulClosed &&
         totalCount < totalLimit && typeCount < typeLimit) {
         this.database.auditEvents.push({
           id,
@@ -345,6 +529,19 @@ class FakeD1Statement {
         updated_at: stillRunning ? current.updated_at : updatedAt,
       });
       changes = 1;
+    } else if (this.sql.startsWith("UPDATE interview_external_syncs SET manifest_json = ?")) {
+      const [manifestJson, sessionId, completedAt, expectedManifestJson] = this.values;
+      const sync = this.database.externalSyncs.get(sessionId);
+      const currentManifestJson = this.sql.includes("COALESCE(manifest_json, '')")
+        ? sync?.manifest_json ?? ""
+        : sync?.manifest_json;
+      if (
+        sync?.status === "completed" && sync.completed_at === completedAt &&
+        currentManifestJson === expectedManifestJson
+      ) {
+        sync.manifest_json = manifestJson;
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_external_syncs SET updated_at")) {
       const [updatedAt, sessionId, expectedStartedAt] = this.values;
       const sync = this.database.externalSyncs.get(sessionId);
@@ -575,12 +772,79 @@ class FakeD1Statement {
         session.updated_at = updatedAt;
         changes = 1;
       }
+    } else if (
+      this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'stored'") &&
+      this.sql.includes("legacy_recording_recovery_claimed")
+    ) {
+      const [storedAt, id, expectedUpdatedAt, expiresAt, retentionUntil, createdAt,
+        claimedAt, claimId, leaseExpiresAt, now, newerThan] = this.values;
+      const session = this.database.sessions.get(id);
+      if (legacyOrphanEligible(this.database, session) &&
+        session.updated_at === expectedUpdatedAt && session.expires_at === expiresAt &&
+        session.retention_until === retentionUntil && session.created_at === createdAt &&
+        currentLegacyClaim(this.database, {
+          sessionId: id,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        })) {
+        session.recording_status = "stored";
+        session.updated_at = storedAt;
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'stored'")) {
       const [updatedAt, id] = this.values;
       const session = this.database.sessions.get(id);
       if (session) {
         session.recording_status = "stored";
         session.updated_at = updatedAt;
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("INSERT INTO interview_transcript_drafts")) {
+      const [sessionId, mode, transcriptJson, transcriptSha256, turnCount,
+        createdAt, updatedAt] = this.values;
+      if (!this.database.transcriptDrafts.has(sessionId)) {
+        this.database.transcriptDrafts.set(sessionId, {
+          session_id: sessionId,
+          mode,
+          transcript_json: transcriptJson,
+          transcript_sha256: transcriptSha256,
+          turn_count: turnCount,
+          sealed_at: null,
+          created_at: createdAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_transcript_drafts SET transcript_json")) {
+      const [transcriptJson, transcriptSha256, turnCount, updatedAt,
+        sessionId, mode, previousSha256] = this.values;
+      const draft = this.database.transcriptDrafts.get(sessionId);
+      if (
+        draft?.mode === mode &&
+        draft.transcript_sha256 === previousSha256 &&
+        draft.sealed_at === null
+      ) {
+        Object.assign(draft, {
+          transcript_json: transcriptJson,
+          transcript_sha256: transcriptSha256,
+          turn_count: turnCount,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_transcript_drafts SET sealed_at")) {
+      const [sealedAt, updatedAt, sessionId, mode, transcriptSha256, transcriptJson] = this.values;
+      const draft = this.database.transcriptDrafts.get(sessionId);
+      if (
+        draft?.mode === mode &&
+        draft.transcript_sha256 === transcriptSha256 &&
+        draft.transcript_json === transcriptJson &&
+        draft.sealed_at === null
+      ) {
+        Object.assign(draft, { sealed_at: sealedAt, updated_at: updatedAt });
         changes = 1;
       }
     } else if (this.sql.startsWith("UPDATE interview_sessions SET transcript_json = ?")) {
@@ -605,7 +869,8 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'in_progress'")) {
       const [updatedAt, id] = this.values;
       const session = this.database.sessions.get(id);
-      if (session && ["created", "in_progress"].includes(session.status)) {
+      if (session && ["created", "in_progress"].includes(session.status) &&
+        (!this.sql.includes("completion_reason_invalid") || !hasCompletionHold(this.database, id))) {
         session.status = "in_progress";
         if (this.sql.includes("recording_status = 'not_applicable'")) {
           session.recording_status = "not_applicable";
@@ -623,7 +888,19 @@ class FakeD1Statement {
           (current?.started_at && current.started_at <= staleBefore) ||
           (!current && session.updated_at <= staleBefore)
         ))
-      );
+      ) && !this.database.auditEvents.some((event) =>
+        event.session_id === sessionId && [
+          "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+        ].includes(event.event_type)) && !this.database.auditEvents.some((event) => {
+        if (event.session_id !== sessionId || event.event_type !== "transcription_failed") return false;
+        if (!this.sql.includes("TRANSCRIPTION_EMPTY")) return false;
+        try {
+          return ["TRANSCRIPTION_FAILED", "TRANSCRIPTION_EMPTY", "TRANSCRIPTION_ID_MISSING"]
+            .includes(JSON.parse(event.detail_json ?? "{}").code);
+        } catch {
+          return false;
+        }
+      });
       if (eligible && (!current || current.started_at <= staleBefore)) {
         this.database.evaluationClaims.set(sessionId, {
           session_id: sessionId,
@@ -650,8 +927,22 @@ class FakeD1Statement {
       const claim = this.database.evaluationClaims.get(claimSessionId);
       const voiceSealed = this.database.auditEvents.some((event) =>
         event.session_id === sealSessionId && event.event_type === "voice_transcript_sealed");
+      const candidateStopped = this.database.auditEvents.some((event) =>
+        event.session_id === id && [
+          "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+        ].includes(event.event_type));
+      const realtimeGap = this.database.auditEvents.some((event) => {
+        if (event.session_id !== id || event.event_type !== "transcription_failed") return false;
+        try {
+          return ["TRANSCRIPTION_FAILED", "TRANSCRIPTION_EMPTY", "TRANSCRIPTION_ID_MISSING"]
+            .includes(JSON.parse(event.detail_json ?? "{}").code);
+        } catch {
+          return false;
+        }
+      });
       if (session && claim?.claim_id === claimId &&
         ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+        !candidateStopped && (!realtimeGap || !this.sql.includes("TRANSCRIPTION_EMPTY")) &&
         (!voiceSealed || session.transcript_json === sealedTranscriptJson)) {
         Object.assign(session, {
           status: "evaluation_processing",
@@ -685,7 +976,21 @@ class FakeD1Statement {
       const claim = this.database.evaluationClaims.get(claimSessionId);
       const voiceSealed = this.database.auditEvents.some((event) =>
         event.session_id === sealSessionId && event.event_type === "voice_transcript_sealed");
+      const candidateStopped = this.database.auditEvents.some((event) =>
+        event.session_id === id && [
+          "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+        ].includes(event.event_type));
+      const realtimeGap = this.database.auditEvents.some((event) => {
+        if (event.session_id !== id || event.event_type !== "transcription_failed") return false;
+        try {
+          return ["TRANSCRIPTION_FAILED", "TRANSCRIPTION_EMPTY", "TRANSCRIPTION_ID_MISSING"]
+            .includes(JSON.parse(event.detail_json ?? "{}").code);
+        } catch {
+          return false;
+        }
+      });
       if (session?.status === "evaluation_processing" && claim?.claim_id === claimId &&
+        !candidateStopped && (!realtimeGap || !this.sql.includes("TRANSCRIPTION_EMPTY")) &&
         (!voiceSealed || session.transcript_json === sealedTranscriptJson)) {
         Object.assign(session, {
           status: "completed",
@@ -705,6 +1010,43 @@ class FakeD1Statement {
         overall_note: overallNote,
         updated_at: updatedAt,
       });
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'legacy_recording_recovered'")
+    ) {
+      const [id, sessionId, detailJson, createdAt, checkedSessionId, expectedUpdatedAt,
+        claimSessionId, claimedAt, claimId, leaseExpiresAt, now,
+        newerSessionId, newerThan, artifactSessionId, objectKey, contentType,
+        byteSize, retentionUntil, recoveredSessionId] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const artifact = this.database.artifacts.find((item) =>
+        item[1] === artifactSessionId && item[2] === objectKey &&
+        item[3] === contentType && item[4] === byteSize && item[6] === retentionUntil);
+      const claimIsCurrent = sessionId === claimSessionId && sessionId === newerSessionId &&
+        sessionId === artifactSessionId && sessionId === recoveredSessionId &&
+        currentLegacyClaim(this.database, {
+          sessionId,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        });
+      if (sessionId === checkedSessionId && session?.status === "in_progress" &&
+        session.recording_status === "stored" && session.updated_at === expectedUpdatedAt &&
+        session.completed_at == null && session.transcript_json == null &&
+        session.evaluation_json == null && session.summary == null && artifact && claimIsCurrent &&
+        !hasLegacyAudit(this.database, sessionId, "legacy_recording_recovered")) {
+        this.database.auditEvents.push({
+          id,
+          session_id: sessionId,
+          event_type: "legacy_recording_recovered",
+          actor_type: "system",
+          detail_json: detailJson,
+          created_at: createdAt,
+        });
+        changes = 1;
+      }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("'recording_recovery_part_missing'")
@@ -767,7 +1109,8 @@ class FakeD1Statement {
       const exists = this.database.sessions.has(existingSessionId);
       const alreadyStarted = this.database.auditEvents.some((event) =>
         event.session_id === checkedSessionId && event.event_type === "recorded_fallback_started");
-      if (exists && !alreadyStarted) {
+      if (exists && !alreadyStarted &&
+        (!this.sql.includes("completion_reason_invalid") || !hasCompletionHold(this.database, sessionId))) {
         this.database.auditEvents.push({
           event_type: "recorded_fallback_started",
           detail_json: "{}",
@@ -781,7 +1124,8 @@ class FakeD1Statement {
       this.sql.includes("SELECT ?, ?, 'interview_started'")
     ) {
       const [, sessionId, existingSessionId] = this.values;
-      if (this.database.sessions.has(existingSessionId)) {
+      if (this.database.sessions.has(existingSessionId) &&
+        (!this.sql.includes("completion_reason_invalid") || !hasCompletionHold(this.database, sessionId))) {
         this.database.auditEvents.push({
           event_type: "interview_started",
           detail_json: "{}",
@@ -823,13 +1167,15 @@ class FakeD1Statement {
       this.sql.includes("'transcription_failed', 'system'")
     ) {
       const [, sessionId, detailJson] = this.values;
-      this.database.auditEvents.push({
-        event_type: "transcription_failed",
-        detail_json: detailJson,
-        created_at: new Date().toISOString(),
-        session_id: sessionId,
-      });
-      changes = 1;
+      if (!this.sql.includes("completion_reason_invalid") || !hasCompletionHold(this.database, sessionId)) {
+        this.database.auditEvents.push({
+          event_type: "transcription_failed",
+          detail_json: detailJson,
+          created_at: new Date().toISOString(),
+          session_id: sessionId,
+        });
+        changes = 1;
+      }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("'google_drive_sync_completed'")
@@ -918,13 +1264,123 @@ class FakeD1Statement {
   }
 
   async first() {
+    if (this.sql.startsWith("SELECT EXISTS (SELECT 1 FROM interview_audit_events hold") &&
+      this.sql.includes("AS transcription_gap")) {
+      const sessionId = this.values[0];
+      const completionHold = this.database.auditEvents.some((event) =>
+        event.session_id === sessionId && [
+          "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+        ].includes(event.event_type));
+      const transcriptionGap = this.database.auditEvents.some((event) => {
+        if (event.session_id !== sessionId || event.event_type !== "transcription_failed") return false;
+        try {
+          return ["TRANSCRIPTION_FAILED", "TRANSCRIPTION_EMPTY", "TRANSCRIPTION_ID_MISSING"]
+            .includes(JSON.parse(event.detail_json ?? "{}").code);
+        } catch {
+          return false;
+        }
+      });
+      return this.database.sessions.has(sessionId) ? {
+        completion_hold: completionHold ? 1 : 0,
+        transcription_gap: transcriptionGap ? 1 : 0,
+      } : null;
+    }
+    if (this.sql.startsWith("SELECT s.id, s.status, s.recording_status") &&
+      this.sql.includes("legacy_recording_recovery_manual_attention")) {
+      const expiredBefore = this.values[0];
+      return [...this.database.sessions.values()]
+        .filter((session) => legacyOrphanEligible(this.database, session, expiredBefore))
+        .sort((left, right) =>
+          left.updated_at.localeCompare(right.updated_at) || left.id.localeCompare(right.id))[0] ?? null;
+    }
+    if (this.sql.startsWith("SELECT 1 AS current_claim") &&
+      this.sql.includes("legacy_recording_recovery_claimed")) {
+      const [sessionId, expectedUpdatedAt, claimedAt, claimId, leaseExpiresAt, now, newerThan] = this.values;
+      const session = this.database.sessions.get(sessionId);
+      return session?.status === "in_progress" &&
+        ["uploading", "failed"].includes(session.recording_status) &&
+        session.updated_at === expectedUpdatedAt && session.completed_at == null &&
+        session.transcript_json == null && session.evaluation_json == null &&
+        session.summary == null && currentLegacyClaim(this.database, {
+          sessionId,
+          claimedAt,
+          claimId,
+          leaseExpiresAt,
+          now,
+          newerThan,
+        }) ? { current_claim: 1 } : null;
+    }
+    if (this.sql.startsWith("SELECT 1 AS present") &&
+      this.sql.includes("legacy_recording_recovery_manual_attention")) {
+      const [id, sessionId] = this.values;
+      return this.database.auditEvents.some((event) =>
+        event.id === id && event.session_id === sessionId &&
+        event.event_type === "legacy_recording_recovery_manual_attention")
+        ? { present: 1 }
+        : null;
+    }
+    if (this.sql.startsWith("SELECT s.status, s.recording_status, s.transcript_json")) {
+      const sessionId = this.values[0];
+      const session = this.database.sessions.get(sessionId);
+      if (!session) return null;
+      const artifact = this.database.artifacts.find((item) => item[1] === sessionId);
+      return {
+        status: session.status,
+        recording_status: session.recording_status,
+        transcript_json: session.transcript_json ?? null,
+        evaluation_json: session.evaluation_json ?? null,
+        summary: session.summary ?? null,
+        completed_at: session.completed_at ?? null,
+        object_key: artifact?.[2] ?? null,
+        content_type: artifact?.[3] ?? null,
+        byte_size: artifact?.[4] ?? null,
+        retention_until: artifact?.[6] ?? null,
+        recovery_audit_present: hasLegacyAudit(
+          this.database,
+          sessionId,
+          "legacy_recording_recovered",
+        ) ? 1 : 0,
+      };
+    }
+    if (this.sql.startsWith("SELECT s.status, s.transcript_json, EXISTS (SELECT 1 FROM interview_audit_events") &&
+      this.sql.includes("reasonable_accommodation_text_selected")) {
+      const session = this.database.sessions.get(this.values[0]);
+      if (!session) return null;
+      return {
+        status: session.status,
+        transcript_json: session.transcript_json ?? null,
+        text_started: this.database.auditEvents.some((event) =>
+          event.session_id === session.id &&
+          event.event_type === "reasonable_accommodation_text_selected") ? 1 : 0,
+        recorded_fallback_started: this.database.auditEvents.some((event) =>
+          event.session_id === session.id &&
+          event.event_type === "recorded_fallback_started") ? 1 : 0,
+        voice_transcript_sealed: this.database.auditEvents.some((event) =>
+          event.session_id === session.id &&
+          event.event_type === "voice_transcript_sealed") ? 1 : 0,
+        evaluation_started: this.database.auditEvents.some((event) =>
+          event.session_id === session.id &&
+          event.event_type === "evaluation_started") ? 1 : 0,
+      };
+    }
+    if (this.sql.startsWith("SELECT mode, transcript_json, transcript_sha256")) {
+      return this.database.transcriptDrafts.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT 1 AS exact_match FROM interview_transcript_drafts")) {
+      const [sessionId, transcriptJson] = this.values;
+      const draft = this.database.transcriptDrafts.get(sessionId);
+      return draft?.transcript_json === transcriptJson && draft.sealed_at
+        ? { exact_match: 1 }
+        : null;
+    }
     if (this.sql.startsWith("SELECT status, (SELECT COUNT(*) FROM interview_audit_events")) {
       const [totalSessionId, typeSessionId, eventType, sealSessionId, sessionId] = this.values;
       const session = this.database.sessions.get(sessionId);
       if (!session) return null;
       const candidateTypes = new Set([
         "audio_playback_blocked", "transcription_failed", "recording_unavailable", "connection_failed",
-        "candidate_requested_stop", "time_limit_reached", "reasonable_accommodation_text_selected",
+        "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+        "time_limit_reached", "reasonable_accommodation_text_selected",
       ]);
       return {
         status: session.status,
@@ -959,7 +1415,7 @@ class FakeD1Statement {
       const candidateTranscriptionFailed = this.database.auditEvents.some((event) => {
         if (event.session_id !== sessionId || event.event_type !== "transcription_failed") return false;
         try {
-          return JSON.parse(event.detail_json ?? "{}").code === "TRANSCRIPTION_FAILED";
+          return isRealtimeTranscriptionGapEvent(event);
         } catch {
           return false;
         }
@@ -1008,7 +1464,8 @@ class FakeD1Statement {
         voice_transcript_sealed: voiceSealed && !fallbackStarted && transcriptHasCandidate ? 1 : 0,
       } : null;
     }
-    if (this.sql.startsWith("SELECT s.id, s.transcript_json FROM interview_sessions")) {
+    if (this.sql.startsWith("SELECT s.id, s.transcript_json") &&
+      this.sql.includes("FROM interview_sessions s")) {
       const [staleBefore, legacyStaleBefore, pendingStaleBefore] = this.values;
       return [...this.database.sessions.values()]
         .filter((session) => {
@@ -1032,16 +1489,30 @@ class FakeD1Statement {
               typeof turn.text === "string" && turn.text.trim());
             if (candidateTurns.length === 0 || candidateTurns.some((turn) =>
               turn.id.startsWith("recorded-fallback-answer-"))) return false;
+            const draft = this.database.transcriptDrafts.get(session.id);
+            const fallbackStarted = this.database.auditEvents.some((event) =>
+              event.session_id === session.id && event.event_type === "recorded_fallback_started");
+            const completion = this.database.recordedCompletions.get(session.id);
+            const durableRecordedFallback = Boolean(fallbackStarted && completion &&
+              completion.expected_answer_count === candidateTurns.length &&
+              candidateTurns.every((turn) => turn.id.startsWith("recorded-transcribed-answer-")));
+            if ((!draft?.sealed_at || draft.transcript_json !== session.transcript_json) &&
+              !durableRecordedFallback) return false;
             const realtimeGap = this.database.auditEvents.some((event) => {
               if (event.session_id !== session.id || event.event_type !== "transcription_failed") return false;
               try {
-                return JSON.parse(event.detail_json ?? "{}").code === "TRANSCRIPTION_FAILED";
+                return ["TRANSCRIPTION_FAILED", "TRANSCRIPTION_EMPTY", "TRANSCRIPTION_ID_MISSING"]
+                  .includes(JSON.parse(event.detail_json ?? "{}").code);
               } catch {
                 return false;
               }
             });
-            return !realtimeGap || candidateTurns.every((turn) =>
-              turn.id.startsWith("recorded-transcribed-answer-"));
+            const candidateStopped = this.database.auditEvents.some((event) =>
+              event.session_id === session.id && [
+                "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+              ].includes(event.event_type));
+            return !candidateStopped && (!realtimeGap || candidateTurns.every((turn) =>
+              turn.id.startsWith("recorded-transcribed-answer-")));
           } catch {
             return false;
           }
@@ -1051,7 +1522,26 @@ class FakeD1Statement {
           const rightStartedAt = this.database.evaluationClaims.get(right.id)?.started_at ?? right.updated_at;
           return leftStartedAt.localeCompare(rightStartedAt) || left.id.localeCompare(right.id);
         })
-        .map((session) => ({ id: session.id, transcript_json: session.transcript_json }))[0] ?? null;
+        .map((session) => {
+          let candidateTurns = [];
+          try {
+            candidateTurns = JSON.parse(session.transcript_json).filter((turn) =>
+              turn?.speaker === "candidate" && typeof turn.id === "string" &&
+              typeof turn.text === "string" && turn.text.trim());
+          } catch {
+            candidateTurns = [];
+          }
+          const fallbackStarted = this.database.auditEvents.some((event) =>
+            event.session_id === session.id && event.event_type === "recorded_fallback_started");
+          const completion = this.database.recordedCompletions.get(session.id);
+          return {
+            id: session.id,
+            transcript_json: session.transcript_json,
+            durable_recorded_fallback: fallbackStarted && completion &&
+              completion.expected_answer_count === candidateTurns.length &&
+              candidateTurns.every((turn) => turn.id.startsWith("recorded-transcribed-answer-")) ? 1 : 0,
+          };
+        })[0] ?? null;
     }
     if (this.sql.startsWith("SELECT s.id") &&
       this.sql.includes("FROM interview_sessions s WHERE s.recording_status IN")) {
@@ -1088,6 +1578,7 @@ class FakeD1Statement {
           const session = this.database.sessions.get(answer.session_id);
           if (!session || !["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status)) return false;
           if (session.recording_status !== "stored") return false;
+          if (hasCompletionHold(this.database, session.id)) return false;
           return (answer.status === "pending" && (!answer.next_retry_at || answer.next_retry_at <= now)) ||
             (answer.status === "processing" && (!answer.claimed_at || answer.claimed_at < staleBefore));
         })
@@ -1102,6 +1593,7 @@ class FakeD1Statement {
         .filter((completion) => {
           const session = this.database.sessions.get(completion.session_id);
           if (!session || !["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status)) return false;
+          if (hasCompletionHold(this.database, session.id)) return false;
           if (session.status === "evaluation_processing") {
             const claim = this.database.evaluationClaims.get(session.id);
             if (!((claim?.started_at && claim.started_at < staleBefore) ||
@@ -1120,8 +1612,63 @@ class FakeD1Statement {
       const invite = this.database.invites.get(this.values[0]);
       return invite ? { used_at: invite.used_at, expires_at: invite.expires_at } : null;
     }
+    if (this.sql.startsWith("SELECT 1 AS active FROM interview_sessions")) {
+      const sessionId = this.values[0];
+      return this.database.sessions.has(sessionId) && !hasCompletionHold(this.database, sessionId)
+        ? { active: 1 }
+        : null;
+    }
+    if (this.sql.startsWith("SELECT 1 AS started FROM interview_sessions")) {
+      const sessionId = this.values[0];
+      const session = this.database.sessions.get(sessionId);
+      const modeStarted = this.database.auditEvents.some((event) =>
+        event.session_id === sessionId && event.event_type === "recorded_fallback_started");
+      return session?.status === "in_progress" && modeStarted && !hasCompletionHold(this.database, sessionId)
+        ? { started: 1 }
+        : null;
+    }
+    if (this.sql.startsWith("SELECT s.id, s.access_token_hash")) {
+      const session = this.database.sessions.get(this.values[0]);
+      return session ? {
+        ...session,
+        candidate_requested_stop: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && event.event_type === "candidate_requested_stop") ? 1 : 0,
+        safety_escalation: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && event.event_type === "safety_escalation") ? 1 : 0,
+        completion_reason_invalid: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && event.event_type === "completion_reason_invalid") ? 1 : 0,
+        candidate_transcription_failed: this.database.auditEvents.some((event) => {
+          if (event.session_id !== session.id || event.event_type !== "transcription_failed") return false;
+          try {
+            return ["TRANSCRIPTION_FAILED", "TRANSCRIPTION_EMPTY", "TRANSCRIPTION_ID_MISSING"]
+              .includes(JSON.parse(event.detail_json ?? "{}").code);
+          } catch {
+            return false;
+          }
+        }) ? 1 : 0,
+      } : null;
+    }
     if (this.sql.startsWith("SELECT id, access_token_hash")) {
       return this.database.sessions.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT s.id, s.status, s.recording_status")) {
+      const session = this.database.sessions.get(this.values[0]);
+      return session ? {
+        id: session.id,
+        status: session.status,
+        recording_status: session.recording_status,
+        transcript_json: session.transcript_json ?? null,
+        evaluation_json: session.evaluation_json ?? null,
+        employment: session.employment,
+        preferred_location: session.preferred_location,
+        candidate_requested_stop: hasCompletionHold(this.database, session.id) &&
+          this.database.auditEvents.some((event) => event.session_id === session.id &&
+            event.event_type === "candidate_requested_stop") ? 1 : 0,
+        safety_escalation: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && event.event_type === "safety_escalation") ? 1 : 0,
+        completion_reason_invalid: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && event.event_type === "completion_reason_invalid") ? 1 : 0,
+      } : null;
     }
     if (this.sql.startsWith("SELECT id, status, recording_status")) {
       const session = this.database.sessions.get(this.values[0]);
@@ -1151,7 +1698,10 @@ class FakeD1Statement {
       return this.database.recordedAnswers.get(`${this.values[0]}:${this.values[1]}`) ?? null;
     }
     if (this.sql.startsWith("SELECT session_id, expected_answer_count, requested_at")) {
-      return this.database.recordedCompletions.get(this.values[0]) ?? null;
+      const sessionId = this.values[0];
+      return this.sql.includes("completion_reason_invalid") && hasCompletionHold(this.database, sessionId)
+        ? null
+        : this.database.recordedCompletions.get(sessionId) ?? null;
     }
     if (this.sql.startsWith("SELECT session_id FROM recorded_interview_completions")) {
       const completion = this.database.recordedCompletions.get(this.values[0]);
@@ -1244,11 +1794,15 @@ class FakeD1Statement {
       };
     }
     if (this.sql.startsWith("SELECT s.id, s.transcript_json, EXISTS")) {
-      const [failedBefore, pendingBefore] = this.values;
+      const [failedBefore, pendingBefore, integrityBefore] = this.values;
       return {
         results: [...this.database.sessions.values()]
           .filter((session) => {
             if (session.status !== "completed" || !["stored", "not_applicable"].includes(session.recording_status)) return false;
+            if (this.database.auditEvents.some((event) =>
+              event.session_id === session.id && [
+                "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+              ].includes(event.event_type))) return false;
             let transcript;
             try {
               transcript = JSON.parse(session.transcript_json ?? "[]");
@@ -1272,14 +1826,24 @@ class FakeD1Statement {
               manifest = {};
             }
             return manifest.transcriptAvailable !== true || manifest.transcriptKind !== "actual_transcript" ||
-              (session.recording_status === "stored" && manifest.recordingIncluded !== true);
+              (session.recording_status === "stored" && manifest.recordingIncluded !== true) ||
+              typeof manifest.integrity?.checkedAt !== "string" ||
+              manifest.integrity.checkedAt <= integrityBefore;
           })
           .sort((left, right) => {
             const leftSync = this.database.externalSyncs.get(left.id);
             const rightSync = this.database.externalSyncs.get(right.id);
-            const leftRunning = leftSync?.status === "running" ? 0 : 1;
-            const rightRunning = rightSync?.status === "running" ? 0 : 1;
-            return leftRunning - rightRunning ||
+            const priority = (sync, session) => {
+              if (sync?.status === "running") return 0;
+              if (sync?.status === "pending") return 1;
+              if (sync?.status === "failed") return 2;
+              let manifest = {};
+              try { manifest = JSON.parse(sync?.manifest_json ?? "{}"); } catch {}
+              const incomplete = manifest.transcriptAvailable !== true || manifest.transcriptKind !== "actual_transcript" ||
+                (session.recording_status === "stored" && manifest.recordingIncluded !== true);
+              return incomplete ? 3 : 4;
+            };
+            return priority(leftSync, left) - priority(rightSync, right) ||
               String(leftSync?.updated_at ?? left.completed_at ?? left.created_at).localeCompare(
                 String(rightSync?.updated_at ?? right.completed_at ?? right.created_at),
               ) || left.id.localeCompare(right.id);
@@ -1289,8 +1853,7 @@ class FakeD1Statement {
             id: session.id,
             transcript_json: session.transcript_json,
             candidate_transcription_failed: this.database.auditEvents.some((event) =>
-              event.session_id === session.id && event.event_type === "transcription_failed" &&
-              JSON.parse(event.detail_json ?? "{}").code === "TRANSCRIPTION_FAILED") ? 1 : 0,
+              event.session_id === session.id && isRealtimeTranscriptionGapEvent(event)) ? 1 : 0,
           })),
       };
     }
@@ -1318,9 +1881,7 @@ class FakeD1Statement {
               recording_status: session.recording_status,
               transcript_json: session.transcript_json,
               candidate_transcription_failed: this.database.auditEvents.some((event) =>
-                event.session_id === session.id &&
-                event.event_type === "transcription_failed" &&
-                JSON.parse(event.detail_json ?? "{}").code === "TRANSCRIPTION_FAILED") ? 1 : 0,
+                event.session_id === session.id && isRealtimeTranscriptionGapEvent(event)) ? 1 : 0,
               created_at: session.created_at,
               completed_at: session.completed_at ?? null,
               retention_until: session.retention_until,
@@ -1335,8 +1896,10 @@ class FakeD1Statement {
     if (this.sql.startsWith("SELECT event_type, detail_json, created_at")) {
       const technicalEventTypes = new Set([
         "audio_playback_blocked", "transcription_failed", "recording_unavailable",
-        "connection_failed", "candidate_requested_stop", "time_limit_reached",
-        "reasonable_accommodation_text_selected",
+        "connection_failed", "candidate_requested_stop", "safety_escalation",
+        "completion_reason_invalid", "time_limit_reached",
+        "reasonable_accommodation_text_selected", "recording_recovery_part_missing",
+        "recording_recovery_manual_attention", "legacy_recording_recovery_manual_attention",
       ]);
       return {
         results: this.database.auditEvents.filter((event) =>
@@ -1395,6 +1958,7 @@ class FakeD1 {
     this.driveUploadSteps = new Map();
     this.driveHierarchyNodes = new Map();
     this.evaluationClaims = new Map();
+    this.transcriptDrafts = new Map();
     this.recordedAnswers = new Map();
     this.recordedCompletions = new Map();
     this.driveConnection = null;
@@ -1418,11 +1982,15 @@ class FakeR2 {
     this.putCount = 0;
     this.getCount = 0;
     this.headCount = 0;
+    this.etagCounter = 0;
+    this.afterGet = null;
   }
 
   async put(key, body, options) {
     this.putCount += 1;
-    if (options?.onlyIf?.etagDoesNotMatch === "*" && this.objects.has(key)) return null;
+    const existing = this.objects.get(key);
+    if (options?.onlyIf?.etagDoesNotMatch === "*" && existing) return null;
+    if (options?.onlyIf?.etagMatches && existing?.etag !== options.onlyIf.etagMatches) return null;
     const bytes = body instanceof ReadableStream
       ? new Uint8Array(await new Response(body).arrayBuffer())
       : body instanceof Uint8Array
@@ -1435,11 +2003,13 @@ class FakeR2 {
     if (options?.sha256 && sha256Hex(bytes) !== options.sha256) {
       throw new Error("R2_SHA256_MISMATCH");
     }
-    this.objects.set(key, { body: bytes, options });
+    const etag = `test-etag-${++this.etagCounter}`;
+    this.objects.set(key, { body: bytes, options, etag });
     return {
-      etag: "test-etag",
+      etag,
       size: bytes.byteLength,
       customMetadata: options?.customMetadata ?? {},
+      httpMetadata: options?.httpMetadata ?? {},
       checksums: options?.sha256
         ? { sha256: Uint8Array.from(Buffer.from(options.sha256, "hex")).buffer }
         : {},
@@ -1457,13 +2027,16 @@ class FakeR2 {
     const offset = options.range?.offset ?? 0;
     const length = options.range?.length ?? (storedBytes.byteLength - offset);
     const bytes = storedBytes.slice(offset, offset + length);
-    return {
+    const result = {
       body: new Blob([bytes]).stream(),
       arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-      etag: "test-etag",
+      etag: object.etag,
       size: bytes.byteLength,
       customMetadata: object.options?.customMetadata ?? {},
+      httpMetadata: object.options?.httpMetadata ?? {},
     };
+    if (this.afterGet) await this.afterGet({ key, object, result });
+    return result;
   }
 
   async head(key) {
@@ -1471,9 +2044,10 @@ class FakeR2 {
     const object = this.objects.get(key);
     if (!object) return null;
     return {
-      etag: "test-etag",
+      etag: object.etag,
       size: object.body.byteLength,
       customMetadata: object.options?.customMetadata ?? {},
+      httpMetadata: object.options?.httpMetadata ?? {},
       checksums: object.options?.sha256
         ? { sha256: Uint8Array.from(Buffer.from(object.options.sha256, "hex")).buffer }
         : {},
@@ -1481,6 +2055,99 @@ class FakeR2 {
   }
 
 }
+
+async function addLegacyV1OrphanFixture(database, recordings, options = {}) {
+  const index = options.index ?? 0;
+  const sessionId = options.sessionId ?? `TD-LEGACY-V1-${String(index).padStart(2, "0")}`;
+  const createdAtMs = Date.parse("2026-08-10T08:10:00.000Z") + index * 60_000;
+  const createdAt = new Date(createdAtMs).toISOString();
+  const expiresAt = new Date(createdAtMs + 2 * 60 * 60_000).toISOString();
+  const retentionUntil = new Date(createdAtMs + 365 * 24 * 60 * 60_000).toISOString();
+  const updatedAt = new Date(createdAtMs + 60 * 60_000).toISOString();
+  const byteSize = options.byteSize ?? (64 + index);
+  const session = {
+    id: sessionId,
+    access_token_hash: `legacy-token-hash-${index}`,
+    candidate_name: `Legacy fixture ${index}`,
+    employment: "fixture",
+    preferred_location: "fixture",
+    status: "in_progress",
+    recording_status: options.recordingStatus ?? "uploading",
+    expires_at: expiresAt,
+    retention_until: retentionUntil,
+    created_at: createdAt,
+    updated_at: updatedAt,
+    transcript_json: null,
+    evaluation_json: null,
+    summary: null,
+    completed_at: null,
+  };
+  database.sessions.set(sessionId, session);
+  database.auditEvents.push(
+    {
+      id: `legacy-consent-${index}`,
+      session_id: sessionId,
+      event_type: "consent_recorded",
+      actor_type: "candidate",
+      detail_json: JSON.stringify({ interviewMode: "camera" }),
+      created_at: createdAt,
+    },
+    {
+      id: `legacy-start-${index}`,
+      session_id: sessionId,
+      event_type: "interview_started",
+      actor_type: "candidate",
+      detail_json: "{}",
+      created_at: createdAt,
+    },
+    {
+      id: `legacy-upload-failed-${index}`,
+      session_id: sessionId,
+      event_type: "recording_unavailable",
+      actor_type: "candidate",
+      detail_json: JSON.stringify({ code: "UPLOAD_FAILED" }),
+      created_at: updatedAt,
+    },
+  );
+  if (options.candidateRequestedStop) {
+    database.auditEvents.push({
+      id: `legacy-stop-${index}`,
+      session_id: sessionId,
+      event_type: "candidate_requested_stop",
+      actor_type: "candidate",
+      detail_json: "{}",
+      created_at: updatedAt,
+    });
+  }
+
+  const stateKey = `interviews/${sessionId}/recording-parts/upload.json`;
+  const partKey = `interviews/${sessionId}/recording-parts/part-000`;
+  const manifestKey = `interviews/${sessionId}/recording.recovered-v1.manifest.json`;
+  const state = {
+    version: 1,
+    sessionId,
+    contentType: "video/webm",
+    byteSize,
+    partSize: 4 * 1024 * 1024,
+    totalParts: 1,
+    audioCoverage: "both",
+    retentionUntil,
+    createdAt: new Date(Date.parse(createdAt) + 60_000).toISOString(),
+  };
+  await recordings.put(stateKey, JSON.stringify(state), {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: { sessionId, retentionUntil },
+  });
+  const partBytes = new Uint8Array(byteSize).fill(80 + index);
+  if (!options.missingPart) {
+    await recordings.put(partKey, partBytes, {
+      httpMetadata: { contentType: "application/octet-stream" },
+      customMetadata: { sessionId, byteSize: String(byteSize), retentionUntil },
+    });
+  }
+  return { session, state, stateKey, partKey, partBytes, manifestKey };
+}
+
 
 async function createTestInterviewSession(
   env,
@@ -1533,6 +2200,55 @@ async function sealVoiceTranscript(env, session, transcript, transcriptionComple
   }, env);
 }
 
+async function startTextTestInterview(env, session) {
+  const response = await request("/api/interviews/text/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  assert.equal(response.status, 200, await response.clone().text());
+}
+
+async function storeSealedTranscriptDraft(env, session, mode, transcript) {
+  const headers = {
+    Authorization: `Bearer ${session.accessToken}`,
+    "Content-Type": "application/json",
+  };
+  const saved = await request("/api/interviews/transcript/draft", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ sessionId: session.sessionId, mode, transcript }),
+  }, env);
+  assert.equal(saved.status, 200, await saved.clone().text());
+  const sealed = await request("/api/interviews/transcript/draft/seal", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ sessionId: session.sessionId, mode, transcript }),
+  }, env);
+  assert.equal(sealed.status, 200, await sealed.clone().text());
+}
+
+async function storeAndSealVoiceTranscript(env, session, transcript) {
+  await storeSealedTranscriptDraft(env, session, "voice", transcript);
+  return await sealVoiceTranscript(env, session, transcript);
+}
+
+function seedExactSealedTranscriptDraft(database, sessionId, transcriptJson, mode = "voice") {
+  const parsed = JSON.parse(transcriptJson);
+  database.transcriptDrafts.set(sessionId, {
+    session_id: sessionId,
+    mode,
+    transcript_json: transcriptJson,
+    transcript_sha256: "fixture-sealed-transcript-sha256",
+    turn_count: Array.isArray(parsed) ? parsed.length : 0,
+    sealed_at: new Date().toISOString(),
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+}
+
 test("scheduled recovery runs a bounded global tick without staff browser authentication", async () => {
   const database = new FakeD1();
   const recordings = new FakeR2();
@@ -1568,6 +2284,256 @@ test("scheduled recovery runs a bounded global tick without staff browser authen
     },
   }]]);
 });
+
+test("scheduled recovery stores one exact legacy v1 orphan per tick without completing or syncing it", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixtures = [];
+  for (let index = 0; index < 4; index += 1) {
+    fixtures.push(await addLegacyV1OrphanFixture(database, recordings, {
+      index,
+      recordingStatus: index % 2 === 0 ? "uploading" : "failed",
+    }));
+  }
+
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => logs.push(args);
+  try {
+    for (let tick = 0; tick < fixtures.length; tick += 1) {
+      await scheduleInterviewRecovery(env);
+      assert.equal(logs.at(-1)[1].states.recording, "advanced", JSON.stringify({
+        tick,
+        sessions: fixtures.map(({ session }) => ({
+          id: session.id,
+          status: session.status,
+          recordingStatus: session.recording_status,
+        })),
+        events: database.auditEvents.map((event) => ({
+          sessionId: event.session_id,
+          type: event.event_type,
+          detail: event.detail_json,
+        })),
+        artifacts: database.artifacts,
+      }));
+      assert.deepEqual(
+        fixtures.map(({ session }) => session.recording_status),
+        fixtures.map((_, index) => index <= tick ? "stored" : index % 2 === 0 ? "uploading" : "failed"),
+        "each scheduled tick must recover only the oldest eligible v1 row",
+      );
+    }
+  } finally {
+    console.info = originalInfo;
+  }
+
+  assert.equal(database.artifacts.length, 4);
+  assert.equal(database.externalSyncs.size, 0);
+  assert.equal(database.recordedCompletions.size, 0);
+  assert.equal(database.recordedAnswers.size, 0);
+  assert.equal(database.evaluationClaims.size, 0);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.event_type === "legacy_recording_recovered").length, 4);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.event_type === "recording_stored").length, 0);
+  for (const fixture of fixtures) {
+    assert.equal(fixture.session.status, "in_progress");
+    assert.equal(fixture.session.transcript_json, null);
+    assert.equal(fixture.session.evaluation_json, null);
+    assert.equal(fixture.session.summary, null);
+    assert.equal(fixture.session.completed_at, null);
+    const storedManifest = recordings.objects.get(fixture.manifestKey);
+    assert.ok(storedManifest, "the recovery manifest must be durably created");
+    assert.equal(storedManifest.options.httpMetadata.contentType, "application/json");
+    assert.equal(storedManifest.options.customMetadata.recoveryMode, "legacy-v1-body-sha256");
+    const manifest = JSON.parse(new TextDecoder().decode(storedManifest.body));
+    assert.deepEqual(manifest.recovery, { mode: "legacy-v1-body-sha256" });
+    assert.deepEqual(manifest.parts, [{
+      key: fixture.partKey,
+      byteSize: fixture.partBytes.byteLength,
+      sha256: sha256Hex(fixture.partBytes),
+    }]);
+  }
+});
+
+test("missing legacy v1 parts create one manual-attention marker and never mutate interview state", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixture = await addLegacyV1OrphanFixture(database, recordings, {
+    index: 10,
+    missingPart: true,
+  });
+  const originalUpdatedAt = fixture.session.updated_at;
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => logs.push(args);
+  try {
+    await scheduleInterviewRecovery(env);
+    assert.equal(logs.at(-1)[1].states.recording, "attention");
+    await scheduleInterviewRecovery(env);
+    assert.equal(logs.at(-1)[1].states.recording, "idle");
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(fixture.session.status, "in_progress");
+  assert.equal(fixture.session.recording_status, "uploading");
+  assert.equal(fixture.session.updated_at, originalUpdatedAt);
+  assert.equal(fixture.session.transcript_json, null);
+  assert.equal(fixture.session.evaluation_json, null);
+  assert.equal(fixture.session.completed_at, null);
+  assert.equal(database.artifacts.length, 0);
+  assert.equal(database.externalSyncs.size, 0);
+  assert.equal(recordings.objects.has(fixture.manifestKey), false);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id &&
+    event.event_type === "legacy_recording_recovery_manual_attention").length, 1);
+});
+
+test("legacy v1 recovery rejects an existing conflicting manifest and preserves every D1 output field", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixture = await addLegacyV1OrphanFixture(database, recordings, { index: 20 });
+  const conflictingBody = JSON.stringify({ version: 1, conflict: true });
+  const conflicting = await recordings.put(fixture.manifestKey, conflictingBody, {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: {
+      sessionId: fixture.session.id,
+      retentionUntil: fixture.session.retention_until,
+      audioCoverage: "both",
+      recordingContentType: "video/webm",
+      recoveryMode: "legacy-v1-body-sha256",
+    },
+  });
+
+  const originalInfo = console.info;
+  console.info = () => {};
+  try {
+    await scheduleInterviewRecovery(env);
+    await scheduleInterviewRecovery(env);
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(fixture.session.status, "in_progress");
+  assert.equal(fixture.session.recording_status, "uploading");
+  assert.equal(fixture.session.transcript_json, null);
+  assert.equal(fixture.session.evaluation_json, null);
+  assert.equal(fixture.session.summary, null);
+  assert.equal(fixture.session.completed_at, null);
+  assert.equal(database.artifacts.length, 0);
+  assert.equal(database.externalSyncs.size, 0);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id &&
+    event.event_type === "legacy_recording_recovery_manual_attention").length, 1);
+  const readback = await recordings.get(fixture.manifestKey);
+  assert.equal(readback.etag, conflicting.etag);
+  assert.equal(new TextDecoder().decode(await readback.arrayBuffer()), conflictingBody);
+});
+
+test("overlapping legacy v1 recovery ticks share a single claim and create one artifact", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixture = await addLegacyV1OrphanFixture(database, recordings, { index: 30 });
+  const originalInfo = console.info;
+  console.info = () => {};
+  try {
+    await Promise.all([
+      scheduleInterviewRecovery(env),
+      scheduleInterviewRecovery(env),
+    ]);
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(fixture.session.recording_status, "stored");
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id &&
+    event.event_type === "legacy_recording_recovery_claimed").length, 1);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id &&
+    event.event_type === "legacy_recording_recovered").length, 1);
+  assert.equal(database.artifacts.filter((artifact) => artifact[1] === fixture.session.id).length, 1);
+});
+
+test("an expired legacy recovery lease and a changed part generation cannot finalize recording", async () => {
+  for (const mode of ["expired-lease", "changed-part"]) {
+    const database = new FakeD1();
+    const recordings = new FakeR2();
+    const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+    const fixture = await addLegacyV1OrphanFixture(database, recordings, {
+      index: mode === "expired-lease" ? 40 : 41,
+    });
+    let injected = false;
+    recordings.afterGet = async ({ key }) => {
+      if (injected || key !== fixture.partKey) return;
+      injected = true;
+      if (mode === "expired-lease") {
+        const claim = database.auditEvents.find((event) =>
+          event.session_id === fixture.session.id &&
+          event.event_type === "legacy_recording_recovery_claimed");
+        const detail = auditDetail(claim);
+        claim.detail_json = JSON.stringify({
+          ...detail,
+          leaseExpiresAt: "2026-08-10T00:00:00.000Z",
+        });
+      } else {
+        await recordings.put(fixture.partKey, new Uint8Array(fixture.partBytes.byteLength).fill(7), {
+          httpMetadata: { contentType: "application/octet-stream" },
+          customMetadata: {
+            sessionId: fixture.session.id,
+            byteSize: String(fixture.partBytes.byteLength),
+            retentionUntil: fixture.session.retention_until,
+          },
+        });
+      }
+    };
+    const originalInfo = console.info;
+    console.info = () => {};
+    try {
+      await scheduleInterviewRecovery(env);
+    } finally {
+      console.info = originalInfo;
+    }
+    assert.equal(fixture.session.status, "in_progress", mode);
+    assert.equal(fixture.session.recording_status, "uploading", mode);
+    assert.equal(fixture.session.transcript_json, null, mode);
+    assert.equal(fixture.session.evaluation_json, null, mode);
+    assert.equal(fixture.session.completed_at, null, mode);
+    assert.equal(database.artifacts.length, 0, mode);
+    assert.equal(database.externalSyncs.size, 0, mode);
+    assert.equal(recordings.objects.has(fixture.manifestKey), false, mode);
+    assert.equal(database.auditEvents.filter((event) =>
+      event.session_id === fixture.session.id &&
+      event.event_type === "legacy_recording_recovered").length, 0, mode);
+    assert.equal(database.auditEvents.filter((event) =>
+      event.session_id === fixture.session.id &&
+      event.event_type === "legacy_recording_recovery_manual_attention").length,
+    mode === "changed-part" ? 1 : 0, mode);
+  }
+});
+
+test("candidate stop permanently excludes a legacy v1 orphan from unattended recovery", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const fixture = await addLegacyV1OrphanFixture(database, recordings, {
+    index: 50,
+    candidateRequestedStop: true,
+  });
+  const originalInfo = console.info;
+  console.info = () => {};
+  try {
+    await scheduleInterviewRecovery(env);
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(fixture.session.recording_status, "uploading");
+  assert.equal(database.artifacts.length, 0);
+  assert.equal(database.auditEvents.some((event) =>
+    event.event_type === "legacy_recording_recovery_claimed"), false);
+});
+
 
 test("internal recovery fails closed without a dedicated strong bearer token", async () => {
   const database = new FakeD1();
@@ -2219,7 +3185,7 @@ test("authenticated production readiness reports missing components without expo
   assert.equal(payload.openAIAuthenticated, false);
   assert.equal(payload.database, false);
   assert.equal(payload.recordingStorage, false);
-  assert.deepEqual(payload.reviewerAuth, { configured: false, dedicated: false });
+  assert.deepEqual(payload.reviewerAuth, { configured: false, dedicated: false, strong: false });
   assert.ok(payload.missing.includes("OPENAI_AUTHENTICATION"));
   assert.ok(payload.missing.includes("INTERVIEW_DATABASE"));
   assert.ok(payload.missing.includes("RECORDING_STORAGE"));
@@ -2273,6 +3239,7 @@ test("Google Drive admin health check refreshes OAuth and verifies only the appr
         trashed: false,
         capabilities: { canAddChildren: true },
         webViewLink: `https://drive.google.com/drive/folders/${rootFolderId}`,
+        permissions: [{ type: "anyone", role: "writer", allowFileDiscovery: false }],
       });
     };
     const response = await request("/api/admin/google-drive/health", {
@@ -2294,6 +3261,7 @@ test("Google Drive admin health check refreshes OAuth and verifies only the appr
     assert.equal(payload.root.name, "オンライン一次面接_自動格納");
     assert.equal(payload.root.canAddChildren, true);
     assert.equal(payload.root.locationType, "my_drive");
+    assert.equal(payload.root.sharingRisk, "anyone_writer");
     assert.match(tokenRequestBody, /grant_type=refresh_token/);
     assert.match(tokenRequestBody, /client_id=google-client-id/);
     const responseText = JSON.stringify(payload);
@@ -2303,6 +3271,7 @@ test("Google Drive admin health check refreshes OAuth and verifies only the appr
   } finally {
     globalThis.fetch = originalFetch;
   }
+
 });
 
 test("Google Drive setup starts with PKCE and grants a short-lived HttpOnly admin session", async () => {
@@ -2718,12 +3687,15 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     name: `${session.sessionId}_文字起こし.txt`,
     mimeType: "text/plain; charset=utf-8",
     size: String(uploadedTranscriptBytes.byteLength),
+    version: "1",
+    modifiedTime: "2026-07-29T03:00:00.000Z",
     trashed: false,
     parents: ["folder-3"],
     appProperties: {
       tokyoDogsArtifact: "transcript",
       tokyoDogsProvider: "google_drive",
     },
+    body: uploadedTranscriptBytes,
   }];
   const legacyDuplicateFile = {
     id: "legacy-duplicate-transcript",
@@ -2775,6 +3747,8 @@ test("candidate archive fails closed before writes for a mismatched transcript d
           id: "folder-3",
           name: `テスト 応募者_${session.sessionId}`,
           mimeType: "application/vnd.google-apps.folder",
+          version: "3",
+          modifiedTime: "2026-07-29T03:10:00.000Z",
           trashed: false,
           parents: ["folder-2"],
           appProperties: {
@@ -2782,6 +3756,7 @@ test("candidate archive fails closed before writes for a mismatched transcript d
             tokyoDogsInterviewSession: session.sessionId,
           },
           webViewLink: "https://drive.google.com/drive/folders/folder-3",
+          permissions: [{ type: "anyone", role: "writer", allowFileDiscovery: false }],
         });
       }
       const createdFolder = createdFolderFiles.find((folder) =>
@@ -2828,16 +3803,17 @@ test("candidate archive fails closed before writes for a mismatched transcript d
         href.includes("alt=media")
       ) {
         const file = uploadedDriveFiles.find((item) => href.includes(`/drive/v3/files/${item.id}?`));
-        if (file?.appProperties?.tokyoDogsArtifact !== "transcript") {
-          throw new Error("only the bounded transcript may be fetched for duplicate repair");
-        }
-        duplicateRepairReads.push("canonical");
-        return new Response(uploadedTranscriptBytes, {
+        const fileBody = file?.body ?? uploadedTranscriptBytes;
+        if (file?.appProperties?.tokyoDogsArtifact === "transcript") duplicateRepairReads.push("canonical");
+        return new Response(fileBody, {
           status: 200,
           // A proxy may report the transferred representation length rather
           // than Drive's logical file size. The bounded final bytes remain the
           // authoritative size/hash receipt.
-          headers: { "Content-Length": String(uploadedTranscriptBytes.byteLength + 1) },
+          headers: {
+            "Content-Length": String(fileBody.byteLength +
+              (legacyDuplicateFile.appProperties.tokyoDogsArtifact === "transcript" ? 1 : 0)),
+          },
         });
       }
       if (href.includes("/drive/v3/files/legacy-duplicate-transcript?") && init.method === "PATCH") {
@@ -2930,6 +3906,9 @@ test("candidate archive fails closed before writes for a mismatched transcript d
           name: recordingMetadata.name,
           mimeType: "video/webm",
           size: String(recordingByteSize),
+          sha256Checksum: "a".repeat(64),
+          version: "20",
+          modifiedTime: "2026-07-29T03:20:00.000Z",
           parents: recordingMetadata.parents,
           appProperties: recordingMetadata.appProperties,
         };
@@ -2959,9 +3938,12 @@ test("candidate archive fails closed before writes for a mismatched transcript d
           name: metadata.name,
           mimeType: metadata.mimeType || mediaBlob.type,
           size: String(mediaBlob.size),
+          version: String((Number(target?.version ?? 0) || nextFile) + 1),
+          modifiedTime: "2026-07-29T03:30:00.000Z",
           parents: metadata.parents ?? target?.parents,
           trashed: target?.trashed ?? false,
           appProperties: metadata.appProperties,
+          body: new Uint8Array(await mediaBlob.arrayBuffer()),
         };
         if (target) Object.assign(target, uploadedFile);
         else uploadedDriveFiles.push(uploadedFile);
@@ -3253,6 +4235,8 @@ test("failed finalization adopts the trusted 83 MB recording and quarantines onl
     trashed: false,
     parents: [folderId],
     appProperties: { tokyoDogsArtifact: "recording", tokyoDogsProvider: "google_drive" },
+    version: "1",
+    modifiedTime: "2026-08-13T04:00:00.000Z",
   };
   const duplicate = {
     ...canonical,
@@ -3278,6 +4262,8 @@ test("failed finalization adopts the trusted 83 MB recording and quarantines onl
         tokyoDogsInterviewSession: session.sessionId,
       },
       webViewLink: `https://drive.google.com/drive/folders/${folderId}`,
+      version: "1",
+      modifiedTime: "2026-08-13T04:00:00.000Z",
     },
     folderUrl: `https://drive.google.com/drive/folders/${folderId}`,
     uploaded,
@@ -3322,7 +4308,14 @@ test("failed finalization adopts the trusted 83 MB recording and quarantines onl
     { id: "evaluation-id", name: "evaluation.json", mimeType: "application/json", size: "10", trashed: false, parents: [folderId], appProperties: { tokyoDogsArtifact: "evaluation_json", tokyoDogsProvider: "google_drive" } },
     { id: "report-doc-id", name: "report", mimeType: "application/vnd.google-apps.document", trashed: false, parents: [folderId], appProperties: { tokyoDogsArtifact: "report_doc", tokyoDogsProvider: "google_drive" } },
     { id: "report-pdf-id", name: "report.pdf", mimeType: "application/pdf", size: "10", trashed: false, parents: [folderId], appProperties: { tokyoDogsArtifact: "report_pdf", tokyoDogsProvider: "google_drive" } },
-  ];
+  ].map((file) => ({
+    ...file,
+    version: "1",
+    modifiedTime: "2026-08-13T04:00:00.000Z",
+  }));
+  const smallBodies = new Map(activeSmallFiles
+    .filter((file) => file.mimeType !== "application/vnd.google-apps.document")
+    .map((file) => [file.id, new Uint8Array(Number(file.size)).fill(31)]));
   let manifest = null;
   let recordingInitiations = 0;
   let recordingContentPuts = 0;
@@ -3349,6 +4342,15 @@ test("failed finalization adopts the trusted 83 MB recording and quarantines onl
           ...(manifest ? [manifest] : []),
         ] });
       }
+      if (href.includes("/export?")) {
+        return new Response(new Uint8Array(10).fill(32));
+      }
+      if (href.includes("alt=media")) {
+        const fileId = href.match(/\/drive\/v3\/files\/([^?]+)/)?.[1] ?? "";
+        const bytes = smallBodies.get(decodeURIComponent(fileId));
+        if (!bytes) return new Response(null, { status: 404 });
+        return new Response(bytes);
+      }
       if (href.includes(`/drive/v3/files/${duplicate.id}?`) && init.method === "PATCH") {
         quarantinePatches += 1;
         const metadata = JSON.parse(String(init.body));
@@ -3371,6 +4373,7 @@ test("failed finalization adopts the trusted 83 MB recording and quarantines onl
       if (href.includes("uploadType=multipart")) {
         const metadata = JSON.parse(await init.body.get("metadata").text());
         const media = init.body.get("media");
+        const mediaBytes = new Uint8Array(await media.arrayBuffer());
         if (metadata.appProperties?.tokyoDogsArtifact === "recording") recordingContentPuts += 1;
         const target = [...activeSmallFiles, manifest].find((file) =>
           file && href.includes(`/files/${encodeURIComponent(file.id)}?`));
@@ -3382,8 +4385,13 @@ test("failed finalization adopts the trusted 83 MB recording and quarantines onl
           trashed: false,
           parents: target?.parents ?? metadata.parents ?? [folderId],
           appProperties: metadata.appProperties,
+          version: "1",
+          modifiedTime: "2026-08-13T04:00:00.000Z",
         };
-        if (metadata.appProperties?.tokyoDogsArtifact === "manifest") manifest = result;
+        if (metadata.appProperties?.tokyoDogsArtifact === "manifest") {
+          manifest = result;
+          smallBodies.set(result.id, mediaBytes);
+        }
         return Response.json(result);
       }
       throw new Error(`Unexpected Drive request: ${href}`);
@@ -4102,6 +5110,7 @@ test("staff inbox lists recent candidates with one shared login and records list
       recordingIncluded: false,
       transcriptAvailable: true,
       transcriptKind: "actual_transcript",
+      integrity: { status: "verified", checkedAt: "2026-08-14T00:00:00.000Z" },
     }),
   });
 
@@ -4469,7 +5478,14 @@ test("voice transcript seal is authenticated, fail-closed, and exactly idempoten
   }, env);
   assert.equal(crossOrigin.status, 403);
 
-  const first = await sealVoiceTranscript(env, session, transcript);
+  const oldTab = await sealVoiceTranscript(env, session, transcript);
+  assert.equal(oldTab.status, 409, "a pre-draft voice tab must fail closed after cutover");
+  assert.equal(database.transcriptDrafts.has(session.sessionId), false);
+  assert.equal(stored.transcript_json, undefined);
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId && event.event_type === "voice_transcript_sealed"), false);
+
+  const first = await storeAndSealVoiceTranscript(env, session, transcript);
   const firstPayload = await first.json();
   assert.equal(first.status, 200, JSON.stringify(firstPayload));
   assert.deepEqual(firstPayload, { sealed: true, alreadySealed: false, turnCount: 2 });
@@ -4579,6 +5595,56 @@ test("candidate technical incidents are audited and cross-origin mutations are r
   assert.equal(staffPayload.review.sourceTranscriptVerified, false);
 });
 
+test("staff detail exposes missing-part and legacy manual-attention recovery events without changing status", async () => {
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  stored.recording_status = "failed";
+  const originalStatus = stored.status;
+  const originalRecordingStatus = stored.recording_status;
+  database.auditEvents.push(
+    {
+      id: "missing-part-visible",
+      session_id: session.sessionId,
+      event_type: "recording_recovery_part_missing",
+      actor_type: "system",
+      detail_json: JSON.stringify({ errorCode: "INTERVIEW_RECORDING_PART_MISSING", attemptCount: 3 }),
+      created_at: "2026-08-14T01:00:00.000Z",
+    },
+    {
+      id: "legacy-attention-visible",
+      session_id: session.sessionId,
+      event_type: "legacy_recording_recovery_manual_attention",
+      actor_type: "system",
+      detail_json: JSON.stringify({ errorCode: "LEGACY_RECORDING_PART_MISSING" }),
+      created_at: "2026-08-14T01:01:00.000Z",
+    },
+  );
+
+  const response = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.deepEqual(payload.review.technicalEvents.map((event) => event.type), [
+    "recording_recovery_part_missing",
+    "legacy_recording_recovery_manual_attention",
+  ]);
+  assert.deepEqual(payload.review.technicalEvents.map((event) => event.detail.errorCode), [
+    "INTERVIEW_RECORDING_PART_MISSING",
+    "LEGACY_RECORDING_PART_MISSING",
+  ]);
+  assert.equal(stored.status, originalStatus);
+  assert.equal(stored.recording_status, originalRecordingStatus);
+  assert.equal(stored.completed_at, undefined);
+});
+
 test("candidate event caps are atomic per type and late harmful events cannot dirty a completed archive", async () => {
   process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const database = new FakeD1();
@@ -4663,8 +5729,12 @@ test("candidate event caps are atomic per type and late harmful events cannot di
   assert.equal(harmlessLateEvent.status, 200);
   const harmfulLateEvent = await sendEvent("transcription_failed", "TRANSCRIPTION_FAILED");
   assert.equal(harmfulLateEvent.status, 409);
+  const lateStop = await sendEvent("candidate_requested_stop", "USER_ACTION");
+  assert.equal(lateStop.status, 409, "a completed receipt cannot be retroactively marked as candidate-stopped");
   assert.equal(database.auditEvents.some((event) =>
     event.session_id === session.sessionId && event.event_type === "transcription_failed"), false);
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId && event.event_type === "candidate_requested_stop"), false);
   assert.equal(database.externalSyncs.get(session.sessionId).manifest_json, manifestJson);
 
   const staffResponse = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
@@ -4788,7 +5858,11 @@ test("recorded contingency requires all 15 actual answer transcriptions before c
   }, env);
   const payload = await complete.json();
   assert.equal(complete.status, 200, JSON.stringify(payload));
-  assert.deepEqual(payload, { stored: true, humanReviewRequired: true });
+  assert.deepEqual(payload, {
+    stored: true,
+    humanReviewRequired: true,
+    automaticEvaluationDeferred: true,
+  });
 
   const stored = database.sessions.get(session.sessionId);
   assert.equal(stored.status, "completed");
@@ -4815,7 +5889,12 @@ test("recorded contingency requires all 15 actual answer transcriptions before c
     body: JSON.stringify({ sessionId: session.sessionId, questionCount: 15 }),
   }, env);
   assert.equal(replay.status, 200);
-  assert.deepEqual(await replay.json(), { stored: true, humanReviewRequired: true, alreadyCompleted: true });
+  assert.deepEqual(await replay.json(), {
+    stored: true,
+    humanReviewRequired: true,
+    automaticEvaluationDeferred: true,
+    alreadyCompleted: true,
+  });
 });
 
 test("recorded contingency can complete a stopped interview with only its answered questions", async () => {
@@ -4882,6 +5961,194 @@ test("recorded contingency can complete a stopped interview with only its answer
     transcript.filter((turn) => turn.speaker === "candidate").map((turn) => turn.text),
     ["途中終了の実回答1", "途中終了の実回答2", "途中終了の実回答3"],
   );
+});
+
+test("a prior technical hold blocks every recorded mutation and completion route", async () => {
+  for (const [eventType, code] of [
+    ["candidate_requested_stop", "USER_ACTION"],
+    ["safety_escalation", "MODEL_SAFETY_ESCALATION"],
+    ["completion_reason_invalid", "UNKNOWN_COMPLETION_REASON"],
+  ]) {
+    const database = new FakeD1();
+    const recordings = new FakeR2();
+    let upstreamCalls = 0;
+    const env = {
+      ...workerEnv,
+      DB: database,
+      RECORDINGS: recordings,
+      OPENAI_API_KEY: "test-key-never-returned",
+      OPENAI_API: { fetch: async () => {
+        upstreamCalls += 1;
+        return Response.json({ text: "must-not-run" });
+      } },
+    };
+    const session = await createTestInterviewSession(env);
+    const event = await request("/api/interviews/event", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId, eventType, code }),
+    }, env);
+    assert.equal(event.status, 200, `${eventType}: ${await event.clone().text()}`);
+
+    const start = await request("/api/interviews/recorded/start", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-Interview-Session": session.sessionId,
+      },
+    }, env);
+    const bytes = new TextEncoder().encode(`held-${eventType}`);
+    const answer = await request("/api/interviews/recorded/answer", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-Interview-Session": session.sessionId,
+        "X-Recorded-Answer-Index": "1",
+        "X-Recorded-Answer-Bytes": String(bytes.byteLength),
+        "Content-Type": "audio/webm",
+      },
+      body: bytes,
+    }, env);
+    const seal = await request("/api/interviews/recorded/seal", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId, expectedAnswerCount: 1 }),
+    }, env);
+    const complete = await request("/api/interviews/recorded/complete", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId, questionCount: 1 }),
+    }, env);
+
+    assert.deepEqual([start.status, answer.status, seal.status, complete.status], [409, 409, 409, 409]);
+    assert.equal(database.recordedAnswers.size, 0);
+    assert.equal(database.recordedCompletions.size, 0);
+    assert.equal(recordings.putCount, 0);
+    assert.equal(upstreamCalls, 0);
+    assert.equal(database.auditEvents.some((item) =>
+      item.session_id === session.sessionId && item.event_type === "recorded_fallback_started"), false);
+    const stored = database.sessions.get(session.sessionId);
+    assert.equal(stored.status, "created");
+    assert.equal(stored.transcript_json, undefined);
+    assert.equal(stored.evaluation_json, undefined);
+  }
+});
+
+test("recorded recovery skips held oldest transcription and completion rows", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  let transcriptionCalls = 0;
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+    OPENAI_API_KEY: "test-key-never-returned",
+    OPENAI_API: {
+      fetch: async (request) => {
+        if (request.url.includes("/audio/transcriptions")) {
+          transcriptionCalls += 1;
+          return Response.json({ text: "正常な次候補者の回答" });
+        }
+        return Response.json({ malformed: true });
+      },
+    },
+  };
+  const heldPending = await createTestInterviewSession(env);
+  const heldReady = await createTestInterviewSession(env);
+  const normal = await createTestInterviewSession(env);
+  const ordered = [heldPending, heldReady, normal];
+  const times = [
+    "2026-08-14T00:00:00.000Z",
+    "2026-08-14T00:01:00.000Z",
+    "2026-08-14T00:02:00.000Z",
+  ];
+  for (let index = 0; index < ordered.length; index += 1) {
+    const item = ordered[index];
+    const stored = database.sessions.get(item.sessionId);
+    stored.status = "in_progress";
+    stored.recording_status = "stored";
+    stored.updated_at = times[index];
+    database.recordedCompletions.set(item.sessionId, {
+      session_id: item.sessionId,
+      expected_answer_count: 1,
+      requested_at: times[index],
+      created_at: times[index],
+      updated_at: times[index],
+    });
+    database.auditEvents.push({
+      id: `fallback-${index}`,
+      session_id: item.sessionId,
+      event_type: "recorded_fallback_started",
+      actor_type: "candidate",
+      detail_json: "{}",
+      created_at: times[index],
+    });
+  }
+  for (const [index, item] of ordered.entries()) {
+    const bytes = new TextEncoder().encode(`durable-answer-${index}`);
+    const key = `interviews/${item.sessionId}/recorded-answers/answer-01.webm`;
+    await recordings.put(key, bytes, {
+      httpMetadata: { contentType: "audio/webm" },
+      customMetadata: { sha256: sha256Hex(bytes) },
+    });
+    database.recordedAnswers.set(`${item.sessionId}:1`, {
+      session_id: item.sessionId,
+      answer_index: 1,
+      object_key: key,
+      content_type: "audio/webm",
+      byte_size: bytes.byteLength,
+      audio_sha256: sha256Hex(bytes),
+      etag: `etag-${index}`,
+      status: index === 1 ? "completed" : "pending",
+      transcript_text: index === 1 ? "保留中の完了済み回答" : null,
+      claim_id: null,
+      claimed_at: null,
+      attempt_count: 0,
+      last_error_code: null,
+      next_retry_at: null,
+      created_at: times[index],
+      updated_at: times[index],
+    });
+  }
+  for (const [index, item] of [heldPending, heldReady].entries()) {
+    database.auditEvents.push({
+      id: `hold-${index}`,
+      session_id: item.sessionId,
+      event_type: index === 0 ? "candidate_requested_stop" : "safety_escalation",
+      actor_type: "candidate",
+      detail_json: "{}",
+      created_at: times[index],
+    });
+  }
+
+  const response = await request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.equal(payload.transcription.sessionId, normal.sessionId);
+  assert.equal(payload.transcription.state, "completed");
+  assert.equal(payload.completion.sessionId, normal.sessionId);
+  assert.equal(payload.completion.state, "completed");
+  assert.equal(transcriptionCalls, 1);
+  assert.equal(database.recordedAnswers.get(`${heldPending.sessionId}:1`).status, "pending");
+  assert.equal(database.sessions.get(heldPending.sessionId).status, "in_progress");
+  assert.equal(database.sessions.get(heldReady.sessionId).status, "in_progress");
+  assert.equal(database.sessions.get(normal.sessionId).status, "completed");
 });
 
 test("recorded answer keeps durable audio pending across OpenAI quota failure and retries without re-upload", async () => {
@@ -5230,7 +6497,11 @@ test("forced 202 flow stores every recording part before a bodyless answer retry
   }, env);
   const completionPayload = await completion.json();
   assert.equal(completion.status, 200, JSON.stringify(completionPayload));
-  assert.deepEqual(completionPayload, { stored: true, humanReviewRequired: true });
+  assert.deepEqual(completionPayload, {
+    stored: true,
+    humanReviewRequired: true,
+    automaticEvaluationDeferred: true,
+  });
   const transcript = JSON.parse(database.sessions.get(session.sessionId).transcript_json);
   assert.equal(transcript.find((turn) => turn.speaker === "candidate").text, "録画確定後の再試行で復旧した実回答");
 
@@ -5254,6 +6525,7 @@ test("forced 202 flow stores every recording part before a bodyless answer retry
   assert.deepEqual(completionReplayPayload, {
     stored: true,
     humanReviewRequired: true,
+    automaticEvaluationDeferred: true,
     alreadyCompleted: true,
   });
 });
@@ -5551,7 +6823,8 @@ test("staff polling completes a durable pending transcription after the candidat
   assert.equal(payload.completion.state, "completed");
   assert.equal(database.sessions.get(session.sessionId).status, "completed");
   assert.equal(recordings.putCount, 1, "staff recovery must reuse the durable answer audio");
-  assert.equal(upstreamCalls, 2);
+  assert.equal(upstreamCalls, 3,
+    "one transcription retry and one bounded automatic-evaluation attempt follow the initial quota response");
   const transcript = JSON.parse(database.sessions.get(session.sessionId).transcript_json);
   assert.equal(transcript.find((turn) => turn.speaker === "candidate").text, "候補者離脱後に復旧した実回答");
 });
@@ -5579,6 +6852,7 @@ test("staff polling completes one stale durable evaluation as human review witho
     { id: "question-1", speaker: "interviewer", text: "経験を教えてください。", createdAt: "2026-07-29T02:00:00.000Z" },
     { id: "answer-1", speaker: "candidate", text: "接客経験があり、安全確認を徹底しました。", createdAt: "2026-07-29T02:00:10.000Z" },
   ]);
+  seedExactSealedTranscriptDraft(database, session.sessionId, stored.transcript_json);
 
   const recovered = await request("/api/staff/transcriptions/recover", {
     method: "POST",
@@ -5615,6 +6889,7 @@ test("staff polling completes a stale released evaluation_pending transcript aft
     { id: "question-pending", speaker: "interviewer", text: "経験を教えてください。", createdAt: "2026-07-29T02:00:00.000Z" },
     { id: "answer-pending", speaker: "candidate", text: "接客経験を安全確認に生かしました。", createdAt: "2026-07-29T02:00:10.000Z" },
   ]);
+  seedExactSealedTranscriptDraft(database, session.sessionId, stored.transcript_json, "text");
 
   const recovered = await request("/api/staff/transcriptions/recover", {
     method: "POST",
@@ -5676,6 +6951,7 @@ test("staff evaluation recovery excludes a stale evaluation_pending transcript w
   stored.transcript_json = JSON.stringify([
     { id: "answer-before-gap", speaker: "candidate", text: "途中まで保存された回答です。", createdAt: "2026-07-29T02:00:10.000Z" },
   ]);
+  seedExactSealedTranscriptDraft(database, session.sessionId, stored.transcript_json);
   database.auditEvents.push({
     session_id: session.sessionId,
     event_type: "transcription_failed",
@@ -5717,6 +6993,7 @@ test("an oldest transcript with a known gap cannot starve the next valid stale e
     text: "途中までの回答です。",
     createdAt: invalidStored.updated_at,
   }]);
+  seedExactSealedTranscriptDraft(database, invalid.sessionId, invalidStored.transcript_json);
   database.auditEvents.push({
     session_id: invalid.sessionId,
     event_type: "transcription_failed",
@@ -5731,6 +7008,7 @@ test("an oldest transcript with a known gap cannot starve the next valid stale e
     text: "最後まで保存された回答です。",
     createdAt: validStored.updated_at,
   }]);
+  seedExactSealedTranscriptDraft(database, valid.sessionId, validStored.transcript_json);
 
   const response = await request("/api/staff/transcriptions/recover", {
     method: "POST",
@@ -5764,6 +7042,19 @@ test("recorded-answer transcripts supersede an earlier realtime gap during evalu
     { id: "recorded-transcribed-question-1", speaker: "interviewer", text: "経験を教えてください。", createdAt: stored.updated_at },
     { id: "recorded-transcribed-answer-1", speaker: "candidate", text: "録画回答で全回答を復旧しました。", createdAt: stored.updated_at },
   ]);
+  database.recordedCompletions.set(session.sessionId, {
+    session_id: session.sessionId,
+    expected_answer_count: 1,
+    requested_at: stored.updated_at,
+    created_at: stored.updated_at,
+    updated_at: stored.updated_at,
+  });
+  database.auditEvents.push({
+    session_id: session.sessionId,
+    event_type: "recorded_fallback_started",
+    detail_json: "{}",
+    created_at: stored.updated_at,
+  });
   database.auditEvents.push({
     session_id: session.sessionId,
     event_type: "transcription_failed",
@@ -5800,6 +7091,7 @@ test("staff polling completes a sealed voice transcript once its recording is st
   stored.transcript_json = JSON.stringify([
     { id: "voice-answer-sealed", speaker: "candidate", text: "音声面接で確定済みの回答です。", createdAt: new Date().toISOString() },
   ]);
+  seedExactSealedTranscriptDraft(database, session.sessionId, stored.transcript_json);
   database.auditEvents.push({
     session_id: session.sessionId,
     event_type: "voice_transcript_sealed",
@@ -5971,6 +7263,7 @@ test("concurrent staff polls complete a stale evaluation only once", async () =>
   stored.transcript_json = JSON.stringify([
     { id: "answer-1", speaker: "candidate", text: "保存済みの実回答です。", createdAt: "2026-07-29T02:00:10.000Z" },
   ]);
+  seedExactSealedTranscriptDraft(database, session.sessionId, stored.transcript_json);
   const poll = () => request("/api/staff/transcriptions/recover", {
     method: "POST",
     headers: {
@@ -6085,7 +7378,7 @@ test("scheduled recovery finalizes normal voice recording parts and evaluation w
     { id: "voice-question-final", speaker: "interviewer", text: "最後に伝えたいことはありますか。", createdAt: "2026-08-12T10:00:00.000Z" },
     { id: "voice-answer-final", speaker: "candidate", text: "安全と誠実さを大切に勤務します。", createdAt: "2026-08-12T10:00:10.000Z" },
   ];
-  const seal = await sealVoiceTranscript(env, session, transcript);
+  const seal = await storeAndSealVoiceTranscript(env, session, transcript);
   assert.equal(seal.status, 200, await seal.clone().text());
   assert.equal(stored.status, "in_progress");
 
@@ -6157,7 +7450,7 @@ test("staff voice recovery leaves an upload with any missing part non-stored", a
     text: "最後まで回答しました。",
     createdAt: "2026-08-12T10:00:10.000Z",
   }];
-  assert.equal((await sealVoiceTranscript(env, session, transcript)).status, 200);
+  assert.equal((await storeAndSealVoiceTranscript(env, session, transcript)).status, 200);
 
   const partSize = 256 * 1024;
   const start = await request("/api/interviews/recording/upload/start", {
@@ -6263,7 +7556,7 @@ test("missing recording parts terminalize once after candidate expiry and never 
     text: "面接回答は確定しましたが録画送信が中断しました。",
     createdAt: new Date(Date.now() - 60 * 60 * 1_000).toISOString(),
   }];
-  assert.equal((await sealVoiceTranscript(env, session, transcript)).status, 200);
+  assert.equal((await storeAndSealVoiceTranscript(env, session, transcript)).status, 200);
   const seal = database.auditEvents.find((event) =>
     event.session_id === session.sessionId && event.event_type === "voice_transcript_sealed");
   seal.created_at = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
@@ -6352,7 +7645,7 @@ test("an accepted recording part heartbeats D1 so active mobile upload is not re
   const session = await createTestInterviewSession(env);
   const stored = database.sessions.get(session.sessionId);
   stored.status = "in_progress";
-  assert.equal((await sealVoiceTranscript(env, session, [{
+  assert.equal((await storeAndSealVoiceTranscript(env, session, [{
     id: "active-upload-answer",
     speaker: "candidate",
     text: "録画を送信中です。",
@@ -6425,7 +7718,7 @@ test("ten oldest missing uploads cannot starve an eleventh sealed upload with al
   for (const [index, session] of [...missingSessions, ready].entries()) {
     const stored = database.sessions.get(session.sessionId);
     stored.status = "in_progress";
-    assert.equal((await sealVoiceTranscript(env, session, [{
+    assert.equal((await storeAndSealVoiceTranscript(env, session, [{
       id: `starvation-answer-${index}`,
       speaker: "candidate",
       text: `保存済み回答${index}`,
@@ -6602,6 +7895,298 @@ test("completed recording recovery fairly stores the eleventh full upload and ex
   } finally {
     console.info = originalInfo;
   }
+});
+
+test("Version 3 recording streams full parts, seals final metadata by CAS, and only then accepts the final partial", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const session = await createTestInterviewSession(env);
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const uploadId = "version-three-upload-id-000001";
+  const otherUploadId = "version-three-upload-id-000002";
+  const commonHeaders = {
+    Authorization: `Bearer ${session.accessToken}`,
+    "X-Interview-Session": session.sessionId,
+    "X-Recording-Upload-Id": uploadId,
+  };
+  const startPayload = {
+    sessionId: session.sessionId,
+    uploadId,
+    contentType: "video/webm",
+    partSize: 4 * 1024 * 1024,
+    uploadVersion: 3,
+  };
+  const start = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...commonHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify(startPayload),
+  }, env);
+  assert.equal(start.status, 200, await start.clone().text());
+  assert.deepEqual(await start.json(), {
+    stored: false,
+    uploadVersion: 3,
+    uploadId,
+    sealed: false,
+    uploadedParts: [],
+    uploadedPartReceipts: [],
+    contentType: "video/webm",
+    partSize: 4 * 1024 * 1024,
+    byteSize: null,
+    totalParts: null,
+    audioCoverage: null,
+  });
+  const otherTab = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...commonHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ ...startPayload, uploadId: otherUploadId }),
+  }, env);
+  assert.equal(otherTab.status, 409, "a second tab must not join another upload id");
+
+  const fullPart = new Uint8Array(4 * 1024 * 1024).fill(31);
+  const secondBeforeFirst = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "1",
+      "X-Recording-Part-Bytes": String(fullPart.byteLength),
+      "X-Recording-Part-Sha256": sha256Hex(fullPart),
+    },
+    body: fullPart,
+  }, env);
+  assert.equal(secondBeforeFirst.status, 400, "a gap must fail closed");
+  const first = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(fullPart.byteLength),
+      "X-Recording-Part-Sha256": sha256Hex(fullPart),
+    },
+    body: fullPart,
+  }, env);
+  assert.equal(first.status, 200, await first.clone().text());
+  const conflictingBytes = new Uint8Array(fullPart.byteLength).fill(32);
+  const conflictingPart = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(conflictingBytes.byteLength),
+      "X-Recording-Part-Sha256": sha256Hex(conflictingBytes),
+    },
+    body: conflictingBytes,
+  }, env);
+  assert.equal(conflictingPart.status, 409, "same index with different bytes must never overwrite");
+
+  const prematureComplete = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers: commonHeaders,
+  }, env);
+  assert.equal(prematureComplete.status, 409, "an unsealed upload is not a complete recording");
+  assert.equal(database.sessions.get(session.sessionId).recording_status, "uploading");
+
+  const finalPart = new Uint8Array(123).fill(33);
+  const sealBody = {
+    sessionId: session.sessionId,
+    uploadId,
+    byteSize: fullPart.byteLength + finalPart.byteLength,
+    totalParts: 2,
+    audioCoverage: "both",
+  };
+  const seal = await request("/api/interviews/recording/upload/seal", {
+    method: "POST",
+    headers: { ...commonHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify(sealBody),
+  }, env);
+  assert.equal(seal.status, 200, await seal.clone().text());
+  assert.equal((await seal.json()).sealed, true);
+  const differentSeal = await request("/api/interviews/recording/upload/seal", {
+    method: "POST",
+    headers: { ...commonHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ ...sealBody, audioCoverage: "candidate-only" }),
+  }, env);
+  assert.equal(differentSeal.status, 409, "sealed metadata is immutable");
+  const final = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...commonHeaders,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "1",
+      "X-Recording-Part-Bytes": String(finalPart.byteLength),
+      "X-Recording-Part-Sha256": sha256Hex(finalPart),
+    },
+    body: finalPart,
+  }, env);
+  assert.equal(final.status, 200, await final.clone().text());
+  const originalPut = recordings.put.bind(recordings);
+  let rejectManifestOnce = true;
+  recordings.put = async (key, body, options) => {
+    if (rejectManifestOnce && key.endsWith("/recording.manifest.json")) {
+      rejectManifestOnce = false;
+      throw new Error("transient manifest write failure");
+    }
+    return await originalPut(key, body, options);
+  };
+  const transientComplete = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers: commonHeaders,
+  }, env);
+  assert.equal(transientComplete.status, 500);
+  assert.equal(
+    database.sessions.get(session.sessionId).recording_status,
+    "uploading",
+    "a transient complete failure must preserve the same resumable D1 claim",
+  );
+  const complete = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers: commonHeaders,
+  }, env);
+  assert.equal(complete.status, 200, await complete.clone().text());
+  const manifestObject = recordings.objects.get(`interviews/${session.sessionId}/recording.manifest.json`);
+  const manifest = JSON.parse(new TextDecoder().decode(manifestObject.body));
+  assert.equal(manifest.version, 3);
+  assert.equal(manifest.byteSize, fullPart.byteLength + finalPart.byteLength);
+  assert.equal(manifest.parts.length, 2);
+  assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
+});
+
+test("completed transcript drafts are append-only, exact-sealed, and separate from the final transcript", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const headers = {
+    Authorization: `Bearer ${session.accessToken}`,
+    "Content-Type": "application/json",
+  };
+  const question = {
+    id: "draft-question-1",
+    speaker: "interviewer",
+    text: "自己紹介をお願いします。",
+    createdAt: "2026-08-14T00:00:00.000Z",
+  };
+  const answer = {
+    id: "draft-answer-1",
+    speaker: "candidate",
+    text: "応募者の確定回答です。",
+    createdAt: "2026-08-14T00:00:10.000Z",
+  };
+  const save = (transcript) => request("/api/interviews/transcript/draft", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ sessionId: session.sessionId, mode: "voice", transcript }),
+  }, env);
+
+  const initial = await save([question]);
+  assert.equal(initial.status, 200, await initial.clone().text());
+  assert.equal((await initial.json()).turnCount, 1);
+  assert.equal(database.sessions.get(session.sessionId).transcript_json, undefined,
+    "an unsealed technical draft must not become the evaluation/Drive transcript");
+
+  const appended = await save([question, answer]);
+  assert.equal(appended.status, 200, await appended.clone().text());
+  const divergent = await save([question, { ...answer, text: "別タブの異なる回答" }]);
+  assert.equal(divergent.status, 409, "a same-position rewrite must fail the prefix CAS");
+
+  const sealed = await request("/api/interviews/transcript/draft/seal", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      mode: "voice",
+      transcript: [question, answer],
+    }),
+  }, env);
+  assert.equal(sealed.status, 200, await sealed.clone().text());
+  assert.equal((await sealed.json()).sealed, true);
+  const afterSeal = await save([question, answer, {
+    id: "late-turn",
+    speaker: "interviewer",
+    text: "遅着した別の質問",
+    createdAt: "2026-08-14T00:00:20.000Z",
+  }]);
+  assert.equal(afterSeal.status, 409, "a sealed snapshot is immutable");
+
+  const voiceSeal = await sealVoiceTranscript(env, session, [question, answer]);
+  assert.equal(voiceSeal.status, 200, await voiceSeal.clone().text());
+  assert.deepEqual(JSON.parse(database.sessions.get(session.sessionId).transcript_json), [question, answer]);
+});
+
+test("Version 3 seal CAS permits one winner and rejects a different concurrent final shape", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const session = await createTestInterviewSession(env);
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const uploadId = "version-three-cas-upload-id-01";
+  const headers = {
+    Authorization: `Bearer ${session.accessToken}`,
+    "X-Interview-Session": session.sessionId,
+    "X-Recording-Upload-Id": uploadId,
+  };
+  assert.equal((await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      uploadId,
+      contentType: "audio/webm",
+      partSize: 4 * 1024 * 1024,
+      uploadVersion: 3,
+    }),
+  }, env)).status, 200);
+  const fullPart = new Uint8Array(4 * 1024 * 1024).fill(41);
+  assert.equal((await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      ...headers,
+      "Content-Type": "application/octet-stream",
+      "X-Recording-Part-Index": "0",
+      "X-Recording-Part-Bytes": String(fullPart.byteLength),
+      "X-Recording-Part-Sha256": sha256Hex(fullPart),
+    },
+    body: fullPart,
+  }, env)).status, 200);
+
+  const stateKey = `interviews/${session.sessionId}/recording-parts/upload.json`;
+  const originalPut = recordings.put.bind(recordings);
+  let firstSealReached;
+  let releaseFirstSeal;
+  const reached = new Promise((resolve) => { firstSealReached = resolve; });
+  const release = new Promise((resolve) => { releaseFirstSeal = resolve; });
+  let holdFirstSeal = true;
+  recordings.put = async (key, body, options) => {
+    if (key === stateKey && options?.onlyIf?.etagMatches && holdFirstSeal) {
+      holdFirstSeal = false;
+      firstSealReached();
+      await release;
+    }
+    return await originalPut(key, body, options);
+  };
+  const seal = (audioCoverage) => request("/api/interviews/recording/upload/seal", {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      uploadId,
+      byteSize: fullPart.byteLength,
+      totalParts: 1,
+      audioCoverage,
+    }),
+  }, env);
+  const delayed = seal("both");
+  await reached;
+  const winner = await seal("candidate-only");
+  releaseFirstSeal();
+  const loser = await delayed;
+  assert.equal(winner.status, 200, await winner.clone().text());
+  assert.equal(loser.status, 409, "a stale seal CAS must not overwrite the winner");
+  const persisted = JSON.parse(new TextDecoder().decode(recordings.objects.get(stateKey).body));
+  assert.equal(persisted.audioCoverage, "candidate-only");
 });
 
 test("recording parts compare R2 actual size and never trust only the declared metadata", async () => {
@@ -7013,9 +8598,10 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
   let capturedAuthorization;
   try {
     globalThis.fetch = async (url, init) => {
-      assert.equal(url, "https://api.openai.com/v1/realtime/client_secrets");
-      capturedBody = JSON.parse(init.body);
-      capturedAuthorization = init.headers.Authorization;
+      const upstreamRequest = normalizedFetchRequest(url, init);
+      assert.equal(upstreamRequest.url, "https://api.openai.com/v1/realtime/client_secrets");
+      capturedBody = await upstreamRequest.clone().json();
+      capturedAuthorization = upstreamRequest.headers.get("Authorization");
       return Response.json({
         value: "ek_test_ephemeral",
         expires_at: 9999999999,
@@ -7197,11 +8783,12 @@ test("same-origin realtime call authorizes the exact new interview session and p
   let capturedSession;
   try {
     globalThis.fetch = async (url, init) => {
-      assert.equal(url, "https://api.openai.com/v1/realtime/calls");
-      assert.equal(init.headers.Authorization, "Bearer test-key-never-returned");
-      assert.ok(init.body instanceof FormData);
-      assert.equal(init.body.get("sdp"), "v=0\r\no=test-offer\r\n");
-      capturedSession = JSON.parse(init.body.get("session"));
+      const upstreamRequest = normalizedFetchRequest(url, init);
+      assert.equal(upstreamRequest.url, "https://api.openai.com/v1/realtime/calls");
+      assert.equal(upstreamRequest.headers.get("Authorization"), "Bearer test-key-never-returned");
+      const form = await upstreamRequest.clone().formData();
+      assert.equal(form.get("sdp"), "v=0\r\no=test-offer\r\n");
+      capturedSession = JSON.parse(form.get("session"));
       return new Response("v=0\r\no=test-answer\r\n", {
         status: 200,
         headers: { "Content-Type": "application/sdp" },
@@ -7266,8 +8853,10 @@ test("different candidates can hold isolated realtime calls at the same time", a
   const bothCallsArrived = new Promise((resolve) => { releaseBothCalls = resolve; });
   try {
     globalThis.fetch = async (url, init) => {
-      assert.equal(url, "https://api.openai.com/v1/realtime/calls");
-      upstreamSessions.push(JSON.parse(init.body.get("session")));
+      const upstreamRequest = normalizedFetchRequest(url, init);
+      assert.equal(upstreamRequest.url, "https://api.openai.com/v1/realtime/calls");
+      const form = await upstreamRequest.clone().formData();
+      upstreamSessions.push(JSON.parse(form.get("session")));
       if (upstreamSessions.length === 2) releaseBothCalls();
       await bothCallsArrived;
       return new Response("v=0\r\no=parallel-answer\r\n", {
@@ -7347,12 +8936,14 @@ async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
     body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
   }, env);
   const session = await sessionResponse.json();
-  database.sessions.get(session.sessionId).status = "in_progress";
+  await startTextTestInterview(env, session);
+  await storeSealedTranscriptDraft(env, session, "text", candidateTurns);
   const originalFetch = globalThis.fetch;
   try {
     globalThis.fetch = async (url, init) => {
-      assert.equal(url, "https://api.openai.com/v1/responses");
-      const body = JSON.parse(init.body);
+      const upstreamRequest = normalizedFetchRequest(url, init);
+      assert.equal(upstreamRequest.url, "https://api.openai.com/v1/responses");
+      const body = await upstreamRequest.clone().json();
       assert.equal(body.store, false);
       assert.equal(body.model, "gpt-5.6-sol");
       assert.equal(body.text.format.strict, true);
@@ -7386,6 +8977,44 @@ async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
     globalThis.fetch = originalFetch;
   }
 }
+
+test("a pre-draft text tab cannot promote its in-memory transcript after cutover", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  await startTextTestInterview(env, session);
+  let upstreamCalls = 0;
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      upstreamCalls += 1;
+      throw new Error("an old tab must fail before OpenAI");
+    };
+    const response = await request("/api/evaluate", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+        transcript: candidateTurns,
+      }),
+    }, env);
+    assert.equal(response.status, 409, await response.clone().text());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const stored = database.sessions.get(session.sessionId);
+  assert.equal(upstreamCalls, 0);
+  assert.equal(database.transcriptDrafts.has(session.sessionId), false);
+  assert.equal(database.evaluationClaims.has(session.sessionId), false);
+  assert.equal(stored.status, "in_progress");
+  assert.equal(stored.transcript_json, undefined);
+  assert.equal(stored.evaluation_json, undefined);
+});
 
 test("candidate evaluation endpoint stores a verified result without disclosing it", async () => {
   process.env.OPENAI_API_KEY = "test-key-never-returned";
@@ -7447,7 +9076,7 @@ test("candidate evaluation rejects an interviewer-only transcript before any Ope
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
   const session = await createTestInterviewSession(env);
-  database.sessions.get(session.sessionId).status = "in_progress";
+  await startTextTestInterview(env, session);
   let upstreamCalls = 0;
   const originalFetch = globalThis.fetch;
   try {
@@ -7477,6 +9106,185 @@ test("candidate evaluation rejects an interviewer-only transcript before any Ope
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("candidate-requested stop cannot seal, evaluate, complete, or create a Drive receipt", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  await startTextTestInterview(env, session);
+  const stopped = await request("/api/interviews/event", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+      Origin: "http://localhost",
+    },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      eventType: "candidate_requested_stop",
+      code: "USER_ACTION",
+    }),
+  }, env);
+  assert.equal(stopped.status, 200, await stopped.clone().text());
+
+  let upstreamCalls = 0;
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      upstreamCalls += 1;
+      throw new Error("a stopped interview must not call OpenAI");
+    };
+    const response = await request("/api/evaluate", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+        transcript: candidateTurns,
+      }),
+    }, env);
+    const payload = await response.json();
+    assert.equal(response.status, 409, JSON.stringify(payload));
+    assert.match(payload.error, /中止または技術保留/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const stored = database.sessions.get(session.sessionId);
+  assert.equal(upstreamCalls, 0);
+  assert.equal(stored.status, "in_progress");
+  assert.equal(stored.completed_at, undefined);
+  assert.equal(stored.evaluation_json, undefined);
+  assert.equal(database.transcriptDrafts.has(session.sessionId), false,
+    "the stop fence must run before the legacy text final-draft seal");
+  assert.equal(database.evaluationClaims.has(session.sessionId), false);
+  assert.equal(database.externalSyncs.has(session.sessionId), false);
+});
+
+test("safety escalation and invalid completion reasons cannot evaluate or complete", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  for (const [eventType, code] of [
+    ["safety_escalation", "MODEL_SAFETY_ESCALATION"],
+    ["completion_reason_invalid", "UNKNOWN_COMPLETION_REASON"],
+  ]) {
+    const database = new FakeD1();
+    const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+    const session = await createTestInterviewSession(env);
+    await startTextTestInterview(env, session);
+    await storeSealedTranscriptDraft(env, session, "text", candidateTurns);
+    const held = await request("/api/interviews/event", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId, eventType, code }),
+    }, env);
+    assert.equal(held.status, 200, await held.clone().text());
+
+    let upstreamCalls = 0;
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => {
+        upstreamCalls += 1;
+        throw new Error("a held interview must not call OpenAI");
+      };
+      const response = await request("/api/evaluate", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sessionId: session.sessionId,
+          employment: "正社員",
+          location: "越谷店",
+          transcript: candidateTurns,
+        }),
+      }, env);
+      assert.equal(response.status, 409, `${eventType}: ${await response.clone().text()}`);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    const stored = database.sessions.get(session.sessionId);
+    assert.equal(upstreamCalls, 0);
+    assert.equal(stored.status, "in_progress");
+    assert.equal(stored.completed_at, undefined);
+    assert.equal(stored.evaluation_json, undefined);
+    assert.equal(database.evaluationClaims.has(session.sessionId), false);
+    assert.equal(database.externalSyncs.has(session.sessionId), false);
+  }
+});
+
+test("an empty realtime completion event blocks voice seal and evaluation despite earlier valid turns", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  const transcript = [{
+    id: "earlier-valid-answer",
+    speaker: "candidate",
+    text: "これより前の回答は文字起こし済みです。",
+    createdAt: "2026-08-14T01:00:00.000Z",
+  }];
+  await storeSealedTranscriptDraft(env, session, "voice", transcript);
+  const gap = await request("/api/interviews/event", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      eventType: "transcription_failed",
+      code: "TRANSCRIPTION_EMPTY",
+    }),
+  }, env);
+  assert.equal(gap.status, 200, await gap.clone().text());
+
+  const seal = await sealVoiceTranscript(env, session, transcript);
+  assert.equal(seal.status, 409, await seal.clone().text());
+  assert.equal(stored.transcript_json, undefined);
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId && event.event_type === "voice_transcript_sealed"), false);
+
+  let upstreamCalls = 0;
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      upstreamCalls += 1;
+      throw new Error("an incomplete transcript must not call OpenAI");
+    };
+    const evaluation = await request("/api/evaluate", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+        transcript,
+      }),
+    }, env);
+    assert.equal(evaluation.status, 409, await evaluation.clone().text());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(upstreamCalls, 0);
+  assert.equal(stored.status, "in_progress");
+  assert.equal(stored.evaluation_json, undefined);
+  assert.equal(database.evaluationClaims.has(session.sessionId), false);
+  assert.equal(database.externalSyncs.has(session.sessionId), false);
 });
 
 test("completed evaluation replay returns its durable receipt without another model call", async () => {
@@ -7575,7 +9383,8 @@ test("concurrent evaluation submissions for the same session never both report s
     body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
   }, env);
   const session = await sessionResponse.json();
-  database.sessions.get(session.sessionId).status = "in_progress";
+  await startTextTestInterview(env, session);
+  await storeSealedTranscriptDraft(env, session, "text", candidateTurns);
   const originalFetch = globalThis.fetch;
   let callCount = 0;
   try {
@@ -7616,7 +9425,8 @@ test("an unavailable evaluation service persists a human-review fallback without
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
   const session = await createTestInterviewSession(env);
-  database.sessions.get(session.sessionId).status = "in_progress";
+  await startTextTestInterview(env, session);
+  await storeSealedTranscriptDraft(env, session, "text", candidateTurns);
   const originalFetch = globalThis.fetch;
   let callCount = 0;
   try {
@@ -7670,7 +9480,8 @@ test("a malformed evaluation response is stored as a human-review fallback", asy
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
   const session = await createTestInterviewSession(env);
-  database.sessions.get(session.sessionId).status = "in_progress";
+  await startTextTestInterview(env, session);
+  await storeSealedTranscriptDraft(env, session, "text", candidateTurns);
   const originalFetch = globalThis.fetch;
   try {
     globalThis.fetch = async () => Response.json({
@@ -7818,6 +9629,307 @@ function requestAdminSync(sessionId, env) {
     body: JSON.stringify({ sessionId }),
   }, env);
 }
+
+test("staff Drive integrity readback is single-owner, cooldown bounded, and reports approved public-writer risk", async () => {
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  const folderId = "candidate-folder-integrity";
+  const parentId = "month-folder-integrity";
+  const bodies = {
+    transcript: "応募者: 接客経験があります。\n",
+    evaluation_json: JSON.stringify({ recommendation: "human_review" }),
+    report_pdf: "%PDF-integrity-test",
+    manifest: JSON.stringify({ schemaVersion: "test" }),
+    report_doc: "オンライン一次面接レポート\n接客経験があります。\n",
+  };
+  const files = [
+    ["transcript-file", "transcript", "text/plain", bodies.transcript],
+    ["evaluation-file", "evaluation_json", "application/json", bodies.evaluation_json],
+    ["report-doc-file", "report_doc", "application/vnd.google-apps.document", bodies.report_doc],
+    ["report-pdf-file", "report_pdf", "application/pdf", bodies.report_pdf],
+    ["manifest-file", "manifest", "application/json", bodies.manifest],
+  ].map(([id, artifact, mimeType, body], index) => ({
+    id,
+    name: id,
+    mimeType,
+    size: String(Buffer.byteLength(body)),
+    version: String(index + 10),
+    modifiedTime: `2026-08-14T01:0${index}:00.000Z`,
+    trashed: false,
+    parents: [folderId],
+    appProperties: { tokyoDogsArtifact: artifact, tokyoDogsProvider: "google_drive" },
+    permissions: [],
+  }));
+  const stored = database.sessions.get(session.sessionId);
+  database.externalSyncs.set(session.sessionId, {
+    provider: "google_drive",
+    status: "completed",
+    requested_at: stored.completed_at,
+    started_at: stored.completed_at,
+    completed_at: stored.completed_at,
+    folder_id: folderId,
+    folder_url: `https://drive.google.com/drive/folders/${folderId}`,
+    manifest_json: JSON.stringify({
+      files: {
+        transcript: { id: "transcript-file" },
+        evaluation: { id: "evaluation-file" },
+        reportDocument: { id: "report-doc-file" },
+        reportPdf: { id: "report-pdf-file" },
+        manifest: { id: "manifest-file" },
+      },
+      recordingIncluded: false,
+      transcriptAvailable: true,
+      transcriptKind: "actual_transcript",
+    }),
+    error_code: null,
+    updated_at: stored.completed_at,
+  });
+  let folderReadCount = 0;
+  const driveMethods = [];
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "drive-read-token" });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/")) {
+        driveMethods.push(init.method ?? "GET");
+        if (href.includes(`/files/${folderId}?`)) {
+          folderReadCount += 1;
+          return Response.json({
+            id: folderId,
+            name: "candidate",
+            mimeType: "application/vnd.google-apps.folder",
+            version: "7",
+            modifiedTime: "2026-08-14T01:00:00.000Z",
+            trashed: false,
+            parents: [parentId],
+            appProperties: { tokyoDogsInterviewSession: session.sessionId },
+            permissions: [{ type: "anyone", role: "writer", allowFileDiscovery: false }],
+          });
+        }
+        if (href.includes("/files?") && href.includes(encodeURIComponent(folderId))) {
+          return Response.json({ files });
+        }
+        if (href.includes("/report-doc-file/export?")) {
+          return new Response(bodies.report_doc, {
+            headers: { "Content-Length": String(Buffer.byteLength(bodies.report_doc)) },
+          });
+        }
+        const media = files.find((file) => href.includes(`/files/${file.id}?alt=media`));
+        if (media) {
+          const body = bodies[media.appProperties.tokyoDogsArtifact];
+          return new Response(body, {
+            headers: { "Content-Length": String(Buffer.byteLength(body)) },
+          });
+        }
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    };
+    const staffRequest = () => request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+      },
+    }, env);
+    const [first, second] = await Promise.all([staffRequest(), staffRequest()]);
+    assert.equal(first.status, 200, await first.clone().text());
+    assert.equal(second.status, 200, await second.clone().text());
+    assert.equal((await first.text()).includes("_integrityCheck"), false);
+    assert.equal((await second.text()).includes("_integrityCheck"), false);
+    assert.equal(folderReadCount, 1, "the D1 claim must collapse simultaneous staff readbacks");
+    const immediate = await staffRequest();
+    const immediatePayload = await immediate.json();
+    assert.equal(immediate.status, 200, JSON.stringify(immediatePayload));
+    assert.equal(folderReadCount, 1, "the completed receipt cooldown must suppress immediate revalidation");
+    assert.equal(immediatePayload.review.driveSync.status, "completed");
+    assert.equal(immediatePayload.review.driveSync.integrityStatus, "verified");
+    assert.equal(immediatePayload.review.driveSync.sharingRisk, "anyone_writer");
+    assert.equal(Object.keys(JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).integrity.artifacts).length, 5);
+    assert.deepEqual(new Set(driveMethods), new Set(["GET"]));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const receipt = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).integrity;
+  const originalVersion = receipt.artifacts.transcript.version;
+  receipt.checkedAt = "2020-01-01T00:00:00.000Z";
+  const manifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+  manifest.integrity = receipt;
+  database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(manifest);
+  files[0].version = String(Number(files[0].version) + 1);
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") return Response.json({ access_token: "drive-read-token" });
+      if (href.includes(`/files/${folderId}?`)) return Response.json({
+        id: folderId,
+        name: "candidate",
+        mimeType: "application/vnd.google-apps.folder",
+        version: "7",
+        modifiedTime: "2026-08-14T01:00:00.000Z",
+        trashed: false,
+        parents: [parentId],
+        appProperties: { tokyoDogsInterviewSession: session.sessionId },
+        permissions: [{ type: "anyone", role: "writer", allowFileDiscovery: false }],
+      });
+      if (href.includes("/files?") && href.includes(encodeURIComponent(folderId))) return Response.json({ files });
+      if (href.includes("/report-doc-file/export?")) return new Response(bodies.report_doc, {
+        headers: { "Content-Length": String(Buffer.byteLength(bodies.report_doc)) },
+      });
+      const media = files.find((file) => href.includes(`/files/${file.id}?alt=media`));
+      if (media) {
+        const body = bodies[media.appProperties.tokyoDogsArtifact];
+        return new Response(body, { headers: { "Content-Length": String(Buffer.byteLength(body)) } });
+      }
+      throw new Error(`unexpected fetch ${href} ${init.method ?? "GET"}`);
+    };
+    const response = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+      },
+    }, env);
+    const payload = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(payload));
+    assert.equal(payload.review.driveSync.status, "completed");
+    assert.equal(payload.review.driveSync.integrityStatus, "drift");
+    assert.equal(payload.review.driveSync.integrityErrorCode, "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT");
+    const preserved = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).integrity;
+    assert.equal(preserved.artifacts.transcript.version, originalVersion, "drift must not replace the original receipt");
+    assert.equal(database.auditEvents.some((event) => event.event_type === "google_drive_sync_failed"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const candidateArchive = await request("/api/interviews/archive", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId }),
+  }, env);
+  assert.equal(candidateArchive.status, 409);
+  assert.deepEqual(await candidateArchive.json(), {
+    stored: false,
+    integrityStatus: "drift",
+    errorCode: "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT",
+    retryable: false,
+  });
+  assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
+
+  const unknownManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+  unknownManifest.integrity = {
+    ...unknownManifest.integrity,
+    status: "unknown",
+    checkedAt: new Date().toISOString(),
+    errorCode: "GOOGLE_DRIVE_API_503",
+  };
+  database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(unknownManifest);
+  const unconfirmedArchive = await request("/api/interviews/archive", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId }),
+  }, env);
+  assert.equal(unconfirmedArchive.status, 503);
+  assert.deepEqual(await unconfirmedArchive.json(), {
+    stored: false,
+    integrityStatus: "unknown",
+    errorCode: "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_UNCONFIRMED",
+    retryable: true,
+  });
+});
+
+test("background Drive recovery prioritizes pending work before one stale completed integrity receipt", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const pending = await seedCompletedInterview(env, database);
+  const stale = await seedCompletedInterview(env, database);
+  const old = "2026-08-01T00:00:00.000Z";
+  database.externalSyncs.set(pending.sessionId, {
+    provider: "google_drive",
+    status: "pending",
+    requested_at: old,
+    started_at: null,
+    completed_at: null,
+    folder_id: null,
+    folder_url: null,
+    manifest_json: null,
+    error_code: null,
+    updated_at: old,
+  });
+  database.externalSyncs.set(stale.sessionId, {
+    provider: "google_drive",
+    status: "completed",
+    requested_at: old,
+    started_at: old,
+    completed_at: old,
+    folder_id: "stale-integrity-folder",
+    folder_url: "https://drive.google.com/drive/folders/stale-integrity-folder",
+    manifest_json: JSON.stringify({
+      files: {},
+      recordingIncluded: false,
+      transcriptAvailable: true,
+      transcriptKind: "actual_transcript",
+      integrity: {
+        schemaVersion: "2026-08-14-v1",
+        status: "verified",
+        checkedAt: old,
+        errorCode: null,
+        sharingRisk: "unknown",
+        folder: null,
+        artifacts: {},
+      },
+    }),
+    error_code: null,
+    updated_at: old,
+  });
+  const tickLogs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => tickLogs.push(args);
+  try {
+    globalThis.fetch = async (url) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "background-drive-token" });
+      }
+      if (href.includes(`/drive/v3/files/${DRIVE_ROOT_FOLDER_ID}?`)) {
+        return Response.json({
+          id: DRIVE_ROOT_FOLDER_ID,
+          name: "unexpected root",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+        });
+      }
+      if (href.includes("/drive/v3/files/stale-integrity-folder?")) {
+        return Response.json({ error: { code: 404 } }, { status: 404 });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    };
+    await scheduleInterviewRecovery(env);
+    assert.equal(database.externalSyncs.get(pending.sessionId).status, "failed",
+      "pending archive work must not be starved by integrity scanning");
+    assert.equal(database.externalSyncs.get(stale.sessionId).status, "completed");
+
+    await scheduleInterviewRecovery(env);
+    const staleManifest = JSON.parse(database.externalSyncs.get(stale.sessionId).manifest_json);
+    assert.equal(database.externalSyncs.get(stale.sessionId).status, "completed");
+    assert.equal(staleManifest.integrity.status, "drift");
+    assert.equal(tickLogs.at(-1)[1].states.drive, "attention");
+  } finally {
+    console.info = originalInfo;
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("two simultaneous archives create one canonical year/month and distinct candidate folders", async () => {
   const originalFetch = globalThis.fetch;
@@ -8013,6 +10125,7 @@ test("an expired Drive step owner performs no chunk or failed transition after a
 
   const driveFiles = [];
   const driveFolders = new Map();
+  const driveFileBodies = new Map();
   let nextFolder = 0;
   let nextFile = 0;
   let recordingMetadata = null;
@@ -8069,6 +10182,8 @@ test("an expired Drive step owner performs no chunk or failed transition after a
           parents: metadata.parents,
           appProperties: metadata.appProperties,
           webViewLink: `https://drive.google.com/drive/folders/${id}`,
+          version: "1",
+          modifiedTime: "2026-08-13T04:00:00.000Z",
         };
         driveFolders.set(id, folder);
         return Response.json(folder);
@@ -8081,9 +10196,15 @@ test("an expired Drive step owner performs no chunk or failed transition after a
       if (href.includes("/export?")) {
         return new Response(new TextEncoder().encode("%PDF lease race"), { status: 200 });
       }
+      if (href.includes("alt=media")) {
+        const fileId = decodeURIComponent(href.match(/\/drive\/v3\/files\/([^?]+)/)?.[1] ?? "");
+        const bytes = driveFileBodies.get(fileId);
+        return bytes ? new Response(bytes) : new Response(null, { status: 404 });
+      }
       if (href.includes("uploadType=multipart")) {
         const metadata = JSON.parse(await init.body.get("metadata").text());
         const media = init.body.get("media");
+        const mediaBytes = new Uint8Array(await media.arrayBuffer());
         const target = driveFiles.find((file) =>
           href.includes(`/files/${encodeURIComponent(file.id)}?`));
         const file = {
@@ -8094,9 +10215,14 @@ test("an expired Drive step owner performs no chunk or failed transition after a
           trashed: false,
           parents: metadata.parents ?? target?.parents,
           appProperties: metadata.appProperties,
+          version: "1",
+          modifiedTime: "2026-08-13T04:00:00.000Z",
         };
         if (target) Object.assign(target, file);
         else driveFiles.push(file);
+        if (file.mimeType !== "application/vnd.google-apps.document") {
+          driveFileBodies.set(file.id, mediaBytes);
+        }
         return Response.json(file);
       }
       if (href.includes("uploadType=resumable")) {
@@ -8141,6 +10267,9 @@ test("an expired Drive step owner performs no chunk or failed transition after a
           trashed: false,
           parents: recordingMetadata.parents,
           appProperties: recordingMetadata.appProperties,
+          sha256Checksum: "b".repeat(64),
+          version: "1",
+          modifiedTime: "2026-08-13T04:00:00.000Z",
         };
         driveFiles.push(recordingFile);
         return Response.json(recordingFile);
@@ -8361,7 +10490,8 @@ test("completed recorded-answer transcripts supersede an earlier realtime transc
     assert.equal(response.status, 200);
     const payload = await response.json();
     assert.equal(payload.result.transcriptKind, "actual_transcript");
-    assert.equal(driveCalls, 0);
+    assert.equal(driveCalls, 1,
+      "a completed receipt is acknowledged only after one bounded integrity revalidation attempt");
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -1,4 +1,9 @@
 import { privacySafeIdentifier, requireOpenAIApiKey } from "@/lib/openai-server";
+import {
+  decodeOpenAIJson,
+  fetchOpenAIBytes,
+  OpenAIRequestFailure,
+} from "@/lib/openai-fetch";
 
 type ManualRepairBindings = {
   INTERVIEW_MANUAL_REPAIR_TOKEN?: string;
@@ -243,19 +248,6 @@ function normalizeDiarizedSegments(payload: unknown): ManualTranscriptSegment[] 
   });
 }
 
-async function readUpstreamPayload(response: Response) {
-  const declaredLength = response.headers.get("Content-Length") ?? "";
-  if (/^\d+$/.test(declaredLength) && Number(declaredLength) > MAX_UPSTREAM_RESPONSE_BYTES) {
-    throw new Error("UPSTREAM_RESPONSE_TOO_LARGE");
-  }
-  const bytes = await readBoundedStream(response.body, MAX_UPSTREAM_RESPONSE_BYTES);
-  try {
-    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
-  } catch {
-    throw new Error("UPSTREAM_RESPONSE_INVALID");
-  }
-}
-
 export type ManualTranscriptionResult =
   | { state: "completed"; segments: ManualTranscriptSegment[] }
   | { state: "upstream_rejected"; status: number }
@@ -272,9 +264,7 @@ export async function createManualTranscriptDraft(input: {
   audio: Uint8Array;
 }): Promise<ManualTranscriptionResult> {
   const bound = bindings();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
-  try {
+  {
     const form = new FormData();
     form.set("model", MANUAL_TRANSCRIPTION_MODEL);
     form.set("language", "ja");
@@ -293,15 +283,22 @@ export async function createManualTranscriptDraft(input: {
         "OpenAI-Safety-Identifier": await privacySafeIdentifier(input.sessionId),
       },
       body: form,
-      signal: controller.signal,
     });
 
     let response: Response;
+    let responseBytes: Uint8Array;
     try {
-      response = bound.OPENAI_API
-        ? await bound.OPENAI_API.fetch(openAIRequest)
-        : await fetch(openAIRequest);
-    } catch {
+      const upstream = await fetchOpenAIBytes(openAIRequest, {
+        timeoutMs: OPENAI_TIMEOUT_MS,
+        maxResponseBytes: MAX_UPSTREAM_RESPONSE_BYTES,
+        fetcher: bound.OPENAI_API,
+      });
+      response = upstream.response;
+      responseBytes = upstream.bytes;
+    } catch (error) {
+      if (error instanceof OpenAIRequestFailure && error.code === "OPENAI_RESPONSE_TOO_LARGE") {
+        return { state: "invalid_upstream_response" };
+      }
       return { state: "upstream_unavailable" };
     }
 
@@ -315,12 +312,10 @@ export async function createManualTranscriptDraft(input: {
     }
 
     try {
-      const payload = await readUpstreamPayload(response);
+      const payload = decodeOpenAIJson(responseBytes);
       return { state: "completed", segments: normalizeDiarizedSegments(payload) };
     } catch {
       return { state: "invalid_upstream_response" };
     }
-  } finally {
-    clearTimeout(timeout);
   }
 }

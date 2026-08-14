@@ -4,9 +4,16 @@ import {
 import {
   hasTrustedRequestOrigin,
   privacySafeIdentifier,
-  readOpenAIError,
   requireOpenAIApiKey,
+  safeOpenAIError,
 } from "@/lib/openai-server";
+import {
+  decodeOpenAIJson,
+  decodeOpenAIText,
+  fetchOpenAIBytes,
+  OpenAIRequestFailure,
+} from "@/lib/openai-fetch";
+import { readBoundedTextBody } from "@/lib/http-body";
 import {
   authorizeInterviewRequest,
   markInterviewStarted,
@@ -43,10 +50,11 @@ export async function POST(request: Request) {
     if (!contentType.toLowerCase().startsWith("application/sdp")) {
       return noStoreText("TD-CONN-SDP: 音声通話の準備情報が正しくありません。", 415);
     }
-    const sdp = await request.text();
-    if (!sdp || sdp.length > 120_000) {
+    const body = await readBoundedTextBody(request, 120_000);
+    if (!body.ok || !body.value) {
       return noStoreText("TD-CONN-SDP: 音声通話の準備情報を確認できません。", 400);
     }
+    const sdp = body.value;
     if (!await reserveInterviewRealtimeConnection(sessionId)) {
       return noStoreText("TD-CONN-LIMIT: 音声回線への再接続回数が上限に達しました。採用担当者へご連絡ください。", 429);
     }
@@ -58,22 +66,27 @@ export async function POST(request: Request) {
       employment: authorized.session.employment,
       location: authorized.session.preferred_location,
     })));
-    const response = await fetch("https://api.openai.com/v1/realtime/calls", {
+    const upstream = await fetchOpenAIBytes(new Request("https://api.openai.com/v1/realtime/calls", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "OpenAI-Safety-Identifier": await privacySafeIdentifier(sessionId),
       },
       body: formData,
-    });
+    }), { timeoutMs: 25_000, maxResponseBytes: 500_000 });
+    const response = upstream.response;
     if (!response.ok) {
-      console.warn("OPENAI_REALTIME_UPSTREAM_REJECTED", {
-        status: response.status,
-        requestId: response.headers.get("x-request-id") ?? "unavailable",
-      });
-      return noStoreText(`TD-CONN-VOICE: ${await readOpenAIError(response)}`, response.status === 429 ? 429 : 502);
+      let code: string | undefined;
+      try {
+        const payload = decodeOpenAIJson(upstream.bytes) as { error?: { code?: string; type?: string } };
+        code = payload.error?.code ?? payload.error?.type;
+      } catch {
+        code = undefined;
+      }
+      console.warn("OPENAI_REALTIME_UPSTREAM_REJECTED", { status: response.status });
+      return noStoreText(`TD-CONN-VOICE: ${safeOpenAIError(response.status, code)}`, response.status === 429 ? 429 : 502);
     }
-    const answer = await response.text();
+    const answer = decodeOpenAIText(upstream.bytes);
     if (!answer) {
       return noStoreText("TD-CONN-VOICE: 音声通話の応答を取得できませんでした。", 502);
     }
@@ -81,11 +94,13 @@ export async function POST(request: Request) {
     return noStoreText(answer, 200, "application/sdp");
   } catch (error) {
     const missingCredential = error instanceof Error && error.message.includes("OPENAI_API_KEY");
+    const upstreamUnavailable = error instanceof OpenAIRequestFailure ||
+      (error instanceof Error && error.message === "OPENAI_RESPONSE_INVALID");
     return noStoreText(
       missingCredential
         ? "TD-CONN-CONFIG: オンライン一次面接の利用設定を確認できません。"
         : "TD-CONN-SERVER: オンライン一次面接サーバーへ接続できませんでした。",
-      missingCredential ? 503 : 500,
+      missingCredential ? 503 : upstreamUnavailable ? 502 : 500,
     );
   }
 }

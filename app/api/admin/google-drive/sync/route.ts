@@ -1,6 +1,7 @@
 import { authorizeInterviewAdmin } from "@/lib/admin-auth";
 import { stepInterviewToGoogleDrive } from "@/lib/google-drive-sync";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 export async function POST(request: Request) {
   try {
@@ -10,9 +11,9 @@ export async function POST(request: Request) {
     if (!await authorizeInterviewAdmin(request)) {
       return noStoreJson({ error: "管理者認証を確認できません。" }, { status: 401 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 1_000) return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
-    const payload = JSON.parse(rawBody) as { sessionId?: unknown };
+    const body = await readBoundedJsonBody<{ sessionId?: unknown }>(request, { maxBytes: 4_000 });
+    if (!body.ok) return noStoreJson({ error: body.status === 413 ? "入力内容が長すぎます。" : "入力内容を確認できませんでした。" }, { status: body.status });
+    const payload = body.value;
     const sessionId = typeof payload.sessionId === "string" ? payload.sessionId.trim().toUpperCase() : "";
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreJson({ error: "面接IDを確認してください。" }, { status: 400 });

@@ -1,4 +1,7 @@
-import { authorizeInterviewRequest } from "@/lib/interview-persistence";
+import {
+  authorizeInterviewRequest,
+  interviewSessionHasCompletionHold,
+} from "@/lib/interview-persistence";
 import {
   MAX_RECORDED_ANSWER_BYTES,
   saveAndTranscribeRecordedAnswer,
@@ -20,6 +23,9 @@ export async function POST(request: Request) {
     const authorized = await authorizeInterviewRequest(request, sessionId);
     if (!authorized?.session) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
+    }
+    if (interviewSessionHasCompletionHold(authorized.session)) {
+      return noStoreJson({ error: "このオンライン一次面接は技術確認中のため回答を追加できません。" }, { status: 409 });
     }
     if (!["in_progress", "evaluation_pending"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接は回答を受け付ける状態ではありません。" }, { status: 409 });
@@ -79,6 +85,9 @@ export async function POST(request: Request) {
     const code = error instanceof Error ? error.message : "";
     if (code === "RECORDED_ANSWER_AUDIO_CONFLICT") {
       return noStoreJson({ error: "同じ質問の回答音声が一致しません。自動上書きは行いません。" }, { status: 409 });
+    }
+    if (code === "RECORDED_INTERVIEW_HELD") {
+      return noStoreJson({ error: "このオンライン一次面接は技術確認中のため回答を追加できません。" }, { status: 409 });
     }
     if (code.includes("STORAGE_UNAVAILABLE") || code.includes("OPENAI_API_KEY")) {
       return noStoreJson({ error: "回答音声の保存または文字起こしの準備が完了していません。" }, { status: 503 });

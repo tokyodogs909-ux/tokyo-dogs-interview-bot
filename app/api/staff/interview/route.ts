@@ -2,6 +2,7 @@ import {
   authorizeReviewerRequest,
   getInterviewReview,
 } from "@/lib/interview-persistence";
+import { revalidateCompletedGoogleDriveArchive } from "@/lib/google-drive-sync";
 import { noStoreJson } from "@/lib/openai-server";
 
 export async function GET(request: Request) {
@@ -14,6 +15,9 @@ export async function GET(request: Request) {
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreJson({ error: "面接IDを確認してください。" }, { status: 400 });
     }
+    // This is a bounded, cooldown-protected readback. A Drive outage or a lost
+    // check lease must never hide the durable interview record from staff.
+    await revalidateCompletedGoogleDriveArchive(sessionId).catch(() => undefined);
     const review = await getInterviewReview(sessionId, reviewer);
     if (!review) {
       return noStoreJson({ error: "該当するオンライン一次面接記録がありません。" }, { status: 404 });

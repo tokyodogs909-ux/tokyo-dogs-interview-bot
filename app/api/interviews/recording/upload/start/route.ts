@@ -1,10 +1,13 @@
 import {
   authorizeInterviewRequest,
+  beginProvisionalInterviewRecording,
   beginResumableInterviewRecording,
   hasRecordingStorage,
+  validateProvisionalRecordingUploadShape,
   validateRecordingUploadShape,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 export async function POST(request: Request) {
   try {
@@ -14,9 +17,7 @@ export async function POST(request: Request) {
     if (!hasRecordingStorage()) {
       return noStoreJson({ error: "録画の保存領域を準備できませんでした。" }, { status: 503 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 2_000) return noStoreJson({ error: "録画情報が長すぎます。" }, { status: 413 });
-    const payload = JSON.parse(rawBody) as {
+    const body = await readBoundedJsonBody<{
       sessionId?: string;
       contentType?: string;
       byteSize?: number;
@@ -24,7 +25,10 @@ export async function POST(request: Request) {
       totalParts?: number;
       audioCoverage?: string;
       uploadVersion?: number;
-    };
+      uploadId?: string;
+    }>(request, { maxBytes: 8_000 });
+    if (!body.ok) return noStoreJson({ error: body.status === 413 ? "録画情報が長すぎます。" : "録画情報を確認できませんでした。" }, { status: body.status });
+    const payload = body.value;
     const sessionId = payload.sessionId?.trim() ?? "";
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreJson({ error: "オンライン一次面接の接続情報が正しくありません。" }, { status: 400 });
@@ -35,6 +39,21 @@ export async function POST(request: Request) {
     }
     if (!["in_progress", "evaluation_pending", "evaluation_processing", "completed"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接は録画を受け付ける状態ではありません。" }, { status: 409 });
+    }
+    if (payload.uploadVersion === 3) {
+      const provisionalShape = validateProvisionalRecordingUploadShape({
+        uploadId: payload.uploadId?.trim() ?? "",
+        contentType: payload.contentType ?? "",
+        partSize: Number(payload.partSize),
+      });
+      if (!provisionalShape) {
+        return noStoreJson({ error: "録画の分割情報を確認できません。" }, { status: 400 });
+      }
+      const result = await beginProvisionalInterviewRecording({
+        session: authorized.session,
+        ...provisionalShape,
+      });
+      return noStoreJson(result);
     }
     const shape = validateRecordingUploadShape({
       contentType: payload.contentType ?? "",
@@ -65,6 +84,9 @@ export async function POST(request: Request) {
     }
     if (code === "INTERVIEW_RECORDING_UPLOAD_BUSY") {
       return noStoreJson({ error: "録画の保存処理を確認中です。少し待ってから再試行してください。" }, { status: 409 });
+    }
+    if (code === "INTERVIEW_RECORDING_UPLOAD_EXPIRED") {
+      return noStoreJson({ error: "録画の保存期限を超えました。採用担当者へご連絡ください。" }, { status: 409 });
     }
     return noStoreJson({ error: "録画の分割保存を開始できませんでした。" }, { status: 500 });
   }

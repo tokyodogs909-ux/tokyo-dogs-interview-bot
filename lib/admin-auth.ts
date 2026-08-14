@@ -1,3 +1,9 @@
+import {
+  authorizeBearerSecret,
+  secureBytesEqual,
+  serverSecretReadiness,
+} from "@/lib/server-secret-auth";
+
 type AdminBindings = {
   INTERVIEW_ADMIN_TOKEN?: string;
 };
@@ -17,20 +23,6 @@ function configuredAdminToken() {
     (typeof process === "undefined" ? "" : process.env.INTERVIEW_ADMIN_TOKEN) ??
     ""
   ).trim();
-}
-
-async function sha256(value: string) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return new Uint8Array(digest);
-}
-
-function constantTimeEqual(left: Uint8Array, right: Uint8Array) {
-  if (left.byteLength !== right.byteLength) return false;
-  let difference = 0;
-  for (let index = 0; index < left.byteLength; index += 1) {
-    difference |= left[index] ^ right[index];
-  }
-  return difference === 0;
 }
 
 function toBase64Url(bytes: Uint8Array) {
@@ -81,10 +73,11 @@ async function setupSessionSignature(payload: string) {
 export async function authorizeInterviewAdmin(request: Request) {
   const expected = configuredAdminToken();
   if (!expected) throw new Error("INTERVIEW_ADMIN_AUTH_UNCONFIGURED");
-  const authorization = request.headers.get("Authorization") ?? "";
-  const actual = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
-  if (!actual) return false;
-  return constantTimeEqual(await sha256(actual), await sha256(expected));
+  return authorizeBearerSecret(request, expected);
+}
+
+export function adminAuthenticationReadiness() {
+  return serverSecretReadiness(configuredAdminToken());
 }
 
 export async function createInterviewAdminSetupSession() {
@@ -107,7 +100,7 @@ export async function authorizeInterviewAdminSetupSession(request: Request) {
   const actualSignature = fromBase64Url(signatureRaw);
   if (!actualSignature) return false;
   const expectedSignature = await setupSessionSignature(`${expiresRaw}.${nonce}`);
-  return constantTimeEqual(actualSignature, expectedSignature);
+  return secureBytesEqual(actualSignature, expectedSignature);
 }
 
 export async function authorizeInterviewAdminOrSetupSession(request: Request) {

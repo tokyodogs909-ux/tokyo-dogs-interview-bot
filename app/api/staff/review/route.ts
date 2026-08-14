@@ -5,6 +5,7 @@ import {
   type VideoReviewScore,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 function cleanScores(value: unknown): VideoReviewScore[] | null {
   if (!Array.isArray(value) || value.length !== VIDEO_REVIEW_DIMENSIONS.length) return null;
@@ -36,15 +37,13 @@ export async function POST(request: Request) {
     if (!reviewer) {
       return noStoreJson({ error: "採用担当者の認証を確認できませんでした。" }, { status: 401 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 10_000) {
-      return noStoreJson({ error: "評価内容が長すぎます。" }, { status: 413 });
-    }
-    const payload = JSON.parse(rawBody) as {
+    const body = await readBoundedJsonBody<{
       sessionId?: string;
       scores?: unknown;
       overallNote?: unknown;
-    };
+    }>(request, { maxBytes: 40_000 });
+    if (!body.ok) return noStoreJson({ error: body.status === 413 ? "評価内容が長すぎます。" : "評価内容を確認できませんでした。" }, { status: body.status });
+    const payload = body.value;
     const sessionId = payload.sessionId?.trim() ?? "";
     const scores = cleanScores(payload.scores);
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId) || !scores) {

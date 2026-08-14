@@ -1,6 +1,7 @@
 import { authorizeInterviewBackgroundRecoveryRequest } from "@/lib/interview-background-recovery";
 import { getInterviewRecoveryTechnicalStatus } from "@/lib/interview-persistence";
 import { noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 const MAX_STATUS_REQUEST_BYTES = 128;
 const SESSION_ID_PATTERN = /^TD-[A-Z0-9-]{6,40}$/;
@@ -21,24 +22,13 @@ export async function POST(request: Request) {
       );
     }
 
-    if (request.headers.get("Content-Type") !== "application/json") {
-      return noStoreJson({ error: "Recovery status content type is invalid." }, { status: 415 });
+    const body = await readBoundedJsonBody(request, { maxBytes: MAX_STATUS_REQUEST_BYTES });
+    if (!body.ok) {
+      return noStoreJson({
+        error: body.status === 415 ? "Recovery status content type is invalid." : "Recovery status request body is invalid.",
+      }, { status: body.status });
     }
-    const contentLength = request.headers.get("Content-Length") ?? "";
-    if (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_STATUS_REQUEST_BYTES) {
-      return noStoreJson({ error: "Recovery status request body is invalid." }, { status: 413 });
-    }
-    const rawBody = await request.text();
-    if (new TextEncoder().encode(rawBody).byteLength > MAX_STATUS_REQUEST_BYTES) {
-      return noStoreJson({ error: "Recovery status request body is invalid." }, { status: 413 });
-    }
-
-    let payload: unknown;
-    try {
-      payload = JSON.parse(rawBody);
-    } catch {
-      payload = null;
-    }
+    const payload = body.value;
     if (
       !payload ||
       typeof payload !== "object" ||

@@ -1,7 +1,6 @@
 import {
   authorizeInterviewRequest,
   completeResumableInterviewRecording,
-  failInterviewRecordingUpload,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
@@ -20,12 +19,15 @@ export async function POST(request: Request) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
     }
     if (authorized.session.recording_status === "stored") return noStoreJson({ stored: true, alreadyStored: true });
-    const result = await completeResumableInterviewRecording(authorized.session);
+    const uploadId = request.headers.get("X-Recording-Upload-Id")?.trim();
+    const result = await completeResumableInterviewRecording(authorized.session, { uploadId });
     return noStoreJson(result);
   } catch (error) {
     const code = error instanceof Error ? error.message : "";
-    if (sessionId && !code.includes("PART_MISSING")) await failInterviewRecordingUpload(sessionId);
-    const status = code.includes("PART_MISSING") ? 409 : 500;
-    return noStoreJson({ error: status === 409 ? "録画データの受信が途中です。自動再送します。" : "録画を確定できませんでした。自動再送します。" }, { status });
+    const resumableConflict = code.includes("PART_MISSING") ||
+      code.includes("UPLOAD_UNSEALED") ||
+      code.includes("UPLOAD_CONFLICT");
+    const status = resumableConflict ? 409 : 500;
+    return noStoreJson({ error: status === 409 ? "録画データの受信または確定が途中です。自動再送します。" : "録画を確定できませんでした。自動再送します。" }, { status });
   }
 }

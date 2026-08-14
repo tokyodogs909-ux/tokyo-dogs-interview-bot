@@ -25,6 +25,7 @@ export async function recoverNextStaleInterviewEvaluation(): Promise<StaleEvalua
   const claimId = await claimInterviewEvaluation({
     sessionId: target.sessionId,
     transcript: target.transcript,
+    source: target.source,
   });
   if (!claimId) return { state: "claimed_elsewhere", sessionId: target.sessionId };
 
@@ -33,6 +34,7 @@ export async function recoverNextStaleInterviewEvaluation(): Promise<StaleEvalua
     transcript: target.transcript,
     evaluation: buildDeferredHumanEvaluation("service_unavailable"),
     claimId,
+    source: target.source,
   });
   return saved
     ? { state: "completed", sessionId: target.sessionId }

@@ -56,6 +56,11 @@ type DriveFolderMetadata = {
   capabilities?: {
     canAddChildren?: boolean;
   };
+  permissions?: Array<{
+    type?: string;
+    role?: string;
+    allowFileDiscovery?: boolean;
+  }>;
 };
 
 type DriveAbout = {
@@ -70,7 +75,23 @@ export type SafeDriveRootMetadata = {
   canAddChildren: boolean;
   locationType: "my_drive" | "shared_drive";
   webViewLink: string | null;
+  /** Display-only sharing risk. It never changes root readiness. */
+  sharingRisk: "anyone_writer" | "anyone_reader" | "restricted" | "unknown";
 };
+
+function safeSharingRisk(folder: DriveFolderMetadata): SafeDriveRootMetadata["sharingRisk"] {
+  if (!Array.isArray(folder.permissions)) return "unknown";
+  const publicRoles = folder.permissions
+    .filter((permission) => permission.type === "anyone")
+    .map((permission) => permission.role);
+  if (publicRoles.some((role) => role === "owner" || role === "organizer" || role === "fileOrganizer" || role === "writer")) {
+    return "anyone_writer";
+  }
+  if (publicRoles.some((role) => role === "reader" || role === "commenter")) {
+    return "anyone_reader";
+  }
+  return "restricted";
+}
 
 function bindings() {
   return (globalThis as typeof globalThis & {
@@ -207,7 +228,7 @@ export async function validateGoogleDriveFolderSelection(
   if (!/^[A-Za-z0-9_-]{10,200}$/.test(normalizedFolderId)) {
     throw new Error("GOOGLE_DRIVE_ROOT_ID_INVALID");
   }
-  const fields = "id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren)";
+  const fields = "id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren),permissions(type,role,allowFileDiscovery)";
   const response = await fetchGoogleWithTimeout(
     `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(normalizedFolderId)}?supportsAllDrives=true&fields=${encodeURIComponent(fields)}`,
     {
@@ -234,6 +255,7 @@ export async function validateGoogleDriveFolderSelection(
     canAddChildren: true,
     locationType: folder.driveId ? "shared_drive" : "my_drive",
     webViewLink: typeof folder.webViewLink === "string" ? folder.webViewLink : null,
+    sharingRisk: safeSharingRisk(folder),
   };
 }
 
@@ -261,6 +283,7 @@ function safeRootFromMetadata(folder: DriveFolderMetadata, expectedName: string)
     canAddChildren: true,
     locationType: folder.driveId ? "shared_drive" : "my_drive",
     webViewLink: typeof folder.webViewLink === "string" ? folder.webViewLink : null,
+    sharingRisk: safeSharingRisk(folder),
   };
 }
 
@@ -273,7 +296,7 @@ function safeRootFromMetadata(folder: DriveFolderMetadata, expectedName: string)
  */
 export async function ensureGoogleDriveManagedRoot(accessToken: string): Promise<SafeDriveRootMetadata> {
   const name = managedRootName();
-  const fields = "files(id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren))";
+  const fields = "files(id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren),permissions(type,role,allowFileDiscovery))";
   const query = new URLSearchParams({
     q: `trashed = false and mimeType = '${FOLDER_MIME_TYPE}' and appProperties has { key='tokyoDogsManagedRoot' and value='${MANAGED_ROOT_PROPERTY}' }`,
     pageSize: "10",
@@ -289,7 +312,7 @@ export async function ensureGoogleDriveManagedRoot(accessToken: string): Promise
   if (existing) return safeRootFromMetadata(existing, name);
 
   const createResponse = await fetchGoogleWithTimeout(
-    `${DRIVE_API_ENDPOINT}/files?fields=${encodeURIComponent("id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren)")}`,
+    `${DRIVE_API_ENDPOINT}/files?fields=${encodeURIComponent("id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren),permissions(type,role,allowFileDiscovery)")}`,
     {
       method: "POST",
       headers: {

@@ -1,9 +1,12 @@
 import { RECORDED_FALLBACK_QUESTIONS, type TranscriptTurn } from "@/lib/interview";
 import { buildDeferredHumanEvaluation } from "@/lib/interview-evaluation-fallback";
+import { evaluateInterviewTranscript } from "@/lib/interview-evaluation-service";
+import { RECORDED_TRANSCRIPT_EVALUATION_WARNING } from "@/lib/recorded-evaluation-marker";
 import {
   claimInterviewEvaluation,
   failInterviewEvaluation,
   getInterviewSessionState,
+  interviewSessionHasCompletionHold,
   saveInterviewEvaluation,
 } from "@/lib/interview-persistence";
 import {
@@ -32,7 +35,7 @@ function recordedTranscript(
 }
 
 export type RecordedInterviewCompletionResult =
-  | { state: "completed"; alreadyCompleted: boolean }
+  | { state: "completed"; alreadyCompleted: boolean; automaticEvaluationDeferred: boolean }
   | { state: "pending"; completedAnswerCount: number; missingAnswerIndexes: number[] }
   | { state: "busy" };
 
@@ -42,6 +45,7 @@ export async function finalizeRecordedInterview(
 ): Promise<RecordedInterviewCompletionResult> {
   const session = await getInterviewSessionState(sessionId);
   if (!session) throw new Error("INTERVIEW_NOT_FOUND");
+  if (interviewSessionHasCompletionHold(session)) throw new Error("RECORDED_INTERVIEW_HELD");
   if (session.recording_status !== "stored") {
     throw new Error("INTERVIEW_RECORDING_NOT_READY_FOR_COMPLETION");
   }
@@ -87,20 +91,49 @@ export async function finalizeRecordedInterview(
           answerTurn.text === answer.text;
       });
     if (!exactRecordedTranscript) throw new Error("RECORDED_COMPLETION_PROVENANCE_MISMATCH");
-    return { state: "completed", alreadyCompleted: true };
+    let automaticEvaluationDeferred = true;
+    try {
+      const storedEvaluation = JSON.parse(session.evaluation_json ?? "null") as {
+        evidenceValidationWarnings?: unknown;
+      } | null;
+      automaticEvaluationDeferred = !Array.isArray(storedEvaluation?.evidenceValidationWarnings) ||
+        !storedEvaluation.evidenceValidationWarnings.includes(RECORDED_TRANSCRIPT_EVALUATION_WARNING);
+    } catch {
+      automaticEvaluationDeferred = true;
+    }
+    return { state: "completed", alreadyCompleted: true, automaticEvaluationDeferred };
   }
   const transcript = recordedTranscript(completedAnswers as Array<{ answerIndex: number; text: string }>);
-  const claimId = await claimInterviewEvaluation({ sessionId, transcript }) ?? "";
+  const claimId = await claimInterviewEvaluation({
+    sessionId,
+    transcript,
+    source: "durable_recorded_fallback",
+  }) ?? "";
   if (!claimId) return { state: "busy" };
   try {
+    // The claim is the one-paid-call fence shared by candidate, staff and cron
+    // completion paths. Only exact server-side transcriptions reach the model;
+    // placeholder or partially transcribed interviews returned pending above.
+    const automatic = await evaluateInterviewTranscript({
+      sessionId,
+      employment: session.employment,
+      preferredLocation: session.preferred_location,
+      transcript,
+      source: "recorded_transcribed",
+    });
     const saved = await saveInterviewEvaluation({
       sessionId,
       transcript,
-      evaluation: buildDeferredHumanEvaluation("recorded_fallback"),
+      evaluation: automatic.evaluation ?? buildDeferredHumanEvaluation("recorded_fallback"),
       claimId,
+      source: "durable_recorded_fallback",
     });
     if (!saved) return { state: "busy" };
-    return { state: "completed", alreadyCompleted: false };
+    return {
+      state: "completed",
+      alreadyCompleted: false,
+      automaticEvaluationDeferred: automatic.automaticEvaluationDeferred,
+    };
   } catch (error) {
     await failInterviewEvaluation(sessionId, claimId);
     throw error;

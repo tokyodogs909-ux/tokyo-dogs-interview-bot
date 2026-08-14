@@ -1,3 +1,5 @@
+import { secureBytesEqual, serverSecretReadiness } from "@/lib/server-secret-auth";
+
 type InviteBindings = {
   INTERVIEW_INVITE_SIGNING_SECRET?: string;
   INTERVIEW_REQUIRE_SIGNED_INVITE?: string;
@@ -29,6 +31,10 @@ function signingSecret() {
 
 export function signedInvitesRequired() {
   return setting("INTERVIEW_REQUIRE_SIGNED_INVITE").toLowerCase() === "true";
+}
+
+export function inviteSigningReadiness() {
+  return serverSecretReadiness(setting("INTERVIEW_INVITE_SIGNING_SECRET"));
 }
 
 export function assertSignedInviteConfigured() {
@@ -76,13 +82,6 @@ export async function hashPublicEntrySource(value: string) {
   return sha256Hex(`public-entry-local-v1:${value}`);
 }
 
-function constantTimeEqual(left: Uint8Array, right: Uint8Array) {
-  if (left.byteLength !== right.byteLength) return false;
-  let difference = 0;
-  for (let index = 0; index < left.byteLength; index += 1) difference |= left[index] ^ right[index];
-  return difference === 0;
-}
-
 export async function sha256Hex(value: string) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -118,7 +117,7 @@ export async function inspectInterviewInviteToken(token: string): Promise<Invite
   } catch {
     return { status: "malformed" };
   }
-  if (!constantTimeEqual(actualSignature, await hmac(parts[0]))) return { status: "malformed" };
+  if (!secureBytesEqual(actualSignature, await hmac(parts[0]))) return { status: "malformed" };
   if (
     payload.v !== 1 ||
     typeof payload.nonce !== "string" ||

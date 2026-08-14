@@ -276,7 +276,9 @@ test("voice interview implements bidirectional audio health and recovery guards"
   );
   assert.match(recordedAnswerRetry, /\/api\/interviews\/recorded\/answer/);
   assert.doesNotMatch(recordedAnswerRetry, /X-Recorded-Answer-Bytes|body:/);
-  assert.match(source, /回答音声の自動文字起こしは完了しています。自動評価は行わず/);
+  assert.match(source, /回答音声の自動文字起こしを根拠に評価補助を作成しました/);
+  assert.match(source, /採用担当者が録画と文字起こしを照合して最終判断/);
+  assert.match(source, /録画・音声の品質は不利益に使用しません/);
   assert.match(source, /recordedAnswerBlobsRef/);
   assert.match(source, /audioBitsPerSecond: 48_000/);
   assert.match(source, /if \(!startRecordedAnswerCapture\(\)\)/);
@@ -311,9 +313,8 @@ test("voice interview implements bidirectional audio health and recovery guards"
 
 test("in-app browser detection matches real LINE, Facebook, and Instagram user agents", async () => {
   const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  const match = source.match(/setEmbeddedBrowser\((\/.*?\/i)\.test\(navigator\.userAgent\)\)/);
-  assert.ok(match, "embedded-browser detection regex not found in app/page.tsx");
-  const detectEmbeddedBrowser = new Function("ua", `return (${match[1]}).test(ua);`);
+  const { isEmbeddedInterviewBrowser: detectEmbeddedBrowser } = await import("../lib/interview-device-readiness.js");
+  assert.match(source, /setEmbeddedBrowser\(isEmbeddedInterviewBrowser\(navigator\.userAgent\)\)/);
 
   const lineIos = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Line/13.15.0";
   const facebookIos = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBAV/450.0.0.0;FBBV/500;]";
@@ -408,7 +409,7 @@ test("candidate receipt stays fail-closed until the server verifies the final Dr
     source.indexOf("async function sealVoiceTranscriptCompletion()"),
     source.indexOf("async function syncInterviewArchive(attempt = 0)"),
   );
-  assert.match(voiceSeal, /if \(!voiceTranscriptionCompleteRef\.current\)/);
+  assert.match(voiceSeal, /if \(voiceTranscriptCompletionBlocker\(\)\)/);
   assert.match(voiceSeal, /turn\.speaker === "candidate" && turn\.text\.trim\(\)\.length > 0/);
   assert.match(voiceSeal, /\/api\/interviews\/voice\/transcript\/seal/);
   assert.match(voiceSeal, /transcriptionComplete: true/);
@@ -506,13 +507,15 @@ test("capped or errored MediaRecorder output cannot be uploaded or receipted as 
 
 test("a failed realtime answer transcription keeps voice finalization fail-closed", async () => {
   const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  assert.match(source, /const voiceTranscriptionCompleteRef = useRef\(true\);/);
+  assert.match(source, /const voiceTranscriptionFailureRef = useRef\(false\);/);
+  assert.match(source, /const realtimeTranscriptIntegrityRef = useRef\(initialRealtimeTranscriptIntegrity\(\)\);/);
 
   const failedEvent = source.slice(
     source.indexOf('if (type === "conversation.item.input_audio_transcription.failed")'),
     source.indexOf("const isAssistantDelta ="),
   );
-  assert.match(failedEvent, /voiceTranscriptionCompleteRef\.current = false;/);
+  assert.match(failedEvent, /applyRealtimeTranscriptIntegrity\(event\);/);
+  assert.match(failedEvent, /voiceTranscriptionFailureRef\.current = true;/);
 
   const finalization = source.slice(
     source.indexOf("async function storeInterviewFinalization()"),
@@ -520,11 +523,11 @@ test("a failed realtime answer transcription keeps voice finalization fail-close
   );
   assert.match(
     finalization,
-    /if \(mode === "voice" && !voiceTranscriptionCompleteRef\.current\) \{[\s\S]*throw new Error/,
+    /if \(mode === "voice" && voiceTranscriptCompletionBlocker\(\)\) \{[\s\S]*throw new Error/,
   );
   assert.ok(
-    [...source.matchAll(/voiceTranscriptionCompleteRef\.current = true;/g)].length >= 3,
-    "the voice-transcription integrity flag must reset for new, restarted, and reset sessions",
+    [...source.matchAll(/resetRealtimeTranscriptIntegrity\(\);/g)].length >= 3,
+    "the voice-transcription integrity state must reset for new, restarted, and reset sessions",
   );
 });
 
@@ -535,7 +538,7 @@ test("server-renders the protected recruiter review entry", async () => {
   assert.match(html, /公式選考レビュー/);
   assert.match(html, /OFFICIAL SELECTION REVIEW/);
   assert.match(html, /採用担当者専用/);
-  assert.match(html, /担当者名/);
+  assert.match(html, /担当者(?:表示)?名/);
   assert.match(html, /例：採用担当/);
   assert.match(html, /候補者一覧を表示/);
   assert.match(html, /候補者用URLをコピー/);
@@ -543,12 +546,26 @@ test("server-renders the protected recruiter review entry", async () => {
   assert.match(html, /閲覧と保存操作は監査ログへ記録/);
   assert.doesNotMatch(html, /staff-review-secret|INTERVIEW_STAFF_TOKEN/);
   const source = await readFile(new URL("../app/staff/page.tsx", import.meta.url), "utf8");
+  assert.match(source, /SHARED RECRUITER ACCESS/);
+  assert.match(source, /担当者表示名（自己申告）/);
+  assert.match(source, /個人認証済みの本人情報ではありません/);
   assert.match(source, /録画未格納/);
   assert.match(source, /録画を含め格納完了/);
   assert.match(source, /review\.sourceTranscriptVerified !== true \? "保存未完了（文字起こし要確認）"/);
   assert.match(source, /review\.sourceTranscriptVerified === true && review\.driveSync\.recordingIncluded/);
   assert.match(source, /turn\.id\.startsWith\("recorded-transcribed-"\)/);
   assert.match(source, /自動評価なし・人手照合必須/);
+  assert.match(source, /RECORDED_TRANSCRIPT_EVALUATION_WARNING/);
+  assert.match(source, /録画式・回答根拠付き自動分析（録画未照合）/);
+  assert.match(source, /自動文字起こし由来・録画未照合です。人手確認が必須で、自動合否は行いません/);
+  assert.match(source, /録画パート不足——応募者の再開または人手確認待ち/);
+  assert.match(source, /旧式録画の不足パートを検出——人手確認が必要/);
+  assert.match(source, /Drive整合性/);
+  assert.match(source, /保存後の差分を検出/);
+  assert.match(source, /保存後差分を検出しました。格納完了とは扱わず/);
+  assert.match(source, /現在内容は照合未完です。格納完了とは扱わず/);
+  assert.match(source, /差分検出（要確認）/);
+  assert.match(source, /現状維持・リンク保有者が編集可能/);
   assert.match(source, /保存完了は音声品質の確認完了を意味しません/);
   assert.match(source, /候補者を検索/);
   assert.match(source, /面接IDを直接指定/);

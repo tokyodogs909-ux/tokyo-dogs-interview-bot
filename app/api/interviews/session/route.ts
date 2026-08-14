@@ -11,24 +11,25 @@ import {
   reservePublicInterviewEntry,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 export async function POST(request: Request) {
   try {
     if (!hasTrustedRequestOrigin(request)) {
       return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 4_000) {
-      return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
-    }
-    const payload = JSON.parse(rawBody) as {
+    const body = await readBoundedJsonBody<{
       candidateName?: string;
       employment?: string;
       location?: string;
       consent?: boolean;
       interviewMode?: "camera" | "text";
       inviteToken?: string;
-    };
+    }>(request, { maxBytes: 16_000 });
+    if (!body.ok) {
+      return noStoreJson({ error: body.status === 413 ? "入力内容が長すぎます。" : "入力内容を確認できませんでした。" }, { status: body.status });
+    }
+    const payload = body.value;
     const candidateName = payload.candidateName?.normalize("NFKC").replace(/\s+/g, " ").trim() ?? "";
     const employment = payload.employment?.trim() ?? "";
     const location = normalizePreferredLocation(payload.location);

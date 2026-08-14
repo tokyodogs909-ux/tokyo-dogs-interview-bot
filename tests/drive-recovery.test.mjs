@@ -18,6 +18,7 @@ function interview(sessionId, patch = {}) {
     driveRecordingIncluded: true,
     driveTranscriptAvailable: true,
     driveTranscriptKind: "actual_transcript",
+    driveIntegrityStatus: "verified",
     sourceTranscriptVerified: true,
     driveUpdatedAt: "2026-08-03T05:59:00.000Z",
     ...patch,
@@ -129,6 +130,12 @@ test("Drive archive health does not call a video-less camera archive stored", ()
 
 test("verified receipt requires every mode-specific Drive artifact", () => {
   assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA")), true);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA-DRIFT", {
+    driveIntegrityStatus: "drift",
+  })), false);
+  assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA-INTEGRITY-UNKNOWN", {
+    driveIntegrityStatus: "unknown",
+  })), false);
   assert.equal(isVerifiedInterviewArchive(interview("TD-CAMERA-NO-VIDEO", {
     driveRecordingIncluded: false,
   })), false);

@@ -1,4 +1,5 @@
 import { EVALUATION_MODEL, REALTIME_MODEL } from "@/lib/interview";
+import { decodeOpenAIJson, fetchOpenAIBytes, type OpenAIFetcher } from "@/lib/openai-fetch";
 
 function processApiKey() {
   const bound = (globalThis as typeof globalThis & {
@@ -34,14 +35,14 @@ const OPENAI_TRANSIENT_CACHE_MS = 30 * 1000;
 const OPENAI_STALE_GOOD_MS = 30 * 60 * 1000;
 const OPENAI_MODEL_TIMEOUT_MS = 8 * 1000;
 
-function healthProbeFetch(request: Request) {
+function healthProbeFetcher(): OpenAIFetcher | undefined {
   // This optional binding is only a dependency-injection seam for the compiled
   // route tests. Sites production does not define it, so health uses the native
   // Cloudflare fetch path below.
   const testFetcher = (globalThis as typeof globalThis & {
     __TOKYO_DOGS_INTERVIEW_BINDINGS__?: { OPENAI_HEALTH_API?: Fetcher };
   }).__TOKYO_DOGS_INTERVIEW_BINDINGS__?.OPENAI_HEALTH_API;
-  return testFetcher ? testFetcher.fetch(request) : fetch(request);
+  return testFetcher;
 }
 
 function diagnosticToken(value: unknown) {
@@ -49,10 +50,10 @@ function diagnosticToken(value: unknown) {
   return /^[a-z0-9._-]{1,80}$/i.test(value) ? value : null;
 }
 
-async function safeOpenAIErrorMetadata(response: Response) {
+function safeOpenAIErrorMetadata(response: Response, bytes: Uint8Array) {
   if (response.ok) return { code: null, type: null };
   try {
-    const payload = await response.clone().json() as {
+    const payload = decodeOpenAIJson(bytes) as {
       error?: { code?: unknown; type?: unknown };
     };
     return {
@@ -72,11 +73,8 @@ type OpenAIModelProbe = {
 };
 
 async function probeOpenAIModel(model: string, apiKey: string): Promise<OpenAIModelProbe> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), OPENAI_MODEL_TIMEOUT_MS);
   const request = new Request(`https://api.openai.com/v1/models/${encodeURIComponent(model)}`, {
     headers: { Authorization: `Bearer ${apiKey}` },
-    signal: controller.signal,
   });
   try {
     // Readiness must follow the same native Cloudflare outbound path as the
@@ -86,8 +84,12 @@ async function probeOpenAIModel(model: string, apiKey: string): Promise<OpenAIMo
     // incoming request even after Promise.race resolves. That made /api/health
     // hang until the caller disconnected. Native fetch observes AbortSignal and
     // gives this public readiness request a real wall-clock fence.
-    const response = await healthProbeFetch(request);
-    const error = await safeOpenAIErrorMetadata(response);
+    const { response, bytes } = await fetchOpenAIBytes(request, {
+      timeoutMs: OPENAI_MODEL_TIMEOUT_MS,
+      maxResponseBytes: 250_000,
+      fetcher: healthProbeFetcher(),
+    });
+    const error = safeOpenAIErrorMetadata(response, bytes);
     if (response.ok) {
       return {
         outcome: "healthy",
@@ -113,14 +115,12 @@ async function probeOpenAIModel(model: string, apiKey: string): Promise<OpenAIMo
       status: null,
       requestId: "unavailable",
       error: {
-        code: error instanceof DOMException && error.name === "AbortError"
+        code: error instanceof Error && error.message === "OPENAI_REQUEST_TIMEOUT"
           ? "timeout"
           : "transport_error",
         type: "transport",
       },
     };
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -311,16 +311,4 @@ export function safeOpenAIError(status: number, code?: string) {
   if (status === 401 || status === 403) return "オンライン一次面接の接続を確認できませんでした。";
   if (status === 429) return "オンライン一次面接の接続が混み合っています。少し待ってから再度お試しください。";
   return "オンライン一次面接へ接続できませんでした。再度お試しください。";
-}
-
-export async function readOpenAIError(response: Response) {
-  try {
-    const payload = (await response.json()) as { error?: { code?: string; type?: string } };
-    return safeOpenAIError(
-      response.status,
-      payload.error?.code ?? payload.error?.type,
-    );
-  } catch {
-    return safeOpenAIError(response.status);
-  }
 }

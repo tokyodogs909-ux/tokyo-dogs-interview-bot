@@ -20,7 +20,11 @@ export function hasVerifiedCandidateTranscript(
   const whollyRecoveredRecordedInterview = candidateTurns.length > 0 && candidateTurns.every((turn) =>
     turn.id.startsWith("recorded-transcribed-answer-"));
   const realtimeTurnMissing = auditEvents.some((event) =>
-    event.type === "transcription_failed" && event.detail?.code === "TRANSCRIPTION_FAILED") &&
+    event.type === "transcription_failed" && [
+      "TRANSCRIPTION_FAILED",
+      "TRANSCRIPTION_EMPTY",
+      "TRANSCRIPTION_ID_MISSING",
+    ].includes(String(event.detail?.code ?? ""))) &&
     !whollyRecoveredRecordedInterview;
   return candidateTurns.some((turn) => turn.text.trim().length > 0) &&
     !candidateTurns.some((turn) => turn.id.startsWith("recorded-fallback-answer-")) &&

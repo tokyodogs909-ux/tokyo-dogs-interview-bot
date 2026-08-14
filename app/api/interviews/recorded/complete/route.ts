@@ -1,11 +1,13 @@
 import {
   authorizeInterviewRequest,
+  interviewSessionHasCompletionHold,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 import {
   RECORDED_ANSWER_COUNT,
 } from "@/lib/recorded-transcription";
 import { finalizeRecordedInterview } from "@/lib/recorded-interview-completion";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 export async function POST(request: Request) {
   let sessionId = "";
@@ -13,11 +15,9 @@ export async function POST(request: Request) {
     if (!hasTrustedRequestOrigin(request)) {
       return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 2_000) {
-      return noStoreJson({ error: "完了情報が長すぎます。" }, { status: 413 });
-    }
-    const payload = JSON.parse(rawBody) as { sessionId?: string; questionCount?: number };
+    const body = await readBoundedJsonBody<{ sessionId?: string; questionCount?: number }>(request, { maxBytes: 8_000 });
+    if (!body.ok) return noStoreJson({ error: body.status === 413 ? "完了情報が長すぎます。" : "録画式面接の完了情報を確認できません。" }, { status: body.status });
+    const payload = body.value;
     sessionId = payload.sessionId?.trim() ?? "";
     const questionCount = Number(payload.questionCount);
     if (
@@ -31,6 +31,9 @@ export async function POST(request: Request) {
     const authorized = await authorizeInterviewRequest(request, sessionId);
     if (!authorized?.session) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
+    }
+    if (interviewSessionHasCompletionHold(authorized.session)) {
+      return noStoreJson({ error: "このオンライン一次面接は技術確認中のため受付完了できません。" }, { status: 409 });
     }
     if (!["in_progress", "evaluation_pending", "evaluation_processing", "completed"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接の受付は完了しています。" }, { status: 409 });
@@ -51,6 +54,7 @@ export async function POST(request: Request) {
     return noStoreJson({
       stored: true,
       humanReviewRequired: true,
+      automaticEvaluationDeferred: completion.automaticEvaluationDeferred,
       ...(completion.alreadyCompleted ? { alreadyCompleted: true } : {}),
     });
   } catch (error) {
@@ -58,6 +62,7 @@ export async function POST(request: Request) {
       return noStoreJson({ error: "実際に保存された回答数と完了情報が一致しません。" }, { status: 409 });
     }
     if (error instanceof Error && [
+      "RECORDED_INTERVIEW_HELD",
       "RECORDED_COMPLETION_NOT_SEALED",
       "INTERVIEW_RECORDING_NOT_READY_FOR_COMPLETION",
       "INTERVIEW_NOT_READY_FOR_COMPLETION",

@@ -56,6 +56,7 @@ export async function PUT(request: Request) {
     }
     const index = Number(request.headers.get("X-Recording-Part-Index"));
     const byteSize = Number(request.headers.get("X-Recording-Part-Bytes"));
+    const uploadId = request.headers.get("X-Recording-Upload-Id")?.trim();
     const sha256Header = request.headers.get("X-Recording-Part-Sha256");
     const sha256 = sha256Header?.trim().toLowerCase();
     // A missing digest is passed to persistence only so an upload that started
@@ -77,6 +78,7 @@ export async function PUT(request: Request) {
     // to downgrade same-size content verification by omitting uploadVersion/SHA.
     const result = await saveResumableInterviewRecordingPart({
       sessionId,
+      uploadId,
       index,
       byteSize,
       sha256: actualSha256,
@@ -89,7 +91,7 @@ export async function PUT(request: Request) {
     return noStoreJson({ ...result, index });
   } catch (error) {
     const code = error instanceof Error ? error.message : "";
-    const status = code.includes("PART_DIGEST_CONFLICT")
+    const status = code.includes("UPLOAD_CONFLICT") || code.includes("UPLOAD_EXPIRED") || code.includes("PART_DIGEST_CONFLICT")
       ? 409
       : code.includes("PART_")
         ? 400

@@ -5,21 +5,22 @@ import {
   type CandidateEventType,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 export async function POST(request: Request) {
   try {
     if (!hasTrustedRequestOrigin(request)) {
       return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 2_000) {
-      return noStoreJson({ error: "イベント内容が長すぎます。" }, { status: 413 });
-    }
-    const payload = JSON.parse(rawBody) as {
+    const body = await readBoundedJsonBody<{
       sessionId?: string;
       eventType?: CandidateEventType;
       code?: string;
-    };
+    }>(request, { maxBytes: 8_000 });
+    if (!body.ok) {
+      return noStoreJson({ error: body.status === 413 ? "イベント内容が長すぎます。" : "イベント内容を確認できませんでした。" }, { status: body.status });
+    }
+    const payload = body.value;
     const sessionId = payload.sessionId?.trim() ?? "";
     if (
       !/^TD-[A-Z0-9-]{6,40}$/.test(sessionId) ||

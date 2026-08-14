@@ -14,10 +14,12 @@ import {
   acquireDriveHierarchyNodeLease,
   acquireDriveUploadStepLease,
   claimExternalSync,
+  claimExternalSyncIntegrityCheck,
   completeExternalSync,
   deferExternalSync,
   deleteDriveUploadStep,
   failExternalSync,
+  finishExternalSyncIntegrityCheck,
   getDriveUploadStep,
   getExternalSyncStatus,
   getInterviewArchiveSource,
@@ -52,6 +54,13 @@ const DRIVE_RECORDING_REQUEST_TIMEOUT_MS = 25_000;
 // fail-closed instead of risking an unbounded download or partial comparison.
 const DRIVE_DUPLICATE_RECORDING_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
 const DRIVE_DUPLICATE_RECORDING_RANGE_BYTES = 4 * 1024 * 1024;
+const DRIVE_INTEGRITY_SMALL_FILE_MAX_BYTES = 8 * 1024 * 1024;
+
+type DrivePermission = {
+  type?: string;
+  role?: string;
+  allowFileDiscovery?: boolean;
+};
 
 type DriveFile = {
   id: string;
@@ -61,10 +70,13 @@ type DriveFile = {
   md5Checksum?: string;
   sha1Checksum?: string;
   sha256Checksum?: string;
+  version?: string;
+  modifiedTime?: string;
   trashed?: boolean;
   webViewLink?: string;
   parents?: string[];
   appProperties?: Record<string, string>;
+  permissions?: DrivePermission[];
 };
 
 type DriveFilePage = {
@@ -93,6 +105,47 @@ type PreparedDriveArchive = {
   recordingDuplicateProof: RecordingDuplicateProof | null;
   transcriptAvailable: boolean;
   transcriptKind: string;
+  expectedContentHashes: Partial<Record<DriveArtifactKey, string>>;
+  expectedContentSizes: Partial<Record<DriveArtifactKey, number>>;
+  sharingRisk: DriveSharingRisk;
+};
+
+export type DriveArtifactKey =
+  | "transcript"
+  | "evaluation_json"
+  | "report_doc"
+  | "report_pdf"
+  | "manifest"
+  | "recording";
+
+export type DriveSharingRisk = "anyone_writer" | "anyone_reader" | "restricted" | "unknown";
+
+export type DriveArtifactIntegrityReceipt = {
+  fileId: string;
+  mimeType: string | null;
+  size: number | null;
+  version: string;
+  modifiedTime: string;
+  contentSha256: string;
+  fingerprintSource:
+    | "sha256Checksum"
+    | "bounded-content-sha256"
+    | "google-doc-text-sha256";
+};
+
+export type GoogleDriveArchiveIntegrity = {
+  schemaVersion: "2026-08-14-v1";
+  status: "verified" | "drift" | "unknown";
+  checkedAt: string;
+  errorCode: string | null;
+  sharingRisk: DriveSharingRisk;
+  folder: {
+    fileId: string;
+    parentId: string;
+    version: string;
+    modifiedTime: string;
+  };
+  artifacts: Partial<Record<DriveArtifactKey, DriveArtifactIntegrityReceipt>>;
 };
 
 export type GoogleDriveSyncResult = {
@@ -103,6 +156,7 @@ export type GoogleDriveSyncResult = {
   recordingIncluded: boolean;
   transcriptAvailable: boolean;
   transcriptKind: string;
+  integrity?: GoogleDriveArchiveIntegrity;
 };
 
 function safeErrorCode(error: unknown) {
@@ -329,6 +383,8 @@ function buildResultJson(source: ArchiveSource) {
       "recording_unavailable",
       "connection_failed",
       "candidate_requested_stop",
+      "safety_escalation",
+      "completion_reason_invalid",
       "time_limit_reached",
       "reasonable_accommodation_text_selected",
     ].includes(event.type)),
@@ -359,7 +415,7 @@ async function findChild(
     spaces: "drive",
     supportsAllDrives: "true",
     includeItemsFromAllDrives: "true",
-    fields: "files(id,name,mimeType,size,webViewLink,parents,appProperties)",
+    fields: "files(id,name,mimeType,size,version,modifiedTime,webViewLink,parents,appProperties)",
   });
   const result = await driveJson<{ files?: DriveFile[] }>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
   return result.files?.[0] ?? null;
@@ -378,7 +434,7 @@ async function listExactFolders(
     spaces: "drive",
     supportsAllDrives: "true",
     includeItemsFromAllDrives: "true",
-    fields: "nextPageToken,files(id,name,mimeType,trashed,webViewLink,parents,appProperties)",
+    fields: "nextPageToken,files(id,name,mimeType,version,modifiedTime,trashed,webViewLink,parents,appProperties)",
   });
   const result = await driveJson<DriveFilePage>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
   if (result.nextPageToken) throw new Error("GOOGLE_DRIVE_HIERARCHY_DUPLICATE");
@@ -387,7 +443,7 @@ async function listExactFolders(
 
 async function getDriveFolderById(accessToken: string, folderId: string) {
   return await driveJson<DriveFile>(
-    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(folderId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,trashed,webViewLink,parents,appProperties")}`,
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(folderId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,version,modifiedTime,trashed,webViewLink,parents,appProperties")}`,
     accessToken,
   );
 }
@@ -527,7 +583,7 @@ async function listFolderChildren(accessToken: string, parentId: string) {
     spaces: "drive",
     supportsAllDrives: "true",
     includeItemsFromAllDrives: "true",
-    fields: "nextPageToken,files(id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,trashed,webViewLink,parents,appProperties)",
+    fields: "nextPageToken,files(id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,version,modifiedTime,trashed,webViewLink,parents,appProperties,permissions(type,role,allowFileDiscovery))",
   });
   const result = await driveJson<DriveFilePage>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
   if (result.nextPageToken) throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
@@ -553,7 +609,7 @@ async function markLegacyDuplicateArtifact(input: {
     throw new Error("GOOGLE_DRIVE_ARCHIVE_CANONICAL_ID_INVALID");
   }
   const response = await fetchWithTimeout(
-    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.fileId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,trashed,webViewLink,parents,appProperties")}`,
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.fileId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,version,modifiedTime,trashed,webViewLink,parents,appProperties")}`,
     {
       method: "PATCH",
       headers: {
@@ -621,6 +677,41 @@ async function readSmallDriveFile(input: {
 async function sha256Bytes(bytes: Uint8Array) {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes).buffer));
   return Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function safeDriveVersion(file: DriveFile) {
+  if (typeof file.version !== "string" || !/^\d+$/.test(file.version)) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return file.version;
+}
+
+function safeDriveModifiedTime(file: DriveFile) {
+  if (typeof file.modifiedTime !== "string" || !Number.isFinite(Date.parse(file.modifiedTime))) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return file.modifiedTime;
+}
+
+function sharingRiskFromPermissions(permissions: DrivePermission[] | undefined): DriveSharingRisk {
+  if (!Array.isArray(permissions)) return "unknown";
+  const publicRoles = permissions
+    .filter((permission) => permission.type === "anyone")
+    .map((permission) => permission.role);
+  if (publicRoles.some((role) => role === "owner" || role === "organizer" || role === "fileOrganizer" || role === "writer")) {
+    return "anyone_writer";
+  }
+  if (publicRoles.some((role) => role === "reader" || role === "commenter")) {
+    return "anyone_reader";
+  }
+  return "restricted";
+}
+
+function highestSharingRisk(risks: DriveSharingRisk[]) {
+  if (risks.includes("anyone_writer")) return "anyone_writer" as const;
+  if (risks.includes("anyone_reader")) return "anyone_reader" as const;
+  if (risks.includes("unknown")) return "unknown" as const;
+  return "restricted" as const;
 }
 
 function exactDriveParent(file: DriveFile, folderId: string) {
@@ -1067,7 +1158,7 @@ async function findArtifact(accessToken: string, folderId: string, artifactKey: 
     spaces: "drive",
     supportsAllDrives: "true",
     includeItemsFromAllDrives: "true",
-    fields: "nextPageToken,files(id,name,mimeType,size,trashed,webViewLink,parents,appProperties)",
+    fields: "nextPageToken,files(id,name,mimeType,size,version,modifiedTime,trashed,webViewLink,parents,appProperties)",
   });
   const result = await driveJson<DriveFilePage>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
   if (result.nextPageToken || (result.files?.length ?? 0) > 1) {
@@ -1126,7 +1217,41 @@ async function exportGoogleDocToPdf(accessToken: string, fileId: string) {
     DRIVE_RECORDING_REQUEST_TIMEOUT_MS,
   );
   if (!response.ok) throw new Error(`GOOGLE_DRIVE_EXPORT_${response.status}`);
-  return new Uint8Array(await response.arrayBuffer());
+  const contentLength = response.headers.get("Content-Length");
+  if (
+    contentLength !== null &&
+    (!/^\d+$/.test(contentLength) || Number(contentLength) > DRIVE_INTEGRITY_SMALL_FILE_MAX_BYTES)
+  ) {
+    await response.body?.cancel();
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > DRIVE_INTEGRITY_SMALL_FILE_MAX_BYTES) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return bytes;
+}
+
+async function exportGoogleDocToText(accessToken: string, fileId: string) {
+  const response = await fetchWithTimeout(
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(fileId)}/export?mimeType=${encodeURIComponent("text/plain")}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+    DRIVE_RECORDING_REQUEST_TIMEOUT_MS,
+  );
+  if (!response.ok) throw new Error(`GOOGLE_DRIVE_EXPORT_${response.status}`);
+  const contentLength = response.headers.get("Content-Length");
+  if (
+    contentLength !== null &&
+    (!/^\d+$/.test(contentLength) || Number(contentLength) > DRIVE_INTEGRITY_SMALL_FILE_MAX_BYTES)
+  ) {
+    await response.body?.cancel();
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > DRIVE_INTEGRITY_SMALL_FILE_MAX_BYTES) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return bytes;
 }
 
 async function uploadRecording(input: {
@@ -1381,6 +1506,62 @@ function fileSummary(file: DriveFile, fallbackName: string) {
   return { id: file.id, name: file.name || fallbackName, size: numericSize };
 }
 
+async function readArtifactIntegrityReceipt(input: {
+  accessToken: string;
+  artifactKey: DriveArtifactKey;
+  file: DriveFile;
+  expectedContentHash?: string;
+  expectedContentSize?: number;
+}) : Promise<DriveArtifactIntegrityReceipt> {
+  const version = safeDriveVersion(input.file);
+  const modifiedTime = safeDriveModifiedTime(input.file);
+  let contentSha256: string;
+  let contentByteSize: number;
+  let fingerprintSource: DriveArtifactIntegrityReceipt["fingerprintSource"];
+
+  if (input.artifactKey === "report_doc") {
+    const exported = await exportGoogleDocToText(input.accessToken, input.file.id);
+    contentSha256 = await sha256Bytes(exported);
+    contentByteSize = exported.byteLength;
+    fingerprintSource = "google-doc-text-sha256";
+  } else if (input.artifactKey === "recording") {
+    const size = safeDriveFileSize(input.file);
+    if (size === null || size < 1) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    const checksum = validatedDriveChecksums(input.file).get("sha256Checksum");
+    if (!checksum) throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    contentSha256 = checksum;
+    fingerprintSource = "sha256Checksum";
+    contentByteSize = size;
+  } else {
+    const bytes = await readSmallDriveFile({
+      accessToken: input.accessToken,
+      file: input.file,
+      maximumBytes: DRIVE_INTEGRITY_SMALL_FILE_MAX_BYTES,
+    });
+    contentSha256 = await sha256Bytes(bytes);
+    contentByteSize = bytes.byteLength;
+    fingerprintSource = "bounded-content-sha256";
+  }
+
+  if (
+    (input.expectedContentHash && contentSha256 !== input.expectedContentHash) ||
+    (input.expectedContentSize !== undefined && contentByteSize !== input.expectedContentSize)
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return {
+    fileId: input.file.id,
+    mimeType: typeof input.file.mimeType === "string" ? input.file.mimeType : null,
+    size: safeDriveFileSize(input.file) ?? contentByteSize,
+    version,
+    modifiedTime,
+    contentSha256,
+    fingerprintSource,
+  };
+}
+
 async function verifyDriveArchive(input: {
   accessToken: string;
   folder: DriveFile;
@@ -1394,8 +1575,11 @@ async function verifyDriveArchive(input: {
   reportProgress: DriveSyncProgress;
   transcriptDuplicateId: string | null;
   recordingDuplicateProof: RecordingDuplicateProof | null;
+  expectedContentHashes: Partial<Record<DriveArtifactKey, string>>;
+  expectedContentSizes: Partial<Record<DriveArtifactKey, number>>;
+  sharingRisk: DriveSharingRisk;
 }) {
-  const fields = "id,name,mimeType,trashed,parents,appProperties,webViewLink";
+  const fields = "id,name,mimeType,version,modifiedTime,trashed,parents,appProperties,webViewLink,permissions(type,role,allowFileDiscovery)";
   const folder = await driveJson<DriveFile & { trashed?: boolean }>(
     `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.folder.id)}?supportsAllDrives=true&fields=${encodeURIComponent(fields)}`,
     input.accessToken,
@@ -1404,11 +1588,13 @@ async function verifyDriveArchive(input: {
     folder.id !== input.folder.id ||
     folder.mimeType !== FOLDER_MIME_TYPE ||
     folder.trashed === true ||
-    !folder.parents?.includes(input.expectedParentId) ||
+    !exactDriveParent(folder, input.expectedParentId) ||
     folder.appProperties?.tokyoDogsInterviewSession !== input.sessionId
   ) {
     throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
   }
+  const folderVersion = safeDriveVersion(folder);
+  const folderModifiedTime = safeDriveModifiedTime(folder);
   const required = ["transcript", "evaluation_json", "report_doc", "report_pdf", "manifest"];
   if (input.recordingByteSize !== null) required.push("recording");
 
@@ -1424,7 +1610,9 @@ async function verifyDriveArchive(input: {
       !canonicalFileId ||
       canonicalFiles.length !== 1 ||
       canonicalFiles[0].trashed === true ||
-      !exactDriveParent(canonicalFiles[0], folder.id)
+      !exactDriveParent(canonicalFiles[0], folder.id) ||
+      canonicalFiles[0].appProperties?.tokyoDogsArtifact !== artifactKey ||
+      canonicalFiles[0].appProperties?.tokyoDogsProvider !== DRIVE_PROVIDER
     ) {
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
     }
@@ -1603,6 +1791,12 @@ async function verifyDriveArchive(input: {
     if (files[0].trashed === true || !exactDriveParent(files[0], folder.id)) {
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
     }
+    if (
+      files[0].appProperties?.tokyoDogsArtifact !== artifactKey ||
+      files[0].appProperties?.tokyoDogsProvider !== DRIVE_PROVIDER
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
   }
   if (input.transcriptDuplicateId) {
     const quarantined = verifiedFiles.find((file) => file.id === input.transcriptDuplicateId);
@@ -1634,10 +1828,292 @@ async function verifyDriveArchive(input: {
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
     }
   }
-  return Object.fromEntries(required.map((key) => {
+  const files = Object.fromEntries(required.map((key) => {
     const file = byArtifact.get(key)?.[0] as DriveFile;
     return [key, fileSummary(file, file.name || key)];
   }));
+  const integrityEntries = await Promise.all(required.map(async (key) => {
+    const artifactKey = key as DriveArtifactKey;
+    const file = byArtifact.get(key)?.[0] as DriveFile;
+    return [artifactKey, await readArtifactIntegrityReceipt({
+      accessToken: input.accessToken,
+      artifactKey,
+      file,
+      expectedContentHash: input.expectedContentHashes[artifactKey],
+      expectedContentSize: input.expectedContentSizes[artifactKey],
+    })] as const;
+  }));
+  return {
+    files,
+    integrity: {
+      schemaVersion: "2026-08-14-v1",
+      status: "verified",
+      checkedAt: new Date().toISOString(),
+      errorCode: null,
+      sharingRisk: highestSharingRisk([
+        input.sharingRisk,
+        sharingRiskFromPermissions(folder.permissions),
+        ...required.map((key) => sharingRiskFromPermissions(
+          (byArtifact.get(key)?.[0] as DriveFile | undefined)?.permissions,
+        )),
+      ]),
+      folder: {
+        fileId: folder.id,
+        parentId: input.expectedParentId,
+        version: folderVersion,
+        modifiedTime: folderModifiedTime,
+      },
+      artifacts: Object.fromEntries(integrityEntries),
+    } satisfies GoogleDriveArchiveIntegrity,
+  };
+}
+
+function receiptFileId(
+  files: Record<string, unknown>,
+  artifactKey: DriveArtifactKey,
+) {
+  const aliases: Record<DriveArtifactKey, string[]> = {
+    transcript: ["transcript"],
+    evaluation_json: ["evaluation_json", "evaluation"],
+    report_doc: ["report_doc", "reportDocument"],
+    report_pdf: ["report_pdf", "reportPdf"],
+    manifest: ["manifest"],
+    recording: ["recording"],
+  };
+  for (const alias of aliases[artifactKey]) {
+    const value = files[alias];
+    if (!value || typeof value !== "object") continue;
+    const id = (value as Record<string, unknown>).fileId ?? (value as Record<string, unknown>).id;
+    if (typeof id === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(id)) return id;
+  }
+  return null;
+}
+
+export function googleDriveIntegrityReceiptsMatch(
+  stored: GoogleDriveArchiveIntegrity,
+  observed: GoogleDriveArchiveIntegrity,
+) {
+  if (
+    stored.folder.fileId !== observed.folder.fileId ||
+    stored.folder.parentId !== observed.folder.parentId ||
+    stored.folder.version !== observed.folder.version ||
+    stored.folder.modifiedTime !== observed.folder.modifiedTime
+  ) return false;
+  const storedKeys = Object.keys(stored.artifacts).sort();
+  const observedKeys = Object.keys(observed.artifacts).sort();
+  if (storedKeys.join("\0") !== observedKeys.join("\0")) return false;
+  return storedKeys.every((key) => {
+    const artifactKey = key as DriveArtifactKey;
+    const left = stored.artifacts[artifactKey];
+    const right = observed.artifacts[artifactKey];
+    return Boolean(
+      left && right &&
+      left.fileId === right.fileId &&
+      left.mimeType === right.mimeType &&
+      left.size === right.size &&
+      left.version === right.version &&
+      left.modifiedTime === right.modifiedTime &&
+      left.contentSha256 === right.contentSha256 &&
+      left.fingerprintSource === right.fingerprintSource,
+    );
+  });
+}
+
+export function googleDriveRecordingReceiptCanBeReused(input: {
+  stored: GoogleDriveArchiveIntegrity;
+  observed: GoogleDriveArchiveIntegrity;
+  sourceByteSize: number;
+  sourceContentType: string;
+}) {
+  if (!googleDriveIntegrityReceiptsMatch(input.stored, input.observed)) return false;
+  const stored = input.stored.artifacts.recording;
+  const observed = input.observed.artifacts.recording;
+  return Boolean(
+    stored && observed &&
+    stored.fileId === observed.fileId &&
+    stored.size === input.sourceByteSize &&
+    observed.size === input.sourceByteSize &&
+    stored.mimeType === input.sourceContentType &&
+    observed.mimeType === input.sourceContentType &&
+    stored.fingerprintSource === "sha256Checksum" &&
+    observed.fingerprintSource === "sha256Checksum" &&
+    stored.contentSha256 === observed.contentSha256 &&
+    stored.version === observed.version &&
+    stored.modifiedTime === observed.modifiedTime,
+  );
+}
+
+export function googleDriveIntegrityFailureStatus(error: unknown) {
+  const code = safeErrorCode(error);
+  if (
+    code === "GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH" ||
+    code === "GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH" ||
+    code === "GOOGLE_DRIVE_RECORDING_SIZE_MISMATCH" ||
+    code === "GOOGLE_DRIVE_API_404" ||
+    code === "GOOGLE_DRIVE_API_410"
+  ) return "drift" as const;
+  return "unknown" as const;
+}
+
+/**
+ * Performs only bounded Drive reads. The caller owns cooldown/claim persistence
+ * and must keep the original receipt when this snapshot differs or fails.
+ */
+export async function readGoogleDriveArchiveIntegritySnapshot(input: {
+  sessionId: string;
+  folderId: string;
+  files: Record<string, unknown>;
+  recordingIncluded: boolean;
+  previous?: GoogleDriveArchiveIntegrity;
+  accessToken?: string;
+}) : Promise<GoogleDriveArchiveIntegrity> {
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(input.folderId)) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+  }
+  const accessToken = input.accessToken ?? await fetchGoogleDriveAccessToken();
+  const fields = "id,name,mimeType,version,modifiedTime,trashed,parents,appProperties,permissions(type,role,allowFileDiscovery)";
+  const folder = await driveJson<DriveFile>(
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.folderId)}?supportsAllDrives=true&fields=${encodeURIComponent(fields)}`,
+    accessToken,
+  );
+  const parentId = input.previous?.folder.parentId ?? (
+    folder.parents?.length === 1 ? folder.parents[0] : null
+  );
+  if (
+    folder.id !== input.folderId ||
+    folder.mimeType !== FOLDER_MIME_TYPE ||
+    folder.trashed === true ||
+    !parentId || !exactDriveParent(folder, parentId) ||
+    folder.appProperties?.tokyoDogsInterviewSession !== input.sessionId
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+  }
+  const required: DriveArtifactKey[] = [
+    "transcript", "evaluation_json", "report_doc", "report_pdf", "manifest",
+  ];
+  if (input.recordingIncluded) required.push("recording");
+  const children = await listFolderChildren(accessToken, folder.id);
+  const byArtifact = indexDriveArtifacts(children);
+  const canonicalFiles = new Map<DriveArtifactKey, DriveFile>();
+  for (const artifactKey of required) {
+    const storedId = receiptFileId(input.files, artifactKey);
+    const previousId = input.previous?.artifacts[artifactKey]?.fileId ?? null;
+    if (storedId && previousId && storedId !== previousId) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    const expectedId = previousId ?? storedId;
+    const matches = byArtifact.get(artifactKey) ?? [];
+    if (
+      !expectedId || matches.length !== 1 || matches[0].id !== expectedId ||
+      matches[0].trashed === true || !exactDriveParent(matches[0], folder.id) ||
+      matches[0].appProperties?.tokyoDogsArtifact !== artifactKey ||
+      matches[0].appProperties?.tokyoDogsProvider !== DRIVE_PROVIDER
+    ) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    }
+    canonicalFiles.set(artifactKey, matches[0]);
+  }
+  const artifactEntries = await Promise.all(required.map(async (artifactKey) => [
+    artifactKey,
+    await readArtifactIntegrityReceipt({
+      accessToken,
+      artifactKey,
+      file: canonicalFiles.get(artifactKey) as DriveFile,
+    }),
+  ] as const));
+  return {
+    schemaVersion: "2026-08-14-v1",
+    status: "verified",
+    checkedAt: new Date().toISOString(),
+    errorCode: null,
+    sharingRisk: highestSharingRisk([
+      sharingRiskFromPermissions(folder.permissions),
+      ...required.map((key) => sharingRiskFromPermissions(canonicalFiles.get(key)?.permissions)),
+    ]),
+    folder: {
+      fileId: folder.id,
+      parentId,
+      version: safeDriveVersion(folder),
+      modifiedTime: safeDriveModifiedTime(folder),
+    },
+    artifacts: Object.fromEntries(artifactEntries),
+  };
+}
+
+function storedGoogleDriveIntegrity(value: unknown): GoogleDriveArchiveIntegrity | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const receipt = value as Partial<GoogleDriveArchiveIntegrity>;
+  if (
+    receipt.schemaVersion !== "2026-08-14-v1" ||
+    !["verified", "drift", "unknown"].includes(String(receipt.status)) ||
+    typeof receipt.checkedAt !== "string" ||
+    !receipt.folder || typeof receipt.folder !== "object" ||
+    typeof receipt.folder.fileId !== "string" ||
+    typeof receipt.folder.parentId !== "string" ||
+    typeof receipt.folder.version !== "string" ||
+    typeof receipt.folder.modifiedTime !== "string" ||
+    !receipt.artifacts || typeof receipt.artifacts !== "object"
+  ) return undefined;
+  return receipt as GoogleDriveArchiveIntegrity;
+}
+
+export async function revalidateCompletedGoogleDriveArchive(sessionId: string) {
+  const claim = await claimExternalSyncIntegrityCheck(sessionId);
+  if (!claim) return null;
+  const files = claim.manifest.files && typeof claim.manifest.files === "object" &&
+    !Array.isArray(claim.manifest.files)
+    ? claim.manifest.files as Record<string, unknown>
+    : {};
+  const previous = storedGoogleDriveIntegrity(claim.manifest.integrity);
+  const recordingIncluded = claim.manifest.recordingIncluded === true;
+  try {
+    const observed = await readGoogleDriveArchiveIntegritySnapshot({
+      sessionId,
+      folderId: claim.folderId,
+      files,
+      recordingIncluded,
+      previous,
+    });
+    const matches = !previous || googleDriveIntegrityReceiptsMatch(previous, observed);
+    const integrity = previous
+      ? {
+          ...previous,
+          status: matches ? "verified" as const : "drift" as const,
+          checkedAt: observed.checkedAt,
+          errorCode: matches ? null : "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT",
+          sharingRisk: observed.sharingRisk === "unknown"
+            ? previous.sharingRisk
+            : observed.sharingRisk,
+        }
+      : observed;
+    await finishExternalSyncIntegrityCheck({
+      claim,
+      manifest: { ...claim.manifest, integrity },
+    });
+    return integrity;
+  } catch (error) {
+    const status = googleDriveIntegrityFailureStatus(error);
+    const checkedAt = new Date().toISOString();
+    const errorCode = status === "drift"
+      ? "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT"
+      : safeErrorCode(error);
+    const integrity = previous
+      ? { ...previous, status, checkedAt, errorCode }
+      : {
+          schemaVersion: "2026-08-14-v1",
+          status,
+          checkedAt,
+          errorCode,
+          sharingRisk: "unknown",
+          folder: null,
+          artifacts: {},
+        };
+    await finishExternalSyncIntegrityCheck({
+      claim,
+      manifest: { ...claim.manifest, integrity },
+    });
+    return integrity;
+  }
 }
 
 /**
@@ -1710,6 +2186,13 @@ async function performDriveSync(
 }
 
 function assertArchiveReady(source: ArchiveSource) {
+  if (source.auditEvents.some((event) => [
+    "candidate_requested_stop",
+    "safety_escalation",
+    "completion_reason_invalid",
+  ].includes(event.type))) {
+    throw new Error("INTERVIEW_NOT_READY_FOR_DRIVE_SYNC");
+  }
   if (source.status !== "completed" || !source.evaluation) {
     throw new Error("INTERVIEW_NOT_READY_FOR_DRIVE_SYNC");
   }
@@ -1778,6 +2261,8 @@ async function prepareDriveArchive(
   const transcriptKind = transcriptAvailable ? "actual_transcript" : "recorded_fallback_placeholder";
   const resultJson = buildResultJson(source);
   const reportHtml = buildReportHtml(source);
+  const transcriptBytes = new TextEncoder().encode(transcript);
+  const resultJsonBytes = new TextEncoder().encode(resultJson);
   const filePrefix = source.sessionId;
   const recordingExtension = source.recording?.contentType.includes("mp4") ? "mp4" : "webm";
   const expectedRecordingName = source.recording
@@ -1795,7 +2280,7 @@ async function prepareDriveArchive(
     expectedRecordingByteSize: source.recording?.byteSize ?? null,
     expectedRecordingName,
     expectedRecordingContentType: source.recording?.contentType ?? null,
-    expectedTranscript: new TextEncoder().encode(transcript),
+    expectedTranscript: transcriptBytes,
   });
   await reportProgress();
   const transcriptFileName = transcriptAvailable
@@ -1839,6 +2324,11 @@ async function prepareDriveArchive(
   preflight.artifactTargetIds.report_doc = reportDoc.id;
   await reportProgress();
   const pdf = await exportGoogleDocToPdf(accessToken, reportDoc.id);
+  const [transcriptHash, resultJsonHash, reportPdfHash] = await Promise.all([
+    sha256Bytes(transcriptBytes),
+    sha256Bytes(resultJsonBytes),
+    sha256Bytes(pdf),
+  ]);
   await reportProgress();
   const reportPdf = await uploadSmallFile({
     accessToken,
@@ -1862,6 +2352,17 @@ async function prepareDriveArchive(
     recordingDuplicateProof: preflight.recordingDuplicateProof,
     transcriptAvailable,
     transcriptKind,
+    expectedContentHashes: {
+      transcript: transcriptHash,
+      evaluation_json: resultJsonHash,
+      report_pdf: reportPdfHash,
+    },
+    expectedContentSizes: {
+      transcript: transcriptBytes.byteLength,
+      evaluation_json: resultJsonBytes.byteLength,
+      report_pdf: pdf.byteLength,
+    },
+    sharingRisk: root.sharingRisk,
   };
 }
 
@@ -1892,6 +2393,7 @@ async function finalizeDriveArchive(
       throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
     }
     uploaded.recording = fileSummary(recordingFile, expectedRecordingName);
+    prepared.expectedContentSizes.recording = source.recording.byteSize;
   }
   // A stored upload step may predate artifact-target persistence, and the
   // folder can change while a multi-request recording upload is in flight.
@@ -1941,6 +2443,10 @@ async function finalizeDriveArchive(
     transcriptKind: prepared.transcriptKind,
     files: uploaded,
   };
+  const manifestBody = JSON.stringify(manifest, null, 2);
+  const manifestBytes = new TextEncoder().encode(manifestBody);
+  prepared.expectedContentHashes.manifest = await sha256Bytes(manifestBytes);
+  prepared.expectedContentSizes.manifest = manifestBytes.byteLength;
   await reportProgress();
   const manifestFile = await uploadSmallFile({
     accessToken,
@@ -1948,7 +2454,7 @@ async function finalizeDriveArchive(
     name: `${filePrefix}_格納結果.json`,
     artifactKey: "manifest",
     contentType: "application/json; charset=utf-8",
-    body: JSON.stringify(manifest, null, 2),
+    body: manifestBody,
     // `null` means the preflight saw no manifest. If a previous finalization
     // POST reached Drive but its response was lost, re-resolve a single exact
     // artifact instead of blindly POSTing a duplicate. findArtifact fails
@@ -1966,7 +2472,7 @@ async function finalizeDriveArchive(
   };
   if (uploaded.recording) canonicalFileIds.recording = uploaded.recording.id;
   await reportProgress();
-  const verifiedFiles = await verifyDriveArchive({
+  const verified = await verifyDriveArchive({
     accessToken,
     folder: prepared.candidateFolder,
     expectedParentId: prepared.expectedParentId,
@@ -1981,15 +2487,19 @@ async function finalizeDriveArchive(
     reportProgress,
     transcriptDuplicateId: prepared.transcriptDuplicateId,
     recordingDuplicateProof: prepared.recordingDuplicateProof,
+    expectedContentHashes: prepared.expectedContentHashes,
+    expectedContentSizes: prepared.expectedContentSizes,
+    sharingRisk: prepared.sharingRisk,
   });
   return {
     status: "completed",
     folderId: prepared.candidateFolder.id,
     folderUrl: prepared.folderUrl,
-    uploaded: verifiedFiles,
+    uploaded: verified.files,
     recordingIncluded: Boolean(source.recording),
     transcriptAvailable: prepared.transcriptAvailable,
     transcriptKind: prepared.transcriptKind,
+    integrity: verified.integrity,
   };
 }
 
@@ -2009,6 +2519,7 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
           recordingIncluded: current.manifest?.recordingIncluded === true,
           transcriptAvailable: current.manifest?.transcriptAvailable === true,
           transcriptKind: typeof current.manifest?.transcriptKind === "string" ? current.manifest.transcriptKind : "unknown",
+          integrity: current.manifest?.integrity as GoogleDriveArchiveIntegrity | undefined,
         };
       }
       throw new Error("GOOGLE_DRIVE_SYNC_ALREADY_RUNNING");
@@ -2029,6 +2540,7 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
           recordingIncluded: lastCompleted.recordingIncluded,
           transcriptAvailable: lastCompleted.transcriptAvailable,
           transcriptKind: lastCompleted.transcriptKind,
+          integrity: lastCompleted.integrity,
         },
       });
       if (!retryRequested) return lastCompleted;
@@ -2063,6 +2575,7 @@ function completedResultFromStatus(status: NonNullable<Awaited<ReturnType<typeof
     recordingIncluded: status.manifest?.recordingIncluded === true,
     transcriptAvailable: status.manifest?.transcriptAvailable === true,
     transcriptKind: typeof status.manifest?.transcriptKind === "string" ? status.manifest.transcriptKind : "unknown",
+    integrity: status.manifest?.integrity as GoogleDriveArchiveIntegrity | undefined,
   };
 }
 
@@ -2147,6 +2660,25 @@ function preparedArchiveFromContext(value: Record<string, unknown>): PreparedDri
     typeof storedRecordingDuplicate.fingerprint === "string"
     ? storedRecordingDuplicate as unknown as RecordingDuplicateProof
     : null;
+  const storedHashes = value.expectedContentHashes && typeof value.expectedContentHashes === "object"
+    ? value.expectedContentHashes as Record<string, unknown>
+    : {};
+  const storedSizes = value.expectedContentSizes && typeof value.expectedContentSizes === "object"
+    ? value.expectedContentSizes as Record<string, unknown>
+    : {};
+  const expectedContentHashes = Object.fromEntries(
+    Object.entries(storedHashes).filter(([key, hash]) =>
+      ["transcript", "evaluation_json", "report_doc", "report_pdf", "manifest", "recording"].includes(key) &&
+      typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash)),
+  ) as Partial<Record<DriveArtifactKey, string>>;
+  const expectedContentSizes = Object.fromEntries(
+    Object.entries(storedSizes).filter(([key, size]) =>
+      ["transcript", "evaluation_json", "report_doc", "report_pdf", "manifest", "recording"].includes(key) &&
+      typeof size === "number" && Number.isSafeInteger(size) && size >= 0),
+  ) as Partial<Record<DriveArtifactKey, number>>;
+  const sharingRisk = ["anyone_writer", "anyone_reader", "restricted", "unknown"].includes(String(value.sharingRisk))
+    ? value.sharingRisk as DriveSharingRisk
+    : "unknown";
   return {
     rootFolderId: value.rootFolderId,
     expectedParentId: value.expectedParentId,
@@ -2160,6 +2692,9 @@ function preparedArchiveFromContext(value: Record<string, unknown>): PreparedDri
     recordingDuplicateProof,
     transcriptAvailable: value.transcriptAvailable,
     transcriptKind: value.transcriptKind,
+    expectedContentHashes,
+    expectedContentSizes,
+    sharingRisk,
   };
 }
 
@@ -2175,6 +2710,9 @@ function preparedArchiveContext(prepared: PreparedDriveArchive): Record<string, 
     recordingDuplicateProof: prepared.recordingDuplicateProof,
     transcriptAvailable: prepared.transcriptAvailable,
     transcriptKind: prepared.transcriptKind,
+    expectedContentHashes: prepared.expectedContentHashes,
+    expectedContentSizes: prepared.expectedContentSizes,
+    sharingRisk: prepared.sharingRisk,
   };
 }
 
@@ -2217,6 +2755,7 @@ async function completeSteppedArchive(input: {
       recordingIncluded: result.recordingIncluded,
       transcriptAvailable: input.prepared.transcriptAvailable,
       transcriptKind: input.prepared.transcriptKind,
+      integrity: result.integrity,
     },
     driveUploadStepLeaseToken: input.leaseToken,
   });
@@ -2251,7 +2790,11 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
     if (!hasActualCandidateTranscript(source)) {
       throw new Error("INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC");
     }
-    if (completedReceiptSatisfiesSource(alreadyCompleted, source)) return alreadyCompleted;
+    if (completedReceiptSatisfiesSource(alreadyCompleted, source)) {
+      await revalidateCompletedGoogleDriveArchive(sessionId);
+      const refreshed = await getExternalSyncStatus(sessionId);
+      return refreshed ? completedResultFromStatus(refreshed) ?? alreadyCompleted : alreadyCompleted;
+    }
 
     // A legacy completed row can describe a five-file archive created before
     // the recording was durable, or a placeholder/unknown transcript. Never
@@ -2350,6 +2893,7 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
             recordingIncluded: false,
             transcriptAvailable: prepared.transcriptAvailable,
             transcriptKind: prepared.transcriptKind,
+            integrity: result.integrity,
           },
         });
         return result;

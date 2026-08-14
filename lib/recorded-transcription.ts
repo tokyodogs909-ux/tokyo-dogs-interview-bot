@@ -1,4 +1,5 @@
 import { privacySafeIdentifier, requireOpenAIApiKey } from "@/lib/openai-server";
+import { decodeOpenAIJson, fetchOpenAIBytes } from "@/lib/openai-fetch";
 import type { InterviewSessionRecord } from "@/lib/interview-persistence";
 
 type RecordedTranscriptionBindings = {
@@ -49,6 +50,27 @@ const SAFE_CAUGHT_TRANSCRIPTION_CODES = new Map<string, string>([
   ["RECORDED_ANSWER_AUDIO_DIGEST_MISMATCH", "recorded_answer_audio_digest_mismatch"],
   ["OPENAI_API_KEY is not configured on the server", "openai_api_key_unconfigured"],
 ]);
+
+function sessionRecordHasCompletionHold(session: InterviewSessionRecord) {
+  return Number(session.candidate_requested_stop ?? 0) === 1 ||
+    Number(session.safety_escalation ?? 0) === 1 ||
+    Number(session.completion_reason_invalid ?? 0) === 1;
+}
+
+async function assertRecordedInterviewMutationAllowed(db: D1Database, sessionId: string) {
+  const active = await db.prepare(`SELECT 1 AS active
+    FROM interview_sessions session
+    WHERE session.id = ?
+      AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = session.id
+          AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          ))
+    LIMIT 1`)
+    .bind(sessionId)
+    .first<{ active: number }>();
+  if (Number(active?.active ?? 0) !== 1) throw new Error("RECORDED_INTERVIEW_HELD");
+}
 
 function bindings() {
   return (globalThis as typeof globalThis & {
@@ -152,7 +174,14 @@ async function registerAudio(input: {
   await input.db.prepare(`INSERT OR IGNORE INTO recorded_answer_transcriptions (
     session_id, answer_index, object_key, content_type, byte_size, audio_sha256,
     status, created_at, updated_at
-  ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
+  ) SELECT ?, ?, ?, ?, ?, ?, 'pending', ?, ?
+    WHERE EXISTS (SELECT 1 FROM interview_sessions session
+      WHERE session.id = ?
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = session.id
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            )))`)
     .bind(
       input.session.id,
       input.answerIndex,
@@ -162,10 +191,11 @@ async function registerAudio(input: {
       digest,
       now,
       now,
+      input.session.id,
     )
     .run();
   const row = await answerRow(input.db, input.session.id, input.answerIndex);
-  if (!row) throw new Error("RECORDED_TRANSCRIPTION_ROW_UNAVAILABLE");
+  if (!row) throw new Error("RECORDED_INTERVIEW_HELD");
   if (
     row.audio_sha256 !== digest ||
     row.byte_size !== input.bytes.byteLength ||
@@ -196,11 +226,17 @@ async function registerAudio(input: {
     });
     etag = object.etag ?? null;
   }
-  await input.db.prepare(`UPDATE recorded_answer_transcriptions
+  const updated = await input.db.prepare(`UPDATE recorded_answer_transcriptions
     SET etag = ?, updated_at = ?
-    WHERE session_id = ? AND answer_index = ? AND audio_sha256 = ?`)
+    WHERE session_id = ? AND answer_index = ? AND audio_sha256 = ?
+      AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = recorded_answer_transcriptions.session_id
+          AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          ))`)
     .bind(etag, new Date().toISOString(), input.session.id, input.answerIndex, digest)
     .run();
+  if (Number(updated.meta?.changes ?? 0) !== 1) throw new Error("RECORDED_INTERVIEW_HELD");
   return await answerRow(input.db, input.session.id, input.answerIndex) ?? row;
 }
 
@@ -258,7 +294,9 @@ function warnRecordedTranscriptionRetry(input: {
 }
 
 function safeCaughtTranscriptionCode(error: unknown) {
-  if (error instanceof Error && error.name === "AbortError") return "transcription_timeout";
+  if (error instanceof Error && (
+    error.name === "AbortError" || error.message === "OPENAI_REQUEST_TIMEOUT"
+  )) return "transcription_timeout";
   if (error instanceof Error) {
     const knownCode = SAFE_CAUGHT_TRANSCRIPTION_CODES.get(error.message);
     if (knownCode) return knownCode;
@@ -282,29 +320,44 @@ async function markPending(input: {
   retryAfterSeconds: number;
 }) {
   const now = new Date();
+  const updatedAt = now.toISOString();
   const retryAt = new Date(now.getTime() + input.retryAfterSeconds * 1000).toISOString();
   await input.db.batch([
     input.db.prepare(`UPDATE recorded_answer_transcriptions
       SET status = 'pending', claim_id = NULL, claimed_at = NULL,
         last_error_code = ?, next_retry_at = ?, updated_at = ?
-      WHERE session_id = ? AND answer_index = ? AND status = 'processing' AND claim_id = ?`)
+      WHERE session_id = ? AND answer_index = ? AND status = 'processing' AND claim_id = ?
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = recorded_answer_transcriptions.session_id
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            ))`)
       .bind(
         input.code,
         retryAt,
-        now.toISOString(),
+        updatedAt,
         input.row.session_id,
         input.row.answer_index,
         input.claimId,
       ),
     input.db.prepare(`INSERT INTO interview_audit_events (
       id, session_id, event_type, actor_type, detail_json
-    ) VALUES (?, ?, 'transcription_failed', 'system', ?)`)
+    ) SELECT ?, ?, 'transcription_failed', 'system', ?
+      WHERE EXISTS (SELECT 1 FROM recorded_answer_transcriptions answer
+        WHERE answer.session_id = ? AND answer.answer_index = ?
+          AND answer.status = 'pending' AND answer.claim_id IS NULL
+          AND answer.last_error_code = ? AND answer.updated_at = ?)
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = ?
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            ))`)
       .bind(crypto.randomUUID(), input.row.session_id, JSON.stringify({
         answerIndex: input.row.answer_index,
         errorCode: input.code,
         retryable: true,
         retryAt,
-      })),
+      }), input.row.session_id, input.row.answer_index, input.code, updatedAt, input.row.session_id),
   ]);
 }
 
@@ -314,26 +367,41 @@ async function markFailed(input: {
   claimId: string;
   code: string;
 }) {
+  const updatedAt = new Date().toISOString();
   await input.db.batch([
     input.db.prepare(`UPDATE recorded_answer_transcriptions
       SET status = 'failed', claim_id = NULL, claimed_at = NULL,
         last_error_code = ?, next_retry_at = NULL, updated_at = ?
-      WHERE session_id = ? AND answer_index = ? AND status = 'processing' AND claim_id = ?`)
+      WHERE session_id = ? AND answer_index = ? AND status = 'processing' AND claim_id = ?
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = recorded_answer_transcriptions.session_id
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            ))`)
       .bind(
         input.code,
-        new Date().toISOString(),
+        updatedAt,
         input.row.session_id,
         input.row.answer_index,
         input.claimId,
       ),
     input.db.prepare(`INSERT INTO interview_audit_events (
       id, session_id, event_type, actor_type, detail_json
-    ) VALUES (?, ?, 'transcription_failed', 'system', ?)`)
+    ) SELECT ?, ?, 'transcription_failed', 'system', ?
+      WHERE EXISTS (SELECT 1 FROM recorded_answer_transcriptions answer
+        WHERE answer.session_id = ? AND answer.answer_index = ?
+          AND answer.status = 'failed' AND answer.claim_id IS NULL
+          AND answer.last_error_code = ? AND answer.updated_at = ?)
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = ?
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            ))`)
       .bind(crypto.randomUUID(), input.row.session_id, JSON.stringify({
         answerIndex: input.row.answer_index,
         errorCode: input.code,
         retryable: false,
-      })),
+      }), input.row.session_id, input.row.answer_index, input.code, updatedAt, input.row.session_id),
   ]);
 }
 
@@ -362,7 +430,12 @@ async function transcribeRegisteredAnswer(
       attempt_count = attempt_count + 1, last_error_code = NULL,
       next_retry_at = NULL, updated_at = ?
     WHERE session_id = ? AND answer_index = ?
-      AND (status = 'pending' OR (status = 'processing' AND claimed_at < ?))`)
+      AND (status = 'pending' OR (status = 'processing' AND claimed_at < ?))
+      AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = recorded_answer_transcriptions.session_id
+          AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          ))`)
     .bind(claimId, claimedAt, claimedAt, row.session_id, row.answer_index, staleBefore)
     .run();
   if (Number(claim.meta?.changes ?? 0) !== 1) {
@@ -390,8 +463,6 @@ async function transcribeRegisteredAnswer(
     await markPending({ db, row: claimedRow, claimId, code: "audio_object_missing", retryAfterSeconds: 30 });
     return { state: "pending", answerIndex: row.answer_index, retryAfterSeconds: 30, reason: "upstream_unavailable" };
   }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TRANSCRIPTION_TIMEOUT_MS);
   let upstreamResponse: Response | null = null;
   try {
     const bytes = await object.arrayBuffer();
@@ -415,10 +486,23 @@ async function transcribeRegisteredAnswer(
         "OpenAI-Safety-Identifier": sessionIdHash,
       },
       body: form,
-      signal: controller.signal,
     });
-    upstreamResponse = openAI ? await openAI.fetch(request) : await fetch(request);
-    const payload = await upstreamResponse.json().catch(() => null) as { text?: unknown } | null;
+    const upstream = await fetchOpenAIBytes(request, {
+      timeoutMs: TRANSCRIPTION_TIMEOUT_MS,
+      maxResponseBytes: 1_000_000,
+      fetcher: openAI,
+    });
+    upstreamResponse = upstream.response;
+    const payload = (() => {
+      try {
+        const decoded = decodeOpenAIJson(upstream.bytes);
+        return decoded && typeof decoded === "object"
+          ? decoded as { text?: unknown; error?: { code?: unknown; type?: unknown } }
+          : null;
+      } catch {
+        return null;
+      }
+    })();
     if (!upstreamResponse.ok) {
       const errorCode = sanitizedOpenAIError(payload) ?? `http_${upstreamResponse.status}`;
       if ([401, 403, 429].includes(upstreamResponse.status) || upstreamResponse.status >= 500) {
@@ -452,7 +536,12 @@ async function transcribeRegisteredAnswer(
     const completed = await db.prepare(`UPDATE recorded_answer_transcriptions
       SET status = 'completed', transcript_text = ?, claim_id = NULL,
         claimed_at = NULL, last_error_code = NULL, next_retry_at = NULL, updated_at = ?
-      WHERE session_id = ? AND answer_index = ? AND status = 'processing' AND claim_id = ?`)
+      WHERE session_id = ? AND answer_index = ? AND status = 'processing' AND claim_id = ?
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = recorded_answer_transcriptions.session_id
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            ))`)
       .bind(text, completedAt, row.session_id, row.answer_index, claimId)
       .run();
     if (Number(completed.meta?.changes ?? 0) !== 1) {
@@ -473,8 +562,6 @@ async function transcribeRegisteredAnswer(
     });
     await markPending({ db, row: claimedRow, claimId, code, retryAfterSeconds: seconds });
     return { state: "pending", answerIndex: row.answer_index, retryAfterSeconds: seconds, reason: "upstream_unavailable" };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -487,6 +574,8 @@ export async function saveAndTranscribeRecordedAnswer(input: {
   if (!validateRecordedAnswerIndex(input.answerIndex)) throw new Error("RECORDED_ANSWER_INDEX_INVALID");
   const { db, bucket, openAI } = resources();
   await ensureSchema(db);
+  if (sessionRecordHasCompletionHold(input.session)) throw new Error("RECORDED_INTERVIEW_HELD");
+  await assertRecordedInterviewMutationAllowed(db, input.session.id);
   let row: RecordedAnswerRow | null;
   if (input.bytes) {
     if (!input.contentType || !validateRecordedAnswerContentType(input.contentType)) {
@@ -542,17 +631,31 @@ export async function sealRecordedInterviewCompletion(sessionId: string, expecte
   }
   const { db } = resources();
   await ensureSchema(db);
+  await assertRecordedInterviewMutationAllowed(db, sessionId);
   const now = new Date().toISOString();
   await db.prepare(`INSERT OR IGNORE INTO recorded_interview_completions (
     session_id, expected_answer_count, requested_at, created_at, updated_at
-  ) VALUES (?, ?, ?, ?, ?)`)
-    .bind(sessionId, expectedAnswerCount, now, now, now)
+  ) SELECT ?, ?, ?, ?, ?
+    WHERE EXISTS (SELECT 1 FROM interview_sessions session
+      WHERE session.id = ?
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = session.id
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            )))`)
+    .bind(sessionId, expectedAnswerCount, now, now, now, sessionId)
     .run();
   const seal = await db.prepare(`SELECT session_id, expected_answer_count, requested_at
-    FROM recorded_interview_completions WHERE session_id = ? LIMIT 1`)
+    FROM recorded_interview_completions completion WHERE session_id = ?
+      AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = completion.session_id
+          AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          ))
+    LIMIT 1`)
     .bind(sessionId)
     .first<{ session_id: string; expected_answer_count: number; requested_at: string }>();
-  if (!seal) throw new Error("RECORDED_COMPLETION_SEAL_UNAVAILABLE");
+  if (!seal) throw new Error("RECORDED_INTERVIEW_HELD");
   if (Number(seal.expected_answer_count) !== expectedAnswerCount) {
     throw new Error("RECORDED_ANSWER_COUNT_MISMATCH");
   }
@@ -563,7 +666,13 @@ export async function getRecordedInterviewCompletionSeal(sessionId: string) {
   const { db } = resources();
   await ensureSchema(db);
   const seal = await db.prepare(`SELECT session_id, expected_answer_count, requested_at
-    FROM recorded_interview_completions WHERE session_id = ? LIMIT 1`)
+    FROM recorded_interview_completions completion WHERE session_id = ?
+      AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = completion.session_id
+          AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          ))
+    LIMIT 1`)
     .bind(sessionId)
     .first<{ session_id: string; expected_answer_count: number; requested_at: string }>();
   return seal
@@ -586,6 +695,11 @@ export async function recoverNextRecordedAnswerTranscription() {
     INNER JOIN recorded_interview_completions c ON c.session_id = r.session_id
     WHERE s.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
       AND s.recording_status = 'stored'
+      AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id
+          AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          ))
       AND r.answer_index <= c.expected_answer_count
       AND (
         (r.status = 'pending' AND (r.next_retry_at IS NULL OR r.next_retry_at <= ?))
@@ -619,6 +733,11 @@ export async function findRecordedInterviewReadyForCompletion() {
         ((e.started_at IS NOT NULL AND e.started_at < ?)
           OR (e.session_id IS NULL AND s.updated_at < ?))))
       AND s.recording_status = 'stored'
+      AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id
+          AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          ))
       AND c.expected_answer_count BETWEEN 1 AND ?
       AND (SELECT COUNT(*) FROM recorded_answer_transcriptions r
         WHERE r.session_id = c.session_id

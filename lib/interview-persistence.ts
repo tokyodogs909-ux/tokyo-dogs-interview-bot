@@ -11,6 +11,7 @@ import {
   sha256Hex,
   signedInvitesRequired,
 } from "@/lib/interview-invite";
+import { secureServerSecretMatch, serverSecretReadiness } from "@/lib/server-secret-auth";
 
 type InterviewBindings = {
   DB?: D1Database;
@@ -31,7 +32,20 @@ export type InterviewSessionRecord = {
   recording_status: string;
   expires_at: string;
   retention_until: string;
+  candidate_requested_stop?: number;
+  safety_escalation?: number;
+  completion_reason_invalid?: number;
+  candidate_transcription_failed?: number;
 };
+
+export function interviewSessionHasCompletionHold(
+  session: Pick<InterviewSessionRecord,
+    "candidate_requested_stop" | "safety_escalation" | "completion_reason_invalid">,
+) {
+  return Number(session.candidate_requested_stop ?? 0) === 1 ||
+    Number(session.safety_escalation ?? 0) === 1 ||
+    Number(session.completion_reason_invalid ?? 0) === 1;
+}
 
 export type AuthorizedReviewer = string;
 
@@ -47,6 +61,13 @@ export const INTERVIEW_RETENTION_DAYS = 365;
 export const RECORDING_UPLOAD_PART_BYTES = 4 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 95 * 1024 * 1024;
 const MAX_RECORDING_PARTS = 32;
+// Before Version 3 is sealed every accepted part must be a complete 4 MiB
+// part. Never accept a prefix that can no longer fit under the final byte cap;
+// the possible last partial is accepted only after seal fixes its exact size.
+const MAX_PROVISIONAL_RECORDING_FULL_PARTS = Math.floor(
+  MAX_RECORDING_BYTES / RECORDING_UPLOAD_PART_BYTES,
+);
+const PROVISIONAL_RECORDING_UPLOAD_MAX_AGE_MS = 3 * 60 * 60 * 1_000;
 // Automatic recovery must never give up while the candidate can still resume
 // with their original token. After expiry, repeated missing-part observations
 // may terminalize the automatic loop; a sparse scheduler still has a finite
@@ -56,6 +77,15 @@ const RECORDING_RECOVERY_ABSOLUTE_DEADLINE_MS = 6 * 60 * 60 * 1_000;
 const RECORDING_RECOVERY_MISSING_ATTEMPT_LIMIT = 12;
 const RECORDING_RECOVERY_MISSING_EVENT = "recording_recovery_part_missing";
 const RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT = "recording_recovery_manual_attention";
+const LEGACY_RECORDING_RECOVERY_CLAIM_EVENT = "legacy_recording_recovery_claimed";
+const LEGACY_RECORDING_RECOVERED_EVENT = "legacy_recording_recovered";
+const LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT =
+  "legacy_recording_recovery_manual_attention";
+const LEGACY_RECORDING_RECOVERY_LEASE_MS = 4 * 60 * 1_000;
+const LEGACY_RECORDING_RECOVERY_EXPIRY_GRACE_MS = 30 * 60 * 1_000;
+const LEGACY_V1_MAX_RECORDING_BYTES = 90 * 1024 * 1024;
+const LEGACY_V1_MAX_PARTS = Math.ceil(LEGACY_V1_MAX_RECORDING_BYTES / RECORDING_UPLOAD_PART_BYTES);
+const LEGACY_V1_STATE_MAX_BYTES = 4 * 1024;
 
 function retentionUntil(from: Date) {
   return new Date(from.getTime() + INTERVIEW_RETENTION_DAYS * 24 * 60 * 60 * 1_000).toISOString();
@@ -67,6 +97,8 @@ export const CANDIDATE_EVENT_TYPES = [
   "recording_unavailable",
   "connection_failed",
   "candidate_requested_stop",
+  "safety_escalation",
+  "completion_reason_invalid",
   "time_limit_reached",
   "reasonable_accommodation_text_selected",
 ] as const;
@@ -132,10 +164,31 @@ export async function getInterviewSessionState(sessionId: string) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
-  return await db.prepare(`SELECT id, status, recording_status, transcript_json
-    FROM interview_sessions WHERE id = ? LIMIT 1`)
+  return await db.prepare(`SELECT s.id, s.status, s.recording_status, s.transcript_json,
+      s.evaluation_json, s.employment, s.preferred_location,
+      EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id
+          AND hold.event_type = 'candidate_requested_stop') AS candidate_requested_stop,
+      EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id
+          AND hold.event_type = 'safety_escalation') AS safety_escalation,
+      EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id
+          AND hold.event_type = 'completion_reason_invalid') AS completion_reason_invalid
+    FROM interview_sessions s WHERE s.id = ? LIMIT 1`)
     .bind(sessionId)
-    .first<{ id: string; status: string; recording_status: string; transcript_json: string | null }>();
+    .first<{
+      id: string;
+      status: string;
+      recording_status: string;
+      transcript_json: string | null;
+      evaluation_json: string | null;
+      employment: string;
+      preferred_location: string;
+      candidate_requested_stop: number;
+      safety_escalation: number;
+      completion_reason_invalid: number;
+    }>();
 }
 
 export type InterviewRecoveryTechnicalStatus = {
@@ -280,7 +333,9 @@ export async function getInterviewRecoveryTechnicalStatus(
         WHERE ta.session_id = s.id
           AND ta.event_type = 'transcription_failed'
           AND CASE WHEN json_valid(ta.detail_json)
-            THEN json_extract(ta.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+            THEN json_extract(ta.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+            )
       ) AS candidate_transcription_failed,
       (SELECT a.byte_size FROM interview_artifacts AS a
         WHERE a.session_id = s.id AND a.kind = 'recording'
@@ -388,6 +443,17 @@ async function ensureSchema(db: D1Database) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_evaluation_claims_started_idx ON interview_evaluation_claims (started_at)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_transcript_drafts (
+      session_id TEXT PRIMARY KEY NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+      mode TEXT NOT NULL,
+      transcript_json TEXT NOT NULL,
+      transcript_sha256 TEXT NOT NULL,
+      turn_count INTEGER NOT NULL,
+      sealed_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_transcript_drafts_sealed_idx ON interview_transcript_drafts (sealed_at)"),
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_artifacts (
       id TEXT PRIMARY KEY NOT NULL,
       session_id TEXT NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
@@ -739,12 +805,300 @@ export async function authorizeInterviewRequest(request: Request, sessionId: str
   const authorization = request.headers.get("Authorization") ?? "";
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
   if (!token) return null;
-  const session = await db.prepare(
-    "SELECT id, access_token_hash, candidate_name, employment, preferred_location, status, recording_status, expires_at, retention_until FROM interview_sessions WHERE id = ? LIMIT 1",
-  ).bind(sessionId).first<InterviewSessionRecord>();
+  const session = await db.prepare(`SELECT s.id, s.access_token_hash, s.candidate_name,
+      s.employment, s.preferred_location, s.status, s.recording_status,
+      s.expires_at, s.retention_until,
+      EXISTS (SELECT 1 FROM interview_audit_events stopped
+        WHERE stopped.session_id = s.id
+          AND stopped.event_type = 'candidate_requested_stop') AS candidate_requested_stop
+      ,EXISTS (SELECT 1 FROM interview_audit_events safety
+        WHERE safety.session_id = s.id
+          AND safety.event_type = 'safety_escalation') AS safety_escalation
+      ,EXISTS (SELECT 1 FROM interview_audit_events invalid_reason
+        WHERE invalid_reason.session_id = s.id
+          AND invalid_reason.event_type = 'completion_reason_invalid') AS completion_reason_invalid
+      ,EXISTS (SELECT 1 FROM interview_audit_events transcript_gap
+        WHERE transcript_gap.session_id = s.id
+          AND transcript_gap.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(transcript_gap.detail_json)
+            THEN json_extract(transcript_gap.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+            )) AS candidate_transcription_failed
+    FROM interview_sessions s WHERE s.id = ? LIMIT 1`)
+    .bind(sessionId).first<InterviewSessionRecord>();
   if (!session || !constantTimeEqualText(session.access_token_hash, await sha256(token))) return null;
   if (Date.parse(session.expires_at) <= Date.now()) return null;
   return { session };
+}
+
+export type InterviewTranscriptDraftMode = "voice" | "text";
+
+type InterviewTranscriptDraftRow = {
+  mode: string;
+  transcript_json: string;
+  transcript_sha256: string;
+  turn_count: number;
+  sealed_at: string | null;
+};
+
+function serializeTranscriptDraft(transcript: TranscriptTurn[]) {
+  if (transcript.length < 1 || transcript.length > 300) {
+    throw new Error("TRANSCRIPT_DRAFT_NOT_READY");
+  }
+  for (const turn of transcript) {
+    if (
+      !turn ||
+      typeof turn.id !== "string" ||
+      turn.id.length < 1 ||
+      turn.id.length > 120 ||
+      (turn.speaker !== "candidate" && turn.speaker !== "interviewer") ||
+      typeof turn.text !== "string" ||
+      turn.text.length < 1 ||
+      turn.text.length > 5_000 ||
+      typeof turn.createdAt !== "string" ||
+      turn.createdAt.length > 40
+    ) {
+      throw new Error("TRANSCRIPT_DRAFT_NOT_READY");
+    }
+  }
+  const serialized = JSON.stringify(transcript);
+  if (serialized.length > 180_000) throw new Error("TRANSCRIPT_DRAFT_NOT_READY");
+  return serialized;
+}
+
+function serializedTranscriptIsPrefix(prefixJson: string, valueJson: string) {
+  const prefix = parseJson<unknown>(prefixJson, null);
+  const value = parseJson<unknown>(valueJson, null);
+  if (!Array.isArray(prefix) || !Array.isArray(value) || prefix.length > value.length) return false;
+  return prefix.every((turn, index) => JSON.stringify(turn) === JSON.stringify(value[index]));
+}
+
+async function interviewTranscriptModeState(
+  db: D1Database,
+  sessionId: string,
+) {
+  return await db.prepare(`SELECT s.status, s.transcript_json,
+      EXISTS (SELECT 1 FROM interview_audit_events
+        WHERE session_id = s.id AND event_type = 'reasonable_accommodation_text_selected') AS text_started,
+      EXISTS (SELECT 1 FROM interview_audit_events
+        WHERE session_id = s.id AND event_type = 'recorded_fallback_started') AS recorded_fallback_started,
+      EXISTS (SELECT 1 FROM interview_audit_events
+        WHERE session_id = s.id AND event_type = 'voice_transcript_sealed') AS voice_transcript_sealed,
+      EXISTS (SELECT 1 FROM interview_audit_events
+        WHERE session_id = s.id AND event_type = 'evaluation_started') AS evaluation_started
+    FROM interview_sessions s WHERE s.id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<{
+      status: string;
+      transcript_json: string | null;
+      text_started: number;
+      recorded_fallback_started: number;
+      voice_transcript_sealed: number;
+      evaluation_started: number;
+    }>();
+}
+
+function transcriptModeMatches(
+  state: { text_started: number; recorded_fallback_started: number } | null,
+  mode: InterviewTranscriptDraftMode,
+) {
+  if (!state || Number(state.recorded_fallback_started) === 1) return false;
+  return mode === "text"
+    ? Number(state.text_started) === 1
+    : Number(state.text_started) !== 1;
+}
+
+/**
+ * Saves a completed-turn snapshot without ever rewriting a prior turn. The
+ * current row digest is used as the compare-and-swap fence, so two tabs may
+ * only converge on the same append-only transcript; divergent histories fail.
+ */
+export async function saveInterviewTranscriptDraft(input: {
+  sessionId: string;
+  mode: InterviewTranscriptDraftMode;
+  transcript: TranscriptTurn[];
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const transcriptJson = serializeTranscriptDraft(input.transcript);
+  const transcriptSha256 = await sha256(transcriptJson);
+  const state = await interviewTranscriptModeState(db, input.sessionId);
+  if (!transcriptModeMatches(state, input.mode)) throw new Error("TRANSCRIPT_DRAFT_MODE_CONFLICT");
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const current = await db.prepare(`SELECT mode, transcript_json, transcript_sha256,
+        turn_count, sealed_at
+      FROM interview_transcript_drafts WHERE session_id = ? LIMIT 1`)
+      .bind(input.sessionId)
+      .first<InterviewTranscriptDraftRow>();
+    if (current) {
+      if (current.mode !== input.mode) throw new Error("TRANSCRIPT_DRAFT_MODE_CONFLICT");
+      if (current.transcript_json === transcriptJson && current.transcript_sha256 === transcriptSha256) {
+        return {
+          sha256: transcriptSha256,
+          turnCount: input.transcript.length,
+          alreadyStored: true,
+          sealed: Boolean(current.sealed_at),
+        };
+      }
+      if (current.sealed_at || !serializedTranscriptIsPrefix(current.transcript_json, transcriptJson)) {
+        throw new Error("TRANSCRIPT_DRAFT_PREFIX_CONFLICT");
+      }
+      if (!state || !["in_progress", "evaluation_pending", "evaluation_processing"].includes(state.status)) {
+        throw new Error("TRANSCRIPT_DRAFT_NOT_READY");
+      }
+      const updated = await db.prepare(`UPDATE interview_transcript_drafts SET
+          transcript_json = ?, transcript_sha256 = ?, turn_count = ?, updated_at = ?
+        WHERE session_id = ? AND mode = ? AND transcript_sha256 = ? AND sealed_at IS NULL`)
+        .bind(
+          transcriptJson,
+          transcriptSha256,
+          input.transcript.length,
+          new Date().toISOString(),
+          input.sessionId,
+          input.mode,
+          current.transcript_sha256,
+        )
+        .run();
+      if (Number(updated.meta?.changes ?? 0) === 1) {
+        return {
+          sha256: transcriptSha256,
+          turnCount: input.transcript.length,
+          alreadyStored: false,
+          sealed: false,
+        };
+      }
+      continue;
+    }
+    if (!state || !["in_progress", "evaluation_pending", "evaluation_processing"].includes(state.status)) {
+      throw new Error("TRANSCRIPT_DRAFT_NOT_READY");
+    }
+    const now = new Date().toISOString();
+    const inserted = await db.prepare(`INSERT INTO interview_transcript_drafts (
+        session_id, mode, transcript_json, transcript_sha256, turn_count,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO NOTHING`)
+      .bind(
+        input.sessionId,
+        input.mode,
+        transcriptJson,
+        transcriptSha256,
+        input.transcript.length,
+        now,
+        now,
+      )
+      .run();
+    if (Number(inserted.meta?.changes ?? 0) === 1) {
+      return {
+        sha256: transcriptSha256,
+        turnCount: input.transcript.length,
+        alreadyStored: false,
+        sealed: false,
+      };
+    }
+  }
+  throw new Error("TRANSCRIPT_DRAFT_CAS_CONFLICT");
+}
+
+/** Seals only the exact snapshot already receipted by the draft endpoint. */
+export async function sealInterviewTranscriptDraft(input: {
+  sessionId: string;
+  mode: InterviewTranscriptDraftMode;
+  transcript: TranscriptTurn[];
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const transcriptJson = serializeTranscriptDraft(input.transcript);
+  const transcriptSha256 = await sha256(transcriptJson);
+  const state = await interviewTranscriptModeState(db, input.sessionId);
+  if (!transcriptModeMatches(state, input.mode)) throw new Error("TRANSCRIPT_DRAFT_MODE_CONFLICT");
+  const current = await db.prepare(`SELECT mode, transcript_json, transcript_sha256,
+      turn_count, sealed_at
+    FROM interview_transcript_drafts WHERE session_id = ? LIMIT 1`)
+    .bind(input.sessionId)
+    .first<InterviewTranscriptDraftRow>();
+  if (
+    !current ||
+    current.mode !== input.mode ||
+    current.transcript_json !== transcriptJson ||
+    current.transcript_sha256 !== transcriptSha256
+  ) {
+    throw new Error("TRANSCRIPT_DRAFT_SEAL_CONFLICT");
+  }
+  if (current.sealed_at) {
+    return { sha256: transcriptSha256, turnCount: input.transcript.length, alreadySealed: true };
+  }
+  if (!state || !["in_progress", "evaluation_pending", "evaluation_processing"].includes(state.status)) {
+    throw new Error("TRANSCRIPT_DRAFT_NOT_READY");
+  }
+  const now = new Date().toISOString();
+  const sealed = await db.prepare(`UPDATE interview_transcript_drafts SET
+      sealed_at = ?, updated_at = ?
+    WHERE session_id = ? AND mode = ? AND transcript_sha256 = ?
+      AND transcript_json = ? AND sealed_at IS NULL`)
+    .bind(
+      now,
+      now,
+      input.sessionId,
+      input.mode,
+      transcriptSha256,
+      transcriptJson,
+    )
+    .run();
+  if (Number(sealed.meta?.changes ?? 0) !== 1) {
+    const raced = await db.prepare(`SELECT mode, transcript_json, transcript_sha256,
+        turn_count, sealed_at
+      FROM interview_transcript_drafts WHERE session_id = ? LIMIT 1`)
+      .bind(input.sessionId)
+      .first<InterviewTranscriptDraftRow>();
+    if (
+      !raced?.sealed_at ||
+      raced.mode !== input.mode ||
+      raced.transcript_json !== transcriptJson ||
+      raced.transcript_sha256 !== transcriptSha256
+    ) {
+      throw new Error("TRANSCRIPT_DRAFT_SEAL_CONFLICT");
+    }
+    return { sha256: transcriptSha256, turnCount: input.transcript.length, alreadySealed: true };
+  }
+  return { sha256: transcriptSha256, turnCount: input.transcript.length, alreadySealed: false };
+}
+
+async function hasExactSealedInterviewTranscriptDraft(input: {
+  db: D1Database;
+  sessionId: string;
+  transcriptJson: string;
+}) {
+  const row = await input.db.prepare(`SELECT 1 AS exact_match
+    FROM interview_transcript_drafts
+    WHERE session_id = ? AND transcript_json = ? AND sealed_at IS NOT NULL
+    LIMIT 1`)
+    .bind(input.sessionId, input.transcriptJson)
+    .first<{ exact_match: number }>();
+  return Number(row?.exact_match ?? 0) === 1;
+}
+
+async function hasInterviewEvaluationTranscriptFence(input: {
+  db: D1Database;
+  sessionId: string;
+  transcriptJson: string;
+  source?: "durable_recorded_fallback";
+}) {
+  if (await hasExactSealedInterviewTranscriptDraft(input)) return true;
+  // Recorded fallback never uses the realtime/text draft protocol. This bypass
+  // is available only to the server-side completion path after it has already
+  // read the durable completion seal and every completed answer transcript.
+  if (input.source === "durable_recorded_fallback") {
+    const state = await interviewTranscriptModeState(input.db, input.sessionId);
+    return Number(state?.recorded_fallback_started ?? 0) === 1;
+  }
+  // Voice and text clients must have receipted and sealed the exact append-only
+  // draft before this paid/final mutation. A pre-deploy tab has no such proof
+  // and fails closed instead of promoting a partial in-memory transcript.
+  return false;
 }
 
 /**
@@ -769,8 +1123,33 @@ export async function sealVoiceInterviewTranscript(input: {
     throw new Error("VOICE_TRANSCRIPT_SEAL_NOT_READY");
   }
   await ensureSchema(db);
+  const blocked = await db.prepare(`SELECT
+      EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id AND hold.event_type IN (
+          'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+        )) AS completion_hold,
+      EXISTS (SELECT 1 FROM interview_audit_events gap
+        WHERE gap.session_id = s.id
+          AND gap.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(gap.detail_json)
+            THEN json_extract(gap.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+            )) AS transcription_gap
+    FROM interview_sessions s WHERE s.id = ? LIMIT 1`)
+    .bind(input.sessionId)
+    .first<{ completion_hold: number; transcription_gap: number }>();
+  if (!blocked || Number(blocked.completion_hold) === 1 || Number(blocked.transcription_gap) === 1) {
+    throw new Error("VOICE_TRANSCRIPT_SEAL_NOT_READY");
+  }
   const transcriptJson = JSON.stringify(input.transcript);
   const transcriptSha256 = await sha256(transcriptJson);
+  if (!await hasExactSealedInterviewTranscriptDraft({
+    db,
+    sessionId: input.sessionId,
+    transcriptJson,
+  })) {
+    throw new Error("VOICE_TRANSCRIPT_DRAFT_NOT_SEALED");
+  }
   const now = new Date().toISOString();
   const results = await db.batch([
     db.prepare(`UPDATE interview_sessions SET transcript_json = ?, updated_at = ?
@@ -784,6 +1163,22 @@ export async function sealVoiceInterviewTranscript(input: {
         AND NOT EXISTS (
           SELECT 1 FROM interview_audit_events
           WHERE session_id = ? AND event_type = 'voice_transcript_sealed'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events blocked
+          WHERE blocked.session_id = interview_sessions.id
+            AND (
+              blocked.event_type IN (
+                'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+              )
+              OR (
+                blocked.event_type = 'transcription_failed'
+                AND CASE WHEN json_valid(blocked.detail_json)
+                  THEN json_extract(blocked.detail_json, '$.code') ELSE NULL END IN (
+                    'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+                  )
+              )
+            )
         )`)
       .bind(transcriptJson, now, input.sessionId, transcriptJson, input.sessionId, input.sessionId),
     db.prepare(`INSERT INTO interview_audit_events (
@@ -801,6 +1196,22 @@ export async function sealVoiceInterviewTranscript(input: {
         AND NOT EXISTS (
           SELECT 1 FROM interview_audit_events
           WHERE session_id = s.id AND event_type = 'voice_transcript_sealed'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events blocked
+          WHERE blocked.session_id = s.id
+            AND (
+              blocked.event_type IN (
+                'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+              )
+              OR (
+                blocked.event_type = 'transcription_failed'
+                AND CASE WHEN json_valid(blocked.detail_json)
+                  THEN json_extract(blocked.detail_json, '$.code') ELSE NULL END IN (
+                    'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+                  )
+              )
+            )
         )`)
       .bind(
         crypto.randomUUID(),
@@ -896,13 +1307,8 @@ export function reviewerAuthenticationReadiness() {
   return {
     configured: Boolean(reviewerSecret()),
     dedicated,
+    strong: serverSecretReadiness(reviewerSecret()).strong,
   };
-}
-
-async function secureTokenMatch(actual: string, expected: string) {
-  if (!actual || !expected) return false;
-  const [actualHash, expectedHash] = await Promise.all([sha256(actual), sha256(expected)]);
-  return constantTimeEqualText(actualHash, expectedHash);
 }
 
 export async function authorizeReviewerRequest(request: Request) {
@@ -920,7 +1326,7 @@ export async function authorizeReviewerRequest(request: Request) {
   if (!expected) throw new Error("INTERVIEW_REVIEW_AUTH_UNCONFIGURED");
   const authorization = request.headers.get("Authorization") ?? "";
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
-  return await secureTokenMatch(token, expected) ? reviewer : null;
+  return await secureServerSecretMatch(token, expected) ? reviewer : null;
 }
 
 export async function markInterviewStarted(sessionId: string) {
@@ -941,25 +1347,57 @@ export async function markRecordedFallbackStarted(sessionId: string) {
   await ensureSchema(db);
   const now = new Date().toISOString();
   await db.batch([
-    db.prepare("UPDATE interview_sessions SET status = 'in_progress', updated_at = ? WHERE id = ? AND status IN ('created', 'in_progress')")
+    db.prepare(`UPDATE interview_sessions SET status = 'in_progress', updated_at = ?
+      WHERE id = ? AND status IN ('created', 'in_progress')
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = interview_sessions.id
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            ))`)
       .bind(now, sessionId),
     db.prepare(`INSERT INTO interview_audit_events (
         id, session_id, event_type, actor_type, detail_json
       )
       SELECT ?, ?, 'interview_started', 'candidate', '{}'
-      WHERE EXISTS (SELECT 1 FROM interview_sessions WHERE id = ?)`)
+      WHERE EXISTS (SELECT 1 FROM interview_sessions session WHERE session.id = ?
+        AND session.status = 'in_progress'
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = session.id
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            )))`)
       .bind(crypto.randomUUID(), sessionId, sessionId),
     db.prepare(`INSERT INTO interview_audit_events (
         id, session_id, event_type, actor_type, detail_json
       )
       SELECT ?, ?, 'recorded_fallback_started', 'candidate', '{}'
-      WHERE EXISTS (SELECT 1 FROM interview_sessions WHERE id = ?)
+      WHERE EXISTS (SELECT 1 FROM interview_sessions session WHERE session.id = ?
+        AND session.status = 'in_progress'
+        AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = session.id
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            )))
         AND NOT EXISTS (
           SELECT 1 FROM interview_audit_events
           WHERE session_id = ? AND event_type = 'recorded_fallback_started'
         )`)
       .bind(crypto.randomUUID(), sessionId, sessionId, sessionId),
   ]);
+  const started = await db.prepare(`SELECT 1 AS started
+    FROM interview_sessions session
+    WHERE session.id = ? AND session.status = 'in_progress'
+      AND EXISTS (SELECT 1 FROM interview_audit_events mode
+        WHERE mode.session_id = session.id AND mode.event_type = 'recorded_fallback_started')
+      AND NOT EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = session.id
+          AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          ))
+    LIMIT 1`)
+    .bind(sessionId)
+    .first<{ started: number }>();
+  if (Number(started?.started ?? 0) !== 1) throw new Error("RECORDED_INTERVIEW_HELD");
 }
 
 export async function markTextInterviewStarted(sessionId: string) {
@@ -1022,7 +1460,28 @@ export async function findNextStaleInterviewEvaluation() {
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
   const staleBefore = new Date(Date.now() - EVALUATION_CLAIM_STALE_AFTER_MS).toISOString();
-  const target = await db.prepare(`SELECT s.id, s.transcript_json
+  const target = await db.prepare(`SELECT s.id, s.transcript_json,
+      (
+        EXISTS (SELECT 1 FROM recorded_interview_completions completion
+          WHERE completion.session_id = s.id
+            AND completion.expected_answer_count = (
+              SELECT COUNT(*) FROM json_each(s.transcript_json) AS answer
+              WHERE CAST(answer.key AS INTEGER) < 300
+                AND CASE WHEN answer.type = 'object'
+                  THEN json_extract(answer.value, '$.speaker') ELSE NULL END = 'candidate'
+            ))
+        AND EXISTS (SELECT 1 FROM interview_audit_events fallback
+          WHERE fallback.session_id = s.id AND fallback.event_type = 'recorded_fallback_started')
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(s.transcript_json) AS candidate
+          WHERE CAST(candidate.key AS INTEGER) < 300
+            AND CASE WHEN candidate.type = 'object'
+              THEN json_extract(candidate.value, '$.speaker') ELSE NULL END = 'candidate'
+            AND COALESCE(CASE WHEN candidate.type = 'object'
+              THEN json_extract(candidate.value, '$.id') ELSE NULL END, '')
+              NOT LIKE 'recorded-transcribed-answer-%'
+        )
+      ) AS durable_recorded_fallback
     FROM interview_sessions s
     LEFT JOIN interview_evaluation_claims c ON c.session_id = s.id
     WHERE (
@@ -1037,6 +1496,42 @@ export async function findNextStaleInterviewEvaluation() {
           AND c.session_id IS NULL
           AND EXISTS (SELECT 1 FROM interview_audit_events seal
             WHERE seal.session_id = s.id AND seal.event_type = 'voice_transcript_sealed')
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events stopped
+        WHERE stopped.session_id = s.id
+          AND stopped.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          )
+      )
+      AND (
+        EXISTS (
+          SELECT 1 FROM interview_transcript_drafts draft
+          WHERE draft.session_id = s.id
+            AND draft.transcript_json = s.transcript_json
+            AND draft.sealed_at IS NOT NULL
+        )
+        OR (
+          EXISTS (SELECT 1 FROM recorded_interview_completions completion
+            WHERE completion.session_id = s.id
+              AND completion.expected_answer_count = (
+                SELECT COUNT(*) FROM json_each(s.transcript_json) AS answer
+                WHERE CAST(answer.key AS INTEGER) < 300
+                  AND CASE WHEN answer.type = 'object'
+                    THEN json_extract(answer.value, '$.speaker') ELSE NULL END = 'candidate'
+              ))
+          AND EXISTS (SELECT 1 FROM interview_audit_events fallback
+            WHERE fallback.session_id = s.id AND fallback.event_type = 'recorded_fallback_started')
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(s.transcript_json) AS candidate
+            WHERE CAST(candidate.key AS INTEGER) < 300
+              AND CASE WHEN candidate.type = 'object'
+                THEN json_extract(candidate.value, '$.speaker') ELSE NULL END = 'candidate'
+              AND COALESCE(CASE WHEN candidate.type = 'object'
+                THEN json_extract(candidate.value, '$.id') ELSE NULL END, '')
+                NOT LIKE 'recorded-transcribed-answer-%'
+          )
         )
       )
       AND s.transcript_json IS NOT NULL
@@ -1068,7 +1563,9 @@ export async function findNextStaleInterviewEvaluation() {
           WHERE failure.session_id = s.id
             AND failure.event_type = 'transcription_failed'
             AND CASE WHEN json_valid(failure.detail_json)
-              THEN json_extract(failure.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+              THEN json_extract(failure.detail_json, '$.code') ELSE NULL END IN (
+                'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+              )
         )
         OR NOT EXISTS (
           SELECT 1 FROM json_each(s.transcript_json) AS turn
@@ -1082,7 +1579,7 @@ export async function findNextStaleInterviewEvaluation() {
     ORDER BY coalesce(c.started_at, s.updated_at), s.id
     LIMIT 1`)
     .bind(staleBefore, staleBefore, staleBefore)
-    .first<{ id: string; transcript_json: string }>();
+    .first<{ id: string; transcript_json: string; durable_recorded_fallback: number }>();
   if (!target) return null;
 
   const transcript = parseJson<unknown>(target.transcript_json, null);
@@ -1114,7 +1611,13 @@ export async function findNextStaleInterviewEvaluation() {
     detail: parseJson<Record<string, unknown>>(event.detail_json, {}),
   }));
   if (!hasVerifiedCandidateTranscript(validTurns, auditEvents)) return null;
-  return { sessionId: target.id, transcript: validTurns };
+  return {
+    sessionId: target.id,
+    transcript: validTurns,
+    source: Number(target.durable_recorded_fallback) === 1
+      ? "durable_recorded_fallback" as const
+      : undefined,
+  };
 }
 
 /**
@@ -1125,18 +1628,44 @@ export async function findNextStaleInterviewEvaluation() {
 export async function claimInterviewEvaluation(input: {
   sessionId: string;
   transcript: TranscriptTurn[];
+  source?: "durable_recorded_fallback";
 }) {
   const db = database();
   if (!db) return null;
+  const transcriptJson = JSON.stringify(input.transcript);
+  if (!await hasInterviewEvaluationTranscriptFence({
+    db,
+    sessionId: input.sessionId,
+    transcriptJson,
+    source: input.source,
+  })) return null;
   const now = new Date().toISOString();
   const claimId = crypto.randomUUID();
   const staleBefore = new Date(Date.now() - EVALUATION_CLAIM_STALE_AFTER_MS).toISOString();
+  const realtimeGapFence = input.source === "durable_recorded_fallback" ? "" : `AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events gap
+        WHERE gap.session_id = s.id
+          AND gap.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(gap.detail_json)
+            THEN json_extract(gap.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+            )
+      )`;
   const claim = await db.prepare(`INSERT INTO interview_evaluation_claims (
     session_id, claim_id, started_at, created_at, updated_at
   ) SELECT s.id, ?, ?, ?, ?
     FROM interview_sessions s
     LEFT JOIN interview_evaluation_claims current ON current.session_id = s.id
-    WHERE s.id = ? AND (
+    WHERE s.id = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events stopped
+        WHERE stopped.session_id = s.id
+          AND stopped.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          )
+      )
+      ${realtimeGapFence}
+      AND (
       s.status IN ('in_progress', 'evaluation_pending') OR
       (s.status = 'evaluation_processing' AND (
         (current.started_at IS NOT NULL AND current.started_at <= ?)
@@ -1157,19 +1686,35 @@ export async function claimInterviewEvaluation(input: {
       AND status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
       AND EXISTS (SELECT 1 FROM interview_evaluation_claims
         WHERE session_id = ? AND claim_id = ?)
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events stopped
+        WHERE stopped.session_id = interview_sessions.id
+          AND stopped.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          )
+      )
+      ${input.source === "durable_recorded_fallback" ? "" : `AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events gap
+        WHERE gap.session_id = interview_sessions.id
+          AND gap.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(gap.detail_json)
+            THEN json_extract(gap.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+            )
+      )`}
       AND (
         NOT EXISTS (SELECT 1 FROM interview_audit_events
           WHERE session_id = ? AND event_type = 'voice_transcript_sealed')
         OR transcript_json = ?
       )`)
     .bind(
-      JSON.stringify(input.transcript),
+      transcriptJson,
       now,
       input.sessionId,
       input.sessionId,
       claimId,
       input.sessionId,
-      JSON.stringify(input.transcript),
+      transcriptJson,
     )
     .run();
   if (Number(session.meta?.changes ?? 0) !== 1) {
@@ -1206,10 +1751,20 @@ export async function saveInterviewEvaluation(input: {
   transcript: TranscriptTurn[];
   evaluation: InterviewEvaluation;
   claimId: string;
+  source?: "durable_recorded_fallback";
 }) {
   const db = database();
   if (!db) return false;
   const now = new Date().toISOString();
+  const realtimeGapFence = input.source === "durable_recorded_fallback" ? "" : `AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events gap
+        WHERE gap.session_id = interview_sessions.id
+          AND gap.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(gap.detail_json)
+            THEN json_extract(gap.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+            )
+      )`;
   // Only the request holding the evaluation_processing claim may complete the
   // session. A duplicate submission is rejected before the model call, and this
   // final fence protects against a stale Worker whose claim was reclaimed.
@@ -1224,6 +1779,14 @@ export async function saveInterviewEvaluation(input: {
       AND status = 'evaluation_processing'
       AND EXISTS (SELECT 1 FROM interview_evaluation_claims
         WHERE session_id = ? AND claim_id = ?)
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events stopped
+        WHERE stopped.session_id = interview_sessions.id
+          AND stopped.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          )
+      )
+      ${realtimeGapFence}
       AND (
         NOT EXISTS (SELECT 1 FROM interview_audit_events
           WHERE session_id = ? AND event_type = 'voice_transcript_sealed')
@@ -1268,10 +1831,10 @@ export async function recordCandidateEvent(input: {
 }) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
-  // Seven independently capped candidate event types can consume at most 112
+  // Nine independently capped candidate event types can consume at most 144
   // rows. Keep a defensive session ceiling above that natural maximum so one
   // event type can never starve another type's reserved capacity.
-  const totalLimit = 128;
+  const totalLimit = 160;
   const typeLimit = 16;
   const result = await db.prepare(`INSERT INTO interview_audit_events (
       id, session_id, event_type, actor_type, detail_json
@@ -1282,12 +1845,18 @@ export async function recordCandidateEvent(input: {
       WHERE session.id = ?
         AND session.status IN ('created', 'in_progress', 'evaluation_pending', 'evaluation_processing', 'completed')
         AND (
-          ? <> 'transcription_failed'
+          ? NOT IN (
+            'transcription_failed', 'candidate_requested_stop',
+            'safety_escalation', 'completion_reason_invalid'
+          )
           OR (
             session.status IN ('created', 'in_progress')
-            AND NOT EXISTS (
-              SELECT 1 FROM interview_audit_events sealed
-              WHERE sealed.session_id = session.id AND sealed.event_type = 'voice_transcript_sealed'
+            AND (
+              ? IN ('candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid')
+              OR NOT EXISTS (
+                SELECT 1 FROM interview_audit_events sealed
+                WHERE sealed.session_id = session.id AND sealed.event_type = 'voice_transcript_sealed'
+              )
             )
           )
         )
@@ -1296,7 +1865,7 @@ export async function recordCandidateEvent(input: {
         WHERE session_id = ? AND actor_type = 'candidate'
           AND event_type IN (
             'audio_playback_blocked', 'transcription_failed', 'recording_unavailable', 'connection_failed',
-            'candidate_requested_stop', 'time_limit_reached',
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid', 'time_limit_reached',
             'reasonable_accommodation_text_selected'
           )) < ?
       AND (SELECT COUNT(*) FROM interview_audit_events
@@ -1307,6 +1876,7 @@ export async function recordCandidateEvent(input: {
     input.eventType,
     JSON.stringify(input.detail ?? {}),
     input.sessionId,
+    input.eventType,
     input.eventType,
     input.sessionId,
     totalLimit,
@@ -1321,7 +1891,7 @@ export async function recordCandidateEvent(input: {
         WHERE session_id = ? AND actor_type = 'candidate'
           AND event_type IN (
             'audio_playback_blocked', 'transcription_failed', 'recording_unavailable', 'connection_failed',
-            'candidate_requested_stop', 'time_limit_reached',
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid', 'time_limit_reached',
             'reasonable_accommodation_text_selected'
           )) AS candidate_event_count,
       (SELECT COUNT(*) FROM interview_audit_events
@@ -1337,9 +1907,15 @@ export async function recordCandidateEvent(input: {
       voice_transcript_sealed: number;
     }>();
   const openStatuses = ["created", "in_progress", "evaluation_pending", "evaluation_processing", "completed"];
-  const harmfulEventClosed = input.eventType === "transcription_failed" && (
-    !state || !["created", "in_progress"].includes(state.status) || Number(state.voice_transcript_sealed) > 0
-  );
+  const harmfulEventClosed = [
+    "candidate_requested_stop",
+    "safety_escalation",
+    "completion_reason_invalid",
+  ].includes(input.eventType)
+    ? !state || !["created", "in_progress"].includes(state.status)
+    : input.eventType === "transcription_failed" && (
+      !state || !["created", "in_progress"].includes(state.status) || Number(state.voice_transcript_sealed) > 0
+    );
   if (!state || !openStatuses.includes(state.status) || harmfulEventClosed) return "closed" as const;
   return "capped" as const;
 }
@@ -1386,6 +1962,8 @@ function safeExternalSyncStatus(row: ExternalSyncRow | null): ExternalSyncStatus
   const status = ["pending", "running", "completed", "failed"].includes(row.status)
     ? row.status as ExternalSyncStatus["status"]
     : "failed";
+  const manifest = parseJson<Record<string, unknown> | null>(row.manifest_json, null);
+  if (manifest) delete manifest._integrityCheck;
   return {
     provider: "google_drive",
     status,
@@ -1394,7 +1972,7 @@ function safeExternalSyncStatus(row: ExternalSyncRow | null): ExternalSyncStatus
     completedAt: row.completed_at,
     folderId: row.folder_id,
     folderUrl: row.folder_url,
-    manifest: parseJson<Record<string, unknown> | null>(row.manifest_json, null),
+    manifest,
     errorCode: row.error_code,
     updatedAt: row.updated_at,
   };
@@ -1411,8 +1989,110 @@ export async function getExternalSyncStatus(sessionId: string) {
   return safeExternalSyncStatus(row);
 }
 
+const DRIVE_INTEGRITY_CHECK_COOLDOWN_MS = 5 * 60 * 1_000;
+const DRIVE_INTEGRITY_CHECK_LEASE_MS = 2 * 60 * 1_000;
+const DRIVE_INTEGRITY_CHECK_KEY = "_integrityCheck";
+
+export type ExternalSyncIntegrityClaim = {
+  sessionId: string;
+  token: string;
+  completedAt: string;
+  folderId: string;
+  folderUrl: string;
+  manifest: Record<string, unknown>;
+  claimedManifestJson: string;
+};
+
+/**
+ * Claims a bounded read-only Drive integrity check without changing the
+ * durable completed state. The whole original manifest and completedAt form
+ * the CAS fence, so two simultaneous staff sessions cannot both perform the
+ * outbound read or overwrite a newer receipt.
+ */
+export async function claimExternalSyncIntegrityCheck(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const row = await db.prepare(`SELECT provider, status, requested_at, started_at, completed_at,
+    folder_id, folder_url, manifest_json, error_code, updated_at
+    FROM interview_external_syncs
+    WHERE session_id = ? AND provider = 'google_drive' LIMIT 1`)
+    .bind(sessionId).first<ExternalSyncRow>();
+  const status = safeExternalSyncStatus(row);
+  if (
+    !row || !status || status.status !== "completed" ||
+    !status.completedAt || !status.folderId || !status.folderUrl
+  ) return null;
+  const manifest = parseJson<Record<string, unknown>>(row.manifest_json, {});
+  const integrity = manifest.integrity && typeof manifest.integrity === "object"
+    ? manifest.integrity as Record<string, unknown>
+    : null;
+  const checkedAt = typeof integrity?.checkedAt === "string" ? Date.parse(integrity.checkedAt) : Number.NaN;
+  const existingCheck = manifest[DRIVE_INTEGRITY_CHECK_KEY] &&
+    typeof manifest[DRIVE_INTEGRITY_CHECK_KEY] === "object"
+    ? manifest[DRIVE_INTEGRITY_CHECK_KEY] as Record<string, unknown>
+    : null;
+  const checkStartedAt = typeof existingCheck?.startedAt === "string"
+    ? Date.parse(existingCheck.startedAt)
+    : Number.NaN;
+  const now = Date.now();
+  if (Number.isFinite(checkedAt) && now - checkedAt < DRIVE_INTEGRITY_CHECK_COOLDOWN_MS) return null;
+  if (Number.isFinite(checkStartedAt) && now - checkStartedAt < DRIVE_INTEGRITY_CHECK_LEASE_MS) return null;
+
+  const token = crypto.randomUUID();
+  const startedAt = new Date(now).toISOString();
+  const claimedManifest = {
+    ...manifest,
+    [DRIVE_INTEGRITY_CHECK_KEY]: { token, startedAt },
+  };
+  const originalManifestJson = row.manifest_json ?? "";
+  const claimedManifestJson = JSON.stringify(claimedManifest);
+  const result = await db.prepare(`UPDATE interview_external_syncs SET manifest_json = ?
+    WHERE session_id = ? AND provider = 'google_drive' AND status = 'completed'
+      AND completed_at = ? AND COALESCE(manifest_json, '') = ?`)
+    .bind(
+      claimedManifestJson,
+      sessionId,
+      status.completedAt,
+      originalManifestJson,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return null;
+  return {
+    sessionId,
+    token,
+    completedAt: status.completedAt,
+    folderId: status.folderId,
+    folderUrl: status.folderUrl,
+    manifest,
+    claimedManifestJson,
+  } satisfies ExternalSyncIntegrityClaim;
+}
+
+export async function finishExternalSyncIntegrityCheck(input: {
+  claim: ExternalSyncIntegrityClaim;
+  manifest: Record<string, unknown>;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const manifest = { ...input.manifest };
+  delete manifest[DRIVE_INTEGRITY_CHECK_KEY];
+  const result = await db.prepare(`UPDATE interview_external_syncs SET manifest_json = ?
+    WHERE session_id = ? AND provider = 'google_drive' AND status = 'completed'
+      AND completed_at = ? AND manifest_json = ?`)
+    .bind(
+      JSON.stringify(manifest),
+      input.claim.sessionId,
+      input.claim.completedAt,
+      input.claim.claimedManifestJson,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) {
+    throw new Error("GOOGLE_DRIVE_INTEGRITY_CHECK_CLAIM_LOST");
+  }
+}
+
 const BACKGROUND_DRIVE_FAILED_RETRY_MS = 10 * 60 * 1_000;
 const BACKGROUND_DRIVE_PENDING_RETRY_MS = 5 * 60 * 1_000;
+const BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS = 24 * 60 * 60 * 1_000;
 
 /**
  * Finds one archive that can be advanced by a server-side scheduled event.
@@ -1430,6 +2110,7 @@ export async function findNextInterviewDriveRecoverySession() {
   const now = Date.now();
   const failedBefore = new Date(now - BACKGROUND_DRIVE_FAILED_RETRY_MS).toISOString();
   const pendingBefore = new Date(now - BACKGROUND_DRIVE_PENDING_RETRY_MS).toISOString();
+  const integrityBefore = new Date(now - BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS).toISOString();
   const candidates = await db.prepare(`SELECT
       s.id, s.transcript_json,
       EXISTS (
@@ -1437,13 +2118,21 @@ export async function findNextInterviewDriveRecoverySession() {
         WHERE ta.session_id = s.id
           AND ta.event_type = 'transcription_failed'
           AND CASE WHEN json_valid(ta.detail_json)
-            THEN json_extract(ta.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+            THEN json_extract(ta.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+            )
       ) AS candidate_transcription_failed
     FROM interview_sessions AS s
     LEFT JOIN interview_external_syncs AS d
       ON d.session_id = s.id AND d.provider = 'google_drive'
     WHERE s.status = 'completed'
       AND s.recording_status IN ('stored', 'not_applicable')
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id AND hold.event_type IN (
+          'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+        )
+      )
       AND s.transcript_json IS NOT NULL
       AND json_valid(s.transcript_json)
       AND json_type(s.transcript_json) = 'array'
@@ -1477,7 +2166,9 @@ export async function findNextInterviewDriveRecoverySession() {
           WHERE failure.session_id = s.id
             AND failure.event_type = 'transcription_failed'
             AND CASE WHEN json_valid(failure.detail_json)
-              THEN json_extract(failure.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+              THEN json_extract(failure.detail_json, '$.code') ELSE NULL END IN (
+                'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+              )
         )
         OR NOT EXISTS (
           SELECT 1 FROM json_each(s.transcript_json) AS turn
@@ -1502,13 +2193,26 @@ export async function findNextInterviewDriveRecoverySession() {
           OR COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') != 'actual_transcript'
           OR (s.recording_status = 'stored'
             AND COALESCE(json_extract(d.manifest_json, '$.recordingIncluded'), 0) != 1)
+          OR json_extract(d.manifest_json, '$.integrity.checkedAt') IS NULL
+          OR json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?
         ))
       )
-    ORDER BY CASE WHEN d.status = 'running' THEN 0 ELSE 1 END,
+    ORDER BY CASE
+        WHEN d.status = 'running' THEN 0
+        WHEN d.status = 'pending' THEN 1
+        WHEN d.status = 'failed' THEN 2
+        WHEN d.status = 'completed' AND (
+          COALESCE(json_extract(d.manifest_json, '$.transcriptAvailable'), 0) != 1
+          OR COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') != 'actual_transcript'
+          OR (s.recording_status = 'stored'
+            AND COALESCE(json_extract(d.manifest_json, '$.recordingIncluded'), 0) != 1)
+        ) THEN 3
+        ELSE 4
+      END,
       COALESCE(d.updated_at, s.completed_at, s.created_at) ASC,
       s.id ASC
     LIMIT 25`)
-    .bind(failedBefore, pendingBefore)
+    .bind(failedBefore, pendingBefore, integrityBefore)
     .all<{ id: string; transcript_json: string; candidate_transcription_failed: number }>();
 
   for (const candidate of candidates.results ?? []) {
@@ -2242,10 +2946,10 @@ export async function getInterviewRecordingChunk(input: {
   if (!manifestObject || !("body" in manifestObject)) throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
   const manifest = JSON.parse(await r2ObjectText(manifestObject)) as RecordingPartManifest;
   if (
-    ![1, 2].includes(manifest.version) ||
+    ![1, 2, 3].includes(manifest.version) ||
     !Array.isArray(manifest.parts) ||
     manifest.parts.length === 0 ||
-    (manifest.version === 2 && manifest.parts.some((part) => !/^[a-f0-9]{64}$/.test(part.sha256 ?? "")))
+    (manifest.version !== 1 && manifest.parts.some((part) => !/^[a-f0-9]{64}$/.test(part.sha256 ?? "")))
   ) {
     throw new Error("INTERVIEW_RECORDING_MANIFEST_INVALID");
   }
@@ -2292,11 +2996,18 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     FROM interview_audit_events
     WHERE session_id = ? AND event_type IN (
       'audio_playback_blocked', 'transcription_failed', 'recording_unavailable',
-      'connection_failed', 'candidate_requested_stop', 'time_limit_reached',
-      'reasonable_accommodation_text_selected'
+      'connection_failed', 'candidate_requested_stop', 'safety_escalation',
+      'completion_reason_invalid', 'time_limit_reached',
+      'reasonable_accommodation_text_selected', 'recording_recovery_part_missing',
+      'recording_recovery_manual_attention', 'legacy_recording_recovery_manual_attention'
     ) ORDER BY created_at`)
     .bind(sessionId)
     .all<Record<string, unknown>>();
+  const transcriptDraft = await db.prepare(`SELECT mode, transcript_json, transcript_sha256,
+      turn_count, sealed_at, updated_at
+    FROM interview_transcript_drafts WHERE session_id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<InterviewTranscriptDraftRow & { updated_at: string }>();
   const parsedTranscript = parseJson<TranscriptTurn[]>(session.transcript_json, []);
   const parsedTechnicalEvents = (technicalEvents.results ?? []).map((event) => ({
     type: String(event.event_type ?? ""),
@@ -2309,6 +3020,10 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
   );
   const driveSync = await getExternalSyncStatus(sessionId);
   const manifestFiles = driveSync?.manifest?.files;
+  const driveIntegrity = driveSync?.manifest?.integrity &&
+    typeof driveSync.manifest.integrity === "object"
+    ? driveSync.manifest.integrity as Record<string, unknown>
+    : null;
   const archivedArtifactCount = manifestFiles && typeof manifestFiles === "object" && !Array.isArray(manifestFiles)
     ? Object.keys(manifestFiles).length
     : 0;
@@ -2322,6 +3037,14 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     status: session.status,
     recordingStatus: session.recording_status,
     transcript: parsedTranscript,
+    transcriptDraft: transcriptDraft ? {
+      mode: transcriptDraft.mode,
+      transcript: parseJson<TranscriptTurn[]>(transcriptDraft.transcript_json, []),
+      turnCount: transcriptDraft.turn_count,
+      sealed: Boolean(transcriptDraft.sealed_at),
+      sealedAt: transcriptDraft.sealed_at,
+      updatedAt: transcriptDraft.updated_at,
+    } : null,
     sourceTranscriptVerified,
     evaluation: parseJson<InterviewEvaluation | null>(session.evaluation_json, null),
     completedAt: session.completed_at,
@@ -2344,6 +3067,18 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
         ? driveSync.manifest.transcriptKind
         : "unknown",
       archivedArtifactCount,
+      integrityStatus: ["verified", "drift", "unknown"].includes(String(driveIntegrity?.status))
+        ? driveIntegrity?.status
+        : "unknown",
+      integrityCheckedAt: typeof driveIntegrity?.checkedAt === "string"
+        ? driveIntegrity.checkedAt
+        : null,
+      integrityErrorCode: typeof driveIntegrity?.errorCode === "string"
+        ? driveIntegrity.errorCode
+        : null,
+      sharingRisk: ["anyone_writer", "anyone_reader", "restricted", "unknown"].includes(
+        String(driveIntegrity?.sharingRisk),
+      ) ? driveIntegrity?.sharingRisk : "unknown",
     } : null,
   };
 }
@@ -2364,6 +3099,7 @@ export type InterviewListItem = {
   driveRecordingIncluded: boolean | null;
   driveTranscriptAvailable: boolean | null;
   driveTranscriptKind: string | null;
+  driveIntegrityStatus: "verified" | "drift" | "unknown" | null;
   sourceTranscriptVerified: boolean;
 };
 
@@ -2414,7 +3150,9 @@ export async function listInterviewSummaryPage(
       WHERE ta.session_id = s.id
         AND ta.event_type = 'transcription_failed'
         AND CASE WHEN json_valid(ta.detail_json)
-          THEN json_extract(ta.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_FAILED'
+          THEN json_extract(ta.detail_json, '$.code') ELSE NULL END IN (
+            'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+          )
     ) AS candidate_transcription_failed,
     d.status AS drive_status, d.folder_url AS drive_folder_url, d.updated_at AS drive_updated_at,
     d.manifest_json AS drive_manifest_json
@@ -2461,6 +3199,13 @@ export async function listInterviewSummaryPage(
       driveTranscriptKind: driveManifest && typeof driveManifest.transcriptKind === "string"
         ? driveManifest.transcriptKind
         : null,
+      driveIntegrityStatus: driveManifest && driveManifest.integrity &&
+        typeof driveManifest.integrity === "object" &&
+        ["verified", "drift", "unknown"].includes(String(
+          (driveManifest.integrity as Record<string, unknown>).status,
+        ))
+        ? (driveManifest.integrity as Record<string, unknown>).status as "verified" | "drift" | "unknown"
+        : driveManifest ? "unknown" : null,
       sourceTranscriptVerified,
     };
   });
@@ -2607,7 +3352,9 @@ async function recordRecordingArtifact(input: {
   throw lastError;
 }
 
-type RecordingUploadState = {
+type RecordingAudioCoverage = "both" | "candidate-only" | "unverified";
+
+type FinalizedRecordingUploadState = {
   // Version 2 requires a SHA-256 receipt for every new part. Version 1 remains
   // readable so already-uploaded production interviews can still be recovered.
   version: 1 | 2;
@@ -2616,17 +3363,45 @@ type RecordingUploadState = {
   byteSize: number;
   partSize: number;
   totalParts: number;
-  audioCoverage: "both" | "candidate-only" | "unverified";
+  audioCoverage: RecordingAudioCoverage;
   retentionUntil: string;
   createdAt: string;
 };
 
+type ProvisionalRecordingUploadState = {
+  // Version 3 starts before MediaRecorder knows the final Blob size. Full
+  // fixed-size parts are durable while the interview is still running, then a
+  // create-once upload is sealed with immutable final metadata.
+  version: 3;
+  sessionId: string;
+  uploadId: string;
+  contentType: string;
+  partSize: typeof RECORDING_UPLOAD_PART_BYTES;
+  byteSize: number | null;
+  totalParts: number | null;
+  audioCoverage: RecordingAudioCoverage | null;
+  sealedAt: string | null;
+  retentionUntil: string;
+  createdAt: string;
+};
+
+type RecordingUploadState = FinalizedRecordingUploadState | ProvisionalRecordingUploadState;
+type SealedRecordingUploadState = FinalizedRecordingUploadState | (ProvisionalRecordingUploadState & {
+  byteSize: number;
+  totalParts: number;
+  audioCoverage: RecordingAudioCoverage;
+  sealedAt: string;
+});
+
 type RecordingPartManifest = {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   contentType: string;
   byteSize: number;
-  audioCoverage: "both" | "candidate-only" | "unverified";
+  audioCoverage: RecordingAudioCoverage;
   parts: Array<{ key: string; byteSize: number; sha256?: string }>;
+  recovery?: {
+    mode: "legacy-v1-body-sha256";
+  };
 };
 
 function recordingUploadStateKey(sessionId: string) {
@@ -2658,6 +3433,26 @@ function verifiedRecordingPartForCompletion(state: RecordingUploadState, part: R
   return /^[a-f0-9]{64}$/.test(sha256) && verifiedRecordingPartSha256(part, sha256);
 }
 
+function isRecordingAudioCoverage(value: unknown): value is RecordingAudioCoverage {
+  return ["both", "candidate-only", "unverified"].includes(String(value));
+}
+
+function isSealedRecordingUploadState(state: RecordingUploadState): state is SealedRecordingUploadState {
+  return state.version !== 3 || (
+    typeof state.sealedAt === "string" &&
+    typeof state.byteSize === "number" &&
+    typeof state.totalParts === "number" &&
+    isRecordingAudioCoverage(state.audioCoverage)
+  );
+}
+
+function assertActiveProvisionalRecordingUpload(state: ProvisionalRecordingUploadState) {
+  const createdAt = Date.parse(state.createdAt);
+  if (!Number.isFinite(createdAt) || Date.now() - createdAt > PROVISIONAL_RECORDING_UPLOAD_MAX_AGE_MS) {
+    throw new Error("INTERVIEW_RECORDING_UPLOAD_EXPIRED");
+  }
+}
+
 async function legacyRecordingPartBodyMatches(input: {
   bucket: R2Bucket;
   key: string;
@@ -2681,21 +3476,241 @@ async function r2ObjectText(object: R2ObjectBody) {
 }
 
 function parseRecordingUploadState(value: string): RecordingUploadState {
-  const parsed = JSON.parse(value) as Partial<RecordingUploadState>;
+  const parsed = JSON.parse(value) as Record<string, unknown>;
+  if (parsed.version === 3) {
+    const nullableFinalShape = parsed.byteSize === null &&
+      parsed.totalParts === null &&
+      parsed.audioCoverage === null &&
+      parsed.sealedAt === null;
+    const sealedShape = typeof parsed.sealedAt === "string" &&
+      Number.isFinite(Date.parse(parsed.sealedAt)) &&
+      validateRecordingUploadShape({
+        contentType: String(parsed.contentType ?? ""),
+        byteSize: Number(parsed.byteSize),
+        partSize: Number(parsed.partSize),
+        totalParts: Number(parsed.totalParts),
+        audioCoverage: String(parsed.audioCoverage ?? ""),
+      }) !== null;
+    if (
+      typeof parsed.sessionId !== "string" ||
+      typeof parsed.uploadId !== "string" ||
+      !/^[A-Za-z0-9_-]{16,80}$/.test(parsed.uploadId) ||
+      typeof parsed.contentType !== "string" ||
+      parsed.partSize !== RECORDING_UPLOAD_PART_BYTES ||
+      typeof parsed.retentionUntil !== "string" ||
+      typeof parsed.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(parsed.createdAt)) ||
+      (!nullableFinalShape && !sealedShape)
+    ) {
+      throw new Error("INTERVIEW_RECORDING_UPLOAD_STATE_INVALID");
+    }
+    return parsed as ProvisionalRecordingUploadState;
+  }
   if (
-    ![1, 2].includes(parsed.version ?? 0) ||
+    (parsed.version !== 1 && parsed.version !== 2) ||
     typeof parsed.sessionId !== "string" ||
     typeof parsed.contentType !== "string" ||
     typeof parsed.byteSize !== "number" ||
     typeof parsed.partSize !== "number" ||
     typeof parsed.totalParts !== "number" ||
-    !["both", "candidate-only", "unverified"].includes(parsed.audioCoverage ?? "") ||
+    !isRecordingAudioCoverage(parsed.audioCoverage) ||
     typeof parsed.retentionUntil !== "string" ||
     typeof parsed.createdAt !== "string"
   ) {
     throw new Error("INTERVIEW_RECORDING_UPLOAD_STATE_INVALID");
   }
-  return parsed as RecordingUploadState;
+  return parsed as FinalizedRecordingUploadState;
+}
+
+type LegacyRecordingOrphanTarget = {
+  id: string;
+  status: "in_progress";
+  recording_status: "uploading" | "failed";
+  expires_at: string;
+  retention_until: string;
+  created_at: string;
+  updated_at: string;
+  transcript_json: null;
+  evaluation_json: null;
+  summary: null;
+  completed_at: null;
+};
+
+type LegacyV1VerifiedRecording = {
+  state: FinalizedRecordingUploadState & { version: 1 };
+  manifestJson: string;
+  objectKey: string;
+};
+
+type LegacyV1Inspection =
+  | { state: "verified"; recording: LegacyV1VerifiedRecording }
+  | { state: "manual_attention"; errorCode: string };
+
+function legacyRecoveryAttention(errorCode: string): LegacyV1Inspection {
+  return { state: "manual_attention", errorCode };
+}
+
+function exactObjectKeys(value: Record<string, unknown>, expected: readonly string[]) {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length &&
+    actual.every((key, index) => key === sortedExpected[index]);
+}
+
+function exactCustomMetadata(
+  value: Record<string, string> | undefined,
+  expected: Record<string, string>,
+) {
+  return Boolean(value) && exactObjectKeys(value as Record<string, unknown>, Object.keys(expected)) &&
+    Object.entries(expected).every(([key, expectedValue]) => value?.[key] === expectedValue);
+}
+
+function isExactLegacyV1State(
+  value: unknown,
+  target: LegacyRecordingOrphanTarget,
+): value is FinalizedRecordingUploadState & { version: 1 } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Partial<FinalizedRecordingUploadState> & Record<string, unknown>;
+  if (!exactObjectKeys(state, [
+    "version",
+    "sessionId",
+    "contentType",
+    "byteSize",
+    "partSize",
+    "totalParts",
+    "audioCoverage",
+    "retentionUntil",
+    "createdAt",
+  ])) return false;
+  const stateCreatedAt = Date.parse(String(state.createdAt ?? ""));
+  const sessionCreatedAt = Date.parse(target.created_at);
+  const expiresAt = Date.parse(target.expires_at);
+  const contentType = typeof state.contentType === "string"
+    ? state.contentType.split(";")[0].toLowerCase()
+    : "";
+  return state.version === 1 &&
+    state.sessionId === target.id &&
+    state.retentionUntil === target.retention_until &&
+    ["video/webm", "audio/webm", "video/mp4", "audio/mp4"].includes(contentType) &&
+    state.contentType === contentType &&
+    Number.isInteger(state.byteSize) &&
+    Number(state.byteSize) > 0 &&
+    Number(state.byteSize) <= LEGACY_V1_MAX_RECORDING_BYTES &&
+    state.partSize === RECORDING_UPLOAD_PART_BYTES &&
+    Number.isInteger(state.totalParts) &&
+    Number(state.totalParts) > 0 &&
+    Number(state.totalParts) <= LEGACY_V1_MAX_PARTS &&
+    Math.ceil(Number(state.byteSize) / RECORDING_UPLOAD_PART_BYTES) === state.totalParts &&
+    ["both", "candidate-only", "unverified"].includes(String(state.audioCoverage ?? "")) &&
+    Number.isFinite(stateCreatedAt) &&
+    Number.isFinite(sessionCreatedAt) &&
+    Number.isFinite(expiresAt) &&
+    stateCreatedAt >= sessionCreatedAt &&
+    stateCreatedAt <= expiresAt;
+}
+
+async function readR2ObjectBytesBounded(object: R2ObjectBody, maximumBytes: number) {
+  if (!Number.isInteger(object.size) || object.size <= 0 || object.size > maximumBytes) {
+    throw new Error("LEGACY_RECORDING_OBJECT_SIZE_INVALID");
+  }
+  const bytes = new Uint8Array(await object.arrayBuffer());
+  if (bytes.byteLength !== object.size || bytes.byteLength > maximumBytes) {
+    throw new Error("LEGACY_RECORDING_OBJECT_SIZE_INVALID");
+  }
+  return bytes;
+}
+
+async function inspectLegacyV1Recording(
+  bucket: R2Bucket,
+  target: LegacyRecordingOrphanTarget,
+): Promise<LegacyV1Inspection> {
+  const stateObject = await bucket.get(recordingUploadStateKey(target.id));
+  if (!stateObject) return legacyRecoveryAttention("LEGACY_V1_UPLOAD_STATE_MISSING");
+  if (
+    stateObject.httpMetadata?.contentType !== "application/json" ||
+    !exactCustomMetadata(stateObject.customMetadata, {
+      sessionId: target.id,
+      retentionUntil: target.retention_until,
+    })
+  ) return legacyRecoveryAttention("LEGACY_V1_UPLOAD_STATE_METADATA_INVALID");
+
+  let statePayload: unknown;
+  try {
+    const stateBytes = await readR2ObjectBytesBounded(stateObject, LEGACY_V1_STATE_MAX_BYTES);
+    statePayload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(stateBytes));
+  } catch {
+    return legacyRecoveryAttention("LEGACY_V1_UPLOAD_STATE_INVALID");
+  }
+  if (!isExactLegacyV1State(statePayload, target)) {
+    return legacyRecoveryAttention("LEGACY_V1_UPLOAD_STATE_INVALID");
+  }
+  const state = statePayload;
+  const parts: RecordingPartManifest["parts"] = [];
+  let totalBytes = 0;
+  for (let index = 0; index < state.totalParts; index += 1) {
+    const key = recordingPartKey(target.id, index);
+    const expectedSize = index === state.totalParts - 1
+      ? state.byteSize - state.partSize * (state.totalParts - 1)
+      : state.partSize;
+    const part = await bucket.get(key);
+    if (!part) return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_MISSING");
+    if (
+      part.size !== expectedSize ||
+      part.httpMetadata?.contentType !== "application/octet-stream" ||
+      !exactCustomMetadata(part.customMetadata, {
+        sessionId: target.id,
+        byteSize: String(expectedSize),
+        retentionUntil: target.retention_until,
+      })
+    ) return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_METADATA_INVALID");
+    let bytes: Uint8Array;
+    try {
+      bytes = await readR2ObjectBytesBounded(part, expectedSize);
+    } catch {
+      return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_BODY_INVALID");
+    }
+    const exact = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    const sha256 = bufferHex(await crypto.subtle.digest("SHA-256", exact));
+    if (!/^[a-f0-9]{64}$/.test(sha256)) {
+      return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_DIGEST_INVALID");
+    }
+    // Version 1 keys were overwriteable while the candidate token was valid.
+    // Re-read metadata after hashing and require the same object generation so
+    // a concurrent replacement can never be finalized under the old digest.
+    const readback = await bucket.head(key);
+    if (
+      !readback ||
+      readback.etag !== part.etag ||
+      readback.size !== expectedSize ||
+      readback.httpMetadata?.contentType !== "application/octet-stream" ||
+      !exactCustomMetadata(readback.customMetadata, {
+        sessionId: target.id,
+        byteSize: String(expectedSize),
+        retentionUntil: target.retention_until,
+      })
+    ) return legacyRecoveryAttention("LEGACY_V1_RECORDING_PART_CHANGED");
+    totalBytes += bytes.byteLength;
+    parts.push({ key, byteSize: bytes.byteLength, sha256 });
+  }
+  if (totalBytes !== state.byteSize) {
+    return legacyRecoveryAttention("LEGACY_V1_RECORDING_SIZE_MISMATCH");
+  }
+  const manifest: RecordingPartManifest = {
+    version: 1,
+    contentType: state.contentType,
+    byteSize: state.byteSize,
+    audioCoverage: state.audioCoverage,
+    parts,
+    recovery: { mode: "legacy-v1-body-sha256" },
+  };
+  return {
+    state: "verified",
+    recording: {
+      state,
+      manifestJson: JSON.stringify(manifest),
+      objectKey: `interviews/${target.id}/recording.recovered-v1.manifest.json`,
+    },
+  };
 }
 
 export function validateRecordingUploadShape(input: {
@@ -2717,7 +3732,148 @@ export function validateRecordingUploadShape(input: {
     byteSize: input.byteSize,
     partSize: input.partSize,
     totalParts: input.totalParts,
-    audioCoverage: input.audioCoverage as RecordingUploadState["audioCoverage"],
+    audioCoverage: input.audioCoverage as RecordingAudioCoverage,
+  };
+}
+
+export function validateProvisionalRecordingUploadShape(input: {
+  uploadId: string;
+  contentType: string;
+  partSize: number;
+}) {
+  const contentType = input.contentType.split(";")[0].toLowerCase();
+  if (!/^[A-Za-z0-9_-]{16,80}$/.test(input.uploadId)) return null;
+  if (!["video/webm", "audio/webm", "video/mp4", "audio/mp4"].includes(contentType)) return null;
+  if (input.partSize !== RECORDING_UPLOAD_PART_BYTES) return null;
+  return { uploadId: input.uploadId, contentType, partSize: RECORDING_UPLOAD_PART_BYTES };
+}
+
+async function recordingUploadReceipts(bucket: R2Bucket, state: RecordingUploadState) {
+  const uploadedParts: number[] = [];
+  const uploadedPartReceipts: Array<{ index: number; sha256: string }> = [];
+  const limit = isSealedRecordingUploadState(state)
+    ? state.totalParts
+    : MAX_PROVISIONAL_RECORDING_FULL_PARTS;
+  for (let index = 0; index < limit; index += 1) {
+    const part = await bucket.head(recordingPartKey(state.sessionId, index));
+    if (!part) {
+      // Version 3 accepts only a contiguous prefix before its final size is
+      // known. Stop at the first gap instead of spending 32 R2 subrequests on
+      // every foreground heartbeat.
+      if (state.version === 3 && state.sealedAt === null) break;
+      continue;
+    }
+    const expectedSize = isSealedRecordingUploadState(state) && index === state.totalParts - 1
+      ? state.byteSize - state.partSize * (state.totalParts - 1)
+      : state.partSize;
+    const sha256 = part.customMetadata?.sha256 ?? "";
+    if (
+      part.size === expectedSize &&
+      Number(part.customMetadata?.byteSize ?? 0) === expectedSize &&
+      /^[a-f0-9]{64}$/.test(sha256) &&
+      verifiedRecordingPartSha256(part, sha256)
+    ) {
+      uploadedParts.push(index);
+      if (state.version !== 1) uploadedPartReceipts.push({ index, sha256 });
+      continue;
+    }
+    if (state.version === 3 && state.sealedAt === null) break;
+  }
+  return { uploadedParts, uploadedPartReceipts };
+}
+
+export async function beginProvisionalInterviewRecording(input: {
+  session: InterviewSessionRecord;
+  uploadId: string;
+  contentType: string;
+  partSize: typeof RECORDING_UPLOAD_PART_BYTES;
+}) {
+  const bucket = bindings().RECORDINGS;
+  if (!bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
+  const stateKey = recordingUploadStateKey(input.session.id);
+  const existingObject = await bucket.get(stateKey);
+  let state: ProvisionalRecordingUploadState;
+  if (existingObject) {
+    const existingState = parseRecordingUploadState(await r2ObjectText(existingObject));
+    if (
+      existingState.version !== 3 ||
+      existingState.sessionId !== input.session.id ||
+      existingState.uploadId !== input.uploadId ||
+      existingState.contentType !== input.contentType ||
+      existingState.partSize !== input.partSize
+    ) {
+      throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+    }
+    state = existingState;
+  } else {
+    const claimed = await claimInterviewRecordingUpload(input.session.id);
+    if (!claimed) {
+      if (input.session.recording_status === "stored") {
+        return {
+          stored: true,
+          uploadVersion: 3 as const,
+          uploadId: input.uploadId,
+          sealed: true,
+          uploadedParts: [] as number[],
+          uploadedPartReceipts: [] as Array<{ index: number; sha256: string }>,
+        };
+      }
+      if (input.session.recording_status !== "uploading") {
+        throw new Error("INTERVIEW_RECORDING_UPLOAD_BUSY");
+      }
+    }
+    const proposedState: ProvisionalRecordingUploadState = {
+      version: 3,
+      sessionId: input.session.id,
+      uploadId: input.uploadId,
+      contentType: input.contentType,
+      partSize: RECORDING_UPLOAD_PART_BYTES,
+      byteSize: null,
+      totalParts: null,
+      audioCoverage: null,
+      sealedAt: null,
+      retentionUntil: input.session.retention_until,
+      createdAt: new Date().toISOString(),
+    };
+    const created = await bucket.put(stateKey, JSON.stringify(proposedState), {
+      onlyIf: { etagDoesNotMatch: "*" },
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: { sessionId: input.session.id, retentionUntil: input.session.retention_until },
+    });
+    if (created) {
+      state = proposedState;
+    } else {
+      const concurrentObject = await bucket.get(stateKey);
+      if (!concurrentObject) throw new Error("INTERVIEW_RECORDING_UPLOAD_BUSY");
+      const concurrent = parseRecordingUploadState(await r2ObjectText(concurrentObject));
+      if (
+        concurrent.version !== 3 ||
+        concurrent.sessionId !== proposedState.sessionId ||
+        concurrent.uploadId !== proposedState.uploadId ||
+        concurrent.contentType !== proposedState.contentType ||
+        concurrent.partSize !== proposedState.partSize
+      ) {
+        throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+      }
+      state = concurrent;
+    }
+  }
+  assertActiveProvisionalRecordingUpload(state);
+  const receipts = await recordingUploadReceipts(bucket, state);
+  const latestSession = input.session.recording_status === "stored"
+    ? input.session
+    : await getInterviewSessionState(input.session.id);
+  return {
+    stored: latestSession?.recording_status === "stored",
+    uploadVersion: 3 as const,
+    uploadId: state.uploadId,
+    sealed: state.sealedAt !== null,
+    ...receipts,
+    contentType: state.contentType,
+    partSize: state.partSize,
+    byteSize: state.byteSize,
+    totalParts: state.totalParts,
+    audioCoverage: state.audioCoverage,
   };
 }
 
@@ -2728,15 +3884,17 @@ export async function beginResumableInterviewRecording(input: {
   byteSize: number;
   partSize: number;
   totalParts: number;
-  audioCoverage: RecordingUploadState["audioCoverage"];
+  audioCoverage: RecordingAudioCoverage;
 }) {
   const bucket = bindings().RECORDINGS;
   if (!bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
   const stateKey = recordingUploadStateKey(input.session.id);
   const existingObject = await bucket.get(stateKey);
-  let state: RecordingUploadState;
+  let state: FinalizedRecordingUploadState;
   if (existingObject) {
-    state = parseRecordingUploadState(await r2ObjectText(existingObject));
+    const existingState = parseRecordingUploadState(await r2ObjectText(existingObject));
+    if (existingState.version === 3) throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+    state = existingState;
     if (
       state.version !== input.uploadVersion ||
       state.sessionId !== input.session.id ||
@@ -2786,6 +3944,7 @@ export async function beginResumableInterviewRecording(input: {
       if (!concurrentObject) throw new Error("INTERVIEW_RECORDING_UPLOAD_BUSY");
       const concurrent = parseRecordingUploadState(await r2ObjectText(concurrentObject));
       if (
+        concurrent.version === 3 ||
         concurrent.version !== proposedState.version ||
         concurrent.sessionId !== proposedState.sessionId ||
         concurrent.contentType !== proposedState.contentType ||
@@ -2796,34 +3955,12 @@ export async function beginResumableInterviewRecording(input: {
       ) {
         throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
       }
-      state = concurrent;
+      state = concurrent as FinalizedRecordingUploadState;
     }
   }
-  const uploadedParts: number[] = [];
-  const uploadedPartReceipts: Array<{ index: number; sha256: string }> = [];
-  for (let index = 0; index < state.totalParts; index += 1) {
-    // Resume needs metadata only. Opening every stored part body here recreates
-    // the same Worker connection exhaustion that previously broke finalization.
-    const part = await bucket.head(recordingPartKey(state.sessionId, index));
-    const expectedSize = index === state.totalParts - 1
-      ? state.byteSize - state.partSize * (state.totalParts - 1)
-      : state.partSize;
-    if (
-      part?.size === expectedSize &&
-      Number(part.customMetadata?.byteSize ?? 0) === expectedSize &&
-      // A pre-rollout Version 1 object may have no checksum. Do not tell a
-      // candidate client to skip it: force an exact replay so the PUT path can
-      // hash the stored body and prove that the browser still has the same
-      // bytes. Staff completion retains the size-only legacy recovery below.
-      /^[a-f0-9]{64}$/.test(part.customMetadata?.sha256 ?? "") &&
-      verifiedRecordingPartSha256(part, part.customMetadata?.sha256 ?? "")
-    ) {
-      uploadedParts.push(index);
-      if (state.version === 2) {
-        uploadedPartReceipts.push({ index, sha256: part.customMetadata?.sha256 ?? "" });
-      }
-    }
-  }
+  // Resume needs metadata only. Opening stored part bodies here recreates the
+  // Worker connection exhaustion that previously broke finalization.
+  const { uploadedParts, uploadedPartReceipts } = await recordingUploadReceipts(bucket, state);
   // The authorization snapshot was read before the R2 metadata walk. Staff
   // recovery may finalize the same upload during that walk, so refresh the D1
   // status at the end instead of returning a stale `stored: false` receipt.
@@ -2843,8 +3980,110 @@ export async function beginResumableInterviewRecording(input: {
   };
 }
 
+function provisionalSealMatches(
+  state: ProvisionalRecordingUploadState,
+  input: { byteSize: number; totalParts: number; audioCoverage: RecordingAudioCoverage },
+) {
+  return state.sealedAt !== null &&
+    state.byteSize === input.byteSize &&
+    state.totalParts === input.totalParts &&
+    state.audioCoverage === input.audioCoverage;
+}
+
+export async function sealProvisionalInterviewRecording(input: {
+  sessionId: string;
+  uploadId: string;
+  byteSize: number;
+  totalParts: number;
+  audioCoverage: RecordingAudioCoverage;
+}) {
+  const bucket = bindings().RECORDINGS;
+  if (!bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
+  const stateKey = recordingUploadStateKey(input.sessionId);
+  const stateObject = await bucket.get(stateKey);
+  if (!stateObject) throw new Error("INTERVIEW_RECORDING_UPLOAD_NOT_STARTED");
+  const parsed = parseRecordingUploadState(await r2ObjectText(stateObject));
+  if (
+    parsed.version !== 3 ||
+    parsed.sessionId !== input.sessionId ||
+    parsed.uploadId !== input.uploadId
+  ) {
+    throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+  }
+  assertActiveProvisionalRecordingUpload(parsed);
+  const shape = validateRecordingUploadShape({
+    contentType: parsed.contentType,
+    byteSize: input.byteSize,
+    partSize: parsed.partSize,
+    totalParts: input.totalParts,
+    audioCoverage: input.audioCoverage,
+  });
+  if (!shape || parsed.partSize !== RECORDING_UPLOAD_PART_BYTES) {
+    throw new Error("INTERVIEW_RECORDING_UPLOAD_SEAL_INVALID");
+  }
+  if (parsed.sealedAt !== null) {
+    if (!provisionalSealMatches(parsed, shape)) {
+      throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+    }
+    return { sealed: true, duplicate: true, ...shape };
+  }
+
+  const lastPartSize = shape.byteSize - shape.partSize * (shape.totalParts - 1);
+  const fullPartsRequired = lastPartSize === shape.partSize ? shape.totalParts : shape.totalParts - 1;
+  for (let index = 0; index < fullPartsRequired; index += 1) {
+    const part = await bucket.head(recordingPartKey(input.sessionId, index));
+    if (
+      !part ||
+      part.size !== shape.partSize ||
+      Number(part.customMetadata?.byteSize ?? 0) !== shape.partSize ||
+      !verifiedRecordingPartForCompletion(parsed, part)
+    ) {
+      throw new Error("INTERVIEW_RECORDING_PART_MISSING");
+    }
+  }
+  // A provisional full part beyond the declared end proves that the sealing
+  // tab does not describe the same byte stream. Never hide it as an orphan.
+  const firstUnexpectedIndex = fullPartsRequired;
+  if (
+    firstUnexpectedIndex < MAX_RECORDING_PARTS &&
+    await bucket.head(recordingPartKey(input.sessionId, firstUnexpectedIndex))
+  ) {
+    throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+  }
+
+  const sealedState: ProvisionalRecordingUploadState = {
+    ...parsed,
+    byteSize: shape.byteSize,
+    totalParts: shape.totalParts,
+    audioCoverage: shape.audioCoverage,
+    sealedAt: new Date().toISOString(),
+  };
+  const sealed = await bucket.put(stateKey, JSON.stringify(sealedState), {
+    onlyIf: { etagMatches: stateObject.etag },
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: { sessionId: input.sessionId, retentionUntil: parsed.retentionUntil },
+  });
+  if (!sealed) {
+    const concurrentObject = await bucket.get(stateKey);
+    if (!concurrentObject) throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+    const concurrent = parseRecordingUploadState(await r2ObjectText(concurrentObject));
+    if (
+      concurrent.version !== 3 ||
+      concurrent.uploadId !== input.uploadId ||
+      !provisionalSealMatches(concurrent, shape)
+    ) {
+      throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+    }
+    await heartbeatInterviewRecordingUpload(input.sessionId);
+    return { sealed: true, duplicate: true, ...shape };
+  }
+  await heartbeatInterviewRecordingUpload(input.sessionId);
+  return { sealed: true, duplicate: false, ...shape };
+}
+
 export async function saveResumableInterviewRecordingPart(input: {
   sessionId: string;
+  uploadId?: string;
   index: number;
   byteSize: number;
   sha256?: string;
@@ -2856,18 +4095,36 @@ export async function saveResumableInterviewRecordingPart(input: {
   const stateObject = await bucket.get(recordingUploadStateKey(input.sessionId));
   if (!stateObject) throw new Error("INTERVIEW_RECORDING_UPLOAD_NOT_STARTED");
   const state = parseRecordingUploadState(await r2ObjectText(stateObject));
-  if (!Number.isInteger(input.index) || input.index < 0 || input.index >= state.totalParts) {
+  if (state.version === 3) {
+    if (state.uploadId !== input.uploadId) throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+    assertActiveProvisionalRecordingUpload(state);
+  }
+  const totalPartLimit = isSealedRecordingUploadState(state)
+    ? state.totalParts
+    : MAX_PROVISIONAL_RECORDING_FULL_PARTS;
+  if (!Number.isInteger(input.index) || input.index < 0 || input.index >= totalPartLimit) {
     throw new Error("INTERVIEW_RECORDING_PART_INVALID");
   }
-  const expectedSize = input.index === state.totalParts - 1
+  const expectedSize = isSealedRecordingUploadState(state) && input.index === state.totalParts - 1
     ? state.byteSize - state.partSize * (state.totalParts - 1)
     : state.partSize;
   if (input.byteSize !== expectedSize) throw new Error("INTERVIEW_RECORDING_PART_SIZE_INVALID");
-  if (state.version === 2 && !/^[a-f0-9]{64}$/.test(input.sha256 ?? "")) {
+  if (state.version !== 1 && !/^[a-f0-9]{64}$/.test(input.sha256 ?? "")) {
     throw new Error("INTERVIEW_RECORDING_PART_DIGEST_INVALID");
   }
   if (input.sha256 !== undefined && !/^[a-f0-9]{64}$/.test(input.sha256)) {
     throw new Error("INTERVIEW_RECORDING_PART_DIGEST_INVALID");
+  }
+  if (state.version === 3 && input.index > 0) {
+    const previous = await bucket.head(recordingPartKey(input.sessionId, input.index - 1));
+    if (
+      !previous ||
+      previous.size !== state.partSize ||
+      Number(previous.customMetadata?.byteSize ?? 0) !== state.partSize ||
+      !verifiedRecordingPartForCompletion(state, previous)
+    ) {
+      throw new Error("INTERVIEW_RECORDING_PART_SEQUENCE_INVALID");
+    }
   }
   const key = recordingPartKey(input.sessionId, input.index);
   // New objects are verified from R2 checksum metadata. A genuinely
@@ -2960,13 +4217,25 @@ export async function saveResumableInterviewRecordingPart(input: {
   return { stored: true, duplicate: false };
 }
 
-export async function completeResumableInterviewRecording(session: InterviewSessionRecord) {
+export async function completeResumableInterviewRecording(
+  session: InterviewSessionRecord,
+  options: { uploadId?: string; unsealedAsMissing?: boolean } = {},
+) {
   const bucket = bindings().RECORDINGS;
   const db = database();
   if (!bucket || !db) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
   const stateObject = await bucket.get(recordingUploadStateKey(session.id));
   if (!stateObject) throw new Error("INTERVIEW_RECORDING_UPLOAD_NOT_STARTED");
-  const state = parseRecordingUploadState(await r2ObjectText(stateObject));
+  const parsedState = parseRecordingUploadState(await r2ObjectText(stateObject));
+  if (parsedState.version === 3 && options.uploadId && parsedState.uploadId !== options.uploadId) {
+    throw new Error("INTERVIEW_RECORDING_UPLOAD_CONFLICT");
+  }
+  if (!isSealedRecordingUploadState(parsedState)) {
+    throw new Error(options.unsealedAsMissing
+      ? "INTERVIEW_RECORDING_PART_MISSING"
+      : "INTERVIEW_RECORDING_UPLOAD_UNSEALED");
+  }
+  const state = parsedState;
   const parts: RecordingPartManifest["parts"] = [];
   for (let index = 0; index < state.totalParts; index += 1) {
     const key = recordingPartKey(session.id, index);
@@ -3072,7 +4341,7 @@ export async function recoverResumableInterviewRecording(sessionId: string) {
   if (!["uploading", "failed"].includes(session.recording_status)) {
     throw new Error("INTERVIEW_RECORDING_RECOVERY_NOT_AVAILABLE");
   }
-  return await completeResumableInterviewRecording(session);
+  return await completeResumableInterviewRecording(session, { unsealedAsMissing: true });
 }
 
 export async function recoverNextSealedResumableInterviewRecording() {
@@ -3236,6 +4505,708 @@ export async function recoverNextSealedResumableInterviewRecording() {
   return firstDeferred ?? { state: "none" } as const;
 }
 
+async function findNextLegacyV1RecordingOrphan() {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const expiredBefore = new Date(
+    Date.now() - LEGACY_RECORDING_RECOVERY_EXPIRY_GRACE_MS,
+  ).toISOString();
+  return await db.prepare(`SELECT
+      s.id, s.status, s.recording_status, s.expires_at, s.retention_until,
+      s.created_at, s.updated_at, s.transcript_json, s.evaluation_json,
+      s.summary, s.completed_at
+    FROM interview_sessions AS s
+    WHERE s.status = 'in_progress'
+      AND s.recording_status IN ('uploading', 'failed')
+      AND s.expires_at <= ?
+      AND s.completed_at IS NULL
+      AND s.transcript_json IS NULL
+      AND s.evaluation_json IS NULL
+      AND s.summary IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = s.id AND artifact.kind = 'recording'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_external_syncs sync
+        WHERE sync.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM recorded_interview_completions completion
+        WHERE completion.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM recorded_answer_transcriptions answer
+        WHERE answer.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_evaluation_claims evaluation_claim
+        WHERE evaluation_claim.session_id = s.id
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events consent
+        WHERE consent.session_id = s.id
+          AND consent.event_type = 'consent_recorded'
+          AND json_valid(consent.detail_json)
+          AND json_extract(consent.detail_json, '$.interviewMode') = 'camera'
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events started
+        WHERE started.session_id = s.id
+          AND started.event_type = 'interview_started'
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events failed_upload
+        WHERE failed_upload.session_id = s.id
+          AND failed_upload.event_type = 'recording_unavailable'
+          AND json_valid(failed_upload.detail_json)
+          AND json_extract(failed_upload.detail_json, '$.code') = 'UPLOAD_FAILED'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events local_capture_failure
+        WHERE local_capture_failure.session_id = s.id
+          AND local_capture_failure.event_type = 'recording_unavailable'
+          AND json_valid(local_capture_failure.detail_json)
+          AND json_extract(local_capture_failure.detail_json, '$.code') IN (
+            'NO_RECORDING_AT_COMPLETION', 'FORMAT_UNAVAILABLE', 'RECORDER_ERROR',
+            'CLIENT_RECORDING_SIZE_LIMIT'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events incompatible
+        WHERE incompatible.session_id = s.id
+          AND incompatible.event_type IN (
+            'recorded_fallback_started', 'voice_transcript_sealed',
+            'evaluation_started', 'evaluation_saved', 'recording_stored',
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid',
+            '${LEGACY_RECORDING_RECOVERED_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+    ORDER BY s.updated_at ASC, s.id ASC
+    LIMIT 1`)
+    .bind(expiredBefore)
+    .first<LegacyRecordingOrphanTarget>();
+}
+
+async function claimLegacyV1RecordingOrphan(
+  target: LegacyRecordingOrphanTarget,
+) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date();
+  const claimedAt = now.toISOString();
+  const staleBefore = new Date(now.getTime() - LEGACY_RECORDING_RECOVERY_LEASE_MS).toISOString();
+  const leaseExpiresAt = new Date(now.getTime() + LEGACY_RECORDING_RECOVERY_LEASE_MS).toISOString();
+  const claimId = crypto.randomUUID();
+  const result = await db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json, created_at
+    ) SELECT ?, ?, '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ?
+          AND s.status = 'in_progress'
+          AND s.recording_status IN ('uploading', 'failed')
+          AND s.updated_at = ?
+          AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL
+          AND s.evaluation_json IS NULL
+          AND s.summary IS NULL
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = ?
+          AND terminal.event_type IN (
+            '${LEGACY_RECORDING_RECOVERED_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events active_claim
+        WHERE active_claim.session_id = ?
+          AND active_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND active_claim.created_at > ?
+      )`)
+    .bind(
+      crypto.randomUUID(),
+      target.id,
+      JSON.stringify({ claimId, leaseExpiresAt }),
+      claimedAt,
+      target.id,
+      target.updated_at,
+      target.id,
+      target.id,
+      staleBefore,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return null;
+  return { claimId, claimedAt, leaseExpiresAt };
+}
+
+async function legacyV1RecoveryClaimIsCurrent(input: {
+  target: LegacyRecordingOrphanTarget;
+  claimId: string;
+  claimedAt: string;
+  leaseExpiresAt: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const row = await db.prepare(`SELECT 1 AS current_claim
+    FROM interview_sessions s
+    WHERE s.id = ?
+      AND s.status = 'in_progress'
+      AND s.recording_status IN ('uploading', 'failed')
+      AND s.updated_at = ?
+      AND s.completed_at IS NULL
+      AND s.transcript_json IS NULL
+      AND s.evaluation_json IS NULL
+      AND s.summary IS NULL
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = s.id
+          AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ?
+          AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = s.id
+          AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = s.id
+          AND terminal.event_type IN (
+            '${LEGACY_RECORDING_RECOVERED_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+    LIMIT 1`)
+    .bind(
+      input.target.id,
+      input.target.updated_at,
+      input.claimedAt,
+      input.claimId,
+      input.leaseExpiresAt,
+      new Date().toISOString(),
+      input.claimedAt,
+    ).first<{ current_claim: number }>();
+  return Number(row?.current_claim ?? 0) === 1;
+}
+
+async function markLegacyV1RecordingManualAttention(input: {
+  target: LegacyRecordingOrphanTarget;
+  claimId: string;
+  claimedAt: string;
+  leaseExpiresAt: string;
+  errorCode: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const createdAt = new Date().toISOString();
+  const attentionEventId = crypto.randomUUID();
+  const result = await db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json, created_at
+    ) SELECT ?, ?, '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ?
+          AND s.status = 'in_progress'
+          AND s.recording_status IN ('uploading', 'failed')
+          AND s.updated_at = ?
+          AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL
+          AND s.evaluation_json IS NULL
+          AND s.summary IS NULL
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = ?
+          AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ?
+          AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = ?
+          AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = ?
+          AND terminal.event_type IN (
+            '${LEGACY_RECORDING_RECOVERED_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )`)
+    .bind(
+      attentionEventId,
+      input.target.id,
+      JSON.stringify({ errorCode: input.errorCode.slice(0, 120) }),
+      createdAt,
+      input.target.id,
+      input.target.updated_at,
+      input.target.id,
+      input.claimedAt,
+      input.claimId,
+      input.leaseExpiresAt,
+      createdAt,
+      input.target.id,
+      input.claimedAt,
+      input.target.id,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return false;
+  const readback = await db.prepare(`SELECT 1 AS present
+    FROM interview_audit_events
+    WHERE id = ? AND session_id = ?
+      AND event_type = '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+    LIMIT 1`)
+    .bind(attentionEventId, input.target.id)
+    .first<{ present: number }>();
+  return Number(readback?.present ?? 0) === 1;
+}
+
+async function createLegacyV1RecoveryManifest(input: {
+  bucket: R2Bucket;
+  target: LegacyRecordingOrphanTarget;
+  recording: LegacyV1VerifiedRecording;
+}) {
+  const expectedCustomMetadata = {
+    sessionId: input.target.id,
+    retentionUntil: input.target.retention_until,
+    audioCoverage: input.recording.state.audioCoverage,
+    recordingContentType: input.recording.state.contentType,
+    recoveryMode: "legacy-v1-body-sha256",
+  };
+  const created = await input.bucket.put(
+    input.recording.objectKey,
+    input.recording.manifestJson,
+    {
+      onlyIf: { etagDoesNotMatch: "*" },
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: expectedCustomMetadata,
+    },
+  );
+  const existing = await input.bucket.get(input.recording.objectKey);
+  const expectedByteSize = new TextEncoder().encode(input.recording.manifestJson).byteLength;
+  if (
+    !existing ||
+    existing.size !== expectedByteSize ||
+    expectedByteSize > LEGACY_V1_STATE_MAX_BYTES * 8 ||
+    (created && existing.etag !== created.etag) ||
+    existing.httpMetadata?.contentType !== "application/json" ||
+    !exactCustomMetadata(existing.customMetadata, expectedCustomMetadata)
+  ) {
+    return { errorCode: "LEGACY_V1_RECOVERY_MANIFEST_CONFLICT" } as const;
+  }
+  let existingJson = "";
+  try {
+    existingJson = new TextDecoder("utf-8", { fatal: true }).decode(
+      await readR2ObjectBytesBounded(existing, LEGACY_V1_STATE_MAX_BYTES * 8),
+    );
+  } catch {
+    return { errorCode: "LEGACY_V1_RECOVERY_MANIFEST_CONFLICT" } as const;
+  }
+  if (existingJson !== input.recording.manifestJson) {
+    return { errorCode: "LEGACY_V1_RECOVERY_MANIFEST_CONFLICT" } as const;
+  }
+  return { etag: existing.etag };
+}
+
+async function finalizeLegacyV1RecordingOrphan(input: {
+  target: LegacyRecordingOrphanTarget;
+  recording: LegacyV1VerifiedRecording;
+  manifestEtag: string | undefined;
+  claimId: string;
+  claimedAt: string;
+  leaseExpiresAt: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const storedAt = new Date().toISOString();
+  const auditDetail = JSON.stringify({
+    sourceVersion: 1,
+    byteSize: input.recording.state.byteSize,
+    contentType: input.recording.state.contentType,
+    audioCoverage: input.recording.state.audioCoverage,
+    partCount: input.recording.state.totalParts,
+    verificationMode: "legacy-v1-body-sha256",
+  });
+  await db.batch([
+    db.prepare(`UPDATE interview_sessions SET recording_status = 'stored', updated_at = ?
+      WHERE id = ?
+        AND status = 'in_progress'
+        AND recording_status IN ('uploading', 'failed')
+        AND updated_at = ?
+        AND expires_at = ?
+        AND retention_until = ?
+        AND created_at = ?
+        AND completed_at IS NULL
+        AND transcript_json IS NULL
+        AND evaluation_json IS NULL
+        AND summary IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_artifacts artifact
+          WHERE artifact.session_id = interview_sessions.id
+            AND artifact.kind = 'recording'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_external_syncs sync
+          WHERE sync.session_id = interview_sessions.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM recorded_interview_completions completion
+          WHERE completion.session_id = interview_sessions.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM recorded_answer_transcriptions answer
+          WHERE answer.session_id = interview_sessions.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_evaluation_claims evaluation_claim
+          WHERE evaluation_claim.session_id = interview_sessions.id
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events consent
+          WHERE consent.session_id = interview_sessions.id
+            AND consent.event_type = 'consent_recorded'
+            AND json_valid(consent.detail_json)
+            AND json_extract(consent.detail_json, '$.interviewMode') = 'camera'
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events started
+          WHERE started.session_id = interview_sessions.id
+            AND started.event_type = 'interview_started'
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events failed_upload
+          WHERE failed_upload.session_id = interview_sessions.id
+            AND failed_upload.event_type = 'recording_unavailable'
+            AND json_valid(failed_upload.detail_json)
+            AND json_extract(failed_upload.detail_json, '$.code') = 'UPLOAD_FAILED'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events incompatible
+          WHERE incompatible.session_id = interview_sessions.id
+            AND (
+              incompatible.event_type IN (
+                'recorded_fallback_started', 'voice_transcript_sealed',
+                'evaluation_started', 'evaluation_saved', 'recording_stored',
+                'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+              )
+              OR (
+                incompatible.event_type = 'recording_unavailable'
+                AND json_valid(incompatible.detail_json)
+                AND json_extract(incompatible.detail_json, '$.code') IN (
+                  'NO_RECORDING_AT_COMPLETION', 'FORMAT_UNAVAILABLE',
+                  'RECORDER_ERROR', 'CLIENT_RECORDING_SIZE_LIMIT'
+                )
+              )
+            )
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events claim
+          WHERE claim.session_id = interview_sessions.id
+            AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+            AND claim.created_at = ?
+            AND json_valid(claim.detail_json)
+            AND json_extract(claim.detail_json, '$.claimId') = ?
+            AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+            AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events newer_claim
+          WHERE newer_claim.session_id = interview_sessions.id
+            AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+            AND newer_claim.created_at > ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events terminal
+          WHERE terminal.session_id = interview_sessions.id
+            AND terminal.event_type IN (
+              '${LEGACY_RECORDING_RECOVERED_EVENT}',
+              '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+            )
+        )`)
+      .bind(
+        storedAt,
+        input.target.id,
+        input.target.updated_at,
+        input.target.expires_at,
+        input.target.retention_until,
+        input.target.created_at,
+        input.claimedAt,
+        input.claimId,
+        input.leaseExpiresAt,
+        storedAt,
+        input.claimedAt,
+      ),
+    db.prepare(`INSERT INTO interview_artifacts (
+        id, session_id, kind, object_key, content_type, byte_size, etag,
+        retention_until, created_at
+      ) SELECT ?, ?, 'recording', ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ?
+          AND s.status = 'in_progress'
+          AND s.recording_status = 'stored'
+          AND s.updated_at = ?
+          AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL
+          AND s.evaluation_json IS NULL
+          AND s.summary IS NULL
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = ?
+          AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ?
+          AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = ?
+          AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = ? AND artifact.kind = 'recording'
+      )`)
+      .bind(
+        crypto.randomUUID(),
+        input.target.id,
+        input.recording.objectKey,
+        input.recording.state.contentType,
+        input.recording.state.byteSize,
+        input.manifestEtag ?? null,
+        input.target.retention_until,
+        storedAt,
+        input.target.id,
+        storedAt,
+        input.target.id,
+        input.claimedAt,
+        input.claimId,
+        input.leaseExpiresAt,
+        storedAt,
+        input.target.id,
+        input.claimedAt,
+        input.target.id,
+      ),
+    db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json, created_at
+      ) SELECT ?, ?, '${LEGACY_RECORDING_RECOVERED_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ?
+          AND s.status = 'in_progress'
+          AND s.recording_status = 'stored'
+          AND s.updated_at = ?
+          AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL
+          AND s.evaluation_json IS NULL
+          AND s.summary IS NULL
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = ?
+          AND claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ?
+          AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = ?
+          AND newer_claim.event_type = '${LEGACY_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = ?
+          AND artifact.kind = 'recording'
+          AND artifact.object_key = ?
+          AND artifact.content_type = ?
+          AND artifact.byte_size = ?
+          AND artifact.retention_until = ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events recovered
+        WHERE recovered.session_id = ?
+          AND recovered.event_type = '${LEGACY_RECORDING_RECOVERED_EVENT}'
+      )`)
+      .bind(
+        crypto.randomUUID(),
+        input.target.id,
+        auditDetail,
+        storedAt,
+        input.target.id,
+        storedAt,
+        input.target.id,
+        input.claimedAt,
+        input.claimId,
+        input.leaseExpiresAt,
+        storedAt,
+        input.target.id,
+        input.claimedAt,
+        input.target.id,
+        input.recording.objectKey,
+        input.recording.state.contentType,
+        input.recording.state.byteSize,
+        input.target.retention_until,
+        input.target.id,
+      ),
+  ]);
+
+  const readback = await db.prepare(`SELECT
+      s.status, s.recording_status, s.transcript_json, s.evaluation_json,
+      s.summary, s.completed_at, artifact.object_key, artifact.content_type,
+      artifact.byte_size, artifact.retention_until,
+      EXISTS (
+        SELECT 1 FROM interview_audit_events recovered
+        WHERE recovered.session_id = s.id
+          AND recovered.event_type = '${LEGACY_RECORDING_RECOVERED_EVENT}'
+      ) AS recovery_audit_present
+    FROM interview_sessions s
+    LEFT JOIN interview_artifacts artifact
+      ON artifact.session_id = s.id AND artifact.kind = 'recording'
+    WHERE s.id = ? LIMIT 1`)
+    .bind(input.target.id)
+    .first<{
+      status: string;
+      recording_status: string;
+      transcript_json: string | null;
+      evaluation_json: string | null;
+      summary: string | null;
+      completed_at: string | null;
+      object_key: string | null;
+      content_type: string | null;
+      byte_size: number | null;
+      retention_until: string | null;
+      recovery_audit_present: number;
+    }>();
+  if (
+    readback?.status !== "in_progress" ||
+    readback.recording_status !== "stored" ||
+    readback.transcript_json !== null ||
+    readback.evaluation_json !== null ||
+    readback.summary !== null ||
+    readback.completed_at !== null ||
+    readback.object_key !== input.recording.objectKey ||
+    readback.content_type !== input.recording.state.contentType ||
+    readback.byte_size !== input.recording.state.byteSize ||
+    readback.retention_until !== input.target.retention_until ||
+    Number(readback.recovery_audit_present) !== 1
+  ) throw new Error("LEGACY_V1_RECORDING_RECOVERY_READBACK_MISMATCH");
+}
+
+/**
+ * Recovers exactly one expired Version 1 upload that reached the old client
+ * completion path but never created a D1 artifact. The legacy protocol did not
+ * persist browser-provided digests, so every bounded part body is re-read and
+ * hashed before a new immutable recovery manifest is created. This operation
+ * deliberately changes only recording storage state; interview completion,
+ * transcripts, evaluation, and Google Drive remain untouched.
+ */
+export async function recoverNextLegacyV1RecordingOrphan() {
+  const db = database();
+  const bucket = bindings().RECORDINGS;
+  if (!db || !bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
+  const target = await findNextLegacyV1RecordingOrphan();
+  if (!target) return { state: "none" } as const;
+  const claim = await claimLegacyV1RecordingOrphan(target);
+  if (!claim) return { state: "waiting", sessionId: target.id } as const;
+
+  let inspection: LegacyV1Inspection;
+  try {
+    inspection = await inspectLegacyV1Recording(bucket, target);
+  } catch {
+    return {
+      state: "waiting",
+      sessionId: target.id,
+      errorCode: "LEGACY_V1_RECORDING_STORAGE_RETRY",
+    } as const;
+  }
+  if (inspection.state === "manual_attention") {
+    const marked = await markLegacyV1RecordingManualAttention({
+      target,
+      claimId: claim.claimId,
+      claimedAt: claim.claimedAt,
+      leaseExpiresAt: claim.leaseExpiresAt,
+      errorCode: inspection.errorCode,
+    });
+    if (!marked) return { state: "waiting", sessionId: target.id } as const;
+    return {
+      state: "manual_attention",
+      sessionId: target.id,
+      errorCode: inspection.errorCode,
+    } as const;
+  }
+  if (!await legacyV1RecoveryClaimIsCurrent({
+    target,
+    claimId: claim.claimId,
+    claimedAt: claim.claimedAt,
+    leaseExpiresAt: claim.leaseExpiresAt,
+  })) return { state: "waiting", sessionId: target.id } as const;
+
+  let manifest: { etag: string | undefined } | { errorCode: string };
+  try {
+    manifest = await createLegacyV1RecoveryManifest({
+      bucket,
+      target,
+      recording: inspection.recording,
+    });
+  } catch {
+    return {
+      state: "waiting",
+      sessionId: target.id,
+      errorCode: "LEGACY_V1_RECORDING_STORAGE_RETRY",
+    } as const;
+  }
+  if ("errorCode" in manifest) {
+    const marked = await markLegacyV1RecordingManualAttention({
+      target,
+      claimId: claim.claimId,
+      claimedAt: claim.claimedAt,
+      leaseExpiresAt: claim.leaseExpiresAt,
+      errorCode: manifest.errorCode,
+    });
+    if (!marked) return { state: "waiting", sessionId: target.id } as const;
+    return {
+      state: "manual_attention",
+      sessionId: target.id,
+      errorCode: manifest.errorCode,
+    } as const;
+  }
+  await finalizeLegacyV1RecordingOrphan({
+    target,
+    recording: inspection.recording,
+    manifestEtag: manifest.etag,
+    claimId: claim.claimId,
+    claimedAt: claim.claimedAt,
+    leaseExpiresAt: claim.leaseExpiresAt,
+  });
+  return {
+    state: "stored",
+    sessionId: target.id,
+    byteSize: inspection.recording.state.byteSize,
+    totalParts: inspection.recording.state.totalParts,
+  } as const;
+}
+
 async function loadRecordingObject(bucket: R2Bucket, objectKey: string) {
   const object = await bucket.get(objectKey);
   if (!object) return null;
@@ -3244,10 +5215,10 @@ async function loadRecordingObject(bucket: R2Bucket, objectKey: string) {
   }
   const manifest = JSON.parse(await r2ObjectText(object)) as RecordingPartManifest;
   if (
-    ![1, 2].includes(manifest.version) ||
+    ![1, 2, 3].includes(manifest.version) ||
     !Array.isArray(manifest.parts) ||
     manifest.parts.length === 0 ||
-    (manifest.version === 2 && manifest.parts.some((part) => !/^[a-f0-9]{64}$/.test(part.sha256 ?? "")))
+    (manifest.version !== 1 && manifest.parts.some((part) => !/^[a-f0-9]{64}$/.test(part.sha256 ?? "")))
   ) return null;
   let partIndex = 0;
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;

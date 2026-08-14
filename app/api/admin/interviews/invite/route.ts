@@ -1,6 +1,7 @@
 import { authorizeInterviewAdmin } from "@/lib/admin-auth";
 import { issueInterviewInvite } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 export async function POST(request: Request) {
   try {
@@ -10,9 +11,9 @@ export async function POST(request: Request) {
     if (!await authorizeInterviewAdmin(request)) {
       return noStoreJson({ error: "管理者認証を確認できません。" }, { status: 401 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 1_000) return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
-    const payload = rawBody ? JSON.parse(rawBody) as { expiresInHours?: unknown } : {};
+    const body = await readBoundedJsonBody<{ expiresInHours?: unknown }>(request, { maxBytes: 4_000, allowEmpty: true });
+    if (!body.ok) return noStoreJson({ error: body.status === 413 ? "入力内容が長すぎます。" : "入力内容を確認できませんでした。" }, { status: body.status });
+    const payload = body.value;
     const expiresInHours = payload.expiresInHours === undefined ? 72 : Number(payload.expiresInHours);
     if (!Number.isFinite(expiresInHours) || expiresInHours < 1 || expiresInHours > 168) {
       return noStoreJson({ error: "有効期限は1〜168時間で指定してください。" }, { status: 400 });

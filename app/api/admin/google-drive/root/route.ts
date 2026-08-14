@@ -13,6 +13,7 @@ import {
   saveGoogleDriveRoot,
 } from "@/lib/google-drive-connection";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 export async function POST(request: Request) {
   try {
@@ -22,9 +23,9 @@ export async function POST(request: Request) {
     if (!await authorizeInterviewAdminOrSetupSession(request)) {
       return noStoreJson({ error: "管理者認証を確認できません。" }, { status: 401 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 500) return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
-    const payload = rawBody ? JSON.parse(rawBody) as { folderId?: unknown } : {};
+    const body = await readBoundedJsonBody<{ folderId?: unknown }>(request, { maxBytes: 2_000, allowEmpty: true });
+    if (!body.ok) return noStoreJson({ error: body.status === 413 ? "入力内容が長すぎます。" : "入力内容を確認できませんでした。" }, { status: body.status });
+    const payload = body.value;
     const requestedFolderId = typeof payload.folderId === "string" ? payload.folderId.trim() : "";
     // Normal operation uses the one approved destination configured by the
     // administrator. An explicit ID remains supported for controlled recovery.

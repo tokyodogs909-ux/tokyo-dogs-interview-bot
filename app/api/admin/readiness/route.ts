@@ -1,10 +1,11 @@
-import { authorizeInterviewAdminOrSetupSession } from "@/lib/admin-auth";
+import { adminAuthenticationReadiness, authorizeInterviewAdminOrSetupSession } from "@/lib/admin-auth";
 import {
   missingGoogleDriveConfiguration,
   validateGoogleDriveRoot,
 } from "@/lib/google-drive-auth";
 import { missingGoogleDriveOAuthSetupConfiguration } from "@/lib/google-drive-connection";
-import { signedInvitesRequired } from "@/lib/interview-invite";
+import { inviteSigningReadiness, signedInvitesRequired } from "@/lib/interview-invite";
+import { backgroundRecoveryAuthenticationReadiness } from "@/lib/interview-background-recovery";
 import {
   hasInterviewDatabase,
   hasRecordingStorage,
@@ -19,6 +20,12 @@ export async function GET(request: Request) {
     }
 
     const reviewerAuth = reviewerAuthenticationReadiness();
+    const secretStrength = {
+      admin: adminAuthenticationReadiness(),
+      staff: reviewerAuth,
+      invite: inviteSigningReadiness(),
+      recovery: backgroundRecoveryAuthenticationReadiness(),
+    };
     const database = hasInterviewDatabase();
     const recordingStorage = hasRecordingStorage();
     const driveMissing = await missingGoogleDriveConfiguration();
@@ -52,6 +59,10 @@ export async function GET(request: Request) {
       database,
       recordingStorage,
       reviewerAuth,
+      secretStrength,
+      warnings: Object.entries(secretStrength)
+        .filter(([, value]) => value.configured && !value.strong)
+        .map(([name]) => `WEAK_${name.toUpperCase()}_SECRET`),
       driveOAuthSetup: { configured: driveOAuthMissing.length === 0 },
       drive: driveRoot,
       candidateEntryMode: signedInvitesRequired() ? "signed_invite" : "common_url",

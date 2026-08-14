@@ -1,6 +1,7 @@
 import { stepInterviewToGoogleDrive } from "@/lib/google-drive-sync";
 import { authorizeInterviewRequest } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 /**
  * Advances the applicant's Drive archive by at most one recording chunk. D1
@@ -12,9 +13,9 @@ export async function POST(request: Request) {
     if (!hasTrustedRequestOrigin(request)) {
       return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 1_000) return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
-    const payload = JSON.parse(rawBody) as { sessionId?: unknown };
+    const body = await readBoundedJsonBody<{ sessionId?: unknown }>(request, { maxBytes: 4_000 });
+    if (!body.ok) return noStoreJson({ error: body.status === 413 ? "入力内容が長すぎます。" : "入力内容を確認できませんでした。" }, { status: body.status });
+    const payload = body.value;
     const sessionId = typeof payload.sessionId === "string" ? payload.sessionId.trim().toUpperCase() : "";
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreJson({ error: "オンライン一次面接の接続情報が正しくありません。" }, { status: 400 });
@@ -25,6 +26,17 @@ export async function POST(request: Request) {
     }
     const result = await stepInterviewToGoogleDrive(sessionId);
     const pendingStep = "phase" in result ? result : null;
+    if (result.status === "completed" && result.integrity?.status !== "verified") {
+      const integrityStatus = result.integrity?.status === "drift" ? "drift" : "unknown";
+      return noStoreJson({
+        stored: false,
+        integrityStatus,
+        errorCode: integrityStatus === "drift"
+          ? "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT"
+          : "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_UNCONFIRMED",
+        retryable: integrityStatus === "unknown",
+      }, { status: integrityStatus === "drift" ? 409 : 503 });
+    }
     return noStoreJson({
       stored: result.status === "completed",
       recordingIncluded: result.recordingIncluded,

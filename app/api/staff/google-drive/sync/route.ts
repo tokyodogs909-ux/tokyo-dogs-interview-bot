@@ -1,6 +1,7 @@
 import { stepInterviewToGoogleDrive } from "@/lib/google-drive-sync";
 import { authorizeReviewerRequest } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 export async function POST(request: Request) {
   try {
@@ -11,15 +12,16 @@ export async function POST(request: Request) {
     if (!reviewer) {
       return noStoreJson({ error: "採用担当者の認証を確認できませんでした。" }, { status: 401 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 1_000) return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
-    const payload = JSON.parse(rawBody) as { sessionId?: unknown };
+    const body = await readBoundedJsonBody<{ sessionId?: unknown }>(request, { maxBytes: 4_000 });
+    if (!body.ok) return noStoreJson({ error: body.status === 413 ? "入力内容が長すぎます。" : "入力内容を確認できませんでした。" }, { status: body.status });
+    const payload = body.value;
     const sessionId = typeof payload.sessionId === "string" ? payload.sessionId.trim().toUpperCase() : "";
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreJson({ error: "面接IDを確認してください。" }, { status: 400 });
     }
     const result = await stepInterviewToGoogleDrive(sessionId);
-    return noStoreJson({ synced: result.status === "completed", result, reviewer });
+    const synced = result.status === "completed" && result.integrity?.status === "verified";
+    return noStoreJson({ synced, result, reviewer });
   } catch (error) {
     const code = error instanceof Error ? error.message : "";
     const archiveNotReady = code === "INTERVIEW_NOT_READY_FOR_DRIVE_SYNC" ||

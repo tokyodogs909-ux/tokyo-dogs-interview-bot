@@ -87,10 +87,12 @@ test("only the exact authenticated completed-session replay can resolve an answe
     stored: true,
     humanReviewRequired: true,
     alreadyCompleted: true,
+    automaticEvaluationDeferred: false,
   };
   assert.equal(isExactRecordedCompletionReplay(200, exact), true);
   assert.equal(isExactRecordedCompletionReplay(409, exact), false, "the answer 409 itself is never success");
   assert.equal(isExactRecordedCompletionReplay(200, { ...exact, alreadyCompleted: false }), false);
+  assert.equal(isExactRecordedCompletionReplay(200, { ...exact, automaticEvaluationDeferred: "false" }), false);
   assert.equal(isExactRecordedCompletionReplay(200, { ...exact, error: "unexpected" }), false);
   assert.equal(isExactRecordedCompletionReplay(200, null), false);
 });

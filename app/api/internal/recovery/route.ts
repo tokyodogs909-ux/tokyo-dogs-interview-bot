@@ -3,6 +3,7 @@ import {
   runInterviewBackgroundRecoveryOnce,
 } from "@/lib/interview-background-recovery";
 import { noStoreJson } from "@/lib/openai-server";
+import { readBoundedJsonBody } from "@/lib/http-body";
 
 export async function POST(request: Request) {
   try {
@@ -20,32 +21,14 @@ export async function POST(request: Request) {
       );
     }
 
-    if (request.headers.get("Content-Type") !== "application/json") {
+    const body = await readBoundedJsonBody(request, { maxBytes: 64 });
+    if (!body.ok) {
       return noStoreJson(
-        { error: "Background recovery content type is invalid." },
-        { status: 415 },
+        { error: body.status === 415 ? "Background recovery content type is invalid." : "Background recovery request body is invalid." },
+        { status: body.status },
       );
     }
-    const contentLength = request.headers.get("Content-Length") ?? "";
-    if (!/^\d+$/.test(contentLength) || Number(contentLength) > 64) {
-      return noStoreJson(
-        { error: "Background recovery request body is invalid." },
-        { status: 413 },
-      );
-    }
-    const rawBody = await request.text();
-    if (new TextEncoder().encode(rawBody).byteLength > 64) {
-      return noStoreJson(
-        { error: "Background recovery request body is invalid." },
-        { status: 413 },
-      );
-    }
-    let payload: unknown;
-    try {
-      payload = JSON.parse(rawBody);
-    } catch {
-      payload = null;
-    }
+    const payload = body.value;
     if (
       !payload ||
       typeof payload !== "object" ||

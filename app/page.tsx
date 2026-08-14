@@ -34,8 +34,26 @@ import {
   isExactRecordedCompletionReplay,
   splitRecordedAnswerUpload,
 } from "@/lib/recorded-answer-upload";
-import { uploadRecordingResumably } from "@/lib/recording-upload";
+import { createLiveRecordingUploader, uploadRecordingResumably } from "@/lib/recording-upload";
+import { createTranscriptDraftWriter } from "@/lib/transcript-draft";
+import { reportCandidateEventOnce } from "@/lib/candidate-event-receipt";
+import { runStickyInterviewCompletionHold } from "@/lib/interview-completion-hold";
+import {
+  initialRealtimeTranscriptIntegrity,
+  realtimeTranscriptIntegrityBlocker,
+  realtimeTranscriptIntegrityReady,
+  reduceRealtimeTranscriptIntegrity,
+} from "@/lib/realtime-transcript-integrity";
 import { initialRecordingAudioCoverageState, reduceRecordingAudioCoverage } from "@/lib/recording-audio-coverage";
+import {
+  cameraInterviewReadiness,
+  initialLocalMediaHealth,
+  initialMicrophoneVerification,
+  isEmbeddedInterviewBrowser,
+  reduceLocalMediaHealth,
+  reduceMicrophoneVerification,
+  reduceSpeakerVerification,
+} from "@/lib/interview-device-readiness";
 import { InterviewerStage } from "./interviewer-stage";
 
 type Stage = "intro" | "setup" | "interview" | "evaluating" | "review";
@@ -71,7 +89,23 @@ type CandidateAudioState = "idle" | "checking" | "ready" | "detected" | "muted" 
 type RemoteAudioState = "idle" | "waiting" | "receiving" | "playing" | "blocked" | "error";
 type NetworkAudioState = "idle" | "connecting" | "connected" | "reconnecting" | "error";
 type RecordingCaptureState = "idle" | "starting" | "recording" | "error";
-type SpeakerTestState = "idle" | "playing" | "passed" | "error";
+type CompletionHold =
+  | "none"
+  | "candidate_requested_stop"
+  | "safety_escalation"
+  | "completion_reason_invalid"
+  | "transcript_incomplete";
+type CandidateEventReceiptState = "stored" | "unconfirmed";
+const SUCCESSFUL_COMPLETION_REASONS = new Set([
+  "ai_completed",
+  "max_duration_reached",
+  "max_duration_connection_unavailable",
+  "recorded_fallback_max_duration_reached",
+  "text_max_duration_reached",
+  "recorded_fallback_completed",
+  "text_interview_completed",
+]);
+type SpeakerTestState = "idle" | "playing" | "played" | "passed" | "error";
 type SetupPhase = "idle" | "requesting" | "devices-ready" | "connecting" | "error";
 type TimedInterviewAction = "warning" | "complete";
 type RecordingAudioMix = {
@@ -110,6 +144,10 @@ type RealtimeEvent = {
   event_id?: string;
   item_id?: string;
   response_id?: string;
+  response?: {
+    id?: string;
+    status?: string;
+  };
   output_index?: number;
   content_index?: number;
   transcript?: string;
@@ -266,6 +304,8 @@ export default function Home() {
   const [speakerTestState, setSpeakerTestState] = useState<SpeakerTestState>("idle");
   const [setupPhase, setSetupPhase] = useState<SetupPhase>("idle");
   const [microphoneLevel, setMicrophoneLevel] = useState(0);
+  const [microphoneCheckPassed, setMicrophoneCheckPassed] = useState(false);
+  const [localMediaRecoveryRequired, setLocalMediaRecoveryRequired] = useState(false);
   const [embeddedBrowser, setEmbeddedBrowser] = useState(false);
   const [copiedPortalLink, setCopiedPortalLink] = useState(false);
   const [screenShareSupported, setScreenShareSupported] = useState(false);
@@ -273,6 +313,7 @@ export default function Home() {
   const [recordedQuestionIndex, setRecordedQuestionIndex] = useState(0);
   const [recordedQuestionReady, setRecordedQuestionReady] = useState(false);
   const [timeControlNotice, setTimeControlNotice] = useState("");
+  const [completionHold, setCompletionHold] = useState<CompletionHold>("none");
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const preparedAudioRef = useRef<HTMLAudioElement>(null);
@@ -292,6 +333,7 @@ export default function Home() {
   // partial evidence and must never be uploaded or unlock a candidate receipt.
   const recordingCompleteRef = useRef(false);
   const recordingBlobRef = useRef<Blob | null>(null);
+  const recordingLiveUploaderRef = useRef<ReturnType<typeof createLiveRecordingUploader> | null>(null);
   const recordingPromiseRef = useRef<Promise<Blob | null> | null>(null);
   const recordingResolveRef = useRef<((blob: Blob | null) => void) | null>(null);
   const recordedAnswerRecorderRef = useRef<MediaRecorder | null>(null);
@@ -324,6 +366,10 @@ export default function Home() {
   const accessTokenRef = useRef("");
   const sessionIdRef = useRef("TD-PENDING");
   const transcriptRef = useRef<TranscriptTurn[]>([]);
+  // UI partials are intentionally separate from this append-only sequence.
+  // Only completed Realtime items enter the durable draft, in completion order.
+  const completedTranscriptRef = useRef<TranscriptTurn[]>([]);
+  const transcriptDraftWriterRef = useRef<ReturnType<typeof createTranscriptDraftWriter> | null>(null);
   const recordedInterviewSessionRef = useRef<string | null>(null);
   const assistantPartialsRef = useRef(new Map<string, string>());
   const processedCompletionCallsRef = useRef(new Set<string>());
@@ -339,6 +385,7 @@ export default function Home() {
   const resumeRemoteAudioActionRef = useRef<(showNotice: boolean) => Promise<boolean>>(async () => false);
   const resumeRecordingAudioContextActionRef = useRef<() => Promise<boolean>>(async () => false);
   const invalidateRecordingRemoteCoverageActionRef = useRef<(code: string, reportNow?: boolean) => void>(() => undefined);
+  const markLocalMediaInterruptedActionRef = useRef<(type: "track_muted" | "track_ended" | "device_changed" | "page_hidden") => void>(() => undefined);
   const previousAudioStatsRef = useRef({ sent: 0, received: 0 });
   const turnStateRef = useRef(initialTurnTakingState());
   const pendingCancelEventsRef = useRef(new Map<string, number>());
@@ -346,12 +393,24 @@ export default function Home() {
   const assistantAudioStartedAtRef = useRef<number | null>(null);
   const recordingGenerationRef = useRef(0);
   const recordingFinalStopRequestedRef = useRef(false);
+  const recordingLocalContinuityValidRef = useRef(true);
+  const attemptedCandidateEventsRef = useRef(new Set<string>());
   const reportedCandidateEventsRef = useRef(new Set<string>());
   const recordedQuestionTimerRef = useRef<number | null>(null);
   const recordedFallbackActiveRef = useRef(false);
   const modeRef = useRef<InterviewMode>("voice");
+  const stageRef = useRef<Stage>("intro");
   const interviewStartedAtRef = useRef<number | null>(null);
   const microphoneLevelRef = useRef(0);
+  const microphoneCheckPassedRef = useRef(false);
+  const microphoneVerificationRef = useRef(initialMicrophoneVerification());
+  const localMediaHealthRef = useRef(initialLocalMediaHealth());
+  const localMediaRecoveryAttemptedRef = useRef(false);
+  const localTrackHandlersRef = useRef(new Map<MediaStreamTrack, {
+    mute: () => void;
+    unmute: () => void;
+    ended: () => void;
+  }>());
   const recordedQuestionReadyRef = useRef(false);
   const timedWarningDeliveredRef = useRef(false);
   const timedMaximumRequestedRef = useRef(false);
@@ -360,10 +419,12 @@ export default function Home() {
   const timedActionTimerRef = useRef<number | null>(null);
   const recordedFallbackQuietSinceRef = useRef<number | null>(null);
   const interviewFinalizationStoredRef = useRef(false);
-  // One failed realtime input transcription means the server transcript is
-  // incomplete. Keep the interview unreceipted instead of archiving a partial
-  // set of answers as though it were a complete voice transcript.
-  const voiceTranscriptionCompleteRef = useRef(true);
+  // Failure is sticky for the current session. Pending speech items and model
+  // responses are tracked separately so a clean-looking partial transcript can
+  // never be sealed before its final server events arrive.
+  const voiceTranscriptionFailureRef = useRef(false);
+  const realtimeTranscriptIntegrityRef = useRef(initialRealtimeTranscriptIntegrity());
+  const completionHoldRef = useRef<CompletionHold>("none");
   const voiceTranscriptSealedRef = useRef(false);
   const queueTimedInterviewActionRef = useRef<(action: TimedInterviewAction) => void>(() => undefined);
 
@@ -371,6 +432,14 @@ export default function Home() {
     () => transcript.filter((turn) => turn.speaker === "candidate").length,
     [transcript],
   );
+  const cameraReadiness = useMemo(() => cameraInterviewReadiness({
+    embeddedBrowser,
+    recoveryRequired: localMediaRecoveryRequired,
+    hasLiveVideo: Boolean(stream?.getVideoTracks().some((track) => track.readyState === "live")),
+    hasLiveAudio: Boolean(stream?.getAudioTracks().some((track) => track.readyState === "live" && track.enabled)),
+    microphoneVerified: microphoneCheckPassed,
+    speakerVerified: speakerTestState === "passed",
+  }), [embeddedBrowser, localMediaRecoveryRequired, microphoneCheckPassed, speakerTestState, stream]);
 
   useEffect(() => {
     streamRef.current = stream;
@@ -379,10 +448,7 @@ export default function Home() {
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      // Instagram's in-app browser UA has no trailing slash after "Instagram"
-      // (e.g. "... Instagram 275.0.0.27.98 (iPhone14,2; ...)"), unlike LINE/Facebook's
-      // "Line/13.x" and "FBAN/FBIOS", so it needs its own unslashed alternative.
-      setEmbeddedBrowser(/(?:Line|FBAN|FBAV)\/|Instagram/i.test(navigator.userAgent));
+      setEmbeddedBrowser(isEmbeddedInterviewBrowser(navigator.userAgent));
       setScreenShareSupported(
         typeof navigator.mediaDevices?.getDisplayMedia === "function" &&
         window.matchMedia("(pointer: fine)").matches,
@@ -402,6 +468,22 @@ export default function Home() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  useEffect(() => {
+    stageRef.current = stage;
+  }, [stage]);
+
+  useEffect(() => {
+    if (
+      !navigator.mediaDevices?.addEventListener ||
+      !["setup", "interview"].includes(stage) ||
+      mode === "text" ||
+      mode === "internal-test"
+    ) return;
+    const handleDeviceChange = () => markLocalMediaInterruptedActionRef.current("device_changed");
+    navigator.mediaDevices.addEventListener("devicechange", handleDeviceChange);
+    return () => navigator.mediaDevices.removeEventListener("devicechange", handleDeviceChange);
+  }, [mode, stage]);
 
   useEffect(() => {
     const activeInterviewCanLoseUnsentMedia = stage === "interview" && mode !== "internal-test";
@@ -486,9 +568,26 @@ export default function Home() {
   }, [stage, mode]);
 
   useEffect(() => {
+    if (stage !== "interview" || (mode !== "voice" && mode !== "recorded-fallback")) return;
+    const markLocalHidden = () => {
+      if (document.visibilityState === "hidden") {
+        markLocalMediaInterruptedActionRef.current("page_hidden");
+      }
+    };
+    const markLocalPageHidden = () => markLocalMediaInterruptedActionRef.current("page_hidden");
+    document.addEventListener("visibilitychange", markLocalHidden);
+    window.addEventListener("pagehide", markLocalPageHidden);
+    return () => {
+      document.removeEventListener("visibilitychange", markLocalHidden);
+      window.removeEventListener("pagehide", markLocalPageHidden);
+    };
+  }, [mode, stage]);
+
+  useEffect(() => {
     resumeRemoteAudioActionRef.current = resumeRemoteAudio;
     resumeRecordingAudioContextActionRef.current = resumeRecordingAudioContext;
     invalidateRecordingRemoteCoverageActionRef.current = invalidateRecordingRemoteCoverage;
+    markLocalMediaInterruptedActionRef.current = markLocalMediaInterrupted;
   });
 
   useEffect(() => {
@@ -496,6 +595,7 @@ export default function Home() {
     return () => {
       channelRef.current?.close();
       peerRef.current?.close();
+      streamRef.current?.getAudioTracks().forEach(unbindLocalMicrophoneTrack);
       streamRef.current?.getTracks().forEach((track) => track.stop());
       displayStreamRef.current?.getTracks().forEach((track) => track.stop());
       if (disconnectTimerRef.current) window.clearTimeout(disconnectTimerRef.current);
@@ -573,7 +673,28 @@ export default function Home() {
         const level = Math.min(100, Math.round(rms * 520));
         microphoneLevelRef.current = level;
         setMicrophoneLevel((current) => Math.abs(current - level) >= 2 ? level : current);
-        if (level >= 4) setCandidateAudioState("detected");
+        microphoneVerificationRef.current = reduceMicrophoneVerification(
+          microphoneVerificationRef.current,
+          {
+            trackLive: audioTrack.readyState === "live" && audioTrack.enabled && !audioTrack.muted,
+            level,
+          },
+        );
+        if (microphoneVerificationRef.current.verified) {
+          setCandidateAudioState("detected");
+          if (!microphoneCheckPassedRef.current) {
+            microphoneCheckPassedRef.current = true;
+            setMicrophoneCheckPassed(true);
+          }
+          if (localMediaRecoveryAttemptedRef.current && localMediaHealthRef.current.blocked) {
+            localMediaHealthRef.current = reduceLocalMediaHealth(localMediaHealthRef.current, {
+              type: "explicit_recovery_verified",
+            });
+            localMediaRecoveryAttemptedRef.current = false;
+            setLocalMediaRecoveryRequired(false);
+            setAudioNotice("マイクの再取得と実音量を確認しました。準備が整ったら、明示的に再接続してください。");
+          }
+        }
         else if (audioTrack.enabled && !audioTrack.muted) setCandidateAudioState("ready");
         meter.animationFrame = window.requestAnimationFrame(update);
       };
@@ -583,6 +704,191 @@ export default function Home() {
       microphoneLevelRef.current = 0;
       setMicrophoneLevel(0);
     }
+  }
+
+  function unbindLocalMicrophoneTrack(track: MediaStreamTrack) {
+    const handlers = localTrackHandlersRef.current.get(track);
+    if (!handlers) return;
+    track.removeEventListener("mute", handlers.mute);
+    track.removeEventListener("unmute", handlers.unmute);
+    track.removeEventListener("ended", handlers.ended);
+    localTrackHandlersRef.current.delete(track);
+  }
+
+  function abortActiveRecordedAnswerForMediaRecovery() {
+    const recorder = recordedAnswerRecorderRef.current;
+    recordedAnswerRecorderRef.current = null;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      recorder.onerror = null;
+      try {
+        recorder.stop();
+      } catch {
+        // The OS may already have stopped the answer recorder.
+      }
+    }
+    recordedAnswerChunksRef.current = [];
+    recordedAnswerStartedAtRef.current = null;
+    recordedQuestionReadyRef.current = false;
+    setRecordedQuestionReady(false);
+  }
+
+  function markLocalMediaInterrupted(type: "track_muted" | "track_ended" | "device_changed" | "page_hidden") {
+    if (
+      endingRef.current ||
+      stageRef.current !== "interview" ||
+      modeRef.current === "text" ||
+      modeRef.current === "internal-test"
+    ) return;
+    const previous = localMediaHealthRef.current;
+    localMediaHealthRef.current = reduceLocalMediaHealth(previous, { type });
+    if (previous.blocked) return;
+    const code = localMediaHealthRef.current.code || "LOCAL_MEDIA_INTERRUPTED";
+    microphoneCheckPassedRef.current = false;
+    microphoneVerificationRef.current = initialMicrophoneVerification();
+    setMicrophoneCheckPassed(false);
+    setSpeakerTestState("idle");
+    setLocalMediaRecoveryRequired(true);
+    setCandidateAudioState("error");
+    setSetupPhase("error");
+    setConnectionState("error");
+    setNetworkAudioState("error");
+    setErrorMessage("TD-CONN-MIC: マイク接続の変更を検知したため、質問を停止しました。「マイクを再取得」を押して、声の入力をもう一度確認してください。");
+    setAudioNotice("マイクが変化したため、自動で別の機器へ切り替えず、面接を停止しています。");
+    reportCandidateEvent("recording_unavailable", code);
+    invalidateRecordingRemoteCoverage(code);
+    if (recorderRef.current && recorderRef.current.state !== "inactive") {
+      // The browser does not prove continuous camera/microphone capture across
+      // a mute, device swap, app background, or track end. Recovery may let the
+      // candidate continue, but the interrupted recording cannot receive the
+      // same complete/archive receipt as uninterrupted media.
+      recordingLocalContinuityValidRef.current = false;
+      recordingCompleteRef.current = false;
+    }
+    if (modeRef.current === "recorded-fallback") abortActiveRecordedAnswerForMediaRecovery();
+    if (stageRef.current === "interview") {
+      stopRealtime({ keepLocalStream: true, keepRecorder: true });
+      setStage("setup");
+    }
+  }
+
+  function bindLocalMicrophoneTrack(track: MediaStreamTrack) {
+    unbindLocalMicrophoneTrack(track);
+    const handlers = {
+      mute: () => markLocalMediaInterruptedActionRef.current("track_muted"),
+      unmute: () => {
+        if (localMediaHealthRef.current.blocked) {
+          setCandidateAudioState("error");
+          setAudioNotice("マイクが再開したように見えても、自動では面接を続けません。「マイクを再取得」を押してください。");
+        } else {
+          setCandidateAudioState("ready");
+        }
+      },
+      ended: () => markLocalMediaInterruptedActionRef.current("track_ended"),
+    };
+    localTrackHandlersRef.current.set(track, handlers);
+    track.addEventListener("mute", handlers.mute);
+    track.addEventListener("unmute", handlers.unmute);
+    track.addEventListener("ended", handlers.ended);
+  }
+
+  async function reacquireLocalMedia() {
+    if (sessionStarting || !localMediaRecoveryRequired) return;
+    setSessionStarting(true);
+    setErrorMessage("");
+    setAudioNotice("カメラとマイクの再取得を確認しています。許可画面が出た場合は「許可」を選んでください。");
+    let acquiredStream: MediaStream | null = null;
+    let nextStream: MediaStream | null = null;
+    try {
+      acquiredStream = await navigator.mediaDevices.getUserMedia({
+        audio: AUDIO_CONSTRAINTS,
+        video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 540 } },
+      });
+      const nextMicrophone = acquiredStream.getAudioTracks()[0];
+      const nextCamera = acquiredStream.getVideoTracks()[0];
+      if (!nextMicrophone || !nextCamera) throw new Error("TD-CONN-MIC: カメラまたはマイクを再取得できませんでした。");
+
+      const mix = recordingAudioMixRef.current;
+      const previousStream = streamRef.current;
+      const activeRecorder = recorderRef.current?.state === "recording";
+      if (activeRecorder) {
+        if (!mix || mix.context.state === "closed") {
+          throw new Error("TD-CONN-MIC: 録画を壊さずにマイクを更新できません。採用担当者へ受付番号をお知らせください。");
+        }
+        const recorderCamera = previousStream?.getVideoTracks()[0];
+        if (!recorderCamera || recorderCamera.readyState !== "live" || recorderCamera.muted) {
+          throw new Error("TD-CONN-CAMERA: 録画中のカメラを安全に継続できません。採用担当者へ受付番号をお知らせください。");
+        }
+        const replacementSource = mix.context.createMediaStreamSource(new MediaStream([nextMicrophone]));
+        replacementSource.connect(mix.destination);
+        try {
+          mix.localSource.disconnect();
+        } catch {
+          // The old source may already be disconnected after an OS interruption.
+        }
+        mix.localSource = replacementSource;
+        // MediaRecorder cannot safely swap encoded video tracks mid-container.
+        // Keep the exact original recorder-owned camera track for the preview;
+        // never imply that the newly acquired camera was added to the recording.
+        nextCamera.stop();
+        nextStream = new MediaStream([recorderCamera, nextMicrophone]);
+      } else {
+        nextStream = acquiredStream;
+      }
+
+      previousStream?.getAudioTracks().forEach(unbindLocalMicrophoneTrack);
+      streamRef.current = nextStream;
+      setStream(nextStream);
+      bindLocalMicrophoneTrack(nextMicrophone);
+      microphoneCheckPassedRef.current = false;
+      microphoneVerificationRef.current = initialMicrophoneVerification();
+      setMicrophoneCheckPassed(false);
+      localMediaRecoveryAttemptedRef.current = true;
+      setCandidateAudioState("checking");
+      setSetupPhase("devices-ready");
+      await startMicrophoneMeter(nextStream);
+      if (activeRecorder) previousStream?.getAudioTracks().forEach((track) => track.stop());
+      else previousStream?.getTracks().forEach((track) => track.stop());
+      setAudioNotice("マイクに向かって話し、入力メーターが動いた後に「オンライン一次面接へ再接続」を押してください。");
+    } catch (error) {
+      acquiredStream?.getTracks().forEach((track) => track.stop());
+      if (recorderRef.current?.state === "recording") {
+        recordingFinalStopRequestedRef.current = false;
+        recordingCompleteRef.current = false;
+        try {
+          recorderRef.current.stop();
+        } catch {
+          recordingResolveRef.current?.(null);
+          recordingResolveRef.current = null;
+        }
+      }
+      localMediaRecoveryAttemptedRef.current = false;
+      setCandidateAudioState("error");
+      setSetupPhase("error");
+      setErrorMessage(deviceErrorMessage(error));
+    } finally {
+      setSessionStarting(false);
+    }
+  }
+
+  async function resumeAfterLocalMediaRecovery() {
+    if (!cameraReadiness.ready || localMediaHealthRef.current.blocked) {
+      setErrorMessage(`TD-CONN-CHECK: ${cameraReadiness.message}`);
+      return;
+    }
+    setErrorMessage("");
+    if (modeRef.current === "recorded-fallback") {
+      recordedFallbackActiveRef.current = true;
+      setSetupPhase("devices-ready");
+      setConnectionState("ready");
+      setNetworkAudioState("idle");
+      setStage("interview");
+      setAudioNotice("マイクの再取得後、同じ質問の回答を最初から録音します。");
+      armRecordedAnswerButton();
+      return;
+    }
+    await connectPreparedInterview();
   }
 
   function stopAudioPrime() {
@@ -682,7 +988,7 @@ export default function Home() {
 
   function speakOnDevice(text: string, updateSpeakerTest = false, keepAudioPrimed = false) {
     if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
-      if (updateSpeakerTest) setSpeakerTestState("error");
+      if (updateSpeakerTest) setSpeakerTestState((state) => reduceSpeakerVerification(state, "playback_failed") as SpeakerTestState);
       setAudioNotice("この端末では音声確認を開始できませんでした。端末の音量と消音設定をご確認ください。");
       return;
     }
@@ -696,15 +1002,15 @@ export default function Home() {
     const japaneseVoice = window.speechSynthesis.getVoices().find((voice) => voice.lang.toLowerCase().startsWith("ja"));
     if (japaneseVoice) utterance.voice = japaneseVoice;
     utterance.onstart = () => {
-      if (updateSpeakerTest) setSpeakerTestState("playing");
+      if (updateSpeakerTest) setSpeakerTestState((state) => reduceSpeakerVerification(state, "playback_started") as SpeakerTestState);
     };
     utterance.onend = () => {
-      if (updateSpeakerTest) setSpeakerTestState("passed");
+      if (updateSpeakerTest) setSpeakerTestState((state) => reduceSpeakerVerification(state, "playback_completed") as SpeakerTestState);
       if (!keepAudioPrimed && !remoteStreamRef.current) stopAudioPrime();
     };
     utterance.onerror = (event) => {
       if (event.error === "canceled" || event.error === "interrupted") return;
-      if (updateSpeakerTest) setSpeakerTestState("error");
+      if (updateSpeakerTest) setSpeakerTestState((state) => reduceSpeakerVerification(state, "playback_failed") as SpeakerTestState);
       if (!keepAudioPrimed && !remoteStreamRef.current) stopAudioPrime();
       setAudioNotice("音声確認を再生できませんでした。端末の消音を解除し、音量を上げてもう一度お試しください。");
     };
@@ -717,7 +1023,7 @@ export default function Home() {
   ) {
     const audio = preparedAudioRef.current;
     if (!audio) {
-      if (options.updateSpeakerTest) setSpeakerTestState("error");
+      if (options.updateSpeakerTest) setSpeakerTestState((state) => reduceSpeakerVerification(state, "playback_failed") as SpeakerTestState);
       setAudioNotice("確認音声の準備ができませんでした。ページを再読み込みして、もう一度お試しください。");
       return false;
     }
@@ -731,19 +1037,19 @@ export default function Home() {
     audio.muted = false;
     audio.volume = 1;
     audio.setAttribute("playsinline", "");
-    if (options.updateSpeakerTest) setSpeakerTestState("playing");
+    if (options.updateSpeakerTest) setSpeakerTestState((state) => reduceSpeakerVerification(state, "playback_started") as SpeakerTestState);
 
     const fail = () => {
-      if (options.updateSpeakerTest) setSpeakerTestState("error");
+      if (options.updateSpeakerTest) setSpeakerTestState((state) => reduceSpeakerVerification(state, "playback_failed") as SpeakerTestState);
       if (!options.keepAudioPrimed && !remoteStreamRef.current) stopAudioPrime();
       setAudioNotice("確認音声を再生できませんでした。端末の消音を解除し、音量を上げて「もう一度聞く」を押してください。");
     };
     audio.onplaying = () => {
-      if (options.updateSpeakerTest) setSpeakerTestState("playing");
+      if (options.updateSpeakerTest) setSpeakerTestState((state) => reduceSpeakerVerification(state, "playback_started") as SpeakerTestState);
       setAudioNotice("");
     };
     audio.onended = () => {
-      if (options.updateSpeakerTest) setSpeakerTestState("passed");
+      if (options.updateSpeakerTest) setSpeakerTestState((state) => reduceSpeakerVerification(state, "playback_completed") as SpeakerTestState);
       if (!options.keepAudioPrimed && !remoteStreamRef.current) stopAudioPrime();
     };
     audio.onerror = fail;
@@ -763,6 +1069,12 @@ export default function Home() {
       updateSpeakerTest: true,
       keepAudioPrimed: stage === "setup" || Boolean(streamRef.current),
     });
+  }
+
+  function confirmSpeakerHeard() {
+    if (speakerTestState !== "played") return;
+    setSpeakerTestState((state) => reduceSpeakerVerification(state, "candidate_confirmed") as SpeakerTestState);
+    setAudioNotice("確認音が聞こえたことを確認しました。");
   }
 
   async function copyPortalLink() {
@@ -854,24 +1166,46 @@ export default function Home() {
     return { state, scheduledNextQuestion };
   }
 
-  function reportCandidateEvent(
-    eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop" | "time_limit_reached" | "reasonable_accommodation_text_selected",
+  function resetRealtimeTranscriptIntegrity() {
+    voiceTranscriptionFailureRef.current = false;
+    realtimeTranscriptIntegrityRef.current = initialRealtimeTranscriptIntegrity();
+  }
+
+  function applyRealtimeTranscriptIntegrity(event: RealtimeEvent) {
+    const next = reduceRealtimeTranscriptIntegrity(realtimeTranscriptIntegrityRef.current, event);
+    realtimeTranscriptIntegrityRef.current = next;
+    if (next.transcriptionFailed) voiceTranscriptionFailureRef.current = true;
+    return next;
+  }
+
+  function voiceTranscriptCompletionBlocker() {
+    if (voiceTranscriptionFailureRef.current) return "transcription_failed";
+    return realtimeTranscriptIntegrityBlocker(realtimeTranscriptIntegrityRef.current);
+  }
+
+  function updateCompletionHold(next: CompletionHold) {
+    completionHoldRef.current = next;
+    setCompletionHold(next);
+  }
+
+  async function reportCandidateEvent(
+    eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop" | "safety_escalation" | "completion_reason_invalid" | "time_limit_reached" | "reasonable_accommodation_text_selected",
     code = "",
-  ) {
+  ): Promise<CandidateEventReceiptState> {
     const activeSessionId = sessionIdRef.current;
     const accessToken = accessTokenRef.current;
-    const dedupeKey = `${eventType}:${code}`;
-    if (!activeSessionId.startsWith("TD-") || activeSessionId === "TD-PENDING" || !accessToken || reportedCandidateEventsRef.current.has(dedupeKey)) return Promise.resolve();
-    reportedCandidateEventsRef.current.add(dedupeKey);
-    return fetch("/api/interviews/event", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ sessionId: activeSessionId, eventType, code }),
-      keepalive: true,
-    }).then(() => undefined).catch(() => undefined);
+    if (!activeSessionId.startsWith("TD-") || activeSessionId === "TD-PENDING" || !accessToken) {
+      return "unconfirmed";
+    }
+    const result = await reportCandidateEventOnce({
+      sessionId: activeSessionId,
+      accessToken,
+      eventType,
+      code,
+      attemptedKeys: attemptedCandidateEventsRef.current,
+      storedKeys: reportedCandidateEventsRef.current,
+    });
+    return result.state;
   }
 
   function clearCandidateResponseDelay() {
@@ -1043,7 +1377,7 @@ export default function Home() {
     if (modeRef.current === "text") {
       const pendingText = textDraft.trim();
       if (pendingText) {
-        upsertTurn({
+        recordCompletedTurn({
           id: `text-time-limit-${Date.now()}`,
           speaker: "candidate",
           text: pendingText,
@@ -1219,11 +1553,82 @@ export default function Home() {
   function upsertTurn(turn: TranscriptTurn) {
     const current = transcriptRef.current;
     const index = current.findIndex((item) => item.id === turn.id);
+    const stableTurn = index >= 0 && current[index].createdAt
+      ? { ...turn, createdAt: current[index].createdAt }
+      : turn;
     const next = index >= 0
-      ? current.map((item, itemIndex) => itemIndex === index ? turn : item)
-      : [...current, turn];
+      ? current.map((item, itemIndex) => itemIndex === index ? stableTurn : item)
+      : [...current, stableTurn];
     transcriptRef.current = next;
     setTranscript(next);
+    return stableTurn;
+  }
+
+  function initializeTranscriptDraftWriter(
+    credentials: InterviewCredentials,
+    draftMode: "voice" | "text",
+  ) {
+    transcriptDraftWriterRef.current = createTranscriptDraftWriter({
+      sessionId: credentials.sessionId,
+      accessToken: credentials.accessToken,
+      mode: draftMode,
+    });
+  }
+
+  function enqueueCompletedTranscriptSnapshot(snapshot = completedTranscriptRef.current) {
+    const writer = transcriptDraftWriterRef.current;
+    if (!writer || snapshot.length < 1) return;
+    void writer.enqueue(snapshot).catch(() => {
+      setProcessingWarning("回答記録の途中保存を確認できませんでした。面接終了時に同じ受付番号で再確認します。この画面は閉じないでください。");
+    });
+  }
+
+  function recordCompletedTurn(turn: TranscriptTurn, options: { enqueue?: boolean } = {}) {
+    const uiTurn = upsertTurn(turn);
+    const current = completedTranscriptRef.current;
+    const existing = current.find((item) => item.id === uiTurn.id);
+    if (existing) {
+      if (existing.speaker !== uiTurn.speaker || existing.text !== uiTurn.text) {
+        voiceTranscriptionFailureRef.current = true;
+        realtimeTranscriptIntegrityRef.current = {
+          ...realtimeTranscriptIntegrityRef.current,
+          transcriptionFailed: true,
+        };
+        setProcessingWarning("同じ発言の確定内容が一致しなかったため、面接記録を自動確定しません。採用担当者が確認します。");
+      }
+      return current;
+    }
+    const next = [...current, uiTurn];
+    completedTranscriptRef.current = next;
+    if (options.enqueue !== false) enqueueCompletedTranscriptSnapshot(next);
+    return next;
+  }
+
+  function finalizationTranscript() {
+    return modeRef.current === "voice" || modeRef.current === "text"
+      ? completedTranscriptRef.current
+      : transcriptRef.current;
+  }
+
+  async function sealDurableTranscriptDraft(draftMode: "voice" | "text") {
+    const snapshot = finalizationTranscript();
+    if (!snapshot.some((turn) => turn.speaker === "candidate" && turn.text.trim().length > 0)) {
+      throw new Error("確定できる回答記録がありません。");
+    }
+    let writer = transcriptDraftWriterRef.current;
+    if (!writer) {
+      const activeSessionId = sessionIdRef.current;
+      const activeAccessToken = accessTokenRef.current;
+      if (!activeSessionId || activeSessionId === "TD-PENDING" || !activeAccessToken) {
+        throw new Error("回答記録の保存情報を確認できません。");
+      }
+      initializeTranscriptDraftWriter(
+        { sessionId: activeSessionId, accessToken: activeAccessToken },
+        draftMode,
+      );
+      writer = transcriptDraftWriterRef.current;
+    }
+    await writer!.seal(snapshot);
   }
 
   function cleanupRecordingAudioMix() {
@@ -1444,6 +1849,16 @@ export default function Home() {
       setRecordingCaptureState("error");
       return;
     }
+    if (options.resume) {
+      // If the original recorder stopped, its encoded container is incomplete.
+      // Starting a second MediaRecorder and concatenating containers would make
+      // a seemingly successful but truncated recording. Keep the accepted v3
+      // parts for staff recovery and require an explicit candidate restart.
+      recordingCompleteRef.current = false;
+      setRecordingCaptureState("error");
+      setAudioNotice("録画が途中で終了したため、自動で別の録画へ切り替えません。採用担当者へ受付番号をお知らせください。");
+      return;
+    }
     setRecordingCaptureState("starting");
     updateRecordingAudioCoverage(null);
     // A reconnect (options.resume) restarts the MediaRecorder but must keep the
@@ -1451,9 +1866,11 @@ export default function Home() {
     // full interview instead of only the segment recorded after recovery.
     if (!options.resume) {
       chunksRef.current = [];
+      recordingLiveUploaderRef.current = null;
       recordingBytesRef.current = 0;
       recordingSizeCappedRef.current = false;
       recordingCompleteRef.current = false;
+      recordingLocalContinuityValidRef.current = true;
     }
     // Each recorder belongs to one generation. A previous recorder's stop event
     // can still be queued when a reconnect starts a new one; without this guard
@@ -1596,6 +2013,16 @@ export default function Home() {
           audioBitsPerSecond: 48_000,
           ...(hasVideo ? { videoBitsPerSecond: 360_000 } : {}),
         });
+        const liveUploader = createLiveRecordingUploader({
+          sessionId: sessionIdRef.current,
+          accessToken: accessTokenRef.current,
+          contentType: recorder.mimeType || mimeType,
+          onProgress: setRecordingUploadProgress,
+          onError: () => {
+            setRecordingUploadState("error");
+            setAudioNotice("録画データの送信が一時停止しています。未送信データをこの画面に保持しているため、画面を閉じずに面接を続けてください。");
+          },
+        });
         recorder.ondataavailable = (event) => {
           if (event.data.size <= 0 || recordingSizeCappedRef.current) return;
           const nextSize = recordingBytesRef.current + event.data.size;
@@ -1616,7 +2043,24 @@ export default function Home() {
             }
             return;
           }
-          chunksRef.current.push(event.data);
+          try {
+            liveUploader.append(event.data);
+          } catch {
+            recordingCaptureFailed = true;
+            recordingCompleteRef.current = false;
+            setRecordingCaptureState("error");
+            setRecordingUploadState("error");
+            reportCandidateEvent("recording_unavailable", "LIVE_RECORDING_BUFFER_FAILED");
+            if (recorder.state !== "inactive") {
+              try {
+                recorder.stop();
+              } catch {
+                recordingResolveRef.current?.(null);
+                recordingResolveRef.current = null;
+              }
+            }
+            return;
+          }
           recordingBytesRef.current = nextSize;
         };
         recorder.onerror = () => {
@@ -1640,14 +2084,18 @@ export default function Home() {
           cleanupRecordingAudioMix();
           if (recorderRef.current === recorder) recorderRef.current = null;
           if (!ownsRecording()) return;
-          if (!chunksRef.current.length) {
+          if (recordingBytesRef.current <= 0) {
             recordingCompleteRef.current = false;
             setRecordingCaptureState("error");
             recordingResolveRef.current?.(null);
             recordingResolveRef.current = null;
             return;
           }
-          const blob = new Blob(chunksRef.current, {
+          // Version 3 owns the actual byte chunks and releases only durable
+          // full parts. Keep a zero-byte completion token for the existing
+          // finalization state machine instead of rebuilding the entire media
+          // Blob in mobile RAM.
+          const blob = new Blob([], {
             type: recorder.mimeType || (hasVideo ? "video/webm" : "audio/webm"),
           });
           // Retain partial bytes locally as incident evidence, but resolve the
@@ -1656,6 +2104,7 @@ export default function Home() {
           if (
             recordingCaptureFailed ||
             recordingSizeCappedRef.current ||
+            !recordingLocalContinuityValidRef.current ||
             !recordingFinalStopRequestedRef.current
           ) {
             recordingCompleteRef.current = false;
@@ -1670,6 +2119,10 @@ export default function Home() {
         recorder.start(1_000);
         selectedRecorder = recorder;
         recorderRef.current = recorder;
+        recordingLiveUploaderRef.current = liveUploader;
+        setRecordingUploadState("uploading");
+        setRecordingUploadProgress(0);
+        void liveUploader.start();
         hasBothAudio = remoteStream ? attachRemoteAudioToRecording(remoteStream) : false;
         break;
       } catch {
@@ -1729,6 +2182,18 @@ export default function Home() {
   async function connectPreparedInterview() {
     const activeStream = streamRef.current;
     if (!activeStream || sessionStarting) return;
+    const readiness = cameraInterviewReadiness({
+      embeddedBrowser,
+      recoveryRequired: localMediaHealthRef.current.blocked,
+      hasLiveVideo: activeStream.getVideoTracks().some((track) => track.readyState === "live"),
+      hasLiveAudio: activeStream.getAudioTracks().some((track) => track.readyState === "live" && track.enabled),
+      microphoneVerified: microphoneCheckPassedRef.current,
+      speakerVerified: speakerTestState === "passed",
+    });
+    if (!readiness.ready) {
+      setErrorMessage(`TD-CONN-CHECK: ${readiness.message}`);
+      return;
+    }
     const preferredLocation = normalizePreferredLocation(location);
     if (!preferredLocation) return;
     setSessionStarting(true);
@@ -1765,6 +2230,12 @@ export default function Home() {
         sessionIdRef.current = activeSessionId;
         setSessionId(activeSessionId);
       }
+      if (recordedInterviewSessionRef.current !== activeSessionId || !transcriptDraftWriterRef.current) {
+        initializeTranscriptDraftWriter(
+          { sessionId: activeSessionId, accessToken: activeAccessToken },
+          "voice",
+        );
+      }
       await connectRealtime("voice", { sessionId: activeSessionId, accessToken: activeAccessToken });
     } catch {
       setStage("setup");
@@ -1772,7 +2243,7 @@ export default function Home() {
       setConnectionState("error");
       setNetworkAudioState("error");
       setRemoteAudioState("waiting");
-      setErrorMessage("自然音声の回線を確認できなかったため、録画式のオンライン一次面接へ自動で切り替えます。カメラとマイクは確認済みです。");
+      setErrorMessage("自然音声の回線を確認できなかったため、録画式へ切り替えます。録画にはカメラ映像と応募者の音声を保存し、端末で読む質問音声は含めず質問文を別に記録します。");
       continueWithRecordedInterview = Boolean(
         streamRef.current &&
         sessionIdRef.current &&
@@ -2104,6 +2575,26 @@ export default function Home() {
     retryRecordedAnswersOnFinalizationRef.current = false;
   }
 
+  function stopCurrentRecordedAnswerForTechnicalHold() {
+    const recorder = recordedAnswerRecorderRef.current;
+    recordedAnswerRecorderRef.current = null;
+    if (recorder && recorder.state !== "inactive") {
+      // This answer was interrupted by an explicit stop/technical hold. Earlier
+      // answer receipts stay durable, but this partial answer is never promoted
+      // into the contiguous completed-answer set.
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      recorder.onerror = null;
+      try {
+        recorder.stop();
+      } catch {
+        // The recorder may already be stopping.
+      }
+    }
+    recordedAnswerChunksRef.current = [];
+    recordedAnswerStartedAtRef.current = null;
+  }
+
   async function startRecordedFallback(options: { continueCurrentAttempt?: boolean } = {}) {
     const activeStream = streamRef.current;
     const activeSessionId = sessionIdRef.current;
@@ -2116,6 +2607,27 @@ export default function Home() {
       (sessionStarting && !options.continueCurrentAttempt)
     ) {
       setErrorMessage("面接記録の準備情報を確認できません。入力画面からもう一度開始してください。");
+      return;
+    }
+    if (
+      localMediaHealthRef.current.blocked ||
+      !microphoneCheckPassedRef.current ||
+      speakerTestState !== "passed" ||
+      !activeStream.getAudioTracks().some((track) => track.readyState === "live" && track.enabled)
+    ) {
+      setErrorMessage("TD-CONN-CHECK: マイクの実音量と確認音の再生を完了してから、録画式面接へ進んでください。");
+      return;
+    }
+    if (
+      recordingLiveUploaderRef.current ||
+      recordingBytesRef.current > 0 ||
+      recorderRef.current?.state === "recording"
+    ) {
+      // A running/started Version 3 upload owns one immutable byte stream and
+      // uploadId. Starting fallback with a second MediaRecorder would either
+      // conflict at the deterministic R2 keys or concatenate two media
+      // containers into a file that appears complete but is truncated.
+      setErrorMessage("TD-CONN-RECORDING: 通常音声方式の録画がすでに始まっているため、同じ受付番号で別の録画式へは切り替えません。通常音声方式へ再接続するか、採用担当者へ受付番号をお知らせください。");
       return;
     }
     setSessionStarting(true);
@@ -2135,7 +2647,7 @@ export default function Home() {
       }
       stopRealtime({ keepLocalStream: true });
       recordedFallbackActiveRef.current = true;
-      const firstQuestion = `TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。音声回線の予備方式で、画面の質問に声で回答し、話し終えたら次の質問へ進んでください。${RECORDED_FALLBACK_QUESTIONS[0]}`;
+      const firstQuestion = `TOKYO DOGSのオンライン一次面接です。オンライン採用担当者の茂木です。音声回線の予備方式で、画面の質問に声で回答し、話し終えたら次の質問へ進んでください。録画にはあなたの音声を保存し、この端末で読む質問音声は含めず、質問文を別に記録します。${RECORDED_FALLBACK_QUESTIONS[0]}`;
       const firstTurn: TranscriptTurn = {
         id: "recorded-fallback-question-1",
         speaker: "interviewer",
@@ -2231,6 +2743,10 @@ export default function Home() {
 
   async function prepareInterview() {
     if (!consent || sessionStarting) return;
+    if (embeddedBrowser) {
+      setErrorMessage("TD-CONN-WEBVIEW: カメラ・音声方式はLINEやSNS内の画面では開始できません。リンクをコピーし、SafariまたはChromeで開いてください。文字入力方式はこの画面でも利用できます。");
+      return;
+    }
     if (!candidateName.trim()) {
       setErrorMessage("氏名を入力してください。");
       return;
@@ -2264,6 +2780,12 @@ export default function Home() {
     setConnectionStep("permissions");
     setScreenCaptureState("idle");
     setMicrophoneLevel(0);
+    microphoneCheckPassedRef.current = false;
+    microphoneVerificationRef.current = initialMicrophoneVerification();
+    setMicrophoneCheckPassed(false);
+    localMediaHealthRef.current = initialLocalMediaHealth();
+    localMediaRecoveryAttemptedRef.current = false;
+    setLocalMediaRecoveryRequired(false);
     setRecordingCaptureState("idle");
     updateRecordingAudioCoverage(null);
     setCandidateAudioState("checking");
@@ -2299,28 +2821,11 @@ export default function Home() {
       setStream(nextStream);
       setCandidateAudioState(microphoneTrack.muted ? "checking" : "ready");
       setSetupPhase("devices-ready");
+      bindLocalMicrophoneTrack(microphoneTrack);
       await startMicrophoneMeter(nextStream);
       void playPreparedAudio("/audio/motegi-devices-ready.mp3", {
         updateSpeakerTest: true,
         keepAudioPrimed: true,
-      });
-      microphoneTrack.addEventListener("mute", () => {
-        if (!endingRef.current) {
-          setCandidateAudioState("error");
-          setAudioNotice("マイク入力が一時停止しています。ほかの通話アプリを閉じ、マイクの許可をご確認ください。");
-        }
-      });
-      microphoneTrack.addEventListener("unmute", () => {
-        setCandidateAudioState("ready");
-        setAudioNotice("");
-      });
-      microphoneTrack.addEventListener("ended", () => {
-        if (!endingRef.current) {
-          stopMicrophoneMeter();
-          setCandidateAudioState("error");
-          setSetupPhase("error");
-          setErrorMessage("TD-CONN-MIC: マイク接続が終了しました。端末の設定を確認し、最初からやり直してください。");
-        }
       });
     } catch (error) {
       nextStream?.getTracks().forEach((track) => track.stop());
@@ -2334,7 +2839,6 @@ export default function Home() {
       return;
     }
     setSessionStarting(false);
-    await connectPreparedInterview();
   }
 
   async function startTextInterview() {
@@ -2373,7 +2877,8 @@ export default function Home() {
       accessTokenRef.current = data.accessToken;
       sessionIdRef.current = data.sessionId;
       setSessionId(data.sessionId);
-      voiceTranscriptionCompleteRef.current = true;
+      resetRealtimeTranscriptIntegrity();
+      updateCompletionHold("none");
       const started = await fetch("/api/interviews/text/start", {
         method: "POST",
         headers: {
@@ -2397,9 +2902,22 @@ export default function Home() {
       startInterviewClock();
       transcriptRef.current = [firstTurn];
       setTranscript([firstTurn]);
+      completedTranscriptRef.current = [firstTurn];
+      initializeTranscriptDraftWriter(
+        { sessionId: data.sessionId, accessToken: data.accessToken },
+        "text",
+      );
+      setProcessingWarning("");
+      try {
+        await transcriptDraftWriterRef.current!.enqueue([firstTurn]);
+      } catch {
+        // A later append contains this exact first turn and the server accepts it
+        // only as an append-only prefix. Finalization still fails closed unless
+        // the complete snapshot receives an exact receipt.
+        setProcessingWarning("最初の質問の途中保存を確認できませんでした。次の回答送信時と面接終了時に同じ受付番号で再確認します。");
+      }
       setConnectionState("ready");
       setConnectionStep("ready");
-      setProcessingWarning("");
       setRecordingUploadState("idle");
       setArchiveSyncState("idle");
       setCompletionSavePending(false);
@@ -2417,7 +2935,8 @@ export default function Home() {
     stopRealtime();
     const id = `TD-TEST-${Date.now().toString(36).toUpperCase()}`;
     sessionIdRef.current = id;
-    voiceTranscriptionCompleteRef.current = true;
+    resetRealtimeTranscriptIntegrity();
+    updateCompletionHold("none");
     const firstTurn: TranscriptTurn = {
       id: "internal-test-question-1",
       speaker: "interviewer",
@@ -2469,6 +2988,7 @@ export default function Home() {
     channelRef.current = null;
     activeChannel?.close();
     if (!options.keepLocalStream) {
+      streamRef.current?.getAudioTracks().forEach(unbindLocalMicrophoneTrack);
       peerRef.current?.getSenders().forEach((sender) => sender.track?.stop());
     }
     peerRef.current?.close();
@@ -2501,6 +3021,7 @@ export default function Home() {
     }
     if (!options.keepLocalStream) {
       stopMicrophoneMeter();
+      streamRef.current?.getAudioTracks().forEach(unbindLocalMicrophoneTrack);
       streamRef.current?.getTracks().forEach((track) => track.stop());
       setStream(null);
     }
@@ -2516,6 +3037,7 @@ export default function Home() {
 
   async function requestEvaluation() {
     setProcessingWarning("");
+    const transcript = finalizationTranscript();
     const response = await fetch("/api/evaluate", {
       method: "POST",
       headers: {
@@ -2526,7 +3048,7 @@ export default function Home() {
         sessionId,
         employment,
         location: normalizePreferredLocation(location),
-        transcript: transcriptRef.current,
+        transcript,
       }),
     });
     const data = (await response.json()) as {
@@ -2706,14 +3228,18 @@ export default function Home() {
 
   async function sealVoiceTranscriptCompletion() {
     if (voiceTranscriptSealedRef.current) return;
-    if (!voiceTranscriptionCompleteRef.current) {
+    if (voiceTranscriptCompletionBlocker()) {
       throw new Error("回答音声の文字起こしに未完了の箇所があるため、面接記録の保存は完了していません。");
     }
-    if (!transcriptRef.current.some((turn) =>
+    const transcript = finalizationTranscript();
+    if (!transcript.some((turn) =>
       turn.speaker === "candidate" && turn.text.trim().length > 0
     )) {
       throw new Error("確定できる回答の文字起こしがありません。");
     }
+    // Flush every completed turn and require the exact durable draft seal
+    // before the legacy voice-completion seal can expose it to evaluation.
+    await sealDurableTranscriptDraft("voice");
     const response = await fetch("/api/interviews/voice/transcript/seal", {
       method: "POST",
       headers: {
@@ -2722,7 +3248,7 @@ export default function Home() {
       },
       body: JSON.stringify({
         sessionId,
-        transcript: transcriptRef.current,
+        transcript,
         transcriptionComplete: true,
       }),
     });
@@ -2788,16 +3314,26 @@ export default function Home() {
       throw new Error("途中までの録画は送信できません。");
     }
     setRecordingUploadState("uploading");
+    const audioCoverage = recordingHasBothAudioRef.current === true
+      ? "both"
+      : recordingHasBothAudioRef.current === false
+        ? "candidate-only"
+        : "unverified";
+    const liveUploader = recordingLiveUploaderRef.current;
+    if (liveUploader) {
+      await liveUploader.finalize(audioCoverage);
+      setRecordingUploadState("stored");
+      return;
+    }
+    // Version 2 remains only for a page that was already open across the v3
+    // rollout and still owns its finalized full Blob. New recordings always use
+    // the live uploader above.
     setRecordingUploadProgress(0);
     await uploadRecordingResumably({
       blob,
       sessionId,
       accessToken: accessTokenRef.current,
-      audioCoverage: recordingHasBothAudioRef.current === true
-        ? "both"
-        : recordingHasBothAudioRef.current === false
-          ? "candidate-only"
-          : "unverified",
+      audioCoverage,
       onProgress: setRecordingUploadProgress,
     });
     setRecordingUploadState("stored");
@@ -2805,16 +3341,17 @@ export default function Home() {
 
   async function storeInterviewFinalization() {
     if (interviewFinalizationStoredRef.current) return;
-    if (mode === "voice" && !voiceTranscriptionCompleteRef.current) {
+    if (mode === "voice" && voiceTranscriptCompletionBlocker()) {
       throw new Error("回答音声の文字起こしに未完了の箇所があるため、面接記録の保存は完了していません。");
     }
-    if (!transcriptRef.current.some((turn) => turn.speaker === "candidate" && turn.text.trim().length > 0)) {
+    if (!finalizationTranscript().some((turn) => turn.speaker === "candidate" && turn.text.trim().length > 0)) {
       throw new Error("評価に必要な回答記録がありません。オンライン一次面接を最初からお試しください。");
     }
     if (mode === "voice") await sealVoiceTranscriptCompletion();
     if (mode === "recorded-fallback") {
       await completeRecordedFallback(retryRecordedAnswersOnFinalizationRef.current);
     } else {
+      if (mode === "text") await sealDurableTranscriptDraft("text");
       await requestEvaluation();
     }
     interviewFinalizationStoredRef.current = true;
@@ -2823,12 +3360,13 @@ export default function Home() {
   function setArchiveCompletionMessage() {
     setProcessingWarning(
       mode === "recorded-fallback"
-        ? "回答音声の自動文字起こしは完了しています。自動評価は行わず、採用担当者が録画と照合します。"
+        ? "回答音声の自動文字起こしを根拠に評価補助を作成しました。採用担当者が録画と文字起こしを照合して最終判断し、録画・音声の品質は不利益に使用しません。"
         : "",
     );
   }
 
   async function retryRecordingUpload() {
+    if (completionHoldRef.current !== "none") return;
     const blob = recordingBlobRef.current;
     if (!blob || recordingUploadState === "uploading") return;
     if (!recordingCompleteRef.current) {
@@ -2865,6 +3403,7 @@ export default function Home() {
   }
 
   async function retryInterviewFinalization() {
+    if (completionHoldRef.current !== "none") return;
     if (archiveSyncState === "syncing") return;
     if (mode !== "text" && !recordingCompleteRef.current) {
       setArchiveSyncState("error");
@@ -2898,14 +3437,109 @@ export default function Home() {
     void completeInterview(reason);
   }
 
+  function rearmPendingCompletionWhenVoiceSettled(delay: number) {
+    if (!pendingCompletionReasonRef.current || modeRef.current !== "voice") return;
+    if (!realtimeTranscriptIntegrityReady(realtimeTranscriptIntegrityRef.current)) return;
+    if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
+    pendingCompletionTimerRef.current = window.setTimeout(runPendingCompletion, delay);
+  }
+
   function scheduleInterviewCompletion(reason: string, delay = 8_000) {
     if (endingRef.current || pendingCompletionReasonRef.current) return;
     pendingCompletionReasonRef.current = reason;
     pendingCompletionTimerRef.current = window.setTimeout(runPendingCompletion, delay);
   }
 
+  function activateInterviewHold(hold: Exclude<CompletionHold, "none">) {
+    if (endingRef.current || completionHoldRef.current !== "none") return false;
+    // This local fence must be the first side effect. Candidate-event delivery
+    // can hang after the server commits, while an already armed AI/time-limit
+    // completion callback fires in the same tab.
+    endingRef.current = true;
+    updateCompletionHold(hold);
+    if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
+    pendingCompletionTimerRef.current = null;
+    pendingCompletionReasonRef.current = null;
+    clearResponseWatchdog();
+    clearCandidateResponseDelay();
+    clearTimedActionTimer();
+    timedActionRef.current = null;
+    timedResponseRef.current = null;
+    setCompletionSavePending(true);
+    setStage("evaluating");
+    setConnectionState("idle");
+    if (modeRef.current === "recorded-fallback") stopCurrentRecordedAnswerForTechnicalHold();
+    stopRealtime();
+    return true;
+  }
+
+  async function holdInterviewForStaffReview(
+    hold: Exclude<CompletionHold, "none">,
+    eventReceipt?: CandidateEventReceiptState,
+  ) {
+    try {
+      if (modeRef.current !== "text") {
+        await (recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current));
+        // Send any complete 4 MiB parts already accumulated, but deliberately do
+        // not seal/finalize the interrupted stream. Server-side recovery therefore
+        // keeps it as technical evidence and cannot promote it to a receipt.
+        await recordingLiveUploaderRef.current?.retry().catch(() => undefined);
+      }
+    } finally {
+      recordingCompleteRef.current = false;
+      interviewFinalizationStoredRef.current = false;
+      voiceTranscriptSealedRef.current = false;
+      if (modeRef.current !== "text") setRecordingUploadState("error");
+      setArchiveSyncState("error");
+      setCompletionSavePending(false);
+      const common = "受領済みの途中記録は技術確認用に保持しますが、面接完了・自動評価・社内Drive格納・受付完了には進めません。採用担当者へ受付番号をお知らせください。";
+      if (hold === "candidate_requested_stop") {
+        setProcessingWarning(eventReceipt === "stored"
+          ? `応募者による中止をサーバーに記録しました。${common}`
+          : `応募者による中止を検知しましたが、サーバー記録の受領確認が取れませんでした。重複を避けるため自動再送は行いません。${common}`);
+      } else if (hold === "safety_escalation") {
+        setProcessingWarning(eventReceipt === "stored"
+          ? `安全上の理由による中断をサーバーに記録しました。${common}`
+          : `安全上の理由による中断を検知しましたが、サーバー記録の受領確認が取れませんでした。重複を避けるため自動再送は行いません。${common}`);
+      } else if (hold === "completion_reason_invalid") {
+        setProcessingWarning(`終了理由を安全に確認できないため技術保留にしました。${common}`);
+      } else {
+        setProcessingWarning(`回答音声の最終文字起こしを確認できないため技術保留にしました。${common}`);
+      }
+      setStage("review");
+    }
+  }
+
+  async function enterInterviewHold(
+    hold: Exclude<CompletionHold, "none">,
+    event?: {
+      type: "candidate_requested_stop" | "safety_escalation" | "completion_reason_invalid";
+      code: string;
+    },
+  ) {
+    await runStickyInterviewCompletionHold({
+      activate: () => activateInterviewHold(hold),
+      report: event ? () => reportCandidateEvent(event.type, event.code) : undefined,
+      finalize: (receipt) => holdInterviewForStaffReview(hold, receipt),
+    });
+  }
+
   async function completeInterview(reason: string) {
-    if (endingRef.current) return;
+    if (reason === "candidate_requested_stop") {
+      await enterInterviewHold("candidate_requested_stop", {
+        type: "candidate_requested_stop",
+        code: "USER_ACTION",
+      });
+      return;
+    }
+    if (reason === "safety_escalation") {
+      await enterInterviewHold("safety_escalation", {
+        type: "safety_escalation",
+        code: "MODEL_SAFETY_ESCALATION",
+      });
+      return;
+    }
+    if (endingRef.current || completionHoldRef.current !== "none") return;
     if (mode === "internal-test") {
       upsertTurn({
         id: `internal-test-complete-${Date.now()}`,
@@ -2917,6 +3551,17 @@ export default function Home() {
       setCompletionSavePending(false);
       setStage("review");
       void reason;
+      return;
+    }
+    if (!SUCCESSFUL_COMPLETION_REASONS.has(reason)) {
+      await enterInterviewHold("completion_reason_invalid", {
+        type: "completion_reason_invalid",
+        code: "UNKNOWN_COMPLETION_REASON",
+      });
+      return;
+    }
+    if (mode === "voice" && voiceTranscriptCompletionBlocker()) {
+      await enterInterviewHold("transcript_incomplete");
       return;
     }
     if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
@@ -3024,7 +3669,12 @@ export default function Home() {
 
   function handleRealtimeEvent(event: RealtimeEvent) {
     const type = event.type ?? "";
+    if (type === "input_audio_buffer.committed") {
+      applyRealtimeTranscriptIntegrity(event);
+      return;
+    }
     if (type === "input_audio_buffer.speech_started") {
+      applyRealtimeTranscriptIntegrity(event);
       assistantAudioExpectedRef.current = false;
       assistantAudioExpectedUntilRef.current = 0;
       applyTurnTaking("candidate_speech_started");
@@ -3033,6 +3683,7 @@ export default function Home() {
       return;
     }
     if (type === "input_audio_buffer.speech_stopped") {
+      applyRealtimeTranscriptIntegrity(event);
       const timedActionPending = Boolean(timedActionRef.current || timedResponseRef.current);
       const { state } = applyTurnTaking("candidate_speech_stopped", {
         suppressNextQuestion: timedActionPending,
@@ -3045,6 +3696,7 @@ export default function Home() {
       return;
     }
     if (type === "response.created") {
+      applyRealtimeTranscriptIntegrity(event);
       currentAssistantAudioItemRef.current = "";
       assistantAudioStartedAtRef.current = null;
       applyTurnTaking("response_created");
@@ -3062,6 +3714,7 @@ export default function Home() {
       return;
     }
     if (type === "response.done") {
+      applyRealtimeTranscriptIntegrity(event);
       markAssistantRecordingAudioExpected(false);
       const timedResponse = timedResponseRef.current;
       const completionPending = Boolean(pendingCompletionReasonRef.current);
@@ -3074,8 +3727,7 @@ export default function Home() {
         return;
       }
       if (completionPending) {
-        if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
-        pendingCompletionTimerRef.current = window.setTimeout(runPendingCompletion, 1_200);
+        rearmPendingCompletionWhenVoiceSettled(1_200);
         return;
       }
       if (!scheduledNextQuestion) {
@@ -3085,19 +3737,28 @@ export default function Home() {
       return;
     }
     if (type === "conversation.item.input_audio_transcription.completed") {
+      applyRealtimeTranscriptIntegrity(event);
       const text = event.transcript?.trim();
-      if (text) {
-        upsertTurn({
-          id: event.item_id || event.event_id || `candidate-${Date.now()}`,
-          speaker: "candidate",
-          text,
-          createdAt: new Date().toISOString(),
-        });
+      const itemId = event.item_id?.trim();
+      if (!text || !itemId) {
+        voiceTranscriptionFailureRef.current = true;
+        setCandidateAudioState("ready");
+        void reportCandidateEvent("transcription_failed", text ? "TRANSCRIPTION_ID_MISSING" : "TRANSCRIPTION_EMPTY");
+        setAudioNotice("回答音声の最終文字起こしを確認できませんでした。面接を完了扱いにせず、受領済み記録を技術確認に回します。");
+        return;
       }
+      recordCompletedTurn({
+        id: itemId,
+        speaker: "candidate",
+        text,
+        createdAt: new Date().toISOString(),
+      });
+      rearmPendingCompletionWhenVoiceSettled(250);
       return;
     }
     if (type === "conversation.item.input_audio_transcription.failed") {
-      voiceTranscriptionCompleteRef.current = false;
+      applyRealtimeTranscriptIntegrity(event);
+      voiceTranscriptionFailureRef.current = true;
       setCandidateAudioState("ready");
       reportCandidateEvent("transcription_failed", "TRANSCRIPTION_FAILED");
       setAudioNotice("回答音声の文字起こしを一部確認できませんでした。内容が画面に表示されない場合は、下の入力欄から補足できます。");
@@ -3129,7 +3790,9 @@ export default function Home() {
         : `${current}${event.delta || ""}`;
       assistantPartialsRef.current.set(id, text);
       if (text) {
-        upsertTurn({ id, speaker: "interviewer", text, createdAt: new Date().toISOString() });
+        const turn = { id, speaker: "interviewer" as const, text, createdAt: new Date().toISOString() };
+        if (isAssistantDone) recordCompletedTurn(turn);
+        else upsertTurn(turn);
       }
       return;
     }
@@ -3138,7 +3801,9 @@ export default function Home() {
       const callId = event.call_id || event.item?.call_id;
       if (!callId || processedCompletionCallsRef.current.has(callId)) return;
       processedCompletionCallsRef.current.add(callId);
-      const completion = validateCompletionArguments(parseCompletionArguments(event));
+      const completionArguments = parseCompletionArguments(event);
+      const completion = validateCompletionArguments(completionArguments);
+      const completionReason = completionArguments.completion_reason;
       if (callId && channelRef.current?.readyState === "open") {
         channelRef.current.send(JSON.stringify({
           type: "conversation.item.create",
@@ -3152,6 +3817,14 @@ export default function Home() {
           },
         }));
       }
+      if (!completionReason || ![
+        "all_topics_covered",
+        "candidate_requested_stop",
+        "safety_escalation",
+      ].includes(completionReason)) {
+        void completeInterview("completion_reason_invalid");
+        return;
+      }
       if (!completion.accepted) {
         channelRef.current?.send(JSON.stringify({
           type: "response.create",
@@ -3162,7 +3835,15 @@ export default function Home() {
         armResponseWatchdog(true);
         return;
       }
-      scheduleInterviewCompletion("ai_completed");
+      if (completionReason === "candidate_requested_stop") {
+        void completeInterview("candidate_requested_stop");
+      } else if (completionReason === "safety_escalation") {
+        void completeInterview("safety_escalation");
+      } else if (completionReason === "all_topics_covered") {
+        scheduleInterviewCompletion("ai_completed");
+      } else {
+        scheduleInterviewCompletion("completion_reason_invalid");
+      }
       return;
     }
     if (type === "error") {
@@ -3202,6 +3883,7 @@ export default function Home() {
     selectedMode: InterviewMode,
     credentials?: { sessionId: string; accessToken: string },
   ) {
+    if (completionHoldRef.current !== "none") return;
     const activeSessionId = credentials?.sessionId ?? sessionId;
     // Reconnecting to the same interview session must not discard the transcript and
     // recording already captured before the disconnect (TD-CONN-* recovery paths reuse
@@ -3218,7 +3900,8 @@ export default function Home() {
     setStage("interview");
     if (isNewInterviewSession) {
       recordingCompleteRef.current = false;
-      voiceTranscriptionCompleteRef.current = true;
+      resetRealtimeTranscriptIntegrity();
+      updateCompletionHold("none");
       startInterviewClock();
       setArchiveSyncState("idle");
       setCompletionSavePending(false);
@@ -3226,6 +3909,7 @@ export default function Home() {
       voiceTranscriptSealedRef.current = false;
       transcriptRef.current = [];
       setTranscript([]);
+      completedTranscriptRef.current = [];
       recordedInterviewSessionRef.current = activeSessionId;
     }
     assistantPartialsRef.current.clear();
@@ -3420,10 +4104,16 @@ export default function Home() {
     const text = textDraft.trim();
     if (!text) return;
     const id = `text-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    upsertTurn({ id, speaker: "candidate", text, createdAt: new Date().toISOString() });
-    setTextDraft("");
+    const candidateTurn: TranscriptTurn = {
+      id,
+      speaker: "candidate",
+      text,
+      createdAt: new Date().toISOString(),
+    };
 
     if (mode === "internal-test") {
+      upsertTurn(candidateTurn);
+      setTextDraft("");
       const answered = transcriptRef.current.filter((turn) => turn.speaker === "candidate").length;
       const nextQuestion = INTERNAL_TEST_QUESTIONS[answered];
       setConnectionState("ai-speaking");
@@ -3444,6 +4134,11 @@ export default function Home() {
     }
 
     if (mode === "text") {
+      // Receipt the submitted answer immediately; the following question is a
+      // second append-only snapshot. This closes the mobile-kill window during
+      // the short UI transition between the two completed turns.
+      recordCompletedTurn(candidateTurn);
+      setTextDraft("");
       if (timedMaximumRequestedRef.current || elapsed >= INTERVIEW_MAX_SECONDS) {
         window.setTimeout(() => void completeInterview("text_max_duration_reached"), 450);
         return;
@@ -3453,7 +4148,7 @@ export default function Home() {
       setConnectionState("ai-speaking");
       window.setTimeout(() => {
         if (nextQuestion) {
-          upsertTurn({
+          recordCompletedTurn({
             id: `text-interview-question-${answered + 1}`,
             speaker: "interviewer",
             text: nextQuestion,
@@ -3474,16 +4169,27 @@ export default function Home() {
       setErrorMessage("TD-CONN-DATA: 回答を送信できませんでした。接続をやり直してください。");
       return;
     }
-    channel.send(JSON.stringify({
-      type: "conversation.item.create",
-      item: {
-        id,
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text }],
-      },
-    }));
-    channel.send(JSON.stringify({ type: "response.create" }));
+    try {
+      channel.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          id,
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text }],
+        },
+      }));
+      // Only a candidate message accepted by the open data channel becomes a
+      // completed durable turn. A failed send remains in the input box.
+      recordCompletedTurn(candidateTurn);
+      setTextDraft("");
+      channel.send(JSON.stringify({ type: "response.create" }));
+    } catch {
+      setConnectionState("error");
+      setNetworkAudioState("error");
+      setErrorMessage("TD-CONN-DATA: 回答を送信できませんでした。接続をやり直してください。");
+      return;
+    }
     armResponseWatchdog(true);
     setConnectionState("ai-speaking");
   }
@@ -3510,7 +4216,10 @@ export default function Home() {
     setElapsed(0);
     transcriptRef.current = [];
     setTranscript([]);
+    completedTranscriptRef.current = [];
+    transcriptDraftWriterRef.current = null;
     processedCompletionCallsRef.current.clear();
+    attemptedCandidateEventsRef.current.clear();
     reportedCandidateEventsRef.current.clear();
     turnStateRef.current = initialTurnTakingState();
     pendingCancelEventsRef.current.clear();
@@ -3518,13 +4227,16 @@ export default function Home() {
     setProcessingWarning("");
     setErrorMessage("");
     recordingBlobRef.current = null;
+    recordingLiveUploaderRef.current = null;
     recordingPromiseRef.current = null;
     recordingResolveRef.current = null;
     recordingBytesRef.current = 0;
     recordingSizeCappedRef.current = false;
     recordingCompleteRef.current = false;
     recordingFinalStopRequestedRef.current = false;
-    voiceTranscriptionCompleteRef.current = true;
+    recordingLocalContinuityValidRef.current = true;
+    resetRealtimeTranscriptIntegrity();
+    updateCompletionHold("none");
     recordingGenerationRef.current += 1;
     setRecordingUploadState("idle");
     setRecordingUploadProgress(0);
@@ -3537,6 +4249,12 @@ export default function Home() {
     setScreenCaptureState("idle");
     setSetupPhase("idle");
     setMicrophoneLevel(0);
+    microphoneCheckPassedRef.current = false;
+    microphoneVerificationRef.current = initialMicrophoneVerification();
+    setMicrophoneCheckPassed(false);
+    localMediaHealthRef.current = initialLocalMediaHealth();
+    localMediaRecoveryAttemptedRef.current = false;
+    setLocalMediaRecoveryRequired(false);
     setCandidateAudioState("idle");
     setRemoteAudioState("idle");
     setNetworkAudioState("idle");
@@ -3556,7 +4274,11 @@ export default function Home() {
     setElapsed(0);
     transcriptRef.current = [];
     setTranscript([]);
+    completedTranscriptRef.current = [];
+    transcriptDraftWriterRef.current = null;
     processedCompletionCallsRef.current.clear();
+    attemptedCandidateEventsRef.current.clear();
+    reportedCandidateEventsRef.current.clear();
     turnStateRef.current = initialTurnTakingState();
     pendingCancelEventsRef.current.clear();
     // A restart issues a brand new interview id, so the next connection must not
@@ -3567,9 +4289,12 @@ export default function Home() {
     recordingSizeCappedRef.current = false;
     recordingCompleteRef.current = false;
     recordingFinalStopRequestedRef.current = false;
-    voiceTranscriptionCompleteRef.current = true;
+    recordingLocalContinuityValidRef.current = true;
+    resetRealtimeTranscriptIntegrity();
+    updateCompletionHold("none");
     recordingGenerationRef.current += 1;
     recordingBlobRef.current = null;
+    recordingLiveUploaderRef.current = null;
     recordingPromiseRef.current = null;
     recordingResolveRef.current = null;
     setTextDraft("");
@@ -3583,6 +4308,12 @@ export default function Home() {
     setScreenCaptureState("idle");
     setSetupPhase("idle");
     setMicrophoneLevel(0);
+    microphoneCheckPassedRef.current = false;
+    microphoneVerificationRef.current = initialMicrophoneVerification();
+    setMicrophoneCheckPassed(false);
+    localMediaHealthRef.current = initialLocalMediaHealth();
+    localMediaRecoveryAttemptedRef.current = false;
+    setLocalMediaRecoveryRequired(false);
     setCandidateAudioState("idle");
     setRemoteAudioState("idle");
     setNetworkAudioState("idle");
@@ -3760,11 +4491,11 @@ export default function Home() {
               <input id="selection-consent" type="checkbox" checked={consent} aria-describedby="consent-summary consent-detail-summary" onChange={(event) => setConsent(event.target.checked)} />
               <span className="consent-copy">
                 <strong>{interviewFormat === "camera" ? "録画・文字起こし・選考利用に同意する" : "回答内容・選考利用に同意する"}</strong>
-                <span id="consent-summary">{interviewFormat === "camera" ? "面接の映像・双方の音声・回答内容を、採用選考と記録の照合に使用します。" : "文字で入力した回答内容を、採用選考と記録の照合に使用します。カメラ・マイク・録画は使用しません。"}</span>
+                <span id="consent-summary">{interviewFormat === "camera" ? "通常音声方式は映像・双方の音声・回答内容を記録します。予備の録画式は映像・応募者音声と質問文を記録します。" : "文字で入力した回答内容を、採用選考と記録の照合に使用します。カメラ・マイク・録画は使用しません。"}</span>
                 <small>評価は権限を付与された採用担当者だけが確認し、求職者には表示されません。</small>
               </span>
             </label>
-            <details className="consent-details"><summary id="consent-detail-summary">記録とデータの詳しい取り扱い</summary><div><p><strong>利用目的</strong><br />入力した氏名は採用記録の照合と保存管理に使用します。{interviewFormat === "camera" ? "録画はカメラ映像と双方の音声を含み、接客ロールプレイなどの職務関連行動、文字起こしの照合、通信トラブル時の記録確認に使用します。" : "文字入力方式では、入力した回答を職務関連の確認と記録作成に使用し、映像・音声は取得しません。"}</p><p><strong>処理と閲覧</strong><br />{interviewFormat === "camera" ? "音声と回答" : "回答"}は外部の文字処理サービスで処理されます。氏名、{interviewFormat === "camera" ? "録画、文字起こし、" : "回答記録、"}評価補助は権限を付与された採用担当者が確認します。自動処理だけで合否を決定しません。</p><p><strong>保管</strong><br />氏名、{interviewFormat === "camera" ? "録画、文字起こし、" : "回答記録、"}評価補助は、面接実施日から原則1年間を保存見直し期限として管理します。選考継続、法令対応、採用後の労務管理など継続利用が必要な場合を除き、期限後は採用責任者が削除対象を確認します。削除や開示等のご相談は、応募時に利用した連絡経路で採用担当者へご連絡ください。</p><p><strong>公平性とご相談</strong><br />笑顔の有無、顔立ち・容姿、服装、背景、カメラ・音声品質、声質、障害・健康状態の推測は評価しません。参加方法や技術不具合は不利益に扱わず、情報不足として採用担当者が確認します。面接中も中止できます。</p></div></details>
+            <details className="consent-details"><summary id="consent-detail-summary">記録とデータの詳しい取り扱い</summary><div><p><strong>利用目的</strong><br />入力した氏名は採用記録の照合と保存管理に使用します。{interviewFormat === "camera" ? "通常音声方式の録画はカメラ映像と応募者・茂木の双方の音声を含みます。音声回線の予備方式へ切り替わった場合は、カメラ映像と応募者の音声を録画し、質問は画面の文面として別に保存します。端末で読み上げる質問音声は予備方式の録画には含まれません。これらを接客ロールプレイなどの職務関連行動、文字起こしの照合、通信トラブル時の記録確認に使用します。" : "文字入力方式では、入力した回答を職務関連の確認と記録作成に使用し、映像・音声は取得しません。"}</p><p><strong>処理と閲覧</strong><br />{interviewFormat === "camera" ? "音声と回答" : "回答"}は外部の文字処理サービスで処理されます。氏名、{interviewFormat === "camera" ? "録画、文字起こし、" : "回答記録、"}評価補助は権限を付与された採用担当者が確認します。自動処理だけで合否を決定しません。</p><p><strong>保管</strong><br />氏名、{interviewFormat === "camera" ? "録画、文字起こし、" : "回答記録、"}評価補助は、面接実施日から原則1年間を保存見直し期限として管理します。選考継続、法令対応、採用後の労務管理など継続利用が必要な場合を除き、期限後は採用責任者が削除対象を確認します。削除や開示等のご相談は、応募時に利用した連絡経路で採用担当者へご連絡ください。</p><p><strong>公平性とご相談</strong><br />笑顔の有無、顔立ち・容姿、服装、背景、カメラ・音声品質、声質、障害・健康状態の推測は評価しません。参加方法や技術不具合は不利益に扱わず、情報不足として採用担当者が確認します。面接中も中止できます。</p></div></details>
             <p className={`consent-status ${consent && candidateName.trim() && normalizePreferredLocation(location) ? "ready" : ""}`} role="status">
               {!candidateName.trim()
                 ? "氏名を入力してください。"
@@ -3781,8 +4512,9 @@ export default function Home() {
               </div>
             )}
             {interviewFormat === "camera" && <div className={`speaker-test ${speakerTestState}`}>
-              <div><strong>端末の音声を確認</strong><span>{speakerTestState === "playing" ? "音声を再生しています" : speakerTestState === "passed" ? "確認音声を再生しました" : speakerTestState === "error" ? "端末の音量設定をご確認ください" : "開始前に茂木の確認音声を聞けます"}</span></div>
+              <div><strong>端末の音声を確認</strong><span>{speakerTestState === "playing" ? "音声を再生しています" : speakerTestState === "played" ? "聞こえた場合は、下の確認ボタンを押してください" : speakerTestState === "passed" ? "確認音が聞こえたことを確認済みです" : speakerTestState === "error" ? "端末の音量設定をご確認ください" : "開始前に茂木の確認音声を聞けます"}</span></div>
               <button type="button" onClick={playSpeakerTest}>{speakerTestState === "idle" ? "音声を確認" : "もう一度聞く"}</button>
+              {speakerTestState === "played" && <button type="button" onClick={confirmSpeakerHeard}>音が聞こえました</button>}
             </div>}
             <ol className="connection-guide">
               <li><strong>1. 同意欄をチェック</strong><span>{interviewFormat === "camera" ? "録画・文字起こし・選考利用" : "回答内容・選考利用"}を確認して、同意欄を押します。</span></li>
@@ -3797,8 +4529,8 @@ export default function Home() {
               </div>
             )}
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
-            <button className="primary-action" aria-label={interviewFormat === "camera" ? "カメラ・マイクを確認して開始" : "文字入力で開始"} disabled={inviteGate !== "ok" || !candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting} onClick={() => void (interviewFormat === "camera" ? prepareInterview() : startTextInterview())}>
-              {inviteGate === "checking" ? "専用リンクを確認中…" : sessionStarting ? "オンライン一次面接を準備中…" : interviewFormat === "camera" ? "カメラ・マイクを確認して開始" : "文字入力でオンライン一次面接を開始"} <span>→</span>
+            <button className="primary-action" aria-label={interviewFormat === "camera" ? "カメラ・マイクを確認して開始" : "文字入力で開始"} disabled={inviteGate !== "ok" || !candidateName.trim() || !normalizePreferredLocation(location) || !consent || sessionStarting || (interviewFormat === "camera" && embeddedBrowser)} onClick={() => void (interviewFormat === "camera" ? prepareInterview() : startTextInterview())}>
+              {inviteGate === "checking" ? "専用リンクを確認中…" : sessionStarting ? "オンライン一次面接を準備中…" : interviewFormat === "camera" && embeddedBrowser ? "SafariまたはChromeで開いてください" : interviewFormat === "camera" ? "カメラ・マイクを確認して開始" : "文字入力でオンライン一次面接を開始"} <span>→</span>
             </button>
             <button className="internal-test-button" onClick={startInternalTest}>接続確認（選考対象外）</button>
             <p className="internal-test-note">録画・音声接続・採用評価を行わず、文字入力で面接画面の操作を確認します。</p>
@@ -3825,7 +4557,7 @@ export default function Home() {
               {stream ? <video ref={videoRef} autoPlay muted playsInline /> : <div className="camera-empty"><img src="/tokyo-dogs-logo.jpg" alt="" /><span>カメラの許可を待っています</span></div>}
               {stream && <span className="connection-ok">カメラ接続済み</span>}
             </div>
-            <div className="microphone-meter" aria-label="マイク入力レベル">
+            <div className="microphone-meter" role="meter" aria-label="マイク入力レベル" aria-valuemin={0} aria-valuemax={100} aria-valuenow={microphoneLevel}>
               <div><strong>マイク入力</strong><span>{candidateAudioCopy}</span></div>
               <div className="meter-track"><i style={{ width: `${Math.max(stream ? 4 : 0, microphoneLevel)}%` }} /></div>
               <small>話しかけると、声に合わせてメーターが動きます。</small>
@@ -3837,19 +4569,28 @@ export default function Home() {
               <div className={networkAudioState === "connected" ? "passed" : networkAudioState === "error" ? "failed" : "checking"}><i /><span>面接回線</span><strong>{networkAudioCopy}</strong></div>
             </div>
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
-            {setupPhase === "error" && accessTokenRef.current && (
+            {localMediaRecoveryRequired && (
+              <div className="recorded-fallback-card" role="alert" aria-live="assertive">
+                <strong>マイク接続が変化したため、面接を停止しました</strong>
+                <span>自動で別のマイクへ切り替えたり、質問を進めたりしません。下のボタンを押してマイクを再取得し、声でメーターが動くことを確認してください。</span>
+                <button type="button" disabled={sessionStarting} onClick={() => void reacquireLocalMedia()}>{sessionStarting ? "マイクを再取得中…" : "マイクを再取得"}</button>
+              </div>
+            )}
+            {setupPhase === "error" && !localMediaRecoveryRequired && accessTokenRef.current && (
               <div className="recorded-fallback-card" role="status">
                 <strong>録画式のオンライン一次面接で続けます</strong>
-                <span>質問を画面と端末音声で案内します。声で回答し、話し終えたら次へ進んでください。録画は選考資料として権限を付与された採用担当者が確認します。</span>
+                <span>質問を画面と端末音声で案内します。録画にはカメラ映像とあなたの回答音声を保存し、端末で読む質問音声は含めず質問文を別に記録します。話し終えたら次へ進んでください。</span>
                 <button type="button" disabled={sessionStarting} onClick={() => void startRecordedFallback()}>{sessionStarting ? "予備方式を準備中…" : "録画式のオンライン一次面接へ進む"}</button>
               </div>
             )}
             <div className="setup-recovery-actions">
               <button type="button" onClick={playSpeakerTest}>確認音を再生</button>
+              {speakerTestState === "played" && <button type="button" onClick={confirmSpeakerHeard}>音が聞こえました</button>}
               {screenShareSupported && <button type="button" onClick={() => void enableScreenCapture()}>{screenCaptureState === "ready" ? "画面共有を追加済み" : "画面共有を追加（任意）"}</button>}
             </div>
-            <button className="primary-action setup-connect-button" disabled={!stream || sessionStarting} onClick={() => void (setupPhase === "error" ? startRecordedFallback() : connectPreparedInterview())}>
-              {sessionStarting ? "オンライン一次面接へ接続中…" : setupPhase === "error" ? "録画式のオンライン一次面接へ進む" : "オンライン一次面接へ接続"} <span>→</span>
+            {!cameraReadiness.ready && !localMediaRecoveryRequired && <div className="inline-error" role="status" aria-live="polite">{cameraReadiness.message}</div>}
+            <button className="primary-action setup-connect-button" disabled={!stream || sessionStarting || !cameraReadiness.ready} onClick={() => void (localMediaHealthRef.current.revision > 0 ? resumeAfterLocalMediaRecovery() : setupPhase === "error" ? startRecordedFallback() : connectPreparedInterview())}>
+              {sessionStarting ? "オンライン一次面接へ接続中…" : setupPhase === "error" ? "録画式のオンライン一次面接へ進む" : localMediaHealthRef.current.revision > 0 ? "オンライン一次面接へ再接続" : "オンライン一次面接へ接続"} <span>→</span>
             </button>
             <p className="setup-footnote">カメラ映像と音声の確認後に録画を開始します。画面共有はPCのみ任意で追加できます。</p>
           </div>
@@ -3859,7 +4600,7 @@ export default function Home() {
       {stage === "interview" && (
         <section className="interview-page">
           {mode === "internal-test" && <div className="internal-test-banner"><strong>接続確認</strong><span>選考対象外・録画・採用評価なし</span></div>}
-          {mode === "recorded-fallback" && <div className="recorded-fallback-banner"><strong>オンライン一次面接・予備方式</strong><span>選考対象・録画を採用担当者が確認</span></div>}
+          {mode === "recorded-fallback" && <div className="recorded-fallback-banner"><strong>オンライン一次面接・予備方式</strong><span>録画はカメラ映像・応募者音声／質問は文面で別記録</span></div>}
           {mode === "text" && <div className="recorded-fallback-banner"><strong>オンライン一次面接・文字入力方式</strong><span>選考対象・カメラとマイクは使用しません</span></div>}
           <div className="interview-topline">
             <div className={`live-state ${connectionState}`}><i />{connectionCopy}</div>
@@ -3887,6 +4628,7 @@ export default function Home() {
                   : "ご回答、勤務条件、接客時の職務関連行動を採用選考の資料として確認します。容姿、笑顔の有無、機器や通信の不具合は評価しません。"}</p>
               </div>
               {(mode === "voice" || mode === "recorded-fallback") && <div className={`privacy-box recording-state ${recordingCaptureState}`}><strong>録画状態</strong><p>{recordingCaptureCopy}</p></div>}
+              {recordingUploadState === "error" && stage === "interview" && <div className="privacy-box recording-state error" role="alert"><strong>録画送信を一時停止</strong><p>受領済み部分は保存されています。未送信部分はこの画面に保持しているため、閉じずに面接終了時の再送をお待ちください。</p></div>}
             </aside>
 
             <div className="conversation-area">
@@ -3947,7 +4689,7 @@ export default function Home() {
                 {(mode === "voice" || mode === "recorded-fallback") && <button className={isMuted ? "control danger" : "control"} onClick={toggleMute}>{isMuted ? "マイクを再開" : "マイクをミュート"}</button>}
                 {connectionState === "error" && <button className="control" onClick={restartConnection}>最初から接続をやり直す</button>}
                 {connectionState === "error" && <button className="control" onClick={startInternalTest}>選考対象外の接続確認へ切り替える</button>}
-                <button className="finish-button" onClick={() => { if (window.confirm("オンライン一次面接を中止し、ここまでの記録を採用担当者へ送りますか？")) { reportCandidateEvent("candidate_requested_stop", "USER_ACTION"); void completeInterview("candidate_requested_stop"); } }}>面接を中止</button>
+                <button className="finish-button" onClick={() => { if (window.confirm("オンライン一次面接を中止しますか？受領済みの途中記録は技術確認用に保持しますが、面接完了・自動評価・受付完了にはなりません。")) { void completeInterview("candidate_requested_stop"); } }}>面接を中止</button>
               </div>
             </div>
           </div>
@@ -3975,17 +4717,18 @@ export default function Home() {
             <p>{mode === "internal-test"
               ? "入力内容は端末内の画面確認だけに使用し、外部送信・保存・録画・文字起こし・採用評価を行っていません。"
               : mode === "recorded-fallback"
-                ? "録画と回答文字起こしはこの応募者画面には表示されません。認証された採用担当者が文字起こしを録画と照合します。"
+                ? "録画、回答文字起こし、文字起こしを根拠に作成した評価補助はこの応募者画面には表示しません。認証された採用担当者が録画と文字起こしを照合して最終判断し、技術品質を不利益に使用しません。"
                 : "採点結果、評価本文、文字起こし、録画はこの応募者画面には表示されません。認証された採用担当者だけが社内の確認画面で閲覧します。"}</p>
           </div>
+          {completionHold !== "none" && <div className="validation-box" role="alert"><strong>{completionHold === "candidate_requested_stop" ? "面接は中止され、受付完了にはなっていません" : completionHold === "safety_escalation" ? "安全上の理由で中断し、受付完了にはなっていません" : completionHold === "completion_reason_invalid" ? "終了理由を確認できず、受付完了にはなっていません" : "最終文字起こしが未確定のため、受付完了にはなっていません"}</strong><p>受領済みの途中記録は採用担当者の技術確認用にだけ保持し、自動評価や合否判断には使用しません。</p></div>}
           {processingWarning && <div className="validation-box"><strong>記録状態を採用担当者が確認します</strong><p>{processingWarning}</p></div>}
           {recordingUploadState === "stored" && recordingCompleteRef.current && <div className="validation-box"><strong>録画の一次保存が完了しました</strong><p>録画は面接IDで保管し、採用担当者以外には開示しません。社内Driveへの最終格納が確認できるまで受付完了にはなりません。</p></div>}
           {archiveSyncState === "stored" && <div className="validation-box"><strong>社内Driveへの格納まで完了しました</strong><p>{mode === "recorded-fallback" ? "録画と回答文字起こしの格納結果をサーバーで再確認済みです。採用担当者が両者を照合します。" : mode === "text" ? "回答記録と評価資料の格納結果をサーバーで再確認済みです。" : "録画・文字起こし・評価資料の格納結果をサーバーで再確認済みです。"}</p></div>}
           {archiveSyncState === "syncing" && <div className="validation-box"><strong>社内Driveへの格納を確認中です</strong><p>録画を含む全資料の実読取が終わるまで、この画面を閉じずにお待ちください。</p></div>}
-          {archiveSyncState !== "stored" && archiveSyncState !== "syncing" && (mode === "text" || (recordingUploadState === "stored" && recordingCompleteRef.current)) && <div className="validation-box"><strong>最終保存を再試行できます</strong><p>完了済みの処理は重複させず、未完了の整理または社内Drive格納から再開します。</p><button type="button" className="secondary-action" onClick={() => void retryInterviewFinalization()}>面接記録の保存を再試行</button></div>}
+          {completionHold === "none" && archiveSyncState !== "stored" && archiveSyncState !== "syncing" && (mode === "text" || (recordingUploadState === "stored" && recordingCompleteRef.current)) && <div className="validation-box"><strong>最終保存を再試行できます</strong><p>完了済みの処理は重複させず、未完了の整理または社内Drive格納から再開します。</p><button type="button" className="secondary-action" onClick={() => void retryInterviewFinalization()}>面接記録の保存を再試行</button></div>}
           {mode === "text" && archiveSyncState === "stored" && <div className="validation-box"><strong>文字入力によるオンライン一次面接を受け付けました</strong><p>カメラ・マイク・録画は使用していません。回答内容は採用担当者が確認します。</p></div>}
-          {recordingUploadState === "error" && recordingBlobRef.current && recordingCompleteRef.current && <div className="validation-box"><strong>録画の送信を再開できます</strong><p>受信済みの部分は再送せず、未送信部分から再開します。この画面を閉じずに再試行してください。</p><button type="button" className="secondary-action" onClick={() => void retryRecordingUpload()}>録画送信を再試行</button></div>}
-          {recordingUploadState === "error" && (!recordingBlobRef.current || !recordingCompleteRef.current) && <div className="validation-box"><strong>この端末から完全な録画を再送できません</strong><p>録画データが生成されていないか、途中で終了したため、採用担当者へ上の受付番号をお知らせください。</p></div>}
+          {completionHold === "none" && recordingUploadState === "error" && recordingBlobRef.current && recordingCompleteRef.current && <div className="validation-box"><strong>録画の送信を再開できます</strong><p>受信済みの部分は再送せず、未送信部分から再開します。この画面を閉じずに再試行してください。</p><button type="button" className="secondary-action" onClick={() => void retryRecordingUpload()}>録画送信を再試行</button></div>}
+          {completionHold === "none" && recordingUploadState === "error" && (!recordingBlobRef.current || !recordingCompleteRef.current) && <div className="validation-box"><strong>この端末から完全な録画を再送できません</strong><p>録画データが生成されていないか、途中で終了したため、採用担当者へ上の受付番号をお知らせください。</p></div>}
           <div className="review-actions"><div><span>{mode === "internal-test" ? "確認時間" : "面接時間"}</span><strong>{formatTime(elapsed)}</strong></div>{mode === "internal-test" && <button className="secondary-action" onClick={resetInterview}>最初から確認</button>}</div>
         </section>
       )}

@@ -9,9 +9,15 @@ import {
   noStoreJson,
   hasTrustedRequestOrigin,
   privacySafeIdentifier,
-  readOpenAIError,
   requireOpenAIApiKey,
+  safeOpenAIError,
 } from "@/lib/openai-server";
+import {
+  decodeOpenAIJson,
+  fetchOpenAIBytes,
+  OpenAIRequestFailure,
+} from "@/lib/openai-fetch";
+import { readBoundedJsonBody } from "@/lib/http-body";
 import {
   authorizeInterviewRequest,
   markInterviewStarted,
@@ -23,15 +29,15 @@ export async function POST(request: Request) {
     if (!hasTrustedRequestOrigin(request)) {
       return noStoreJson({ error: "リクエスト元を確認できません。" }, { status: 403 });
     }
-    const rawBody = await request.text();
-    if (rawBody.length > 4_000) {
-      return noStoreJson({ error: "入力内容が長すぎます。" }, { status: 413 });
-    }
-    const payload = JSON.parse(rawBody) as {
+    const body = await readBoundedJsonBody<{
       sessionId?: string;
       employment?: string;
       location?: string;
-    };
+    }>(request, { maxBytes: 16_000 });
+    if (!body.ok) {
+      return noStoreJson({ error: body.status === 413 ? "入力内容が長すぎます。" : "入力内容を確認できませんでした。" }, { status: body.status });
+    }
+    const payload = body.value;
     const sessionId = payload.sessionId?.trim() ?? "";
     const employment = payload.employment?.trim() ?? "";
     const location = normalizePreferredLocation(payload.location);
@@ -70,7 +76,7 @@ export async function POST(request: Request) {
 
     const apiKey = requireOpenAIApiKey();
     const safetyIdentifier = await privacySafeIdentifier(sessionId);
-    const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+    const upstream = await fetchOpenAIBytes(new Request("https://api.openai.com/v1/realtime/client_secrets", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -81,20 +87,25 @@ export async function POST(request: Request) {
         expires_after: { anchor: "created_at", seconds: 600 },
         session: buildRealtimeSessionConfig({ employment, location }),
       }),
-    });
+    }), { timeoutMs: 25_000, maxResponseBytes: 500_000 });
+    const response = upstream.response;
 
     if (!response.ok) {
-      console.warn("OPENAI_REALTIME_SESSION_REJECTED", {
-        status: response.status,
-        requestId: response.headers.get("x-request-id") ?? "unavailable",
-      });
+      let code: string | undefined;
+      try {
+        const payload = decodeOpenAIJson(upstream.bytes) as { error?: { code?: string; type?: string } };
+        code = payload.error?.code ?? payload.error?.type;
+      } catch {
+        code = undefined;
+      }
+      console.warn("OPENAI_REALTIME_SESSION_REJECTED", { status: response.status });
       return noStoreJson(
-        { error: await readOpenAIError(response) },
+        { error: safeOpenAIError(response.status, code) },
         { status: response.status === 429 ? 429 : 502 },
       );
     }
 
-    const data = (await response.json()) as {
+    const data = decodeOpenAIJson(upstream.bytes) as {
       value?: string;
       expires_at?: number;
       session?: { model?: string };
@@ -111,7 +122,11 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
-    const status = message.includes("OPENAI_API_KEY") ? 503 : 500;
+    const status = message.includes("OPENAI_API_KEY")
+      ? 503
+      : error instanceof OpenAIRequestFailure || message === "OPENAI_RESPONSE_INVALID"
+        ? 502
+        : 500;
     return noStoreJson(
       { error: status === 503 ? "オンライン一次面接の接続設定が完了していません。" : "オンライン一次面接を開始できませんでした。" },
       { status },

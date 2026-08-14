@@ -1,6 +1,7 @@
 import { recoverNextStaleInterviewEvaluation } from "@/lib/interview-evaluation-recovery";
 import {
   findNextInterviewDriveRecoverySession,
+  recoverNextLegacyV1RecordingOrphan,
   recoverNextSealedResumableInterviewRecording,
 } from "@/lib/interview-persistence";
 import { finalizeRecordedInterview } from "@/lib/recorded-interview-completion";
@@ -9,6 +10,7 @@ import {
   recoverNextRecordedAnswerTranscription,
 } from "@/lib/recorded-transcription";
 import { stepInterviewToGoogleDrive } from "@/lib/google-drive-sync";
+import { authorizeBearerSecret, bearerToken, serverSecretReadiness } from "@/lib/server-secret-auth";
 
 type InterviewBackgroundRecoveryBindings = {
   INTERVIEW_RECOVERY_TOKEN?: string;
@@ -35,22 +37,6 @@ function configuredRecoveryToken() {
   ).trim();
 }
 
-async function sha256(value: string) {
-  return new Uint8Array(await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(value),
-  ));
-}
-
-function constantTimeEqual(left: Uint8Array, right: Uint8Array) {
-  if (left.byteLength !== right.byteLength) return false;
-  let difference = 0;
-  for (let index = 0; index < left.byteLength; index += 1) {
-    difference |= left[index] ^ right[index];
-  }
-  return difference === 0;
-}
-
 /**
  * Authenticates the machine-only recovery endpoint with a dedicated 256-bit
  * bearer token. Hashing both inputs before comparison keeps the comparison
@@ -61,19 +47,13 @@ export async function authorizeInterviewBackgroundRecoveryRequest(
 ): Promise<InterviewBackgroundRecoveryAuthorization> {
   const expected = configuredRecoveryToken();
   if (expected.length < MINIMUM_RECOVERY_TOKEN_LENGTH) return "unconfigured";
+  if (!bearerToken(request)) return "unauthorized";
+  return await authorizeBearerSecret(request, expected) ? "authorized" : "unauthorized";
+}
 
-  const authorization = request.headers.get("Authorization") ?? "";
-  if (authorization.length > 512 || !authorization.startsWith("Bearer ")) {
-    return "unauthorized";
-  }
-  const actual = authorization.slice(7).trim();
-  if (!actual) return "unauthorized";
-
-  const [actualHash, expectedHash] = await Promise.all([
-    sha256(actual),
-    sha256(expected),
-  ]);
-  return constantTimeEqual(actualHash, expectedHash) ? "authorized" : "unauthorized";
+export function backgroundRecoveryAuthenticationReadiness() {
+  const readiness = serverSecretReadiness(configuredRecoveryToken());
+  return { ...readiness, configured: configuredRecoveryToken().length >= MINIMUM_RECOVERY_TOKEN_LENGTH };
 }
 
 type RecoveryStageState = "idle" | "advanced" | "waiting" | "attention";
@@ -87,14 +67,41 @@ export type InterviewBackgroundRecoverySummary = {
 };
 
 async function recoverRecording(): Promise<RecoveryStageState> {
+  let legacyState: RecoveryStageState;
   try {
-    const result = await recoverNextSealedResumableInterviewRecording();
-    if (result.state === "none") return "idle";
-    if (result.state === "stored") return "advanced";
-    return result.state === "waiting" ? "waiting" : "attention";
+    const legacy = await recoverNextLegacyV1RecordingOrphan();
+    legacyState = legacy.state === "none"
+      ? "idle"
+      : legacy.state === "stored"
+        ? "advanced"
+        : legacy.state === "waiting"
+          ? "waiting"
+          : "attention";
   } catch {
-    return "attention";
+    legacyState = "attention";
   }
+
+  // A damaged legacy object must not starve the normal sealed-upload queue,
+  // and a repeatedly waiting sealed upload must not starve the legacy queue.
+  // Each helper remains independently bounded to at most one successful store.
+  let sealedState: RecoveryStageState;
+  try {
+    const sealed = await recoverNextSealedResumableInterviewRecording();
+    sealedState = sealed.state === "none"
+      ? "idle"
+      : sealed.state === "stored"
+        ? "advanced"
+        : sealed.state === "waiting"
+          ? "waiting"
+          : "attention";
+  } catch {
+    sealedState = "attention";
+  }
+
+  if (legacyState === "advanced" || sealedState === "advanced") return "advanced";
+  if (legacyState === "attention" || sealedState === "attention") return "attention";
+  if (legacyState === "waiting" || sealedState === "waiting") return "waiting";
+  return "idle";
 }
 
 async function recoverTranscription(): Promise<RecoveryStageState> {
@@ -134,7 +141,8 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
     const sessionId = await findNextInterviewDriveRecoverySession();
     if (!sessionId) return "idle";
     const result = await stepInterviewToGoogleDrive(sessionId);
-    return result.status === "completed" ? "advanced" : "waiting";
+    if (result.status !== "completed") return "waiting";
+    return result.integrity?.status === "verified" ? "advanced" : "attention";
   } catch {
     return "attention";
   }
