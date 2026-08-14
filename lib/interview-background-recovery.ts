@@ -90,7 +90,8 @@ async function recoverRecording(): Promise<RecoveryStageState> {
   try {
     const result = await recoverNextSealedResumableInterviewRecording();
     if (result.state === "none") return "idle";
-    return result.state === "stored" ? "advanced" : "attention";
+    if (result.state === "stored") return "advanced";
+    return result.state === "waiting" ? "waiting" : "attention";
   } catch {
     return "attention";
   }

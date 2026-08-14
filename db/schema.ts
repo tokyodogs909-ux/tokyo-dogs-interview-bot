@@ -142,6 +142,18 @@ export const interviewDriveUploadSteps = sqliteTable("interview_drive_upload_ste
   index("interview_drive_upload_steps_lease_idx").on(table.leaseExpiresAt),
 ]);
 
+export const interviewDriveHierarchyNodes = sqliteTable("interview_drive_hierarchy_nodes", {
+  nodeKey: text("node_key").primaryKey(),
+  canonicalFolderId: text("canonical_folder_id"),
+  creationAttemptedAt: text("creation_attempted_at"),
+  leaseToken: text("lease_token"),
+  leaseExpiresAt: text("lease_expires_at"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("interview_drive_hierarchy_nodes_lease_idx").on(table.leaseExpiresAt),
+]);
+
 export const recordedAnswerTranscriptions = sqliteTable("recorded_answer_transcriptions", {
   sessionId: text("session_id").notNull().references(() => interviewSessions.id, { onDelete: "cascade" }),
   answerIndex: integer("answer_index").notNull(),

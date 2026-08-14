@@ -47,6 +47,15 @@ export const INTERVIEW_RETENTION_DAYS = 365;
 export const RECORDING_UPLOAD_PART_BYTES = 4 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 95 * 1024 * 1024;
 const MAX_RECORDING_PARTS = 32;
+// Automatic recovery must never give up while the candidate can still resume
+// with their original token. After expiry, repeated missing-part observations
+// may terminalize the automatic loop; a sparse scheduler still has a finite
+// six-hour absolute deadline from the durable completion/transcript seal.
+const RECORDING_RECOVERY_EXPIRY_GRACE_MS = 30 * 60 * 1_000;
+const RECORDING_RECOVERY_ABSOLUTE_DEADLINE_MS = 6 * 60 * 60 * 1_000;
+const RECORDING_RECOVERY_MISSING_ATTEMPT_LIMIT = 12;
+const RECORDING_RECOVERY_MISSING_EVENT = "recording_recovery_part_missing";
+const RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT = "recording_recovery_manual_attention";
 
 function retentionUntil(from: Date) {
   return new Date(from.getTime() + INTERVIEW_RETENTION_DAYS * 24 * 60 * 60 * 1_000).toISOString();
@@ -471,6 +480,16 @@ async function ensureSchema(db: D1Database) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_drive_upload_steps_lease_idx ON interview_drive_upload_steps (lease_expires_at)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_drive_hierarchy_nodes (
+      node_key TEXT PRIMARY KEY NOT NULL,
+      canonical_folder_id TEXT,
+      creation_attempted_at TEXT,
+      lease_token TEXT,
+      lease_expires_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_drive_hierarchy_nodes_lease_idx ON interview_drive_hierarchy_nodes (lease_expires_at)"),
   ]);
   const sessionColumns = await db.prepare("PRAGMA table_info(interview_sessions)")
     .all<{ name: string }>();
@@ -1248,15 +1267,81 @@ export async function recordCandidateEvent(input: {
   detail?: Record<string, string | number | boolean>;
 }) {
   const db = database();
-  if (!db) return;
-  await db.prepare(
-    "INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, ?, 'candidate', ?)",
-  ).bind(
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  // Seven independently capped candidate event types can consume at most 112
+  // rows. Keep a defensive session ceiling above that natural maximum so one
+  // event type can never starve another type's reserved capacity.
+  const totalLimit = 128;
+  const typeLimit = 16;
+  const result = await db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json
+    )
+    SELECT ?, ?, ?, 'candidate', ?
+    WHERE EXISTS (
+      SELECT 1 FROM interview_sessions session
+      WHERE session.id = ?
+        AND session.status IN ('created', 'in_progress', 'evaluation_pending', 'evaluation_processing', 'completed')
+        AND (
+          ? <> 'transcription_failed'
+          OR (
+            session.status IN ('created', 'in_progress')
+            AND NOT EXISTS (
+              SELECT 1 FROM interview_audit_events sealed
+              WHERE sealed.session_id = session.id AND sealed.event_type = 'voice_transcript_sealed'
+            )
+          )
+        )
+    )
+      AND (SELECT COUNT(*) FROM interview_audit_events
+        WHERE session_id = ? AND actor_type = 'candidate'
+          AND event_type IN (
+            'audio_playback_blocked', 'transcription_failed', 'recording_unavailable', 'connection_failed',
+            'candidate_requested_stop', 'time_limit_reached',
+            'reasonable_accommodation_text_selected'
+          )) < ?
+      AND (SELECT COUNT(*) FROM interview_audit_events
+        WHERE session_id = ? AND actor_type = 'candidate' AND event_type = ?) < ?`)
+    .bind(
     crypto.randomUUID(),
     input.sessionId,
     input.eventType,
     JSON.stringify(input.detail ?? {}),
+    input.sessionId,
+    input.eventType,
+    input.sessionId,
+    totalLimit,
+    input.sessionId,
+    input.eventType,
+    typeLimit,
   ).run();
+  if (Number(result.meta?.changes ?? 0) === 1) return "stored" as const;
+
+  const state = await db.prepare(`SELECT status,
+      (SELECT COUNT(*) FROM interview_audit_events
+        WHERE session_id = ? AND actor_type = 'candidate'
+          AND event_type IN (
+            'audio_playback_blocked', 'transcription_failed', 'recording_unavailable', 'connection_failed',
+            'candidate_requested_stop', 'time_limit_reached',
+            'reasonable_accommodation_text_selected'
+          )) AS candidate_event_count,
+      (SELECT COUNT(*) FROM interview_audit_events
+        WHERE session_id = ? AND actor_type = 'candidate' AND event_type = ?) AS candidate_event_type_count
+      ,(SELECT COUNT(*) FROM interview_audit_events
+        WHERE session_id = ? AND event_type = 'voice_transcript_sealed') AS voice_transcript_sealed
+    FROM interview_sessions WHERE id = ? LIMIT 1`)
+    .bind(input.sessionId, input.sessionId, input.eventType, input.sessionId, input.sessionId)
+    .first<{
+      status: string;
+      candidate_event_count: number;
+      candidate_event_type_count: number;
+      voice_transcript_sealed: number;
+    }>();
+  const openStatuses = ["created", "in_progress", "evaluation_pending", "evaluation_processing", "completed"];
+  const harmfulEventClosed = input.eventType === "transcription_failed" && (
+    !state || !["created", "in_progress"].includes(state.status) || Number(state.voice_transcript_sealed) > 0
+  );
+  if (!state || !openStatuses.includes(state.status) || harmfulEventClosed) return "closed" as const;
+  return "capped" as const;
 }
 
 function parseJson<T>(value: unknown, fallback: T): T {
@@ -1521,16 +1606,27 @@ export async function completeExternalSync(input: {
   folderId: string;
   folderUrl: string;
   manifest: Record<string, unknown>;
+  driveUploadStepLeaseToken?: string;
 }) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   const now = new Date().toISOString();
+  const driveStepLeaseFence = input.driveUploadStepLeaseToken
+    ? ` AND EXISTS (
+        SELECT 1 FROM interview_drive_upload_steps step
+        WHERE step.session_id = ? AND step.started_at = ?
+          AND step.lease_token = ? AND step.lease_expires_at > ?
+      )`
+    : "";
+  const driveStepLeaseBindings = input.driveUploadStepLeaseToken
+    ? [input.sessionId, input.startedAt, input.driveUploadStepLeaseToken, now]
+    : [];
   const results = await db.batch([
     db.prepare(`UPDATE interview_external_syncs SET
       status = CASE WHEN requested_at > ? THEN 'pending' ELSE 'completed' END,
       completed_at = CASE WHEN requested_at > ? THEN NULL ELSE ? END,
       folder_id = ?, folder_url = ?, manifest_json = ?, error_code = NULL, updated_at = ?
-      WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?`)
+      WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?${driveStepLeaseFence}`)
       .bind(
         input.startedAt,
         input.startedAt,
@@ -1541,6 +1637,7 @@ export async function completeExternalSync(input: {
         now,
         input.sessionId,
         input.startedAt,
+        ...driveStepLeaseBindings,
       ),
     db.prepare(`INSERT INTO interview_audit_events (
       id, session_id, event_type, actor_type, detail_json
@@ -1548,17 +1645,20 @@ export async function completeExternalSync(input: {
       WHERE EXISTS (
         SELECT 1 FROM interview_external_syncs
         WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?
-      )`)
+      )${driveStepLeaseFence}`)
       .bind(
         crypto.randomUUID(),
         input.sessionId,
         JSON.stringify({ folderId: input.folderId }),
         input.sessionId,
         input.startedAt,
+        ...driveStepLeaseBindings,
       ),
   ]);
   if (Number(results[0]?.meta?.changes ?? 0) !== 1) {
-    throw new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
+    throw new Error(input.driveUploadStepLeaseToken
+      ? "GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST"
+      : "GOOGLE_DRIVE_SYNC_CLAIM_LOST");
   }
   return (await getExternalSyncStatus(input.sessionId))?.status === "pending";
 }
@@ -1594,6 +1694,28 @@ export async function failExternalSync(input: {
         input.startedAt,
       ),
   ]);
+}
+
+export async function deferExternalSync(input: {
+  sessionId: string;
+  startedAt: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
+  // Shared year/month hierarchy creation is serialized independently from a
+  // candidate archive. Contention is a normal wait state, not a failed sync.
+  // Fence the release on the exact running claim so a stale worker cannot put
+  // a newer owner's sync back into pending.
+  const result = await db.prepare(`UPDATE interview_external_syncs SET
+    status = 'pending', started_at = NULL, completed_at = NULL,
+    error_code = NULL, updated_at = ?
+    WHERE session_id = ? AND provider = 'google_drive' AND status = 'running'
+      AND started_at = ?`)
+    .bind(now, input.sessionId, input.startedAt).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) {
+    throw new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
+  }
 }
 
 export type DriveUploadStepState = {
@@ -1779,6 +1901,101 @@ export async function initializeDriveUploadStep(input: {
 
 const DRIVE_UPLOAD_STEP_LEASE_MS = 90_000;
 
+const DRIVE_HIERARCHY_NODE_LEASE_MS = 90_000;
+
+export async function acquireDriveHierarchyNodeLease(nodeKey: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const leaseToken = crypto.randomUUID();
+  const leaseExpiresAt = new Date(now.getTime() + DRIVE_HIERARCHY_NODE_LEASE_MS).toISOString();
+  const result = await db.prepare(`INSERT INTO interview_drive_hierarchy_nodes (
+      node_key, canonical_folder_id, creation_attempted_at, lease_token, lease_expires_at, created_at, updated_at
+    ) VALUES (?, NULL, NULL, ?, ?, ?, ?)
+    ON CONFLICT(node_key) DO UPDATE SET
+      lease_token = excluded.lease_token,
+      lease_expires_at = excluded.lease_expires_at,
+      updated_at = excluded.updated_at
+    WHERE interview_drive_hierarchy_nodes.lease_token IS NULL
+      OR interview_drive_hierarchy_nodes.lease_expires_at IS NULL
+      OR interview_drive_hierarchy_nodes.lease_expires_at <= ?`)
+    .bind(nodeKey, leaseToken, leaseExpiresAt, nowIso, nowIso, nowIso).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return null;
+  const stored = await db.prepare(`SELECT canonical_folder_id, creation_attempted_at
+    FROM interview_drive_hierarchy_nodes
+    WHERE node_key = ? AND lease_token = ? AND lease_expires_at > ? LIMIT 1`)
+    .bind(nodeKey, leaseToken, nowIso)
+    .first<{ canonical_folder_id: string | null; creation_attempted_at: string | null }>();
+  if (!stored) throw new Error("GOOGLE_DRIVE_HIERARCHY_LEASE_LOST");
+  return {
+    leaseToken,
+    canonicalFolderId: stored.canonical_folder_id,
+    creationAttemptedAt: stored.creation_attempted_at,
+  };
+}
+
+export async function renewDriveHierarchyNodeLease(input: { nodeKey: string; leaseToken: string }) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const leaseExpiresAt = new Date(now.getTime() + DRIVE_HIERARCHY_NODE_LEASE_MS).toISOString();
+  const result = await db.prepare(`UPDATE interview_drive_hierarchy_nodes SET
+      lease_expires_at = ?, updated_at = ?
+    WHERE node_key = ? AND lease_token = ? AND lease_expires_at > ?`)
+    .bind(leaseExpiresAt, nowIso, input.nodeKey, input.leaseToken, nowIso).run();
+  return Number(result.meta?.changes ?? 0) === 1;
+}
+
+export async function setDriveHierarchyNodeCanonicalFolder(input: {
+  nodeKey: string;
+  leaseToken: string;
+  folderId: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
+  const result = await db.prepare(`UPDATE interview_drive_hierarchy_nodes SET
+      canonical_folder_id = ?, updated_at = ?
+    WHERE node_key = ? AND lease_token = ? AND lease_expires_at > ?
+      AND (canonical_folder_id IS NULL OR canonical_folder_id = ?)`)
+    .bind(input.folderId, now, input.nodeKey, input.leaseToken, now, input.folderId).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) {
+    throw new Error("GOOGLE_DRIVE_HIERARCHY_CANONICAL_CONFLICT");
+  }
+}
+
+export async function markDriveHierarchyNodeCreationAttempt(input: {
+  nodeKey: string;
+  leaseToken: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
+  const result = await db.prepare(`UPDATE interview_drive_hierarchy_nodes SET
+      creation_attempted_at = ?, updated_at = ?
+    WHERE node_key = ? AND lease_token = ? AND lease_expires_at > ?
+      AND canonical_folder_id IS NULL AND creation_attempted_at IS NULL`)
+    .bind(now, now, input.nodeKey, input.leaseToken, now).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) {
+    throw new Error("GOOGLE_DRIVE_HIERARCHY_CREATION_UNCERTAIN");
+  }
+}
+
+export async function releaseDriveHierarchyNodeLease(input: { nodeKey: string; leaseToken: string }) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
+  const result = await db.prepare(`UPDATE interview_drive_hierarchy_nodes SET
+      lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+    WHERE node_key = ? AND lease_token = ? AND lease_expires_at > ?`)
+    .bind(now, input.nodeKey, input.leaseToken, now).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) {
+    throw new Error("GOOGLE_DRIVE_HIERARCHY_LEASE_LOST");
+  }
+}
+
 export async function acquireDriveUploadStepLease(sessionId: string, startedAt: string) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
@@ -1792,6 +2009,36 @@ export async function acquireDriveUploadStepLease(sessionId: string, startedAt: 
       AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)`)
     .bind(leaseToken, leaseExpiresAt, nowIso, sessionId, startedAt, nowIso).run();
   return Number(result.meta?.changes ?? 0) === 1 ? leaseToken : null;
+}
+
+/**
+ * Extends a live upload-step lease only for its current owner. An already
+ * expired owner may never resurrect itself: it must stop before the next Drive
+ * mutation and let a fresh request acquire a new token.
+ */
+export async function renewDriveUploadStepLease(input: {
+  sessionId: string;
+  startedAt: string;
+  leaseToken: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const leaseExpiresAt = new Date(now.getTime() + DRIVE_UPLOAD_STEP_LEASE_MS).toISOString();
+  const result = await db.prepare(`UPDATE interview_drive_upload_steps SET
+    lease_expires_at = ?, updated_at = ?
+    WHERE session_id = ? AND started_at = ? AND lease_token = ?
+      AND lease_expires_at > ?`)
+    .bind(
+      leaseExpiresAt,
+      nowIso,
+      input.sessionId,
+      input.startedAt,
+      input.leaseToken,
+      nowIso,
+    ).run();
+  return Number(result.meta?.changes ?? 0) === 1;
 }
 
 export async function updateDriveUploadStep(input: {
@@ -1817,7 +2064,8 @@ export async function updateDriveUploadStep(input: {
     lease_token = CASE WHEN ? = 1 THEN NULL ELSE lease_token END,
     lease_expires_at = CASE WHEN ? = 1 THEN NULL ELSE lease_expires_at END,
     updated_at = ?
-    WHERE session_id = ? AND started_at = ? AND lease_token = ?`)
+    WHERE session_id = ? AND started_at = ? AND lease_token = ?
+      AND lease_expires_at > ?`)
     .bind(
       input.committedOffset,
       input.phase ?? null,
@@ -1831,6 +2079,7 @@ export async function updateDriveUploadStep(input: {
       input.sessionId,
       input.startedAt,
       input.leaseToken,
+      now,
     ).run();
   if (Number(result.meta?.changes ?? 0) !== 1) throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST");
 }
@@ -1847,8 +2096,9 @@ export async function updateDriveUploadStepContext(input: {
   const contextJson = JSON.stringify(input.context);
   const result = await db.prepare(`UPDATE interview_drive_upload_steps SET
     context_json = ?, updated_at = ?
-    WHERE session_id = ? AND started_at = ? AND lease_token = ?`)
-    .bind(contextJson, now, input.sessionId, input.startedAt, input.leaseToken).run();
+    WHERE session_id = ? AND started_at = ? AND lease_token = ?
+      AND lease_expires_at > ?`)
+    .bind(contextJson, now, input.sessionId, input.startedAt, input.leaseToken, now).run();
   if (Number(result.meta?.changes ?? 0) !== 1) throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST");
   const stored = await getDriveUploadStep(input.sessionId);
   if (
@@ -1866,17 +2116,29 @@ export async function releaseDriveUploadStepLease(input: {
 }) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date().toISOString();
   await db.prepare(`UPDATE interview_drive_upload_steps SET
     lease_token = NULL, lease_expires_at = NULL, updated_at = ?
-    WHERE session_id = ? AND started_at = ? AND lease_token = ?`)
-    .bind(new Date().toISOString(), input.sessionId, input.startedAt, input.leaseToken).run();
+    WHERE session_id = ? AND started_at = ? AND lease_token = ?
+      AND lease_expires_at > ?`)
+    .bind(now, input.sessionId, input.startedAt, input.leaseToken, now).run();
 }
 
-export async function deleteDriveUploadStep(sessionId: string, startedAt: string) {
+export async function deleteDriveUploadStep(input: {
+  sessionId: string;
+  startedAt: string;
+  leaseToken: string;
+}) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
-  await db.prepare("DELETE FROM interview_drive_upload_steps WHERE session_id = ? AND started_at = ?")
-    .bind(sessionId, startedAt).run();
+  const now = new Date().toISOString();
+  const result = await db.prepare(`DELETE FROM interview_drive_upload_steps
+    WHERE session_id = ? AND started_at = ? AND lease_token = ?
+      AND lease_expires_at > ?`)
+    .bind(input.sessionId, input.startedAt, input.leaseToken, now).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) {
+    throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST");
+  }
 }
 
 export async function getInterviewArchiveSource(sessionId: string) {
@@ -2823,10 +3085,25 @@ export async function recoverNextSealedResumableInterviewRecording() {
   // foreground upload. The shorter updated_at fence still excludes an upload
   // whose part heartbeat shows current activity.
   const completedBefore = new Date(Date.now() - 5 * 60 * 1_000).toISOString();
-  const targets = await db.prepare(`SELECT s.id
+  const targets = await db.prepare(`SELECT s.id, s.expires_at, s.created_at,
+      COALESCE(
+        (SELECT c.requested_at FROM recorded_interview_completions c WHERE c.session_id = s.id),
+        (SELECT MIN(a.created_at) FROM interview_audit_events a
+          WHERE a.session_id = s.id AND a.event_type = 'voice_transcript_sealed'),
+        s.completed_at,
+        s.created_at
+      ) AS recovery_sealed_at,
+      (SELECT COUNT(*) FROM interview_audit_events missing
+        WHERE missing.session_id = s.id
+          AND missing.event_type = '${RECORDING_RECOVERY_MISSING_EVENT}') AS missing_attempt_count
     FROM interview_sessions s
     WHERE s.recording_status IN ('uploading', 'failed')
       AND s.updated_at <= ?
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = s.id
+          AND terminal.event_type = '${RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+      )
       AND (
         (
           s.status = 'completed'
@@ -2867,8 +3144,18 @@ export async function recoverNextSealedResumableInterviewRecording() {
     ) ASC, s.id ASC
     LIMIT 10`)
     .bind(staleBefore, completedBefore)
-    .all<{ id: string }>();
-  let firstDeferred: { state: "incomplete" | "failed"; sessionId: string; errorCode: string } | null = null;
+    .all<{
+      id: string;
+      expires_at: string;
+      created_at: string;
+      recovery_sealed_at: string;
+      missing_attempt_count: number;
+    }>();
+  let firstDeferred: {
+    state: "waiting" | "manual_attention" | "failed";
+    sessionId: string;
+    errorCode: string;
+  } | null = null;
   for (const target of targets.results ?? []) {
     try {
       const result = await recoverResumableInterviewRecording(target.id);
@@ -2876,12 +3163,70 @@ export async function recoverNextSealedResumableInterviewRecording() {
     } catch (error) {
       const code = error instanceof Error ? error.message : "INTERVIEW_RECORDING_RECOVERY_FAILED";
       if (code.includes("PART_MISSING")) {
-        // Missing parts are not a failed upload: the candidate may still be
-        // sending them. Move this row behind the one-minute activity fence and
-        // inspect another bounded candidate in the same tick, avoiding FIFO
-        // starvation when an abandoned upload is the oldest row.
+        const observedAt = new Date();
+        const observedAtIso = observedAt.toISOString();
+        const attemptCount = Math.max(0, Number(target.missing_attempt_count) || 0) + 1;
+        await db.prepare(`INSERT INTO interview_audit_events (
+          id, session_id, event_type, actor_type, detail_json, created_at
+        ) VALUES (?, ?, '${RECORDING_RECOVERY_MISSING_EVENT}', 'system', ?, ?)`)
+          .bind(
+            crypto.randomUUID(),
+            target.id,
+            JSON.stringify({ attemptCount, errorCode: code.slice(0, 120) }),
+            observedAtIso,
+          ).run();
+
+        const expiresAt = Date.parse(target.expires_at);
+        const sealedAt = Date.parse(target.recovery_sealed_at || target.created_at);
+        const candidateResumeDeadline = Number.isFinite(expiresAt)
+          ? expiresAt + RECORDING_RECOVERY_EXPIRY_GRACE_MS
+          : Number.POSITIVE_INFINITY;
+        const absoluteDeadline = Number.isFinite(sealedAt)
+          ? sealedAt + RECORDING_RECOVERY_ABSOLUTE_DEADLINE_MS
+          : Number.POSITIVE_INFINITY;
+        const candidateGraceElapsed = observedAt.getTime() >= candidateResumeDeadline;
+        const shouldTerminalize = candidateGraceElapsed && (
+          attemptCount >= RECORDING_RECOVERY_MISSING_ATTEMPT_LIMIT ||
+          observedAt.getTime() >= absoluteDeadline
+        );
+
+        if (shouldTerminalize) {
+          // `failed` remains resumable by the authenticated foreground path;
+          // the durable marker terminates only unattended selection so cron no
+          // longer emits the same attention state forever.
+          await failInterviewRecordingUpload(target.id);
+          await db.prepare(`INSERT INTO interview_audit_events (
+            id, session_id, event_type, actor_type, detail_json, created_at
+          ) SELECT ?, ?, '${RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}', 'system', ?, ?
+            WHERE NOT EXISTS (
+              SELECT 1 FROM interview_audit_events
+              WHERE session_id = ? AND event_type = '${RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+            )`)
+            .bind(
+              crypto.randomUUID(),
+              target.id,
+              JSON.stringify({
+                attemptCount,
+                errorCode: code.slice(0, 120),
+                expiresAt: target.expires_at,
+                recoverySealedAt: target.recovery_sealed_at,
+              }),
+              observedAtIso,
+              target.id,
+            ).run();
+          firstDeferred ??= {
+            state: "manual_attention",
+            sessionId: target.id,
+            errorCode: code.slice(0, 120),
+          };
+          continue;
+        }
+
+        // Missing parts are not yet a failed upload: the candidate may still
+        // be sending them. Move this row behind the one-minute activity fence
+        // and inspect another bounded candidate in the same tick.
         await heartbeatInterviewRecordingUpload(target.id);
-        firstDeferred ??= { state: "incomplete", sessionId: target.id, errorCode: code.slice(0, 120) };
+        firstDeferred ??= { state: "waiting", sessionId: target.id, errorCode: code.slice(0, 120) };
         continue;
       }
       await failInterviewRecordingUpload(target.id);

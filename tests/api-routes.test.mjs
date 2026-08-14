@@ -246,6 +246,87 @@ class FakeD1Statement {
         });
         changes = 1;
       }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, ?, 'candidate'")
+    ) {
+      const [id, sessionId, eventType, detailJson, statusSessionId, guardedEventType,
+        totalSessionId, totalLimit, typeSessionId, countedEventType, typeLimit] = this.values;
+      const session = this.database.sessions.get(statusSessionId);
+      const allowedStatus = ["created", "in_progress", "evaluation_pending", "evaluation_processing", "completed"]
+        .includes(session?.status);
+      const harmfulClosed = guardedEventType === "transcription_failed" && (
+        !["created", "in_progress"].includes(session?.status) ||
+        this.database.auditEvents.some((event) =>
+          event.session_id === statusSessionId && event.event_type === "voice_transcript_sealed")
+      );
+      const candidateTypes = new Set([
+        "audio_playback_blocked", "transcription_failed", "recording_unavailable", "connection_failed",
+        "candidate_requested_stop", "time_limit_reached", "reasonable_accommodation_text_selected",
+      ]);
+      const totalCount = this.database.auditEvents.filter((event) =>
+        event.session_id === totalSessionId && event.actor_type === "candidate" &&
+        candidateTypes.has(event.event_type)).length;
+      const typeCount = this.database.auditEvents.filter((event) =>
+        event.session_id === typeSessionId && event.actor_type === "candidate" &&
+        event.event_type === countedEventType).length;
+      if (sessionId === statusSessionId && eventType === countedEventType && allowedStatus && !harmfulClosed &&
+        totalCount < totalLimit && typeCount < typeLimit) {
+        this.database.auditEvents.push({
+          id,
+          session_id: sessionId,
+          event_type: eventType,
+          actor_type: "candidate",
+          detail_json: detailJson,
+          created_at: new Date().toISOString(),
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("INSERT INTO interview_drive_hierarchy_nodes")) {
+      const [nodeKey, leaseToken, leaseExpiresAt, createdAt, updatedAt, now] = this.values;
+      const current = this.database.driveHierarchyNodes.get(nodeKey);
+      if (!current || !current.lease_token || !current.lease_expires_at || current.lease_expires_at <= now) {
+        this.database.driveHierarchyNodes.set(nodeKey, {
+          node_key: nodeKey,
+          canonical_folder_id: current?.canonical_folder_id ?? null,
+          creation_attempted_at: current?.creation_attempted_at ?? null,
+          lease_token: leaseToken,
+          lease_expires_at: leaseExpiresAt,
+          created_at: current?.created_at ?? createdAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_drive_hierarchy_nodes SET lease_expires_at")) {
+      const [leaseExpiresAt, updatedAt, nodeKey, leaseToken, now] = this.values;
+      const node = this.database.driveHierarchyNodes.get(nodeKey);
+      if (node?.lease_token === leaseToken && node.lease_expires_at > now) {
+        Object.assign(node, { lease_expires_at: leaseExpiresAt, updated_at: updatedAt });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_drive_hierarchy_nodes SET canonical_folder_id")) {
+      const [folderId, updatedAt, nodeKey, leaseToken, now, expectedFolderId] = this.values;
+      const node = this.database.driveHierarchyNodes.get(nodeKey);
+      if (node?.lease_token === leaseToken && node.lease_expires_at > now &&
+        (!node.canonical_folder_id || node.canonical_folder_id === expectedFolderId)) {
+        Object.assign(node, { canonical_folder_id: folderId, updated_at: updatedAt });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_drive_hierarchy_nodes SET creation_attempted_at")) {
+      const [attemptedAt, updatedAt, nodeKey, leaseToken, now] = this.values;
+      const node = this.database.driveHierarchyNodes.get(nodeKey);
+      if (node?.lease_token === leaseToken && node.lease_expires_at > now &&
+        !node.canonical_folder_id && !node.creation_attempted_at) {
+        Object.assign(node, { creation_attempted_at: attemptedAt, updated_at: updatedAt });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_drive_hierarchy_nodes SET lease_token = NULL")) {
+      const [updatedAt, nodeKey, leaseToken, now] = this.values;
+      const node = this.database.driveHierarchyNodes.get(nodeKey);
+      if (node?.lease_token === leaseToken && node.lease_expires_at > now) {
+        Object.assign(node, { lease_token: null, lease_expires_at: null, updated_at: updatedAt });
+        changes = 1;
+      }
     } else if (this.sql.startsWith("INSERT INTO interview_external_syncs")) {
       const [sessionId, requestedAt, updatedAt] = this.values;
       const current = this.database.externalSyncs.get(sessionId);
@@ -269,6 +350,7 @@ class FakeD1Statement {
       const sync = this.database.externalSyncs.get(sessionId);
       if (sync?.status === "running" && sync.started_at === expectedStartedAt) {
         sync.updated_at = updatedAt;
+        this.database.externalHeartbeatCount += 1;
         changes = 1;
       }
     } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = 'running'")) {
@@ -278,6 +360,22 @@ class FakeD1Statement {
         Object.assign(sync, {
           status: "running",
           started_at: startedAt,
+          completed_at: null,
+          error_code: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("UPDATE interview_external_syncs SET status = 'pending'") &&
+      this.sql.includes("AND started_at = ?")
+    ) {
+      const [updatedAt, sessionId, expectedStartedAt] = this.values;
+      const sync = this.database.externalSyncs.get(sessionId);
+      if (sync?.status === "running" && sync.started_at === expectedStartedAt) {
+        Object.assign(sync, {
+          status: "pending",
+          started_at: null,
           completed_at: null,
           error_code: null,
           updated_at: updatedAt,
@@ -301,7 +399,20 @@ class FakeD1Statement {
       const [startedAtForStatus, , completedAt, folderId, folderUrl, manifestJson,
         updatedAt, sessionId, expectedStartedAt] = this.values;
       const sync = this.database.externalSyncs.get(sessionId);
-      if (sync?.started_at === expectedStartedAt) {
+      const stepLeaseRequired = this.sql.includes("FROM interview_drive_upload_steps step");
+      const [leaseSessionId, leaseStartedAt, leaseToken, leaseNow] = this.values.slice(9);
+      const leaseStep = stepLeaseRequired ? this.database.driveUploadSteps.get(leaseSessionId) : null;
+      if (stepLeaseRequired && this.database.beforeExternalSyncComplete) {
+        const hook = this.database.beforeExternalSyncComplete;
+        this.database.beforeExternalSyncComplete = null;
+        await hook({ sessionId: leaseSessionId, step: leaseStep });
+      }
+      const leaseValid = !stepLeaseRequired || (
+        leaseStep?.started_at === leaseStartedAt &&
+        leaseStep.lease_token === leaseToken &&
+        leaseStep.lease_expires_at > leaseNow
+      );
+      if (sync?.started_at === expectedStartedAt && leaseValid) {
         const retry = sync.requested_at > startedAtForStatus;
         Object.assign(sync, {
           status: retry ? "pending" : "completed",
@@ -351,6 +462,16 @@ class FakeD1Statement {
         Object.assign(step, { lease_token: leaseToken, lease_expires_at: leaseExpiresAt, updated_at: updatedAt });
         changes = 1;
       }
+    } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET lease_expires_at = ?, updated_at = ?")) {
+      const [leaseExpiresAt, updatedAt, sessionId, startedAt, leaseToken, now] = this.values;
+      const step = this.database.driveUploadSteps.get(sessionId);
+      if (
+        step?.started_at === startedAt && step.lease_token === leaseToken &&
+        step.lease_expires_at && step.lease_expires_at > now
+      ) {
+        Object.assign(step, { lease_expires_at: leaseExpiresAt, updated_at: updatedAt });
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET started_at = ?, lease_token = NULL")) {
       const [nextStartedAt, updatedAt, sessionId, previousStartedAt, expectedTotalBytes,
         expectedContentType, now, syncSessionId, syncStartedAt] = this.values;
@@ -374,9 +495,12 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET committed_offset")) {
       const [committedOffset, phase, replaceMarker, recordingFileJson,
         uploadUrlCiphertext, uploadUrlIv, releaseLease, , updatedAt,
-        sessionId, startedAt, leaseToken] = this.values;
+        sessionId, startedAt, leaseToken, now] = this.values;
       const step = this.database.driveUploadSteps.get(sessionId);
-      if (step?.started_at === startedAt && step.lease_token === leaseToken) {
+      if (
+        step?.started_at === startedAt && step.lease_token === leaseToken &&
+        step.lease_expires_at > now
+      ) {
         step.committed_offset = committedOffset;
         if (phase) step.phase = phase;
         if (replaceMarker) step.recording_file_json = recordingFileJson;
@@ -390,24 +514,38 @@ class FakeD1Statement {
         changes = 1;
       }
     } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET context_json")) {
-      const [contextJson, updatedAt, sessionId, startedAt, leaseToken] = this.values;
+      const [contextJson, updatedAt, sessionId, startedAt, leaseToken, now] = this.values;
       const step = this.database.driveUploadSteps.get(sessionId);
-      if (step?.started_at === startedAt && step.lease_token === leaseToken) {
+      if (
+        step?.started_at === startedAt && step.lease_token === leaseToken &&
+        step.lease_expires_at > now
+      ) {
         step.context_json = contextJson;
         step.updated_at = updatedAt;
         changes = 1;
       }
     } else if (this.sql.startsWith("UPDATE interview_drive_upload_steps SET lease_token = NULL")) {
-      const [updatedAt, sessionId, startedAt, leaseToken] = this.values;
+      const [updatedAt, sessionId, startedAt, leaseToken, now] = this.values;
       const step = this.database.driveUploadSteps.get(sessionId);
-      if (step?.started_at === startedAt && step.lease_token === leaseToken) {
+      if (
+        step?.started_at === startedAt && step.lease_token === leaseToken &&
+        step.lease_expires_at > now
+      ) {
         Object.assign(step, { lease_token: null, lease_expires_at: null, updated_at: updatedAt });
         changes = 1;
       }
     } else if (this.sql.startsWith("DELETE FROM interview_drive_upload_steps")) {
-      const [sessionId, startedAt] = this.values;
+      const [sessionId, startedAt, leaseToken, now] = this.values;
       const step = this.database.driveUploadSteps.get(sessionId);
-      if (step?.started_at === startedAt) {
+      if (this.database.beforeDriveUploadStepDelete) {
+        const hook = this.database.beforeDriveUploadStepDelete;
+        this.database.beforeDriveUploadStepDelete = null;
+        await hook({ sessionId, step });
+      }
+      if (
+        step?.started_at === startedAt && step.lease_token === leaseToken &&
+        step.lease_expires_at > now
+      ) {
         this.database.driveUploadSteps.delete(sessionId);
         changes = 1;
       }
@@ -569,6 +707,35 @@ class FakeD1Statement {
       });
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'recording_recovery_part_missing'")
+    ) {
+      const [, sessionId, detailJson, createdAt] = this.values;
+      this.database.auditEvents.push({
+        event_type: "recording_recovery_part_missing",
+        detail_json: detailJson,
+        created_at: createdAt,
+        session_id: sessionId,
+      });
+      changes = 1;
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'recording_recovery_manual_attention'")
+    ) {
+      const [, sessionId, detailJson, createdAt, checkedSessionId] = this.values;
+      const exists = this.database.auditEvents.some((event) =>
+        event.session_id === checkedSessionId &&
+        event.event_type === "recording_recovery_manual_attention");
+      if (!exists) {
+        this.database.auditEvents.push({
+          event_type: "recording_recovery_manual_attention",
+          detail_json: detailJson,
+          created_at: createdAt,
+          session_id: sessionId,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("'voice_transcript_sealed'")
     ) {
       const [, detailJson, sessionId, transcriptJson] = this.values;
@@ -665,6 +832,45 @@ class FakeD1Statement {
       changes = 1;
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'google_drive_sync_completed'")
+    ) {
+      const [, sessionId, detailJson, syncSessionId, expectedStartedAt] = this.values;
+      const sync = this.database.externalSyncs.get(syncSessionId);
+      const stepLeaseRequired = this.sql.includes("FROM interview_drive_upload_steps step");
+      const [leaseSessionId, leaseStartedAt, leaseToken, leaseNow] = this.values.slice(5);
+      const step = stepLeaseRequired ? this.database.driveUploadSteps.get(leaseSessionId) : null;
+      const leaseValid = !stepLeaseRequired || (
+        step?.started_at === leaseStartedAt && step.lease_token === leaseToken &&
+        step.lease_expires_at > leaseNow
+      );
+      if (sync?.started_at === expectedStartedAt && sessionId === syncSessionId && leaseValid) {
+        this.database.auditEvents.push({
+          event_type: "google_drive_sync_completed",
+          actor_type: "system",
+          detail_json: detailJson,
+          created_at: new Date().toISOString(),
+          session_id: sessionId,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'google_drive_sync_failed'")
+    ) {
+      const [, sessionId, detailJson, syncSessionId, expectedStartedAt] = this.values;
+      const sync = this.database.externalSyncs.get(syncSessionId);
+      if (sync?.started_at === expectedStartedAt && sessionId === syncSessionId) {
+        this.database.auditEvents.push({
+          event_type: "google_drive_sync_failed",
+          actor_type: "system",
+          detail_json: detailJson,
+          created_at: new Date().toISOString(),
+          session_id: sessionId,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("VALUES (?, ?, ?, 'candidate', ?)")
     ) {
       const [, sessionId, eventType, detailJson] = this.values;
@@ -712,6 +918,36 @@ class FakeD1Statement {
   }
 
   async first() {
+    if (this.sql.startsWith("SELECT status, (SELECT COUNT(*) FROM interview_audit_events")) {
+      const [totalSessionId, typeSessionId, eventType, sealSessionId, sessionId] = this.values;
+      const session = this.database.sessions.get(sessionId);
+      if (!session) return null;
+      const candidateTypes = new Set([
+        "audio_playback_blocked", "transcription_failed", "recording_unavailable", "connection_failed",
+        "candidate_requested_stop", "time_limit_reached", "reasonable_accommodation_text_selected",
+      ]);
+      return {
+        status: session.status,
+        candidate_event_count: this.database.auditEvents.filter((event) =>
+          event.session_id === totalSessionId && event.actor_type === "candidate" &&
+          candidateTypes.has(event.event_type)).length,
+        candidate_event_type_count: this.database.auditEvents.filter((event) =>
+          event.session_id === typeSessionId && event.actor_type === "candidate" &&
+          event.event_type === eventType).length,
+        voice_transcript_sealed: this.database.auditEvents.filter((event) =>
+          event.session_id === sealSessionId && event.event_type === "voice_transcript_sealed").length,
+      };
+    }
+    if (this.sql.startsWith("SELECT canonical_folder_id, creation_attempted_at FROM interview_drive_hierarchy_nodes")) {
+      const [nodeKey, leaseToken, now] = this.values;
+      const node = this.database.driveHierarchyNodes.get(nodeKey);
+      return node?.lease_token === leaseToken && node.lease_expires_at > now
+        ? {
+          canonical_folder_id: node.canonical_folder_id,
+          creation_attempted_at: node.creation_attempted_at,
+        }
+        : null;
+    }
     if (this.sql.startsWith("SELECT s.status AS session_status")) {
       const sessionId = this.values[0];
       const session = this.database.sessions.get(sessionId);
@@ -817,7 +1053,8 @@ class FakeD1Statement {
         })
         .map((session) => ({ id: session.id, transcript_json: session.transcript_json }))[0] ?? null;
     }
-    if (this.sql.startsWith("SELECT s.id FROM interview_sessions s WHERE s.recording_status IN")) {
+    if (this.sql.startsWith("SELECT s.id") &&
+      this.sql.includes("FROM interview_sessions s WHERE s.recording_status IN")) {
       const [staleBefore, completedBefore] = this.values;
       return [...this.database.sessions.values()]
         .filter((session) => {
@@ -948,7 +1185,8 @@ class FakeD1Statement {
           .map((event) => ({ event_type: event.event_type, detail_json: event.detail_json })),
       };
     }
-    if (this.sql.startsWith("SELECT s.id FROM interview_sessions s WHERE s.recording_status IN")) {
+    if (this.sql.startsWith("SELECT s.id") &&
+      this.sql.includes("FROM interview_sessions s WHERE s.recording_status IN")) {
       const [staleBefore, completedBefore] = this.values;
       return {
         results: [...this.database.sessions.values()]
@@ -966,10 +1204,13 @@ class FakeD1Statement {
               event.session_id === session.id && event.event_type === "voice_transcript_sealed");
             const hasSeal = this.database.recordedCompletions.has(session.id) ||
               (voiceSealed && !fallbackStarted && transcriptHasCandidate);
+            const terminal = this.database.auditEvents.some((event) =>
+              event.session_id === session.id &&
+              event.event_type === "recording_recovery_manual_attention");
             const recoverableStatus = session.status === "completed"
               ? typeof session.completed_at === "string" && session.completed_at <= completedBefore
               : hasSeal && ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status);
-            return recoverableStatus &&
+            return !terminal && recoverableStatus &&
               ["uploading", "failed"].includes(session.recording_status) &&
               session.updated_at <= staleBefore;
           })
@@ -985,7 +1226,21 @@ class FakeD1Statement {
             return leftSeal.localeCompare(rightSeal) || left.id.localeCompare(right.id);
           })
           .slice(0, 10)
-          .map((session) => ({ id: session.id })),
+          .map((session) => {
+            const sealAt = this.database.recordedCompletions.get(session.id)?.requested_at ??
+              this.database.auditEvents.find((event) =>
+                event.session_id === session.id && event.event_type === "voice_transcript_sealed")?.created_at ??
+              session.completed_at ?? session.created_at;
+            return {
+              id: session.id,
+              expires_at: session.expires_at,
+              created_at: session.created_at,
+              recovery_sealed_at: sealAt,
+              missing_attempt_count: this.database.auditEvents.filter((event) =>
+                event.session_id === session.id &&
+                event.event_type === "recording_recovery_part_missing").length,
+            };
+          }),
       };
     }
     if (this.sql.startsWith("SELECT s.id, s.transcript_json, EXISTS")) {
@@ -1138,10 +1393,14 @@ class FakeD1 {
     this.publicEntries = [];
     this.externalSyncs = new Map();
     this.driveUploadSteps = new Map();
+    this.driveHierarchyNodes = new Map();
     this.evaluationClaims = new Map();
     this.recordedAnswers = new Map();
     this.recordedCompletions = new Map();
     this.driveConnection = null;
+    this.externalHeartbeatCount = 0;
+    this.beforeExternalSyncComplete = null;
+    this.beforeDriveUploadStepDelete = null;
   }
 
   prepare(sql) {
@@ -2436,6 +2695,7 @@ test("candidate archive fails closed before writes for a mismatched transcript d
   const uploadedNames = [];
   const artifactUploadRequests = [];
   const createdFolders = [];
+  const createdFolderFiles = [];
   const expectedTranscriptText = [
     "TOKYO DOGS オンライン一次面接 文字起こし",
     `面接ID: ${session.sessionId}`,
@@ -2524,14 +2784,21 @@ test("candidate archive fails closed before writes for a mismatched transcript d
           webViewLink: "https://drive.google.com/drive/folders/folder-3",
         });
       }
+      const createdFolder = createdFolderFiles.find((folder) =>
+        href.includes(`/drive/v3/files/${folder.id}?`));
+      if (createdFolder) return Response.json(createdFolder);
       if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
         const query = new URL(href).searchParams.get("q") ?? "";
         const isFolderChildrenReadback = query === "'folder-3' in parents and trashed = false";
+        const parentId = query.match(/^'([^']+)' in parents/)?.[1];
+        const property = query.match(/appProperties has \{ key='([^']+)' and value='([^']+)' \}/);
         folderListDebug.push({ query, uploadedCount: uploadedDriveFiles.length, isFolderChildrenReadback });
         return Response.json({
           files: isFolderChildrenReadback
             ? [...uploadedDriveFiles, legacyDuplicateFile, ...blockingDriveFiles]
-            : [],
+            : createdFolderFiles.filter((folder) =>
+                folder.parents?.includes(parentId) &&
+                (!property || folder.appProperties?.[property[1]] === property[2])),
         });
       }
       if (
@@ -2597,14 +2864,17 @@ test("candidate archive fails closed before writes for a mismatched transcript d
         const metadata = JSON.parse(String(init.body));
         const id = `folder-${++nextFile}`;
         createdFolders.push(metadata.name);
-        return Response.json({
+        const folder = {
           id,
           name: metadata.name,
           mimeType: metadata.mimeType,
+          trashed: false,
           parents: metadata.parents,
           appProperties: metadata.appProperties,
           webViewLink: `https://drive.google.com/drive/folders/${id}`,
-        });
+        };
+        createdFolderFiles.push(folder);
+        return Response.json(folder);
       }
       if (href.includes("/export?")) {
         return new Response(new TextEncoder().encode("%PDF-1.7 test report"), {
@@ -2856,7 +3126,9 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     ]);
     assert.equal(database.driveUploadSteps.has(session.sessionId), false, "durable upload capability is removed after exact readback");
     assert.match(database.externalSyncs.get(session.sessionId).folder_url, /^https:\/\/drive\.google\.com\/drive\/folders\/folder-/);
-    assert.deepEqual(createdFolders, ["2026", "07", `テスト 応募者_${session.sessionId}`]);
+    assert.deepEqual(createdFolderFiles.map((folder) => folder.name),
+      ["2026", "07", `テスト 応募者_${session.sessionId}`],
+      "failed artifact preflights must reuse the canonical hierarchy instead of recreating folders");
     assert.deepEqual(new Set(uploadedNames), new Set([
       `${session.sessionId}_文字起こし.txt`,
       `${session.sessionId}_評価データ.json`,
@@ -4305,6 +4577,106 @@ test("candidate technical incidents are audited and cross-origin mutations are r
   assert.equal(staffResponse.status, 200);
   assert.equal(staffPayload.review.technicalEvents[0].type, "transcription_failed");
   assert.equal(staffPayload.review.sourceTranscriptVerified, false);
+});
+
+test("candidate event caps are atomic per type and late harmful events cannot dirty a completed archive", async () => {
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const session = await createTestInterviewSession(env);
+  const sendEvent = (eventType, code = "TEST_EVENT") => request("/api/interviews/event", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+      Origin: "http://localhost",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId, eventType, code }),
+  }, env);
+
+  const concurrent = await Promise.all(Array.from({ length: 24 }, () => sendEvent("connection_failed")));
+  assert.equal(concurrent.filter((response) => response.status === 200).length, 16);
+  assert.equal(concurrent.filter((response) => response.status === 429).length, 8);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === session.sessionId && event.event_type === "connection_failed").length, 16);
+
+  const independentType = await sendEvent("audio_playback_blocked");
+  assert.equal(independentType.status, 200, await independentType.clone().text());
+
+  const sealedSession = await createTestInterviewSession(env);
+  database.sessions.get(sealedSession.sessionId).status = "in_progress";
+  database.auditEvents.push({
+    id: "sealed-before-late-event",
+    session_id: sealedSession.sessionId,
+    event_type: "voice_transcript_sealed",
+    actor_type: "candidate",
+    detail_json: "{}",
+    created_at: new Date().toISOString(),
+  });
+  const sealedLateEvent = await request("/api/interviews/event", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${sealedSession.accessToken}`,
+      "Content-Type": "application/json",
+      Origin: "http://localhost",
+    },
+    body: JSON.stringify({
+      sessionId: sealedSession.sessionId,
+      eventType: "transcription_failed",
+      code: "TRANSCRIPTION_FAILED",
+    }),
+  }, env);
+  assert.equal(sealedLateEvent.status, 409, "a sealed in-progress transcript is already immutable");
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === sealedSession.sessionId && event.event_type === "transcription_failed").length, 0);
+
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "completed";
+  stored.recording_status = "not_applicable";
+  stored.transcript_json = JSON.stringify([{
+    id: "candidate-answer-final",
+    speaker: "candidate",
+    text: "安全確認を大切にします。",
+    createdAt: "2026-08-14T01:00:00.000Z",
+  }]);
+  stored.evaluation_json = JSON.stringify({ recommendation: "human_review", dimensions: [] });
+  stored.completed_at = "2026-08-14T01:01:00.000Z";
+  const manifestJson = JSON.stringify({
+    recordingIncluded: false,
+    transcriptAvailable: true,
+    transcriptKind: "actual_transcript",
+  });
+  database.externalSyncs.set(session.sessionId, {
+    provider: "google_drive",
+    status: "completed",
+    requested_at: stored.completed_at,
+    started_at: stored.completed_at,
+    completed_at: stored.completed_at,
+    folder_id: "candidate-folder-final",
+    folder_url: "https://drive.google.com/drive/folders/candidate-folder-final",
+    manifest_json: manifestJson,
+    error_code: null,
+    updated_at: stored.completed_at,
+  });
+
+  const harmlessLateEvent = await sendEvent("time_limit_reached");
+  assert.equal(harmlessLateEvent.status, 200);
+  const harmfulLateEvent = await sendEvent("transcription_failed", "TRANSCRIPTION_FAILED");
+  assert.equal(harmfulLateEvent.status, 409);
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId && event.event_type === "transcription_failed"), false);
+  assert.equal(database.externalSyncs.get(session.sessionId).manifest_json, manifestJson);
+
+  const staffResponse = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const staffPayload = await staffResponse.json();
+  assert.equal(staffResponse.status, 200, JSON.stringify(staffPayload));
+  assert.equal(staffPayload.review.sourceTranscriptVerified, true);
+  assert.equal(staffPayload.review.driveSync.status, "completed");
 });
 
 test("recorded contingency requires all 15 actual answer transcriptions before completion", async () => {
@@ -5816,6 +6188,16 @@ test("staff voice recovery leaves an upload with any missing part non-stored", a
   }, env);
   assert.equal(firstPart.status, 200);
   stored.updated_at = new Date(0).toISOString();
+  // Even an aggressively polled upload cannot be terminalized while the
+  // candidate's original token (plus the recovery grace) is still valid.
+  for (let attempt = 1; attempt <= 50; attempt += 1) {
+    database.auditEvents.push({
+      session_id: session.sessionId,
+      event_type: "recording_recovery_part_missing",
+      detail_json: JSON.stringify({ attemptCount: attempt }),
+      created_at: new Date(Date.now() - attempt * 1_000).toISOString(),
+    });
+  }
 
   const recovered = await request("/api/staff/transcriptions/recover", {
     method: "POST",
@@ -5826,7 +6208,7 @@ test("staff voice recovery leaves an upload with any missing part non-stored", a
   }, env);
   const payload = await recovered.json();
   assert.equal(recovered.status, 200, JSON.stringify(payload));
-  assert.deepEqual(payload.recording, { sessionId: session.sessionId, state: "incomplete" });
+  assert.deepEqual(payload.recording, { sessionId: session.sessionId, state: "waiting" });
   assert.equal(payload.evaluation, null);
   assert.equal(stored.recording_status, "uploading");
   assert.ok(Date.parse(stored.updated_at) > Date.parse(new Date(0).toISOString()),
@@ -5834,6 +6216,128 @@ test("staff voice recovery leaves an upload with any missing part non-stored", a
   assert.equal(stored.status, "in_progress");
   assert.equal(database.artifacts.some((artifact) => artifact[1] === session.sessionId), false);
   assert.deepEqual(JSON.parse(stored.transcript_json), transcript);
+
+  const finalBytes = new Uint8Array(17).fill(32);
+  const resumedPart = await request("/api/interviews/recording/upload/part", {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "X-Recording-Part-Index": "1",
+      "X-Recording-Part-Bytes": String(finalBytes.byteLength),
+      "X-Recording-Part-Sha256": sha256Hex(finalBytes),
+      "Content-Type": "application/octet-stream",
+    },
+    body: finalBytes,
+  }, env);
+  assert.equal(resumedPart.status, 200, await resumedPart.clone().text());
+  const resumedComplete = await request("/api/interviews/recording/upload/complete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sessionId: session.sessionId }),
+  }, env);
+  assert.equal(resumedComplete.status, 200, await resumedComplete.clone().text());
+  assert.equal(stored.recording_status, "stored",
+    "a waiting recovery observation must not block foreground resume");
+});
+
+test("missing recording parts terminalize once after candidate expiry and never loop in recovery", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = {
+    ...workerEnv,
+    DB: database,
+    RECORDINGS: recordings,
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
+  };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  const transcript = [{
+    id: "voice-answer-abandoned-upload",
+    speaker: "candidate",
+    text: "面接回答は確定しましたが録画送信が中断しました。",
+    createdAt: new Date(Date.now() - 60 * 60 * 1_000).toISOString(),
+  }];
+  assert.equal((await sealVoiceTranscript(env, session, transcript)).status, 200);
+  const seal = database.auditEvents.find((event) =>
+    event.session_id === session.sessionId && event.event_type === "voice_transcript_sealed");
+  seal.created_at = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
+
+  assert.equal((await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      contentType: "video/webm",
+      byteSize: 1_024,
+      partSize: 256 * 1024,
+      totalParts: 1,
+      audioCoverage: "both",
+      uploadVersion: 2,
+    }),
+  }, env)).status, 200);
+
+  stored.expires_at = new Date(Date.now() - 31 * 60 * 1_000).toISOString();
+  stored.updated_at = new Date(0).toISOString();
+  for (let attempt = 1; attempt < 12; attempt += 1) {
+    database.auditEvents.push({
+      session_id: session.sessionId,
+      event_type: "recording_recovery_part_missing",
+      detail_json: JSON.stringify({ attemptCount: attempt }),
+      created_at: new Date(Date.now() - (12 - attempt) * 60_000).toISOString(),
+    });
+  }
+
+  const recover = () => request("/api/staff/transcriptions/recover", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const firstResponse = await recover();
+  const firstPayload = await firstResponse.json();
+  assert.equal(firstResponse.status, 200, JSON.stringify(firstPayload));
+  assert.deepEqual(firstPayload.recording, {
+    sessionId: session.sessionId,
+    state: "manual_attention",
+  });
+  assert.equal(stored.recording_status, "failed");
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === session.sessionId &&
+    event.event_type === "recording_recovery_part_missing").length, 12);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === session.sessionId &&
+    event.event_type === "recording_recovery_manual_attention").length, 1);
+
+  stored.updated_at = new Date(0).toISOString();
+  const secondResponse = await recover();
+  const secondPayload = await secondResponse.json();
+  assert.equal(secondResponse.status, 200, JSON.stringify(secondPayload));
+  assert.equal(secondPayload.recording, null,
+    "the terminal marker must remove the abandoned upload from unattended selection");
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === session.sessionId &&
+    event.event_type === "recording_recovery_part_missing").length, 12);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === session.sessionId &&
+    event.event_type === "recording_recovery_manual_attention").length, 1);
+
+  const logs = [];
+  const originalInfo = console.info;
+  console.info = (...args) => logs.push(args);
+  try {
+    await scheduleInterviewRecovery(env);
+  } finally {
+    console.info = originalInfo;
+  }
+  assert.equal(logs.at(-1)[1].states.recording, "idle",
+    "the next unattended tick must converge instead of repeating attention");
 });
 
 test("an accepted recording part heartbeats D1 so active mobile upload is not reclaimed", async () => {
@@ -5970,7 +6474,7 @@ test("ten oldest missing uploads cannot starve an eleventh sealed upload with al
   }, env);
   const firstPayload = await firstTick.json();
   assert.equal(firstTick.status, 200, JSON.stringify(firstPayload));
-  assert.equal(firstPayload.recording.state, "incomplete");
+  assert.equal(firstPayload.recording.state, "waiting");
   assert.equal(database.sessions.get(ready.sessionId).recording_status, "uploading");
   for (const session of missingSessions) {
     assert.equal(database.sessions.get(session.sessionId).recording_status, "uploading");
@@ -6078,7 +6582,7 @@ test("completed recording recovery fairly stores the eleventh full upload and ex
   console.info = (...args) => tickLogs.push(args);
   try {
     await scheduleInterviewRecovery(env);
-    assert.equal(tickLogs.at(-1)[1].states.recording, "attention");
+    assert.equal(tickLogs.at(-1)[1].states.recording, "waiting");
     assert.equal(database.sessions.get(ready.sessionId).recording_status, "uploading");
     for (const session of missingSessions) {
       assert.equal(database.sessions.get(session.sessionId).recording_status, "uploading",
@@ -7227,6 +7731,44 @@ test("a permanent Google Drive refresh-token failure is surfaced instead of retr
   }
 });
 
+test("Google token response-body stalls are aborted inside the same bounded request", { timeout: 1_000 }, async () => {
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  try {
+    globalThis.setTimeout = (callback, _delay, ...args) => originalSetTimeout(callback, 0, ...args);
+    globalThis.fetch = async (url, init = {}) => {
+      assert.equal(String(url), "https://oauth2.googleapis.com/token");
+      const stream = new ReadableStream({
+        start(controller) {
+          init.signal?.addEventListener("abort", () => {
+            controller.error(new DOMException("aborted", "AbortError"));
+          }, { once: true });
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    assert.equal(response.status, 502);
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "failed");
+    assert.equal(database.externalSyncs.get(session.sessionId).error_code, "GOOGLE_DRIVE_TOKEN_REFRESH_TRANSIENT");
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("every Google outbound module routes requests through a 25 second body-aware timeout", async () => {
+  const files = ["google-drive-auth.ts", "google-drive-oauth.ts", "google-drive-sync.ts"];
+  for (const file of files) {
+    const source = await readFile(new URL(`../lib/${file}`, import.meta.url), "utf8");
+    assert.match(source, /25_000/);
+    assert.doesNotMatch(source, /await fetch\((?:GOOGLE_TOKEN_ENDPOINT|TOKEN_ENDPOINT|`\$\{DRIVE_(?:API|UPLOAD)_ENDPOINT)/);
+  }
+});
+
 const DRIVE_ROOT_FOLDER_ID = "10z2FVOAv_MXGlfgxfsO-VgC_41v3Ui3T";
 
 function driveSyncEnv(database) {
@@ -7276,6 +7818,418 @@ function requestAdminSync(sessionId, env) {
     body: JSON.stringify({ sessionId }),
   }, env);
 }
+
+test("two simultaneous archives create one canonical year/month and distinct candidate folders", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const [first, second] = await Promise.all([
+    seedCompletedInterview(env, database),
+    seedCompletedInterview(env, database),
+  ]);
+  const folders = [];
+  let nextFolder = 0;
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      if (href.includes(`/drive/v3/files/${DRIVE_ROOT_FOLDER_ID}?`)) {
+        return Response.json({
+          id: DRIVE_ROOT_FOLDER_ID,
+          name: "オンライン一次面接_自動格納",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+        });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
+        const query = new URL(href).searchParams.get("q") ?? "";
+        const parentId = query.match(/^'([^']+)' in parents/)?.[1];
+        const property = query.match(/appProperties has \{ key='([^']+)' and value='([^']+)' \}/);
+        return Response.json({
+          files: folders.filter((folder) =>
+            folder.parents?.includes(parentId) &&
+            (!property || folder.appProperties?.[property[1]] === property[2])),
+        });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method === "POST") {
+        const metadata = JSON.parse(String(init.body));
+        if (metadata.appProperties?.tokyoDogsInterviewYear) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        const folder = {
+          id: `parallel-folder-${++nextFolder}`,
+          name: metadata.name,
+          mimeType: metadata.mimeType,
+          trashed: false,
+          parents: metadata.parents,
+          appProperties: metadata.appProperties,
+        };
+        folders.push(folder);
+        return Response.json(folder);
+      }
+      const folder = folders.find((item) => href.includes(`/drive/v3/files/${item.id}?`));
+      if (folder) return Response.json(folder);
+      throw new Error("stop after hierarchy verification");
+    };
+
+    const responses = await Promise.all([
+      requestAdminSync(first.sessionId, env),
+      requestAdminSync(second.sessionId, env),
+    ]);
+    assert.deepEqual(responses.map((response) => response.status), [502, 502]);
+    const years = folders.filter((folder) => folder.appProperties?.tokyoDogsInterviewYear === "2026");
+    const months = folders.filter((folder) => folder.appProperties?.tokyoDogsInterviewMonth === "2026-07");
+    const candidates = folders.filter((folder) => folder.appProperties?.tokyoDogsInterviewSession);
+    assert.equal(years.length, 1);
+    assert.equal(months.length, 1);
+    assert.equal(candidates.length, 2);
+    assert.deepEqual(new Set(candidates.map((folder) => folder.appProperties.tokyoDogsInterviewSession)),
+      new Set([first.sessionId, second.sessionId]));
+    assert.equal(new Set(candidates.map((folder) => folder.id)).size, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a lost hierarchy create response records uncertainty and never issues a second POST", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  let createCalls = 0;
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      if (href.includes(`/drive/v3/files/${DRIVE_ROOT_FOLDER_ID}?`)) {
+        return Response.json({
+          id: DRIVE_ROOT_FOLDER_ID,
+          name: "オンライン一次面接_自動格納",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+        });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
+        return Response.json({ files: [] });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method === "POST") {
+        createCalls += 1;
+        throw new TypeError("simulated response loss");
+      }
+      throw new Error("unexpected request after uncertain create");
+    };
+
+    const first = await requestAdminSync(session.sessionId, env);
+    assert.equal(first.status, 502);
+    const second = await requestAdminSync(session.sessionId, env);
+    assert.equal(second.status, 502);
+    assert.equal(createCalls, 1, "an uncertain POST must never be replayed automatically");
+    assert.equal(database.externalSyncs.get(session.sessionId).error_code,
+      "GOOGLE_DRIVE_HIERARCHY_CREATION_UNCERTAIN");
+    const yearNode = database.driveHierarchyNodes.get(`year:${DRIVE_ROOT_FOLDER_ID}:2026`);
+    assert.ok(yearNode.creation_attempted_at);
+    assert.equal(yearNode.canonical_folder_id, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a busy shared Drive hierarchy releases the session claim and returns initializing pending", { timeout: 3_500 }, async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const session = await seedCompletedInterview(env, database);
+  const now = new Date();
+  database.driveHierarchyNodes.set(`year:${DRIVE_ROOT_FOLDER_ID}:2026`, {
+    node_key: `year:${DRIVE_ROOT_FOLDER_ID}:2026`,
+    canonical_folder_id: null,
+    creation_attempted_at: null,
+    lease_token: "other-session-live-owner",
+    lease_expires_at: new Date(now.getTime() + 90_000).toISOString(),
+    created_at: now.toISOString(),
+    updated_at: now.toISOString(),
+  });
+  let driveCalls = 0;
+  try {
+    globalThis.fetch = async (url) => {
+      driveCalls += 1;
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      if (href.includes(`/drive/v3/files/${DRIVE_ROOT_FOLDER_ID}?`)) {
+        return Response.json({
+          id: DRIVE_ROOT_FOLDER_ID,
+          name: "オンライン一次面接_自動格納",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+        });
+      }
+      throw new Error("a busy hierarchy must not reach a Drive list or mutation");
+    };
+    const response = await requestAdminSync(session.sessionId, env);
+    const payload = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(payload));
+    assert.equal(payload.synced, false);
+    assert.equal(payload.result.phase, "initializing");
+    assert.equal(driveCalls, 2);
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "pending");
+    assert.equal(database.externalSyncs.get(session.sessionId).started_at, null);
+    assert.equal(database.externalSyncs.get(session.sessionId).error_code, null);
+    assert.equal(database.auditEvents.some((event) =>
+      event.session_id === session.sessionId && event.event_type === "google_drive_sync_failed"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("an expired Drive step owner performs no chunk or failed transition after a new worker acquires", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = {
+    ...driveSyncEnv(database),
+    RECORDINGS: recordings,
+    GOOGLE_DRIVE_TOKEN_ENCRYPTION_SECRET: "test-only-drive-step-encryption-secret-at-least-32-characters",
+  };
+  const session = await seedCompletedInterview(env, database);
+  const stored = database.sessions.get(session.sessionId);
+  stored.recording_status = "stored";
+  const recordingByteSize = 4 * 1024 * 1024 + 17;
+  const recordingBytes = new Uint8Array(recordingByteSize).fill(91);
+  const recordingKey = `interviews/${session.sessionId}/recording.webm`;
+  recordings.objects.set(recordingKey, { body: recordingBytes, options: {} });
+  database.artifacts.push([
+    "lease-race-recording", session.sessionId, recordingKey, "video/webm",
+    recordingByteSize, "recording-etag", stored.retention_until,
+  ]);
+
+  const driveFiles = [];
+  const driveFolders = new Map();
+  let nextFolder = 0;
+  let nextFile = 0;
+  let recordingMetadata = null;
+  let remoteCommittedBytes = 0;
+  const folderMutationHeartbeatCounts = [];
+  let statusQueries = 0;
+  let dataPuts = 0;
+  let releaseFirstStatus;
+  let firstStatusArrived;
+  const firstStatusBlocked = new Promise((resolve) => { firstStatusArrived = resolve; });
+  const firstMayContinue = new Promise((resolve) => { releaseFirstStatus = resolve; });
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+      }
+      if (href.includes(`/drive/v3/files/${DRIVE_ROOT_FOLDER_ID}?`)) {
+        return Response.json({
+          id: DRIVE_ROOT_FOLDER_ID,
+          name: "オンライン一次面接_自動格納",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+          webViewLink: `https://drive.google.com/drive/folders/${DRIVE_ROOT_FOLDER_ID}`,
+        });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
+        const query = new URL(href).searchParams.get("q") ?? "";
+        const parentId = query.match(/^'([^']+)' in parents/)?.[1];
+        const artifactKey = query.match(
+          /key='tokyoDogsArtifact' and value='([^']+)'/,
+        )?.[1];
+        const property = query.match(/appProperties has \{ key='([^']+)' and value='([^']+)' \}/);
+        const children = [...driveFolders.values(), ...driveFiles];
+        return Response.json({
+          files: parentId
+            ? children.filter((file) =>
+                file.parents?.includes(parentId) &&
+                (!artifactKey || file.appProperties?.tokyoDogsArtifact === artifactKey) &&
+                (!property || file.appProperties?.[property[1]] === property[2]))
+            : [],
+        });
+      }
+      if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method === "POST") {
+        folderMutationHeartbeatCounts.push(database.externalHeartbeatCount);
+        const metadata = JSON.parse(String(init.body));
+        const id = `lease-folder-${++nextFolder}`;
+        const folder = {
+          id,
+          name: metadata.name,
+          mimeType: metadata.mimeType,
+          trashed: false,
+          parents: metadata.parents,
+          appProperties: metadata.appProperties,
+          webViewLink: `https://drive.google.com/drive/folders/${id}`,
+        };
+        driveFolders.set(id, folder);
+        return Response.json(folder);
+      }
+      const storedFolder = [...driveFolders.values()].find((folder) =>
+        href.includes(`/drive/v3/files/${folder.id}?`));
+      if (storedFolder) {
+        return Response.json(storedFolder);
+      }
+      if (href.includes("/export?")) {
+        return new Response(new TextEncoder().encode("%PDF lease race"), { status: 200 });
+      }
+      if (href.includes("uploadType=multipart")) {
+        const metadata = JSON.parse(await init.body.get("metadata").text());
+        const media = init.body.get("media");
+        const target = driveFiles.find((file) =>
+          href.includes(`/files/${encodeURIComponent(file.id)}?`));
+        const file = {
+          id: target?.id ?? `lease-file-${++nextFile}`,
+          name: metadata.name,
+          mimeType: metadata.mimeType || media.type,
+          size: String(media.size),
+          trashed: false,
+          parents: metadata.parents ?? target?.parents,
+          appProperties: metadata.appProperties,
+        };
+        if (target) Object.assign(target, file);
+        else driveFiles.push(file);
+        return Response.json(file);
+      }
+      if (href.includes("uploadType=resumable")) {
+        recordingMetadata = JSON.parse(String(init.body));
+        return new Response(null, {
+          status: 200,
+          headers: { Location: "https://upload.example.test/lease-race" },
+        });
+      }
+      if (href === "https://upload.example.test/lease-race") {
+        const contentRange = init.headers["Content-Range"];
+        if (contentRange === `bytes */${recordingByteSize}`) {
+          statusQueries += 1;
+          if (statusQueries === 1) {
+            firstStatusArrived();
+            await firstMayContinue;
+          }
+          return new Response(null, {
+            status: 308,
+            headers: remoteCommittedBytes > 0
+              ? { Range: `bytes=0-${remoteCommittedBytes - 1}` }
+              : {},
+          });
+        }
+        dataPuts += 1;
+        assert.ok(dataPuts <= 2, "each committed recording range may be sent only once");
+        assert.equal(recordingMetadata.appProperties.tokyoDogsArtifact, "recording");
+        const range = contentRange.match(/^bytes (\d+)-(\d+)\/(\d+)$/);
+        assert.ok(range);
+        remoteCommittedBytes = Number(range[2]) + 1;
+        if (remoteCommittedBytes < recordingByteSize) {
+          return new Response(null, {
+            status: 308,
+            headers: { Range: `bytes=0-${remoteCommittedBytes - 1}` },
+          });
+        }
+        const recordingFile = {
+          id: `lease-file-${++nextFile}`,
+          name: recordingMetadata.name,
+          mimeType: "video/webm",
+          size: String(recordingByteSize),
+          trashed: false,
+          parents: recordingMetadata.parents,
+          appProperties: recordingMetadata.appProperties,
+        };
+        driveFiles.push(recordingFile);
+        return Response.json(recordingFile);
+      }
+      throw new Error(`Unexpected Drive request: ${href}`);
+    };
+
+    const initialize = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    const initializePayload = await initialize.json();
+    assert.equal(initialize.status, 200, JSON.stringify(initializePayload));
+    assert.equal(initializePayload.phase, "uploading");
+    assert.ok(database.driveUploadSteps.has(session.sessionId));
+    assert.equal(folderMutationHeartbeatCounts.length, 3);
+    assert.ok(folderMutationHeartbeatCounts[1] > folderMutationHeartbeatCounts[0]);
+    assert.ok(folderMutationHeartbeatCounts[2] > folderMutationHeartbeatCounts[1],
+      "each folder mutation must have its own fenced progress renewal");
+
+    const archive = () => request("/api/interviews/archive", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    const oldWorker = archive();
+    await firstStatusBlocked;
+    const stepDuringOldWorker = database.driveUploadSteps.get(session.sessionId);
+    const oldLeaseToken = stepDuringOldWorker.lease_token;
+    assert.ok(oldLeaseToken);
+    stepDuringOldWorker.lease_expires_at = new Date(0).toISOString();
+
+    const newResponse = await archive();
+    const newPayload = await newResponse.json();
+    assert.equal(newResponse.status, 200, JSON.stringify(newPayload));
+    assert.equal(newPayload.phase, "uploading");
+    assert.equal(dataPuts, 1);
+    assert.equal(database.driveUploadSteps.get(session.sessionId).committed_offset, 4 * 1024 * 1024);
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "running");
+
+    releaseFirstStatus();
+    const oldResponse = await oldWorker;
+    const oldPayload = await oldResponse.json();
+    assert.equal(oldResponse.status, 200, JSON.stringify(oldPayload));
+    assert.equal(oldPayload.phase, "busy");
+    assert.equal(dataPuts, 1, "the expired owner must perform zero Drive mutations");
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "running",
+      "the expired owner must not fail the shared external-sync claim");
+    assert.equal(database.externalSyncs.get(session.sessionId).error_code, null);
+    assert.notEqual(database.driveUploadSteps.get(session.sessionId).lease_token, oldLeaseToken);
+
+    database.beforeExternalSyncComplete = async ({ step }) => {
+      step.lease_expires_at = new Date(0).toISOString();
+    };
+    const expiredAtCompletion = await archive();
+    const expiredAtCompletionPayload = await expiredAtCompletion.json();
+    assert.equal(expiredAtCompletion.status, 200, JSON.stringify(expiredAtCompletionPayload));
+    assert.equal(expiredAtCompletionPayload.phase, "busy");
+    assert.equal(dataPuts, 2);
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "running",
+      "completion must CAS against the unexpired step token");
+    assert.equal(database.driveUploadSteps.get(session.sessionId).phase, "finalizing");
+    assert.equal(database.auditEvents.filter((event) =>
+      event.session_id === session.sessionId && event.event_type === "google_drive_sync_completed").length, 0,
+    "an expired completion owner must not append a completion audit");
+
+    database.beforeDriveUploadStepDelete = async ({ step }) => {
+      step.lease_token = "new-owner-after-completion";
+      step.lease_expires_at = new Date(Date.now() + 90_000).toISOString();
+    };
+    const stolenBeforeDelete = await archive();
+    const stolenBeforeDeletePayload = await stolenBeforeDelete.json();
+    assert.equal(stolenBeforeDelete.status, 200, JSON.stringify(stolenBeforeDeletePayload));
+    assert.equal(stolenBeforeDeletePayload.phase, "busy");
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
+    assert.equal(database.driveUploadSteps.has(session.sessionId), true,
+      "an old completion worker must not delete a step now owned by another token");
+    assert.equal(
+      database.driveUploadSteps.get(session.sessionId).lease_token,
+      "new-owner-after-completion",
+    );
+    assert.equal(database.auditEvents.filter((event) =>
+      event.session_id === session.sessionId && event.event_type === "google_drive_sync_completed").length, 1);
+  } finally {
+    releaseFirstStatus?.();
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("Drive archive waits for a camera interview recording instead of completing without video", async () => {
   const originalFetch = globalThis.fetch;
@@ -7558,6 +8512,7 @@ test("a Google Drive worker that loses its claim stops before duplicating candid
   const env = driveSyncEnv(database);
   const session = await seedCompletedInterview(env, database);
   const uploadedNames = [];
+  const folders = [];
   let nextFile = 0;
   let reclaimed = false;
 
@@ -7577,20 +8532,30 @@ test("a Google Drive worker that loses its claim stops before duplicating candid
         });
       }
       if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
-        return Response.json({ files: [] });
+        const query = new URL(href).searchParams.get("q") ?? "";
+        const parentId = query.match(/^'([^']+)' in parents/)?.[1];
+        const property = query.match(/appProperties has \{ key='([^']+)' and value='([^']+)' \}/);
+        return Response.json({ files: folders.filter((folder) =>
+          folder.parents?.includes(parentId) &&
+          (!property || folder.appProperties?.[property[1]] === property[2])) });
       }
       if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method === "POST") {
         const metadata = JSON.parse(String(init.body));
         const id = `folder-${++nextFile}`;
-        return Response.json({
+        const folder = {
           id,
           name: metadata.name,
           mimeType: metadata.mimeType,
+          trashed: false,
           parents: metadata.parents,
           appProperties: metadata.appProperties,
           webViewLink: `https://drive.google.com/drive/folders/${id}`,
-        });
+        };
+        folders.push(folder);
+        return Response.json(folder);
       }
+      const folder = folders.find((item) => href.includes(`/drive/v3/files/${item.id}?`));
+      if (folder) return Response.json(folder);
       if (href.includes("uploadType=multipart")) {
         const metadata = JSON.parse(await init.body.get("metadata").text());
         uploadedNames.push(metadata.name);

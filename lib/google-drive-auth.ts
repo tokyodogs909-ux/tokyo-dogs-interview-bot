@@ -7,6 +7,35 @@ const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 export const DRIVE_API_ENDPOINT = "https://www.googleapis.com/drive/v3";
 export const DRIVE_UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3";
 const FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
+const GOOGLE_DRIVE_REQUEST_TIMEOUT_MS = 25_000;
+
+async function fetchGoogleWithTimeout(url: string, init: RequestInit, errorCode: string) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GOOGLE_DRIVE_REQUEST_TIMEOUT_MS);
+  const response = await fetch(url, { ...init, signal: controller.signal }).catch(() => {
+    clearTimeout(timer);
+    throw new Error(errorCode);
+  });
+  if (!response.body) {
+    clearTimeout(timer);
+    return response;
+  }
+  const finish = () => clearTimeout(timer);
+  return new Proxy(response, {
+    get(target, property) {
+      if (["arrayBuffer", "blob", "formData", "json", "text"].includes(String(property))) {
+        return async (...args: unknown[]) => {
+          try {
+            const method = Reflect.get(target, property, target) as (...methodArgs: unknown[]) => Promise<unknown>;
+            return await method.apply(target, args);
+          } finally { finish(); }
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
 
 type GoogleDriveBindings = {
   GOOGLE_DRIVE_CLIENT_ID?: string;
@@ -128,9 +157,9 @@ async function readJson(response: Response) {
 }
 
 export async function fetchGoogleDriveAccountEmail(accessToken: string) {
-  const response = await fetch(`${DRIVE_API_ENDPOINT}/about?fields=user(emailAddress)`, {
+  const response = await fetchGoogleWithTimeout(`${DRIVE_API_ENDPOINT}/about?fields=user(emailAddress)`, {
     headers: { Authorization: `Bearer ${accessToken}` },
-  });
+  }, "GOOGLE_DRIVE_ACCOUNT_LOOKUP_FAILED");
   const about = await readJson(response) as DriveAbout;
   const email = about.user?.emailAddress?.trim().toLowerCase() ?? "";
   if (!response.ok || !email) throw new Error("GOOGLE_DRIVE_ACCOUNT_LOOKUP_FAILED");
@@ -139,7 +168,7 @@ export async function fetchGoogleDriveAccountEmail(accessToken: string) {
 
 export async function fetchGoogleDriveAccessToken() {
   const config = await configuredDriveCredentials();
-  const response = await fetch(TOKEN_ENDPOINT, {
+  const response = await fetchGoogleWithTimeout(TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -148,7 +177,7 @@ export async function fetchGoogleDriveAccessToken() {
       refresh_token: config.refreshToken,
       grant_type: "refresh_token",
     }),
-  });
+  }, "GOOGLE_DRIVE_TOKEN_REFRESH_TRANSIENT");
   const payload = await readJson(response);
   const accessToken = typeof payload.access_token === "string" ? payload.access_token.trim() : "";
   if (!response.ok || !accessToken) {
@@ -179,11 +208,12 @@ export async function validateGoogleDriveFolderSelection(
     throw new Error("GOOGLE_DRIVE_ROOT_ID_INVALID");
   }
   const fields = "id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren)";
-  const response = await fetch(
+  const response = await fetchGoogleWithTimeout(
     `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(normalizedFolderId)}?supportsAllDrives=true&fields=${encodeURIComponent(fields)}`,
     {
       headers: { Authorization: `Bearer ${accessToken}` },
     },
+    "GOOGLE_DRIVE_ROOT_LOOKUP_FAILED",
   );
   const folder = await readJson(response) as DriveFolderMetadata;
   if (!response.ok) throw new Error("GOOGLE_DRIVE_ROOT_LOOKUP_FAILED");
@@ -250,15 +280,15 @@ export async function ensureGoogleDriveManagedRoot(accessToken: string): Promise
     spaces: "drive",
     fields,
   });
-  const lookupResponse = await fetch(`${DRIVE_API_ENDPOINT}/files?${query}`, {
+  const lookupResponse = await fetchGoogleWithTimeout(`${DRIVE_API_ENDPOINT}/files?${query}`, {
     headers: { Authorization: `Bearer ${accessToken}` },
-  });
+  }, "GOOGLE_DRIVE_MANAGED_ROOT_LOOKUP_FAILED");
   const lookup = await readJson(lookupResponse) as { files?: DriveFolderMetadata[] };
   if (!lookupResponse.ok) throw new Error("GOOGLE_DRIVE_MANAGED_ROOT_LOOKUP_FAILED");
   const existing = lookup.files?.find((folder) => folder.name === name);
   if (existing) return safeRootFromMetadata(existing, name);
 
-  const createResponse = await fetch(
+  const createResponse = await fetchGoogleWithTimeout(
     `${DRIVE_API_ENDPOINT}/files?fields=${encodeURIComponent("id,name,mimeType,trashed,driveId,webViewLink,capabilities(canAddChildren)")}`,
     {
       method: "POST",
@@ -272,6 +302,7 @@ export async function ensureGoogleDriveManagedRoot(accessToken: string): Promise
         appProperties: { tokyoDogsManagedRoot: MANAGED_ROOT_PROPERTY },
       }),
     },
+    "GOOGLE_DRIVE_MANAGED_ROOT_CREATE_FAILED",
   );
   const created = await readJson(createResponse) as DriveFolderMetadata;
   if (!createResponse.ok) throw new Error("GOOGLE_DRIVE_MANAGED_ROOT_CREATE_FAILED");

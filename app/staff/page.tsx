@@ -170,6 +170,10 @@ function isTextInterviewRecord(value: ReviewRecord | null) {
   return Boolean(value?.technicalEvents.some((event) => event.type === "reasonable_accommodation_text_selected"));
 }
 
+function isRecordedFallbackReview(value: ReviewRecord | null) {
+  return Boolean(value?.transcript.some((turn) => turn.id.startsWith("recorded-transcribed-")));
+}
+
 function emptyScores(): VideoScore[] {
   return VIDEO_REVIEW_DIMENSIONS.map((dimension) => ({
     name: dimension.name,
@@ -474,6 +478,7 @@ export default function StaffReviewPage() {
 
   const reviewedVideoDimensions = scores.filter((item) => item.score !== null).length;
   const textInterviewSelected = isTextInterviewRecord(review);
+  const recordedFallbackSelected = isRecordedFallbackReview(review);
   const normalizedFilter = listFilter.normalize("NFKC").trim().toLowerCase();
   const filteredInterviews = (recentInterviews ?? []).filter((item) => !normalizedFilter || [
     item.candidateName,
@@ -673,13 +678,15 @@ export default function StaffReviewPage() {
           </section>
 
           {review.technicalEvents.length > 0 && <div className="staff-message"><strong>進行・技術フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>参加方法や技術的な事象は、応募者の不利益な評価に使用しません。</p></div>}
-          {review.evaluation && <p className="guardrail-copy"><strong>回答評価は応募者の回答記録を基にした補助情報です。</strong> 合否判断前に、{textInterviewSelected ? "入力された回答" : "録画の実際の発言"}と根拠引用を採用担当者が照合してください。</p>}
+          {review.evaluation && !recordedFallbackSelected && <p className="guardrail-copy"><strong>回答評価は応募者の回答記録を基にした補助情報です。</strong> 合否判断前に、{textInterviewSelected ? "入力された回答" : "録画の実際の発言"}と根拠引用を採用担当者が照合してください。</p>}
+          {recordedFallbackSelected && <p className="guardrail-copy"><strong>録画式は自動評価していません。人手による録画照合が必須です。</strong> 自動文字起こしは回答整理の補助情報であり、録画の実際の発言との一致は未照合です。技術不具合や録画・音声品質を応募者の不利益に扱わないでください。</p>}
 
           <div className="staff-grid">
             <article className="staff-panel recording-panel">
               <div className="panel-title"><p>録画確認</p><h2>接客ロールプレイ</h2></div>
               {recordingUrl ? <video src={recordingUrl} controls playsInline /> : <div className="recording-empty">{textInterviewSelected ? "文字入力方式のため録画はありません。回答記録をご確認ください。" : "録画を取得できないか、録画がまだ保存されていません。"}</div>}
-              {recordingUrl && recordingAudioCoverage !== "both" && <p className="guardrail-copy"><strong>録画内の双方音声は未確認です。</strong> 応募者音声のみ、または端末側で確認できなかった可能性があります。映像と文字起こしを照合し、技術不具合を不利益に扱わないでください。</p>}
+              {recordingUrl && recordedFallbackSelected && <p className="guardrail-copy"><strong>録画式の保存動画は人手照合必須です。</strong> 質問文と自動文字起こしは別記録として保存されています。録画を再生して応募者の実際の回答と照合し、技術不具合を不利益に扱わないでください。</p>}
+              {recordingUrl && !recordedFallbackSelected && recordingAudioCoverage !== "both" && <p className="guardrail-copy"><strong>保存状態：録画ファイルは保存済みです。</strong> <strong>品質状態：録画内の双方音声は未確認です。</strong> 保存完了は音声品質の確認完了を意味しません。映像と文字起こしを照合し、技術不具合を不利益に扱わないでください。</p>}
               <p className="guardrail-copy">接客ロールプレイ中の傾聴、理解確認、落ち着いた応対、説明、安全配慮など、職務上観察できる行動だけを確認します。笑顔の有無、顔立ち・容姿、服装、背景、カメラ品質、障害や健康状態の推測は評価しません。</p>
             </article>
 
@@ -696,7 +703,7 @@ export default function StaffReviewPage() {
             </article>
           </div>
 
-          {review.evaluation ? <section className="staff-panel evaluation-panel"><div className="panel-title"><p>回答根拠付き評価</p><h2>{recommendationLabels[review.evaluation.recommendation]}</h2></div><p className="evaluation-summary">{review.evaluation.summary}</p>{review.evaluation.evidenceValidationWarnings.length > 0 && <div className="validation-box"><strong>評価本文の要確認事項（{review.evaluation.evidenceValidationWarnings.length}件）</strong><ul>{review.evaluation.evidenceValidationWarnings.map((warning) => <li key={warning}>{warning}</li>)}</ul><p>これらの指摘がある評価は「人による要確認」として扱い、該当箇所を確認してから判断してください。</p></div>}<div className="score-grid">{review.evaluation.dimensions.map((dimension) => <article className="score-card" key={dimension.name}><div className="score-card-head"><div><span>確信度 {dimension.confidence}</span><h3>{dimension.name}</h3></div><strong>{dimension.score ?? "—"}<small>/5</small></strong></div><p>{dimension.rationale}</p><div className="evidence-list">{dimension.evidence.length ? dimension.evidence.map((evidence) => <blockquote key={`${dimension.name}-${evidence.turnId}-${evidence.quote}`}><span>照合済み</span>「{evidence.quote}」<small>{evidence.relevance}</small></blockquote>) : <div className="no-evidence">有効な回答根拠なし</div>}</div></article>)}</div></section> : <div className="staff-message">回答評価は未作成です。文字起こしを採用担当者が確認してください。</div>}
+          {recordedFallbackSelected ? <section className="staff-panel evaluation-panel"><div className="panel-title"><p>録画式予備面接</p><h2>自動評価なし・人手照合必須</h2></div><p className="evaluation-summary">回答音声の自動文字起こしは保存されていますが、録画の実際の発言との一致は未照合です。録画と下の文字起こしを採用担当者が照合してから判断してください。技術不具合や録画・音声品質は応募者の評価に使用しません。</p></section> : review.evaluation ? <section className="staff-panel evaluation-panel"><div className="panel-title"><p>回答根拠付き評価</p><h2>{recommendationLabels[review.evaluation.recommendation]}</h2></div><p className="evaluation-summary">{review.evaluation.summary}</p>{review.evaluation.evidenceValidationWarnings.length > 0 && <div className="validation-box"><strong>評価本文の要確認事項（{review.evaluation.evidenceValidationWarnings.length}件）</strong><ul>{review.evaluation.evidenceValidationWarnings.map((warning) => <li key={warning}>{warning}</li>)}</ul><p>これらの指摘がある評価は「人による要確認」として扱い、該当箇所を確認してから判断してください。</p></div>}<div className="score-grid">{review.evaluation.dimensions.map((dimension) => <article className="score-card" key={dimension.name}><div className="score-card-head"><div><span>確信度 {dimension.confidence}</span><h3>{dimension.name}</h3></div><strong>{dimension.score ?? "—"}<small>/5</small></strong></div><p>{dimension.rationale}</p><div className="evidence-list">{dimension.evidence.length ? dimension.evidence.map((evidence) => <blockquote key={`${dimension.name}-${evidence.turnId}-${evidence.quote}`}><span>文字起こし内一致（録画未照合）</span>「{evidence.quote}」<small>{evidence.relevance}</small></blockquote>) : <div className="no-evidence">有効な回答根拠なし</div>}</div></article>)}</div></section> : <div className="staff-message">回答評価は未作成です。文字起こしを採用担当者が確認してください。</div>}
 
           <details className="transcript-details"><summary>文字起こしを確認（{review.transcript.length}件）</summary><div>{review.transcript.map((turn) => <article key={turn.id}><span>{turn.speaker === "interviewer" ? "オンライン採用担当者 茂木" : "応募者"}</span><p>{turn.text}</p></article>)}</div></details>
 

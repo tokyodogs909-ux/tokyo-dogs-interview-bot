@@ -31,11 +31,17 @@ export async function POST(request: Request) {
     if (!authorized) {
       return noStoreJson({ error: "オンライン一次面接の認証を確認できません。" }, { status: 401 });
     }
-    await recordCandidateEvent({
+    const result = await recordCandidateEvent({
       sessionId,
       eventType: payload.eventType as CandidateEventType,
       detail: payload.code ? { code: payload.code.replace(/[^A-Z0-9_-]/gi, "").slice(0, 80) } : {},
     });
+    if (result === "closed") {
+      return noStoreJson({ error: "終了した面接には状態記録を追加できません。" }, { status: 409 });
+    }
+    if (result === "capped") {
+      return noStoreJson({ error: "状態記録の上限に達しました。" }, { status: 429 });
+    }
     return noStoreJson({ stored: true });
   } catch {
     return noStoreJson({ error: "状態記録を保存できませんでした。" }, { status: 500 });

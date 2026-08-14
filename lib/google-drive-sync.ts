@@ -11,9 +11,11 @@ import {
 } from "@/lib/google-drive-connection";
 import {
   adoptFinalizingDriveUploadStep,
+  acquireDriveHierarchyNodeLease,
   acquireDriveUploadStepLease,
   claimExternalSync,
   completeExternalSync,
+  deferExternalSync,
   deleteDriveUploadStep,
   failExternalSync,
   getDriveUploadStep,
@@ -22,8 +24,13 @@ import {
   getInterviewRecordingChunk,
   heartbeatExternalSync,
   initializeDriveUploadStep,
+  markDriveHierarchyNodeCreationAttempt,
   releaseDriveUploadStepLease,
+  releaseDriveHierarchyNodeLease,
+  renewDriveHierarchyNodeLease,
+  renewDriveUploadStepLease,
   requestExternalSync,
+  setDriveHierarchyNodeCanonicalFolder,
   updateDriveUploadStepContext,
   updateDriveUploadStep,
 } from "@/lib/interview-persistence";
@@ -123,11 +130,43 @@ function wait(milliseconds: number) {
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
+  const response = await fetch(url, { ...init, signal: controller.signal }).catch((error) => {
     clearTimeout(timer);
+    throw error;
+  });
+  if (!response.body) {
+    clearTimeout(timer);
+    return response;
   }
+  const finish = () => clearTimeout(timer);
+  const timedBody = new Proxy(response.body, {
+    get(target, property) {
+      if (property === "cancel") {
+        return async (...args: Parameters<ReadableStream["cancel"]>) => {
+          try { return await target.cancel(...args); } finally { finish(); }
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return new Proxy(response, {
+    get(target, property) {
+      if (property === "body") return timedBody;
+      if (["arrayBuffer", "blob", "formData", "json", "text"].includes(String(property))) {
+        return async (...args: unknown[]) => {
+          try {
+            const method = Reflect.get(target, property, target) as (...methodArgs: unknown[]) => Promise<unknown>;
+            return await method.apply(target, args);
+          } finally {
+            finish();
+          }
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 function driveQueryValue(value: string) {
@@ -298,13 +337,13 @@ function buildResultJson(source: ArchiveSource) {
 }
 
 async function driveJson<T>(url: string, accessToken: string, init: RequestInit = {}) {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     ...init,
     headers: {
       Authorization: `Bearer ${accessToken}`,
       ...(init.headers ?? {}),
     },
-  });
+  }, DRIVE_RECORDING_REQUEST_TIMEOUT_MS);
   if (!response.ok) throw new Error(`GOOGLE_DRIVE_API_${response.status}`);
   return await response.json() as T;
 }
@@ -324,6 +363,161 @@ async function findChild(
   });
   const result = await driveJson<{ files?: DriveFile[] }>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
   return result.files?.[0] ?? null;
+}
+
+async function listExactFolders(
+  accessToken: string,
+  parentId: string,
+  propertyKey: string,
+  propertyValue: string,
+) {
+  const propertyQuery = `mimeType = '${FOLDER_MIME_TYPE}' and appProperties has { key='${driveQueryValue(propertyKey)}' and value='${driveQueryValue(propertyValue)}' }`;
+  const params = new URLSearchParams({
+    q: `'${driveQueryValue(parentId)}' in parents and trashed = false and ${propertyQuery}`,
+    pageSize: "100",
+    spaces: "drive",
+    supportsAllDrives: "true",
+    includeItemsFromAllDrives: "true",
+    fields: "nextPageToken,files(id,name,mimeType,trashed,webViewLink,parents,appProperties)",
+  });
+  const result = await driveJson<DriveFilePage>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
+  if (result.nextPageToken) throw new Error("GOOGLE_DRIVE_HIERARCHY_DUPLICATE");
+  return result.files ?? [];
+}
+
+async function getDriveFolderById(accessToken: string, folderId: string) {
+  return await driveJson<DriveFile>(
+    `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(folderId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,trashed,webViewLink,parents,appProperties")}`,
+    accessToken,
+  );
+}
+
+function assertHierarchyFolder(input: {
+  folder: DriveFile;
+  folderId: string;
+  parentId: string;
+  name: string;
+  propertyKey: string;
+  propertyValue: string;
+}) {
+  if (
+    input.folder.id !== input.folderId ||
+    input.folder.name !== input.name ||
+    input.folder.mimeType !== FOLDER_MIME_TYPE ||
+    input.folder.trashed === true ||
+    input.folder.parents?.length !== 1 ||
+    input.folder.parents[0] !== input.parentId ||
+    input.folder.appProperties?.tokyoDogsKind !== input.propertyKey ||
+    input.folder.appProperties?.[input.propertyKey] !== input.propertyValue
+  ) {
+    throw new Error("GOOGLE_DRIVE_HIERARCHY_CANONICAL_MISMATCH");
+  }
+}
+
+async function acquireHierarchyLeaseWithRetry(nodeKey: string) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const lease = await acquireDriveHierarchyNodeLease(nodeKey);
+    if (lease) return lease;
+    if (attempt < 39) await wait(50);
+  }
+  throw new Error("GOOGLE_DRIVE_HIERARCHY_BUSY");
+}
+
+async function ensureCanonicalHierarchyFolder(input: {
+  accessToken: string;
+  nodeKey: string;
+  parentId: string;
+  name: string;
+  propertyKey: string;
+  propertyValue: string;
+  reportProgress: DriveSyncProgress;
+}) {
+  const lease = await acquireHierarchyLeaseWithRetry(input.nodeKey);
+  let leaseHeld = true;
+  const renew = async () => {
+    if (!await renewDriveHierarchyNodeLease({ nodeKey: input.nodeKey, leaseToken: lease.leaseToken })) {
+      leaseHeld = false;
+      throw new Error("GOOGLE_DRIVE_HIERARCHY_LEASE_LOST");
+    }
+  };
+  const release = async () => {
+    if (!leaseHeld) return;
+    await releaseDriveHierarchyNodeLease({ nodeKey: input.nodeKey, leaseToken: lease.leaseToken });
+    leaseHeld = false;
+  };
+  try {
+    let canonicalFolder: DriveFile;
+    let canonicalStored = Boolean(lease.canonicalFolderId);
+    if (lease.canonicalFolderId) {
+      await renew();
+      canonicalFolder = await getDriveFolderById(input.accessToken, lease.canonicalFolderId);
+      assertHierarchyFolder({ ...input, folder: canonicalFolder, folderId: lease.canonicalFolderId });
+    } else {
+      await renew();
+      const existing = await listExactFolders(
+        input.accessToken,
+        input.parentId,
+        input.propertyKey,
+        input.propertyValue,
+      );
+      if (existing.length > 1) throw new Error("GOOGLE_DRIVE_HIERARCHY_DUPLICATE");
+      if (existing.length === 1) {
+        await renew();
+        canonicalFolder = await getDriveFolderById(input.accessToken, existing[0].id);
+        assertHierarchyFolder({ ...input, folder: canonicalFolder, folderId: existing[0].id });
+      } else {
+        if (lease.creationAttemptedAt) {
+          throw new Error("GOOGLE_DRIVE_HIERARCHY_CREATION_UNCERTAIN");
+        }
+        await renew();
+        await input.reportProgress();
+        await markDriveHierarchyNodeCreationAttempt({
+          nodeKey: input.nodeKey,
+          leaseToken: lease.leaseToken,
+        });
+        const created = await createFolder(input.accessToken, input.parentId, input.name, {
+          tokyoDogsKind: input.propertyKey,
+          [input.propertyKey]: input.propertyValue,
+        });
+        // Persist the returned ID before any additional outbound request. If
+        // the Worker is canceled after the POST response, the next owner uses
+        // exact-ID verification and can never issue a second create.
+        await setDriveHierarchyNodeCanonicalFolder({
+          nodeKey: input.nodeKey,
+          leaseToken: lease.leaseToken,
+          folderId: created.id,
+        });
+        canonicalStored = true;
+        await renew();
+        canonicalFolder = await getDriveFolderById(input.accessToken, created.id);
+        assertHierarchyFolder({ ...input, folder: canonicalFolder, folderId: created.id });
+      }
+      if (!canonicalStored) {
+        await renew();
+        await setDriveHierarchyNodeCanonicalFolder({
+          nodeKey: input.nodeKey,
+          leaseToken: lease.leaseToken,
+          folderId: canonicalFolder.id,
+        });
+      }
+    }
+
+    await renew();
+    const exact = await listExactFolders(
+      input.accessToken,
+      input.parentId,
+      input.propertyKey,
+      input.propertyValue,
+    );
+    if (exact.length !== 1 || exact[0].id !== canonicalFolder.id) {
+      throw new Error("GOOGLE_DRIVE_HIERARCHY_DUPLICATE");
+    }
+    await release();
+    return canonicalFolder;
+  } catch (error) {
+    await release().catch(() => undefined);
+    throw error;
+  }
 }
 
 async function listFolderChildren(accessToken: string, parentId: string) {
@@ -926,9 +1120,10 @@ async function uploadSmallFile(input: {
 }
 
 async function exportGoogleDocToPdf(accessToken: string, fileId: string) {
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(fileId)}/export?mimeType=${encodeURIComponent("application/pdf")}`,
     { headers: { Authorization: `Bearer ${accessToken}` } },
+    DRIVE_RECORDING_REQUEST_TIMEOUT_MS,
   );
   if (!response.ok) throw new Error(`GOOGLE_DRIVE_EXPORT_${response.status}`);
   return new Uint8Array(await response.arrayBuffer());
@@ -1548,10 +1743,26 @@ async function prepareDriveArchive(
   }).formatToParts(date);
   const year = parts.find((part) => part.type === "year")?.value ?? String(date.getUTCFullYear());
   const month = parts.find((part) => part.type === "month")?.value ?? String(date.getUTCMonth() + 1).padStart(2, "0");
-  await reportProgress();
-  const yearFolder = await ensureFolder(accessToken, root.id, year, "tokyoDogsInterviewYear", year);
+  const yearFolder = await ensureCanonicalHierarchyFolder({
+    accessToken,
+    nodeKey: `year:${root.id}:${year}`,
+    parentId: root.id,
+    name: year,
+    propertyKey: "tokyoDogsInterviewYear",
+    propertyValue: year,
+    reportProgress,
+  });
   const monthKey = `${year}-${month}`;
-  const monthFolder = await ensureFolder(accessToken, yearFolder.id, month, "tokyoDogsInterviewMonth", monthKey);
+  const monthFolder = await ensureCanonicalHierarchyFolder({
+    accessToken,
+    nodeKey: `month:${yearFolder.id}:${monthKey}`,
+    parentId: yearFolder.id,
+    name: month,
+    propertyKey: "tokyoDogsInterviewMonth",
+    propertyValue: monthKey,
+    reportProgress,
+  });
+  await reportProgress();
   const candidateFolder = await ensureFolder(
     accessToken,
     monthFolder.id,
@@ -1992,6 +2203,10 @@ async function completeSteppedArchive(input: {
       });
     },
   );
+  // Finalization performs readback after its last Drive mutation. Renew once
+  // more so both the completion receipt and capability deletion are fenced by
+  // the same still-live step owner.
+  await input.reportProgress();
   const retryRequested = await completeExternalSync({
     sessionId: input.sessionId,
     startedAt: input.startedAt,
@@ -2003,8 +2218,13 @@ async function completeSteppedArchive(input: {
       transcriptAvailable: input.prepared.transcriptAvailable,
       transcriptKind: input.prepared.transcriptKind,
     },
+    driveUploadStepLeaseToken: input.leaseToken,
   });
-  await deleteDriveUploadStep(input.sessionId, input.startedAt);
+  await deleteDriveUploadStep({
+    sessionId: input.sessionId,
+    startedAt: input.startedAt,
+    leaseToken: input.leaseToken,
+  });
   return retryRequested ? { ...result, status: "pending" as const } : result;
 }
 
@@ -2164,7 +2384,15 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
         totalBytes: step.totalBytes,
       });
     } catch (error) {
-      await failExternalSync({ sessionId, startedAt, errorCode: safeErrorCode(error) });
+      const errorCode = safeErrorCode(error);
+      if (errorCode === "GOOGLE_DRIVE_HIERARCHY_BUSY") {
+        // The hierarchy owner is healthy but still creating/verifying a shared
+        // year or month node. Release this session's initializer claim and let
+        // the foreground retry (or recovery tick) re-enter from pending state.
+        await deferExternalSync({ sessionId, startedAt });
+        return pendingStep({ phase: "initializing" });
+      }
+      await failExternalSync({ sessionId, startedAt, errorCode });
       throw error;
     }
   }
@@ -2186,6 +2414,13 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
     leaseHeld = false;
   };
   const reportProgress = async () => {
+    if (!await renewDriveUploadStepLease({
+      sessionId,
+      startedAt: step.startedAt,
+      leaseToken,
+    })) {
+      throw new Error("GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST");
+    }
     if (!await heartbeatExternalSync(sessionId, step.startedAt)) {
       throw new Error("GOOGLE_DRIVE_SYNC_CLAIM_LOST");
     }
@@ -2275,6 +2510,9 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
     if (!chunk || chunk.byteSize !== step.totalBytes || chunk.contentType !== step.contentType) {
       throw new Error("INTERVIEW_RECORDING_ARTIFACT_MISSING");
     }
+    // R2 reads and resumable-status reconciliation can be slow. Renew directly
+    // before the sole Drive data mutation so an expired worker sends no chunk.
+    await reportProgress();
     const uploaded = await putOneRecordingChunk({
       uploadLocation,
       contentType: step.contentType,
@@ -2328,8 +2566,22 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
       totalBytes: step.totalBytes,
     });
   } catch (error) {
-    await releaseLease().catch(() => undefined);
+    const errorCode = safeErrorCode(error);
+    if (errorCode === "GOOGLE_DRIVE_UPLOAD_STEP_LEASE_LOST") {
+      // A newer worker may already own the same external-sync claim. The stale
+      // worker must not mark that shared claim failed or perform any other
+      // state write after its lease-expiry CAS returned zero.
+      await releaseLease().catch(() => undefined);
+      return pendingStep({
+        phase: "busy",
+        folderId: step.folderId,
+        folderUrl: step.folderUrl,
+        committedOffset: step.committedOffset,
+        totalBytes: step.totalBytes,
+      });
+    }
     if (isTransientDriveError(error)) {
+      await releaseLease().catch(() => undefined);
       return pendingStep({
         phase: "retrying",
         folderId: step.folderId,
@@ -2338,7 +2590,25 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
         totalBytes: step.totalBytes,
       });
     }
+    // Only a currently fenced owner may transition the shared external claim
+    // to failed. If expiry happened while handling the error, leave the claim
+    // untouched for the new owner and converge as a busy response.
+    if (!await renewDriveUploadStepLease({
+      sessionId,
+      startedAt: step.startedAt,
+      leaseToken,
+    }).catch(() => false)) {
+      leaseHeld = false;
+      return pendingStep({
+        phase: "busy",
+        folderId: step.folderId,
+        folderUrl: step.folderUrl,
+        committedOffset: step.committedOffset,
+        totalBytes: step.totalBytes,
+      });
+    }
     await failExternalSync({ sessionId, startedAt: step.startedAt, errorCode: safeErrorCode(error) });
+    await releaseLease().catch(() => undefined);
     throw error;
   }
 }

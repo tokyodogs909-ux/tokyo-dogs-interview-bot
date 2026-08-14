@@ -6,6 +6,35 @@ import {
 
 const GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+const GOOGLE_DRIVE_REQUEST_TIMEOUT_MS = 25_000;
+
+async function fetchGoogleWithTimeout(url: string, init: RequestInit) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GOOGLE_DRIVE_REQUEST_TIMEOUT_MS);
+  const response = await fetch(url, { ...init, signal: controller.signal }).catch(() => {
+    clearTimeout(timer);
+    throw new Error("GOOGLE_DRIVE_OAUTH_TOKEN_EXCHANGE_FAILED");
+  });
+  if (!response.body) {
+    clearTimeout(timer);
+    return response;
+  }
+  const finish = () => clearTimeout(timer);
+  return new Proxy(response, {
+    get(target, property) {
+      if (["arrayBuffer", "blob", "formData", "json", "text"].includes(String(property))) {
+        return async (...args: unknown[]) => {
+          try {
+            const method = Reflect.get(target, property, target) as (...methodArgs: unknown[]) => Promise<unknown>;
+            return await method.apply(target, args);
+          } finally { finish(); }
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
 export const GOOGLE_DRIVE_OAUTH_STATE_COOKIE = "td_drive_oauth_state";
 export const GOOGLE_DRIVE_OAUTH_VERIFIER_COOKIE = "td_drive_oauth_verifier";
 const OAUTH_COOKIE_PATH = "/api/admin/google-drive/oauth";
@@ -128,7 +157,7 @@ export async function exchangeGoogleDriveAuthorizationCode(request: Request) {
     throw new Error("GOOGLE_DRIVE_OAUTH_CALLBACK_INVALID");
   }
   const { clientId, clientSecret } = googleDriveOAuthClientSettings();
-  const response = await fetch(GOOGLE_TOKEN_ENDPOINT, {
+  const response = await fetchGoogleWithTimeout(GOOGLE_TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({

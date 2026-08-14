@@ -253,6 +253,11 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(staffSource, /評価本文の要確認事項/);
   assert.match(staffSource, /録画内の双方音声は未確認です/);
   assert.match(staffSource, /応募者の回答記録を基にした補助情報/);
+  assert.match(staffSource, /文字起こし内一致（録画未照合）/);
+  assert.doesNotMatch(staffSource, /<span>照合済み<\/span>/);
+  assert.match(staffSource, /録画式は自動評価していません。人手による録画照合が必須です/);
+  assert.match(staffSource, /保存状態：録画ファイルは保存済みです/);
+  assert.match(staffSource, /品質状態：録画内の双方音声は未確認です/);
   assert.match(driveSyncSource, /評価本文の要確認事項/);
   assert.match(driveSyncSource, /応募者端末で生成された文字起こし/);
   assert.match(source, /stage === "setup"/);
@@ -542,6 +547,9 @@ test("server-renders the protected recruiter review entry", async () => {
   assert.match(source, /録画を含め格納完了/);
   assert.match(source, /review\.sourceTranscriptVerified !== true \? "保存未完了（文字起こし要確認）"/);
   assert.match(source, /review\.sourceTranscriptVerified === true && review\.driveSync\.recordingIncluded/);
+  assert.match(source, /turn\.id\.startsWith\("recorded-transcribed-"\)/);
+  assert.match(source, /自動評価なし・人手照合必須/);
+  assert.match(source, /保存完了は音声品質の確認完了を意味しません/);
   assert.match(source, /候補者を検索/);
   assert.match(source, /面接IDを直接指定/);
   assert.match(source, /navigator\.clipboard\.writeText/);
