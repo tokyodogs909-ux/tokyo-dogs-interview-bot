@@ -1256,7 +1256,7 @@ export default function Home() {
   }
 
   async function reportCandidateEvent(
-    eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop" | "safety_escalation" | "completion_reason_invalid" | "time_limit_reached" | "reasonable_accommodation_text_selected",
+    eventType: "audio_playback_blocked" | "transcription_failed" | "recording_unavailable" | "connection_failed" | "candidate_requested_stop" | "model_candidate_stop_rejected" | "safety_escalation" | "completion_reason_invalid" | "time_limit_reached" | "reasonable_accommodation_text_selected",
     code = "",
   ): Promise<CandidateEventReceiptState> {
     const activeSessionId = sessionIdRef.current;
@@ -3705,12 +3705,18 @@ export default function Home() {
     });
   }
 
+  async function stopInterviewFromCandidateButton() {
+    await enterInterviewHold("candidate_requested_stop", {
+      type: "candidate_requested_stop",
+      code: "CANDIDATE_STOP_BUTTON_CONFIRMED",
+    });
+  }
+
   async function completeInterview(reason: string) {
     if (reason === "candidate_requested_stop") {
-      await enterInterviewHold("candidate_requested_stop", {
-        type: "candidate_requested_stop",
-        code: "USER_ACTION",
-      });
+      // A model/tool/internal call can never prove a visible candidate gesture.
+      // Only stopInterviewFromCandidateButton() may create the durable hold.
+      void reportCandidateEvent("model_candidate_stop_rejected", "NON_BUTTON_SOURCE");
       return;
     }
     if (reason === "safety_escalation") {
@@ -4011,6 +4017,7 @@ export default function Home() {
       // schema changed. A model function call can never prove a candidate UI
       // action, so continue the interview and require the visible stop button.
       if (modelAssertedCandidateStop) {
+        void reportCandidateEvent("model_candidate_stop_rejected", "MODEL_TOOL_ARGUMENT");
         channelRef.current?.send(JSON.stringify({
           type: "response.create",
           response: {
@@ -4920,7 +4927,7 @@ export default function Home() {
                 {(mode === "voice" || mode === "recorded-fallback") && <button className={isMuted ? "control danger" : "control"} onClick={toggleMute}>{isMuted ? "マイクを再開" : "マイクをミュート"}</button>}
                 {connectionState === "error" && <button className="control" onClick={restartConnection}>最初から接続をやり直す</button>}
                 {connectionState === "error" && <button className="control" onClick={startInternalTest}>選考対象外の接続確認へ切り替える</button>}
-                <button className="finish-button" onClick={() => { if (window.confirm("オンライン一次面接を中止しますか？受領済みの途中記録は技術確認用に保持しますが、面接完了・自動評価・受付完了にはなりません。")) { void completeInterview("candidate_requested_stop"); } }}>面接を中止</button>
+                <button className="finish-button" onClick={() => { if (window.confirm("オンライン一次面接を中止しますか？受領済みの途中記録は技術確認用に保持しますが、面接完了・自動評価・受付完了にはなりません。")) { void stopInterviewFromCandidateButton(); } }}>面接を中止</button>
               </div>
             </div>
           </div>

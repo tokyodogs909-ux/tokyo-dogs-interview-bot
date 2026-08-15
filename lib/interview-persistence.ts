@@ -102,11 +102,14 @@ export const CANDIDATE_EVENT_TYPES = [
   "recording_unavailable",
   "connection_failed",
   "candidate_requested_stop",
+  "model_candidate_stop_rejected",
   "safety_escalation",
   "completion_reason_invalid",
   "time_limit_reached",
   "reasonable_accommodation_text_selected",
 ] as const;
+
+export const CANDIDATE_STOP_BUTTON_EVENT_CODE = "CANDIDATE_STOP_BUTTON_CONFIRMED";
 
 export type CandidateEventType = (typeof CANDIDATE_EVENT_TYPES)[number];
 
@@ -2060,10 +2063,10 @@ export async function recordCandidateEvent(input: {
 }) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
-  // Nine independently capped candidate event types can consume at most 144
+  // Ten independently capped candidate event types can consume at most 160
   // rows. Keep a defensive session ceiling above that natural maximum so one
   // event type can never starve another type's reserved capacity.
-  const totalLimit = 160;
+  const totalLimit = 176;
   const typeLimit = 16;
   const result = await db.prepare(`INSERT INTO interview_audit_events (
       id, session_id, event_type, actor_type, detail_json
@@ -2094,7 +2097,8 @@ export async function recordCandidateEvent(input: {
         WHERE session_id = ? AND actor_type = 'candidate'
           AND event_type IN (
             'audio_playback_blocked', 'transcription_failed', 'recording_unavailable', 'connection_failed',
-            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid', 'time_limit_reached',
+            'candidate_requested_stop', 'model_candidate_stop_rejected',
+            'safety_escalation', 'completion_reason_invalid', 'time_limit_reached',
             'reasonable_accommodation_text_selected'
           )) < ?
       AND (SELECT COUNT(*) FROM interview_audit_events
@@ -2120,7 +2124,8 @@ export async function recordCandidateEvent(input: {
         WHERE session_id = ? AND actor_type = 'candidate'
           AND event_type IN (
             'audio_playback_blocked', 'transcription_failed', 'recording_unavailable', 'connection_failed',
-            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid', 'time_limit_reached',
+            'candidate_requested_stop', 'model_candidate_stop_rejected',
+            'safety_escalation', 'completion_reason_invalid', 'time_limit_reached',
             'reasonable_accommodation_text_selected'
           )) AS candidate_event_count,
       (SELECT COUNT(*) FROM interview_audit_events
@@ -3225,7 +3230,8 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
     FROM interview_audit_events
     WHERE session_id = ? AND event_type IN (
       'audio_playback_blocked', 'transcription_failed', 'recording_unavailable',
-      'connection_failed', 'candidate_requested_stop', 'safety_escalation',
+      'connection_failed', 'candidate_requested_stop', 'model_candidate_stop_rejected',
+      'safety_escalation',
       'completion_reason_invalid', 'time_limit_reached',
       'reasonable_accommodation_text_selected', 'recording_recovery_part_missing',
       'recording_recovery_manual_attention', 'legacy_recording_recovery_manual_attention',

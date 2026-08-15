@@ -130,6 +130,10 @@ test("candidate stop, safety escalation, and unknown reasons are technical holds
   assert.match(source, /安全上の理由で中断し、受付完了にはなっていません/);
   assert.doesNotMatch(interviewSource, /enum: \["all_topics_covered", "candidate_requested_stop"/);
   assert.match(source, /modelAssertedCandidateStop/);
+  assert.match(source, /reportCandidateEvent\("model_candidate_stop_rejected", "MODEL_TOOL_ARGUMENT"\)/);
+  assert.match(source, /stopInterviewFromCandidateButton/);
+  assert.match(source, /CANDIDATE_STOP_BUTTON_CONFIRMED/);
+  assert.doesNotMatch(source, /completeInterview\("candidate_requested_stop"\)/);
   assert.match(source, /応募者本人が画面の「面接を中止」ボタンを押していないため、面接を中止しないでください/);
 });
 

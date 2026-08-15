@@ -98,6 +98,7 @@ const technicalEventLabels: Record<string, string> = {
   recording_unavailable: "録画または双方音声の欠落",
   connection_failed: "音声・通信接続の失敗",
   candidate_requested_stop: "応募者による中止",
+  model_candidate_stop_rejected: "AIまたは内部処理による中止要求を拒否——面接は継続",
   safety_escalation: "安全上の理由による中断——自動評価なし・人手確認必須",
   completion_reason_invalid: "終了理由を確認できず技術保留",
   time_limit_reached: "27分上限後の安全終了",

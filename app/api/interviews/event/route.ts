@@ -1,5 +1,6 @@
 import {
   authorizeInterviewRequest,
+  CANDIDATE_STOP_BUTTON_EVENT_CODE,
   CANDIDATE_EVENT_TYPES,
   recordCandidateEvent,
   type CandidateEventType,
@@ -27,6 +28,12 @@ export async function POST(request: Request) {
       !(CANDIDATE_EVENT_TYPES as readonly string[]).includes(payload.eventType ?? "")
     ) {
       return noStoreJson({ error: "記録イベントを確認できません。" }, { status: 400 });
+    }
+    if (
+      payload.eventType === "candidate_requested_stop" &&
+      payload.code !== CANDIDATE_STOP_BUTTON_EVENT_CODE
+    ) {
+      return noStoreJson({ error: "中止操作を確認できません。" }, { status: 400 });
     }
     const authorized = await authorizeInterviewRequest(request, sessionId);
     if (!authorized) {

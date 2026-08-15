@@ -601,7 +601,7 @@ class FakeD1Statement {
         );
       const candidateTypes = new Set([
         "audio_playback_blocked", "transcription_failed", "recording_unavailable", "connection_failed",
-        "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+        "candidate_requested_stop", "model_candidate_stop_rejected", "safety_escalation", "completion_reason_invalid",
         "time_limit_reached", "reasonable_accommodation_text_selected",
       ]);
       const totalCount = this.database.auditEvents.filter((event) =>
@@ -1674,7 +1674,7 @@ class FakeD1Statement {
       if (!session) return null;
       const candidateTypes = new Set([
         "audio_playback_blocked", "transcription_failed", "recording_unavailable", "connection_failed",
-        "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
+        "candidate_requested_stop", "model_candidate_stop_rejected", "safety_escalation", "completion_reason_invalid",
         "time_limit_reached", "reasonable_accommodation_text_selected",
       ]);
       return {
@@ -2192,7 +2192,7 @@ class FakeD1Statement {
     if (this.sql.startsWith("SELECT event_type, detail_json, created_at")) {
       const technicalEventTypes = new Set([
         "audio_playback_blocked", "transcription_failed", "recording_unavailable",
-        "connection_failed", "candidate_requested_stop", "safety_escalation",
+        "connection_failed", "candidate_requested_stop", "model_candidate_stop_rejected", "safety_escalation",
         "completion_reason_invalid", "time_limit_reached",
         "reasonable_accommodation_text_selected", "recording_recovery_part_missing",
         "recording_recovery_manual_attention", "legacy_recording_recovery_manual_attention",
@@ -6400,7 +6400,7 @@ test("candidate event caps are atomic per type and late harmful events cannot di
   assert.equal(harmlessLateEvent.status, 200);
   const harmfulLateEvent = await sendEvent("transcription_failed", "TRANSCRIPTION_FAILED");
   assert.equal(harmfulLateEvent.status, 409);
-  const lateStop = await sendEvent("candidate_requested_stop", "USER_ACTION");
+  const lateStop = await sendEvent("candidate_requested_stop", "CANDIDATE_STOP_BUTTON_CONFIRMED");
   assert.equal(lateStop.status, 409, "a completed receipt cannot be retroactively marked as candidate-stopped");
   assert.equal(database.auditEvents.some((event) =>
     event.session_id === session.sessionId && event.event_type === "transcription_failed"), false);
@@ -6636,7 +6636,7 @@ test("recorded contingency can complete a stopped interview with only its answer
 
 test("a prior technical hold blocks every recorded mutation and completion route", async () => {
   for (const [eventType, code] of [
-    ["candidate_requested_stop", "USER_ACTION"],
+    ["candidate_requested_stop", "CANDIDATE_STOP_BUTTON_CONFIRMED"],
     ["safety_escalation", "MODEL_SAFETY_ESCALATION"],
     ["completion_reason_invalid", "UNKNOWN_COMPLETION_REASON"],
   ]) {
@@ -9785,7 +9785,7 @@ test("candidate-requested stop cannot seal, evaluate, complete, or create a Driv
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
   const session = await createTestInterviewSession(env);
   await startTextTestInterview(env, session);
-  const stopped = await request("/api/interviews/event", {
+  const unprovenStop = await request("/api/interviews/event", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${session.accessToken}`,
@@ -9796,6 +9796,22 @@ test("candidate-requested stop cannot seal, evaluate, complete, or create a Driv
       sessionId: session.sessionId,
       eventType: "candidate_requested_stop",
       code: "USER_ACTION",
+    }),
+  }, env);
+  assert.equal(unprovenStop.status, 400, "a generic or model-origin stop must not create the durable hold");
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId && event.event_type === "candidate_requested_stop"), false);
+  const stopped = await request("/api/interviews/event", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+      Origin: "http://localhost",
+    },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      eventType: "candidate_requested_stop",
+      code: "CANDIDATE_STOP_BUTTON_CONFIRMED",
     }),
   }, env);
   assert.equal(stopped.status, 200, await stopped.clone().text());
@@ -9836,6 +9852,45 @@ test("candidate-requested stop cannot seal, evaluate, complete, or create a Driv
     "the stop fence must run before the legacy text final-draft seal");
   assert.equal(database.evaluationClaims.has(session.sessionId), false);
   assert.equal(database.externalSyncs.has(session.sessionId), false);
+});
+
+test("a rejected model stop is observable without stopping the interview", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env);
+  const rejected = await request("/api/interviews/event", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+      Origin: "http://localhost",
+    },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      eventType: "model_candidate_stop_rejected",
+      code: "MODEL_TOOL_ARGUMENT",
+    }),
+  }, env);
+  assert.equal(rejected.status, 200, await rejected.clone().text());
+  assert.equal(database.sessions.get(session.sessionId).status, "created");
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId &&
+    event.event_type === "model_candidate_stop_rejected"), true);
+
+  const staffResponse = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const staffPayload = await staffResponse.json();
+  assert.equal(staffResponse.status, 200, JSON.stringify(staffPayload));
+  assert.equal(staffPayload.review.technicalEvents.some((event) =>
+    event.type === "model_candidate_stop_rejected" &&
+    event.detail.code === "MODEL_TOOL_ARGUMENT"), true);
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId &&
+    ["candidate_requested_stop", "safety_escalation", "completion_reason_invalid"].includes(event.event_type)), false);
 });
 
 test("safety escalation and invalid completion reasons cannot evaluate or complete", async () => {
