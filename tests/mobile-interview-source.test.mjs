@@ -4,6 +4,7 @@ import test from "node:test";
 
 const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
 const persistenceSource = await readFile(new URL("../lib/interview-persistence.ts", import.meta.url), "utf8");
+const interviewSource = await readFile(new URL("../lib/interview.ts", import.meta.url), "utf8");
 
 function functionBody(name, nextName) {
   const start = source.indexOf(`  ${name}`);
@@ -95,7 +96,8 @@ test("candidate stop, safety escalation, and unknown reasons are technical holds
     "async function holdInterviewForStaffReview(",
     "async function completeInterview(reason: string)",
   );
-  assert.match(hold, /recordingLiveUploaderRef\.current\?\.retry\(\)/);
+  assert.match(hold, /await liveUploader\.finalize\(audioCoverage\)/);
+  assert.match(hold, /interruptedRecordingStored = true/);
   assert.match(hold, /recordingCompleteRef\.current = false/);
   assert.match(hold, /setArchiveSyncState\("error"\)/);
   assert.doesNotMatch(hold, /sealVoiceTranscriptCompletion|sealRecordedFallbackCompletion/);
@@ -126,6 +128,9 @@ test("candidate stop, safety escalation, and unknown reasons are technical holds
   assert.match(source, /completionHold === "none" && archiveSyncState !== "stored"/);
   assert.match(source, /面接は中止され、受付完了にはなっていません/);
   assert.match(source, /安全上の理由で中断し、受付完了にはなっていません/);
+  assert.doesNotMatch(interviewSource, /enum: \["all_topics_covered", "candidate_requested_stop"/);
+  assert.match(source, /modelAssertedCandidateStop/);
+  assert.match(source, /応募者本人が画面の「面接を中止」ボタンを押していないため、面接を中止しないでください/);
 });
 
 test("voice completion consumes strict pending item and response lifecycle state", () => {

@@ -3640,22 +3640,40 @@ export default function Home() {
     hold: Exclude<CompletionHold, "none">,
     eventReceipt?: CandidateEventReceiptState,
   ) {
+    let interruptedRecordingStored = modeRef.current === "text";
     try {
       if (modeRef.current !== "text") {
         await (recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current));
-        // Send any complete 4 MiB parts already accumulated, but deliberately do
-        // not seal/finalize the interrupted stream. Server-side recovery therefore
-        // keeps it as technical evidence and cannot promote it to a receipt.
-        await recordingLiveUploaderRef.current?.retry().catch(() => undefined);
+        const liveUploader = recordingLiveUploaderRef.current;
+        if (liveUploader) {
+          const audioCoverage = recordingHasBothAudioRef.current === true
+            ? "both"
+            : recordingHasBothAudioRef.current === false
+              ? "candidate-only"
+              : "unverified";
+          // Stopping for technical review is not interview completion, but the
+          // exact bytes captured through that stop still need a durable receipt.
+          // Finalizing only the recording keeps transcript/evaluation/Drive
+          // blocked while preventing the last partial chunk from dying with the
+          // browser tab.
+          await liveUploader.finalize(audioCoverage);
+          interruptedRecordingStored = true;
+          setRecordingUploadState("stored");
+        }
       }
     } finally {
       recordingCompleteRef.current = false;
       interviewFinalizationStoredRef.current = false;
       voiceTranscriptSealedRef.current = false;
-      if (modeRef.current !== "text") setRecordingUploadState("error");
+      if (modeRef.current !== "text" && !interruptedRecordingStored) setRecordingUploadState("error");
       setArchiveSyncState("error");
       setCompletionSavePending(false);
-      const common = "受領済みの途中記録は技術確認用に保持しますが、面接完了・自動評価・社内Drive格納・受付完了には進めません。採用担当者へ受付番号をお知らせください。";
+      const recordingStatus = modeRef.current === "text"
+        ? "入力済みの途中回答"
+        : interruptedRecordingStored
+          ? "中断時点までの録画"
+          : "受領済みの途中録画パート";
+      const common = `${recordingStatus}は技術確認用に保持しますが、面接完了・自動評価・社内Drive格納・受付完了には進めません。採用担当者へ受付番号をお知らせください。`;
       if (hold === "candidate_requested_stop") {
         setProcessingWarning(eventReceipt === "stored"
           ? `応募者による中止をサーバーに記録しました。${common}`
@@ -3967,6 +3985,7 @@ export default function Home() {
       const completionArguments = parseCompletionArguments(event);
       const completion = validateCompletionArguments(completionArguments);
       const completionReason = completionArguments.completion_reason;
+      const modelAssertedCandidateStop = completionReason === "candidate_requested_stop";
       if (callId && channelRef.current?.readyState === "open") {
         channelRef.current.send(JSON.stringify({
           type: "conversation.item.create",
@@ -3974,7 +3993,7 @@ export default function Home() {
             type: "function_call_output",
             call_id: callId,
             output: JSON.stringify({
-              accepted: completion.accepted,
+              accepted: completion.accepted && !modelAssertedCandidateStop,
               missing_topic_ids: completion.missingTopicIds,
             }),
           },
@@ -3988,6 +4007,19 @@ export default function Home() {
         void completeInterview("completion_reason_invalid");
         return;
       }
+      // Compatibility fence for a page that was already open when the tool
+      // schema changed. A model function call can never prove a candidate UI
+      // action, so continue the interview and require the visible stop button.
+      if (modelAssertedCandidateStop) {
+        channelRef.current?.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            instructions: "応募者本人が画面の「面接を中止」ボタンを押していないため、面接を中止しないでください。終了案内はせず、直前の回答を踏まえて次の未確認テーマを一つだけ質問してください。",
+          },
+        }));
+        armResponseWatchdog(true);
+        return;
+      }
       if (!completion.accepted) {
         channelRef.current?.send(JSON.stringify({
           type: "response.create",
@@ -3998,9 +4030,7 @@ export default function Home() {
         armResponseWatchdog(true);
         return;
       }
-      if (completionReason === "candidate_requested_stop") {
-        void completeInterview("candidate_requested_stop");
-      } else if (completionReason === "safety_escalation") {
+      if (completionReason === "safety_escalation") {
         void completeInterview("safety_escalation");
       } else if (completionReason === "all_topics_covered") {
         scheduleInterviewCompletion("ai_completed");

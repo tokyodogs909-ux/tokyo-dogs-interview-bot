@@ -297,7 +297,11 @@ export const COMPLETE_INTERVIEW_TOOL = {
     properties: {
       completion_reason: {
         type: "string",
-        enum: ["all_topics_covered", "candidate_requested_stop", "safety_escalation"],
+        // Only the visible candidate-side stop button may assert that the
+        // candidate requested to stop. Allowing the model to emit the same
+        // reason made an AI misclassification indistinguishable from an
+        // explicit user action in the audit trail.
+        enum: ["all_topics_covered", "safety_escalation"],
       },
       topics_covered: {
         type: "array",

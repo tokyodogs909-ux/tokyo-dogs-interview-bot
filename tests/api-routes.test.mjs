@@ -132,6 +132,51 @@ function currentLegacyClaim(database, input) {
   return !newer && !terminal;
 }
 
+function interruptedV3Eligible(database, session, expiredBefore = null) {
+  const draft = session ? database.transcriptDrafts.get(session.id) : null;
+  if (!session || session.status !== "in_progress" ||
+    !["uploading", "failed"].includes(session.recording_status) ||
+    (expiredBefore && session.expires_at > expiredBefore) ||
+    session.completed_at != null || session.transcript_json != null ||
+    session.evaluation_json != null || session.summary != null ||
+    !draft || draft.mode !== "voice" || draft.sealed_at != null || draft.turn_count <= 0 ||
+    database.artifacts.some((artifact) => artifact[1] === session.id) ||
+    database.externalSyncs.has(session.id) || database.recordedCompletions.has(session.id) ||
+    [...database.recordedAnswers.values()].some((answer) => answer.session_id === session.id) ||
+    database.evaluationClaims.has(session.id) || database.sessionReplacements.has(session.id) ||
+    !hasCompletionHold(database, session.id)) return false;
+  try {
+    const transcript = JSON.parse(draft.transcript_json);
+    if (!Array.isArray(transcript) || !transcript.some((turn) =>
+      turn?.speaker === "candidate" && typeof turn.text === "string" && turn.text.trim())) return false;
+  } catch {
+    return false;
+  }
+  return !database.auditEvents.some((event) =>
+    event.session_id === session.id && [
+      "interrupted_recording_recovered", "interrupted_recording_recovery_manual_attention",
+    ].includes(event.event_type));
+}
+
+function currentInterruptedV3Claim(database, input) {
+  const claim = database.auditEvents.find((event) =>
+    event.session_id === input.sessionId &&
+    event.event_type === "interrupted_v3_recording_recovery_claimed" &&
+    event.created_at === input.claimedAt &&
+    auditDetail(event).claimId === input.claimId &&
+    auditDetail(event).leaseExpiresAt === input.leaseExpiresAt);
+  if (!claim || input.leaseExpiresAt <= input.now) return false;
+  const newer = database.auditEvents.some((event) =>
+    event.session_id === input.sessionId &&
+    event.event_type === "interrupted_v3_recording_recovery_claimed" &&
+    event.created_at > input.newerThan);
+  const terminal = database.auditEvents.some((event) =>
+    event.session_id === input.sessionId && [
+      "interrupted_recording_recovered", "interrupted_recording_recovery_manual_attention",
+    ].includes(event.event_type));
+  return !newer && !terminal;
+}
+
 class FakeD1Statement {
   constructor(database, sql) {
     this.database = database;
@@ -267,6 +312,50 @@ class FakeD1Statement {
       }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'interrupted_v3_recording_recovery_claimed'")
+    ) {
+      const [id, sessionId, detailJson, claimedAt, checkedSessionId, expectedUpdatedAt,
+        draftSha256, draftTurnCount, draftUpdatedAt, terminalSessionId,
+        activeSessionId, staleBefore] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const draft = this.database.transcriptDrafts.get(checkedSessionId);
+      const terminal = this.database.auditEvents.some((event) =>
+        event.session_id === terminalSessionId && [
+          "interrupted_recording_recovered", "interrupted_recording_recovery_manual_attention",
+        ].includes(event.event_type));
+      const active = this.database.auditEvents.some((event) =>
+        event.session_id === activeSessionId &&
+        event.event_type === "interrupted_v3_recording_recovery_claimed" &&
+        event.created_at > staleBefore);
+      if (sessionId === checkedSessionId && interruptedV3Eligible(this.database, session) &&
+        session.updated_at === expectedUpdatedAt && draft?.transcript_sha256 === draftSha256 &&
+        draft.turn_count === draftTurnCount && draft.updated_at === draftUpdatedAt &&
+        !terminal && !active) {
+        this.database.auditEvents.push({
+          id, session_id: sessionId, event_type: "interrupted_v3_recording_recovery_claimed",
+          actor_type: "system", detail_json: detailJson, created_at: claimedAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'interrupted_recording_recovery_manual_attention'")
+    ) {
+      const [id, sessionId, detailJson, createdAt, claimSessionId, claimedAt,
+        claimId, leaseExpiresAt, now, newerSessionId, newerThan, terminalSessionId] = this.values;
+      if (sessionId === claimSessionId && sessionId === newerSessionId &&
+        sessionId === terminalSessionId && currentInterruptedV3Claim(this.database, {
+          sessionId, claimedAt, claimId, leaseExpiresAt, now, newerThan,
+        })) {
+        this.database.auditEvents.push({
+          id, session_id: sessionId,
+          event_type: "interrupted_recording_recovery_manual_attention",
+          actor_type: "system", detail_json: detailJson, created_at: createdAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("SELECT ?, ?, 'legacy_recording_recovery_claimed'")
     ) {
       const [id, sessionId, detailJson, claimedAt, checkedSessionId, expectedUpdatedAt,
@@ -325,6 +414,27 @@ class FakeD1Statement {
           detail_json: detailJson,
           created_at: createdAt,
         });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_artifacts") &&
+      this.sql.includes("interrupted_v3_recording_recovery_claimed")
+    ) {
+      const [id, sessionId, objectKey, contentType, byteSize, etag, retentionUntil,
+        createdAt, checkedSessionId, expectedUpdatedAt, claimSessionId, claimedAt,
+        claimId, leaseExpiresAt, now, newerSessionId, newerThan, artifactSessionId] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      if (sessionId === checkedSessionId && sessionId === claimSessionId &&
+        sessionId === newerSessionId && sessionId === artifactSessionId &&
+        session?.status === "in_progress" && session.recording_status === "stored" &&
+        session.updated_at === expectedUpdatedAt && session.completed_at == null &&
+        session.transcript_json == null && session.evaluation_json == null && session.summary == null &&
+        currentInterruptedV3Claim(this.database, {
+          sessionId, claimedAt, claimId, leaseExpiresAt, now, newerThan,
+        }) && !this.database.artifacts.some((artifact) => artifact[1] === sessionId)) {
+        this.database.artifacts.push([
+          id, sessionId, objectKey, contentType, byteSize, etag, retentionUntil, createdAt,
+        ]);
         changes = 1;
       }
     } else if (
@@ -821,6 +931,26 @@ class FakeD1Statement {
       }
     } else if (
       this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'stored'") &&
+      this.sql.includes("interrupted_v3_recording_recovery_claimed")
+    ) {
+      const [storedAt, id, expectedUpdatedAt, expiresAt, retentionUntil, createdAt,
+        draftSha256, draftTurnCount, draftUpdatedAt, claimedAt, claimId,
+        leaseExpiresAt, now, newerThan] = this.values;
+      const session = this.database.sessions.get(id);
+      const draft = this.database.transcriptDrafts.get(id);
+      if (interruptedV3Eligible(this.database, session) &&
+        session.updated_at === expectedUpdatedAt && session.expires_at === expiresAt &&
+        session.retention_until === retentionUntil && session.created_at === createdAt &&
+        draft?.transcript_sha256 === draftSha256 && draft.turn_count === draftTurnCount &&
+        draft.updated_at === draftUpdatedAt && currentInterruptedV3Claim(this.database, {
+          sessionId: id, claimedAt, claimId, leaseExpiresAt, now, newerThan,
+        })) {
+        session.recording_status = "stored";
+        session.updated_at = storedAt;
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("UPDATE interview_sessions SET recording_status = 'stored'") &&
       this.sql.includes("legacy_recording_recovery_claimed")
     ) {
       const [storedAt, id, expectedUpdatedAt, expiresAt, retentionUntil, createdAt,
@@ -1057,6 +1187,34 @@ class FakeD1Statement {
         overall_note: overallNote,
         updated_at: updatedAt,
       });
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("SELECT ?, ?, 'interrupted_recording_recovered'")
+    ) {
+      const [id, sessionId, detailJson, createdAt, checkedSessionId, expectedUpdatedAt,
+        artifactSessionId, objectKey, contentType, byteSize, retentionUntil,
+        claimSessionId, claimedAt, claimId, leaseExpiresAt, now,
+        newerSessionId, newerThan, recoveredSessionId] = this.values;
+      const session = this.database.sessions.get(checkedSessionId);
+      const artifact = this.database.artifacts.find((item) =>
+        item[1] === artifactSessionId && item[2] === objectKey && item[3] === contentType &&
+        item[4] === byteSize && item[6] === retentionUntil);
+      if (sessionId === checkedSessionId && sessionId === artifactSessionId &&
+        sessionId === claimSessionId && sessionId === newerSessionId &&
+        sessionId === recoveredSessionId && session?.status === "in_progress" &&
+        session.recording_status === "stored" && session.updated_at === expectedUpdatedAt &&
+        session.completed_at == null && session.transcript_json == null &&
+        session.evaluation_json == null && session.summary == null && artifact &&
+        currentInterruptedV3Claim(this.database, {
+          sessionId, claimedAt, claimId, leaseExpiresAt, now, newerThan,
+        }) && !this.database.auditEvents.some((event) =>
+          event.session_id === sessionId && event.event_type === "interrupted_recording_recovered")) {
+        this.database.auditEvents.push({
+          id, session_id: sessionId, event_type: "interrupted_recording_recovered",
+          actor_type: "system", detail_json: detailJson, created_at: createdAt,
+        });
+        changes = 1;
+      }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("SELECT ?, ?, 'legacy_recording_recovered'")
@@ -1357,6 +1515,69 @@ class FakeD1Statement {
         recorded_fallback_started: this.database.auditEvents.some((event) =>
           event.session_id === session.id && event.event_type === "recorded_fallback_started") ? 1 : 0,
         completion_hold: hasCompletionHold(this.database, session.id) ? 1 : 0,
+      };
+    }
+    if (this.sql.startsWith("SELECT s.id, s.status, s.recording_status") &&
+      this.sql.includes("interrupted_recording_recovery_manual_attention")) {
+      const expiredBefore = this.values[0];
+      const session = [...this.database.sessions.values()]
+        .filter((item) => interruptedV3Eligible(this.database, item, expiredBefore))
+        .sort((left, right) =>
+          left.updated_at.localeCompare(right.updated_at) || left.id.localeCompare(right.id))[0];
+      if (!session) return null;
+      const draft = this.database.transcriptDrafts.get(session.id);
+      return {
+        ...session,
+        draft_sha256: draft.transcript_sha256,
+        draft_turn_count: draft.turn_count,
+        draft_updated_at: draft.updated_at,
+      };
+    }
+    if (this.sql.startsWith("SELECT 1 AS current_claim") &&
+      this.sql.includes("interrupted_v3_recording_recovery_claimed")) {
+      const [sessionId, expectedUpdatedAt, draftSha256, draftTurnCount, draftUpdatedAt,
+        claimedAt, claimId, leaseExpiresAt, now, newerThan] = this.values;
+      const session = this.database.sessions.get(sessionId);
+      const draft = this.database.transcriptDrafts.get(sessionId);
+      return interruptedV3Eligible(this.database, session) &&
+        session.updated_at === expectedUpdatedAt && draft?.transcript_sha256 === draftSha256 &&
+        draft.turn_count === draftTurnCount && draft.updated_at === draftUpdatedAt &&
+        currentInterruptedV3Claim(this.database, {
+          sessionId, claimedAt, claimId, leaseExpiresAt, now, newerThan,
+        }) ? { current_claim: 1 } : null;
+    }
+    if (this.sql.startsWith("SELECT 1 AS present") &&
+      this.sql.includes("interrupted_recording_recovery_manual_attention")) {
+      const [id, sessionId] = this.values;
+      return this.database.auditEvents.some((event) => event.id === id &&
+        event.session_id === sessionId &&
+        event.event_type === "interrupted_recording_recovery_manual_attention")
+        ? { present: 1 }
+        : null;
+    }
+    if (this.sql.startsWith("SELECT s.status, s.recording_status, s.transcript_json") &&
+      this.sql.includes("draft.transcript_sha256 AS draft_sha256")) {
+      const sessionId = this.values[0];
+      const session = this.database.sessions.get(sessionId);
+      const draft = this.database.transcriptDrafts.get(sessionId);
+      if (!session || !draft) return null;
+      const artifact = this.database.artifacts.find((item) => item[1] === sessionId);
+      return {
+        status: session.status,
+        recording_status: session.recording_status,
+        transcript_json: session.transcript_json ?? null,
+        evaluation_json: session.evaluation_json ?? null,
+        summary: session.summary ?? null,
+        completed_at: session.completed_at ?? null,
+        object_key: artifact?.[2] ?? null,
+        content_type: artifact?.[3] ?? null,
+        byte_size: artifact?.[4] ?? null,
+        retention_until: artifact?.[6] ?? null,
+        draft_sha256: draft.transcript_sha256,
+        draft_turn_count: draft.turn_count,
+        draft_sealed_at: draft.sealed_at,
+        recovery_audit_present: this.database.auditEvents.some((event) =>
+          event.session_id === sessionId && event.event_type === "interrupted_recording_recovered") ? 1 : 0,
       };
     }
     if (this.sql.startsWith("SELECT s.id, s.status, s.recording_status") &&
@@ -1954,6 +2175,7 @@ class FakeD1Statement {
               status: session.status,
               recording_status: session.recording_status,
               transcript_json: session.transcript_json,
+              completion_hold: hasCompletionHold(this.database, session.id) ? 1 : 0,
               candidate_transcription_failed: this.database.auditEvents.some((event) =>
                 event.session_id === session.id && isRealtimeTranscriptionGapEvent(event)) ? 1 : 0,
               created_at: session.created_at,
@@ -1974,6 +2196,7 @@ class FakeD1Statement {
         "completion_reason_invalid", "time_limit_reached",
         "reasonable_accommodation_text_selected", "recording_recovery_part_missing",
         "recording_recovery_manual_attention", "legacy_recording_recovery_manual_attention",
+        "interrupted_recording_recovered", "interrupted_recording_recovery_manual_attention",
         "device_session_replaced",
       ]);
       return {
@@ -2224,6 +2447,118 @@ async function addLegacyV1OrphanFixture(database, recordings, options = {}) {
   return { session, state, stateKey, partKey, partBytes, manifestKey };
 }
 
+async function addInterruptedV3Fixture(database, recordings, options = {}) {
+  const index = options.index ?? 0;
+  const sessionId = options.sessionId ?? `TD-INTERRUPTED-V3-${String(index).padStart(2, "0")}`;
+  const createdAtMs = Date.parse("2026-08-14T08:10:00.000Z") + index * 60_000;
+  const createdAt = new Date(createdAtMs).toISOString();
+  const expiresAt = new Date(createdAtMs + 2 * 60 * 60_000).toISOString();
+  const retentionUntil = new Date(createdAtMs + 365 * 24 * 60 * 60_000).toISOString();
+  const updatedAt = new Date(createdAtMs + 20 * 60_000).toISOString();
+  const transcript = [
+    { id: `ai-${index}`, speaker: "interviewer", text: "Fixture question", createdAt },
+    { id: `candidate-${index}`, speaker: "candidate", text: "Fixture answer", createdAt: updatedAt },
+  ];
+  const transcriptJson = JSON.stringify(transcript);
+  const draftSha256 = sha256Hex(new TextEncoder().encode(transcriptJson));
+  const session = {
+    id: sessionId,
+    access_token_hash: `interrupted-token-hash-${index}`,
+    candidate_name: `Interrupted fixture ${index}`,
+    employment: "fixture",
+    preferred_location: "fixture",
+    status: "in_progress",
+    recording_status: options.recordingStatus ?? "uploading",
+    expires_at: expiresAt,
+    retention_until: retentionUntil,
+    created_at: createdAt,
+    updated_at: updatedAt,
+    transcript_json: null,
+    evaluation_json: null,
+    summary: null,
+    completed_at: null,
+  };
+  database.sessions.set(sessionId, session);
+  database.transcriptDrafts.set(sessionId, {
+    session_id: sessionId,
+    mode: "voice",
+    transcript_json: transcriptJson,
+    transcript_sha256: draftSha256,
+    turn_count: transcript.length,
+    sealed_at: null,
+    created_at: new Date(createdAtMs + 5_000).toISOString(),
+    updated_at: new Date(createdAtMs + 20 * 60_000 + 1_000).toISOString(),
+  });
+  database.auditEvents.push(
+    {
+      id: `interrupted-consent-${index}`,
+      session_id: sessionId,
+      event_type: "consent_recorded",
+      actor_type: "candidate",
+      detail_json: JSON.stringify({ interviewMode: "camera" }),
+      created_at: createdAt,
+    },
+    {
+      id: `interrupted-start-${index}`,
+      session_id: sessionId,
+      event_type: "interview_started",
+      actor_type: "candidate",
+      detail_json: "{}",
+      created_at: createdAt,
+    },
+    {
+      id: `interrupted-hold-${index}`,
+      session_id: sessionId,
+      event_type: options.holdEvent ?? "candidate_requested_stop",
+      actor_type: "candidate",
+      detail_json: JSON.stringify({ code: "USER_ACTION" }),
+      created_at: updatedAt,
+    },
+  );
+  const stateKey = `interviews/${sessionId}/recording-parts/upload.json`;
+  const manifestKey = `interviews/${sessionId}/recording.interrupted-v3.manifest.json`;
+  const state = {
+    version: 3,
+    sessionId,
+    uploadId: `fixtureuploadid${String(index).padStart(8, "0")}`,
+    contentType: "video/webm",
+    partSize: 4 * 1024 * 1024,
+    byteSize: null,
+    totalParts: null,
+    audioCoverage: null,
+    sealedAt: null,
+    retentionUntil,
+    createdAt: new Date(createdAtMs + 10_000).toISOString(),
+  };
+  if (!options.missingState) {
+    await recordings.put(stateKey, JSON.stringify(state), {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: { sessionId, retentionUntil },
+    });
+  }
+  const partCount = options.partCount ?? 1;
+  const partKeys = [];
+  for (let partIndex = 0; partIndex < partCount; partIndex += 1) {
+    if (options.missingIndex === partIndex) continue;
+    const storedIndex = options.gapAfterIndex === partIndex ? partIndex + 1 : partIndex;
+    const key = `interviews/${sessionId}/recording-parts/part-${String(storedIndex).padStart(3, "0")}`;
+    const bytes = new Uint8Array(4 * 1024 * 1024).fill(40 + index + partIndex);
+    const sha256 = sha256Hex(bytes);
+    await recordings.put(key, bytes, {
+      sha256,
+      httpMetadata: { contentType: "application/octet-stream" },
+      customMetadata: {
+        sessionId,
+        byteSize: String(bytes.byteLength),
+        sha256,
+        retentionUntil,
+      },
+    });
+    partKeys.push(key);
+  }
+  return { session, state, stateKey, manifestKey, partKeys, transcriptJson, draftSha256 };
+}
+
 
 async function createTestInterviewSession(
   env,
@@ -2430,6 +2765,180 @@ test("scheduled recovery stores one exact legacy v1 orphan per tick without comp
       sha256: sha256Hex(fixture.partBytes),
     }]);
   }
+});
+
+test("scheduled recovery preserves an expired interrupted v3 full-part prefix without completing or evaluating it", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings, INTERVIEW_STAFF_TOKEN: "staff-test-token" };
+  const fixture = await addInterruptedV3Fixture(database, recordings, { partCount: 2 });
+  const sourceSnapshot = {
+    status: fixture.session.status,
+    transcriptJson: fixture.session.transcript_json,
+    evaluationJson: fixture.session.evaluation_json,
+    summary: fixture.session.summary,
+    completedAt: fixture.session.completed_at,
+    draftJson: database.transcriptDrafts.get(fixture.session.id).transcript_json,
+    draftSha256: database.transcriptDrafts.get(fixture.session.id).transcript_sha256,
+  };
+
+  await scheduleInterviewRecovery(env);
+
+  assert.equal(fixture.session.recording_status, "stored");
+  assert.deepEqual({
+    status: fixture.session.status,
+    transcriptJson: fixture.session.transcript_json,
+    evaluationJson: fixture.session.evaluation_json,
+    summary: fixture.session.summary,
+    completedAt: fixture.session.completed_at,
+    draftJson: database.transcriptDrafts.get(fixture.session.id).transcript_json,
+    draftSha256: database.transcriptDrafts.get(fixture.session.id).transcript_sha256,
+  }, sourceSnapshot, "partial evidence recovery must not promote canonical interview state");
+  assert.equal(database.evaluationClaims.size, 0);
+  assert.equal(database.externalSyncs.size, 0);
+  assert.equal(database.artifacts.length, 1);
+  assert.deepEqual(database.artifacts[0].slice(1, 7), [
+    fixture.session.id,
+    fixture.manifestKey,
+    "video/webm",
+    8 * 1024 * 1024,
+    database.artifacts[0][5],
+    fixture.session.retention_until,
+  ]);
+  const manifestObject = await recordings.get(fixture.manifestKey);
+  assert.ok(manifestObject);
+  const manifest = JSON.parse(await new Response(manifestObject.body).text());
+  assert.equal(manifest.recovery.mode, "interrupted-v3-full-parts");
+  assert.equal(manifest.byteSize, 8 * 1024 * 1024);
+  assert.equal(manifest.audioCoverage, "unverified");
+  assert.deepEqual(manifest.parts.map((part) => part.key), fixture.partKeys);
+  assert.equal(manifest.parts.every((part) => /^[a-f0-9]{64}$/.test(part.sha256)), true);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id && event.event_type === "interrupted_recording_recovered").length, 1);
+  const recoveredDetail = auditDetail(database.auditEvents.find((event) =>
+    event.session_id === fixture.session.id && event.event_type === "interrupted_recording_recovered"));
+  assert.deepEqual(recoveredDetail, {
+    sourceVersion: 3,
+    byteSize: 8 * 1024 * 1024,
+    contentType: "video/webm",
+    audioCoverage: "unverified",
+    partCount: 2,
+    verificationMode: "interrupted-v3-full-parts",
+    tailCompleteness: "last_partial_not_received",
+  });
+
+  const reviewResponse = await request(`/api/staff/interview?sessionId=${fixture.session.id}`, {
+    headers: {
+      Authorization: "Bearer staff-test-token",
+      "X-Interview-Reviewer": "fixture-reviewer",
+    },
+  }, env);
+  assert.equal(reviewResponse.status, 200);
+  const review = (await reviewResponse.json()).review;
+  assert.equal(review.status, "in_progress");
+  assert.equal(review.recordingStatus, "stored");
+  assert.equal(review.transcript.length, 0);
+  assert.equal(review.evaluation, null);
+  assert.equal(review.transcriptDraft.sealed, false);
+  assert.equal(review.transcriptDraft.turnCount, 2);
+  assert.equal(review.technicalEvents.some((event) =>
+    event.type === "interrupted_recording_recovered"), true);
+
+  const putCount = recordings.putCount;
+  await scheduleInterviewRecovery(env);
+  assert.equal(recordings.putCount, putCount, "a completed recovery must be an idle no-op on the next tick");
+  assert.equal(database.artifacts.length, 1);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id && event.event_type === "interrupted_recording_recovered").length, 1);
+});
+
+for (const mode of ["missing-state", "no-full-parts", "part-gap", "digest-mismatch", "sealed-state"]) {
+  test(`interrupted v3 recovery fails closed without canonical mutation: ${mode}`, async () => {
+    const database = new FakeD1();
+    const recordings = new FakeR2();
+    const fixture = await addInterruptedV3Fixture(database, recordings, {
+      index: ["missing-state", "no-full-parts", "part-gap", "digest-mismatch", "sealed-state"].indexOf(mode) + 10,
+      missingState: mode === "missing-state",
+      partCount: mode === "no-full-parts" ? 0 : mode === "part-gap" ? 2 : 1,
+      gapAfterIndex: mode === "part-gap" ? 0 : undefined,
+    });
+    if (mode === "digest-mismatch") {
+      const object = recordings.objects.get(fixture.partKeys[0]);
+      object.body = Uint8Array.from(object.body);
+      object.body[0] ^= 0xff;
+    }
+    if (mode === "sealed-state") {
+      const state = {
+        ...fixture.state,
+        byteSize: 4 * 1024 * 1024,
+        totalParts: 1,
+        audioCoverage: "unverified",
+        sealedAt: new Date().toISOString(),
+      };
+      await recordings.put(fixture.stateKey, JSON.stringify(state), {
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: { sessionId: fixture.session.id, retentionUntil: fixture.session.retention_until },
+      });
+    }
+    const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+    await scheduleInterviewRecovery(env);
+    assert.equal(fixture.session.status, "in_progress");
+    assert.equal(fixture.session.recording_status, "uploading");
+    assert.equal(fixture.session.transcript_json, null);
+    assert.equal(fixture.session.evaluation_json, null);
+    assert.equal(fixture.session.completed_at, null);
+    assert.equal(database.artifacts.length, 0);
+    assert.equal(database.externalSyncs.size, 0);
+    assert.equal(database.auditEvents.filter((event) =>
+      event.session_id === fixture.session.id &&
+      event.event_type === "interrupted_recording_recovery_manual_attention").length, 1);
+    const writesAfterAttention = recordings.putCount;
+    await scheduleInterviewRecovery(env);
+    assert.equal(recordings.putCount, writesAfterAttention);
+    assert.equal(database.auditEvents.filter((event) =>
+      event.session_id === fixture.session.id &&
+      event.event_type === "interrupted_recording_recovery_manual_attention").length, 1);
+  });
+}
+
+test("interrupted v3 recovery converges after a lost manifest response and concurrent ticks", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const fixture = await addInterruptedV3Fixture(database, recordings, { index: 30, partCount: 1 });
+  const originalPut = recordings.put.bind(recordings);
+  let loseManifestResponse = true;
+  recordings.put = async (key, body, options) => {
+    const result = await originalPut(key, body, options);
+    if (key === fixture.manifestKey && loseManifestResponse) {
+      loseManifestResponse = false;
+      throw new Error("simulated response loss after commit");
+    }
+    return result;
+  };
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  await Promise.all([scheduleInterviewRecovery(env), scheduleInterviewRecovery(env)]);
+  assert.equal(fixture.session.recording_status, "stored");
+  assert.equal(database.artifacts.length, 1);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id && event.event_type === "interrupted_recording_recovered").length, 1);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === fixture.session.id &&
+    event.event_type === "interrupted_recording_recovery_manual_attention").length, 0);
+  assert.ok(recordings.objects.has(fixture.manifestKey));
+});
+
+test("an unsealed v3 upload without an explicit hold is never recovered as interrupted evidence", async () => {
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const fixture = await addInterruptedV3Fixture(database, recordings, { index: 31, partCount: 1 });
+  database.auditEvents = database.auditEvents.filter((event) =>
+    event.session_id !== fixture.session.id || event.event_type !== "candidate_requested_stop");
+  await scheduleInterviewRecovery({ ...workerEnv, DB: database, RECORDINGS: recordings });
+  assert.equal(fixture.session.recording_status, "uploading");
+  assert.equal(database.artifacts.length, 0);
+  assert.equal(recordings.objects.has(fixture.manifestKey), false);
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === fixture.session.id && event.event_type.startsWith("interrupted_")), false);
 });
 
 test("missing legacy v1 parts create one manual-attention marker and never mutate interview state", async () => {

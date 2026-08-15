@@ -81,6 +81,11 @@ const LEGACY_RECORDING_RECOVERY_CLAIM_EVENT = "legacy_recording_recovery_claimed
 const LEGACY_RECORDING_RECOVERED_EVENT = "legacy_recording_recovered";
 const LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT =
   "legacy_recording_recovery_manual_attention";
+const INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT =
+  "interrupted_v3_recording_recovery_claimed";
+const INTERRUPTED_V3_RECORDING_RECOVERED_EVENT = "interrupted_recording_recovered";
+const INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT =
+  "interrupted_recording_recovery_manual_attention";
 const LEGACY_RECORDING_RECOVERY_LEASE_MS = 4 * 60 * 1_000;
 const LEGACY_RECORDING_RECOVERY_EXPIRY_GRACE_MS = 30 * 60 * 1_000;
 const LEGACY_V1_MAX_RECORDING_BYTES = 90 * 1024 * 1024;
@@ -3224,6 +3229,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
       'completion_reason_invalid', 'time_limit_reached',
       'reasonable_accommodation_text_selected', 'recording_recovery_part_missing',
       'recording_recovery_manual_attention', 'legacy_recording_recovery_manual_attention',
+      'interrupted_recording_recovered', 'interrupted_recording_recovery_manual_attention',
       'device_session_replaced'
     ) ORDER BY created_at`)
     .bind(sessionId)
@@ -3326,6 +3332,7 @@ export type InterviewListItem = {
   driveTranscriptKind: string | null;
   driveIntegrityStatus: "verified" | "drift" | "unknown" | null;
   sourceTranscriptVerified: boolean;
+  completionHold: boolean;
 };
 
 export type InterviewListPage = {
@@ -3370,6 +3377,12 @@ export async function listInterviewSummaryPage(
   const select = `SELECT
     s.id, s.candidate_name, s.employment, s.preferred_location,
     s.status, s.recording_status, s.transcript_json, s.created_at, s.completed_at, s.retention_until,
+    EXISTS (
+      SELECT 1 FROM interview_audit_events AS hold
+      WHERE hold.session_id = s.id AND hold.event_type IN (
+        'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+      )
+    ) AS completion_hold,
     EXISTS (
       SELECT 1 FROM interview_audit_events AS ta
       WHERE ta.session_id = s.id
@@ -3432,6 +3445,7 @@ export async function listInterviewSummaryPage(
         ? (driveManifest.integrity as Record<string, unknown>).status as "verified" | "drift" | "unknown"
         : driveManifest ? "unknown" : null,
       sourceTranscriptVerified,
+      completionHold: Number(row.completion_hold ?? 0) === 1,
     };
   });
   if (options.audit !== false) {
@@ -3625,7 +3639,7 @@ type RecordingPartManifest = {
   audioCoverage: RecordingAudioCoverage;
   parts: Array<{ key: string; byteSize: number; sha256?: string }>;
   recovery?: {
-    mode: "legacy-v1-body-sha256";
+    mode: "legacy-v1-body-sha256" | "interrupted-v3-full-parts";
   };
 };
 
@@ -5429,6 +5443,681 @@ export async function recoverNextLegacyV1RecordingOrphan() {
     sessionId: target.id,
     byteSize: inspection.recording.state.byteSize,
     totalParts: inspection.recording.state.totalParts,
+  } as const;
+}
+
+type InterruptedV3RecordingTarget = {
+  id: string;
+  status: "in_progress";
+  recording_status: "uploading" | "failed";
+  expires_at: string;
+  retention_until: string;
+  created_at: string;
+  updated_at: string;
+  transcript_json: null;
+  evaluation_json: null;
+  summary: null;
+  completed_at: null;
+  draft_sha256: string;
+  draft_turn_count: number;
+  draft_updated_at: string;
+};
+
+type InterruptedV3VerifiedRecording = {
+  state: ProvisionalRecordingUploadState;
+  manifestJson: string;
+  objectKey: string;
+  byteSize: number;
+  totalParts: number;
+};
+
+type InterruptedV3Inspection =
+  | { state: "verified"; recording: InterruptedV3VerifiedRecording }
+  | { state: "manual_attention"; errorCode: string };
+
+function interruptedV3Attention(errorCode: string): InterruptedV3Inspection {
+  return { state: "manual_attention", errorCode };
+}
+
+function isExactUnsealedInterruptedV3State(
+  value: unknown,
+  target: InterruptedV3RecordingTarget,
+): value is ProvisionalRecordingUploadState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Partial<ProvisionalRecordingUploadState> & Record<string, unknown>;
+  if (!exactObjectKeys(state, [
+    "version", "sessionId", "uploadId", "contentType", "partSize", "byteSize",
+    "totalParts", "audioCoverage", "sealedAt", "retentionUntil", "createdAt",
+  ])) return false;
+  const createdAt = Date.parse(String(state.createdAt ?? ""));
+  const sessionCreatedAt = Date.parse(target.created_at);
+  const expiresAt = Date.parse(target.expires_at);
+  const contentType = typeof state.contentType === "string"
+    ? state.contentType.split(";")[0].toLowerCase()
+    : "";
+  return state.version === 3 &&
+    state.sessionId === target.id &&
+    typeof state.uploadId === "string" && /^[A-Za-z0-9_-]{16,80}$/.test(state.uploadId) &&
+    state.contentType === contentType &&
+    ["video/webm", "audio/webm", "video/mp4", "audio/mp4"].includes(contentType) &&
+    state.partSize === RECORDING_UPLOAD_PART_BYTES &&
+    state.byteSize === null && state.totalParts === null && state.audioCoverage === null &&
+    state.sealedAt === null && state.retentionUntil === target.retention_until &&
+    Number.isFinite(createdAt) && Number.isFinite(sessionCreatedAt) && Number.isFinite(expiresAt) &&
+    createdAt >= sessionCreatedAt && createdAt <= expiresAt;
+}
+
+async function findNextInterruptedV3Recording() {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const expiredBefore = new Date(
+    Date.now() - RECORDING_RECOVERY_EXPIRY_GRACE_MS,
+  ).toISOString();
+  return await db.prepare(`SELECT
+      s.id, s.status, s.recording_status, s.expires_at, s.retention_until,
+      s.created_at, s.updated_at, s.transcript_json, s.evaluation_json,
+      s.summary, s.completed_at, draft.transcript_sha256 AS draft_sha256,
+      draft.turn_count AS draft_turn_count, draft.updated_at AS draft_updated_at
+    FROM interview_sessions s
+    JOIN interview_transcript_drafts draft ON draft.session_id = s.id
+    WHERE s.status = 'in_progress'
+      AND s.recording_status IN ('uploading', 'failed')
+      AND s.expires_at <= ?
+      AND s.completed_at IS NULL
+      AND s.transcript_json IS NULL
+      AND s.evaluation_json IS NULL
+      AND s.summary IS NULL
+      AND draft.mode = 'voice'
+      AND draft.sealed_at IS NULL
+      AND draft.turn_count > 0
+      AND json_valid(draft.transcript_json)
+      AND EXISTS (
+        SELECT 1 FROM json_each(draft.transcript_json) turn
+        WHERE json_extract(turn.value, '$.speaker') = 'candidate'
+          AND length(trim(COALESCE(json_extract(turn.value, '$.text'), ''))) > 0
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id
+          AND hold.event_type IN (
+            'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+          )
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events consent
+        WHERE consent.session_id = s.id AND consent.event_type = 'consent_recorded'
+          AND json_valid(consent.detail_json)
+          AND json_extract(consent.detail_json, '$.interviewMode') = 'camera'
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events started
+        WHERE started.session_id = s.id AND started.event_type = 'interview_started'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = s.id AND artifact.kind = 'recording'
+      )
+      AND NOT EXISTS (SELECT 1 FROM interview_external_syncs sync WHERE sync.session_id = s.id)
+      AND NOT EXISTS (
+        SELECT 1 FROM recorded_interview_completions completion WHERE completion.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM recorded_answer_transcriptions answer WHERE answer.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_evaluation_claims evaluation_claim WHERE evaluation_claim.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_session_replacements replacement
+        WHERE replacement.source_session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = s.id
+          AND terminal.event_type IN (
+            '${INTERRUPTED_V3_RECORDING_RECOVERED_EVENT}',
+            '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+    ORDER BY s.updated_at ASC, s.id ASC
+    LIMIT 1`)
+    .bind(expiredBefore)
+    .first<InterruptedV3RecordingTarget>();
+}
+
+async function claimInterruptedV3Recording(target: InterruptedV3RecordingTarget) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const now = new Date();
+  const claimedAt = now.toISOString();
+  const staleBefore = new Date(now.getTime() - LEGACY_RECORDING_RECOVERY_LEASE_MS).toISOString();
+  const leaseExpiresAt = new Date(now.getTime() + LEGACY_RECORDING_RECOVERY_LEASE_MS).toISOString();
+  const claimId = crypto.randomUUID();
+  const result = await db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json, created_at
+    ) SELECT ?, ?, '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        JOIN interview_transcript_drafts draft ON draft.session_id = s.id
+        WHERE s.id = ?
+          AND s.status = 'in_progress'
+          AND s.recording_status IN ('uploading', 'failed')
+          AND s.updated_at = ?
+          AND s.completed_at IS NULL AND s.transcript_json IS NULL
+          AND s.evaluation_json IS NULL AND s.summary IS NULL
+          AND draft.mode = 'voice' AND draft.sealed_at IS NULL
+          AND draft.transcript_sha256 = ? AND draft.turn_count = ? AND draft.updated_at = ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = ?
+          AND terminal.event_type IN (
+            '${INTERRUPTED_V3_RECORDING_RECOVERED_EVENT}',
+            '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events active_claim
+        WHERE active_claim.session_id = ?
+          AND active_claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND active_claim.created_at > ?
+      )`)
+    .bind(
+      crypto.randomUUID(), target.id, JSON.stringify({ claimId, leaseExpiresAt }), claimedAt,
+      target.id, target.updated_at, target.draft_sha256, target.draft_turn_count,
+      target.draft_updated_at, target.id, target.id, staleBefore,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return null;
+  return { claimId, claimedAt, leaseExpiresAt };
+}
+
+async function interruptedV3ClaimIsCurrent(input: {
+  target: InterruptedV3RecordingTarget;
+  claimId: string;
+  claimedAt: string;
+  leaseExpiresAt: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const row = await db.prepare(`SELECT 1 AS current_claim
+    FROM interview_sessions s
+    JOIN interview_transcript_drafts draft ON draft.session_id = s.id
+    WHERE s.id = ? AND s.status = 'in_progress'
+      AND s.recording_status IN ('uploading', 'failed') AND s.updated_at = ?
+      AND s.completed_at IS NULL AND s.transcript_json IS NULL
+      AND s.evaluation_json IS NULL AND s.summary IS NULL
+      AND draft.mode = 'voice' AND draft.sealed_at IS NULL
+      AND draft.transcript_sha256 = ? AND draft.turn_count = ? AND draft.updated_at = ?
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = s.id
+          AND claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ? AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = s.id
+          AND newer_claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = s.id
+          AND terminal.event_type IN (
+            '${INTERRUPTED_V3_RECORDING_RECOVERED_EVENT}',
+            '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      ) LIMIT 1`)
+    .bind(
+      input.target.id, input.target.updated_at, input.target.draft_sha256,
+      input.target.draft_turn_count, input.target.draft_updated_at,
+      input.claimedAt, input.claimId, input.leaseExpiresAt,
+      new Date().toISOString(), input.claimedAt,
+    ).first<{ current_claim: number }>();
+  return Number(row?.current_claim ?? 0) === 1;
+}
+
+async function inspectInterruptedV3Recording(
+  bucket: R2Bucket,
+  target: InterruptedV3RecordingTarget,
+): Promise<InterruptedV3Inspection> {
+  const stateObject = await bucket.get(recordingUploadStateKey(target.id));
+  if (!stateObject) return interruptedV3Attention("INTERRUPTED_V3_UPLOAD_STATE_MISSING");
+  if (
+    stateObject.httpMetadata?.contentType !== "application/json" ||
+    !exactCustomMetadata(stateObject.customMetadata, {
+      sessionId: target.id,
+      retentionUntil: target.retention_until,
+    })
+  ) return interruptedV3Attention("INTERRUPTED_V3_UPLOAD_STATE_METADATA_INVALID");
+  let statePayload: unknown;
+  try {
+    const bytes = await readR2ObjectBytesBounded(stateObject, LEGACY_V1_STATE_MAX_BYTES);
+    statePayload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    return interruptedV3Attention("INTERRUPTED_V3_UPLOAD_STATE_INVALID");
+  }
+  if (!isExactUnsealedInterruptedV3State(statePayload, target)) {
+    return interruptedV3Attention("INTERRUPTED_V3_UPLOAD_STATE_INVALID");
+  }
+  const state = statePayload;
+  const parts: RecordingPartManifest["parts"] = [];
+  let sawGap = false;
+  for (let index = 0; index < MAX_PROVISIONAL_RECORDING_FULL_PARTS; index += 1) {
+    const key = recordingPartKey(target.id, index);
+    const firstHead = await bucket.head(key);
+    if (!firstHead) {
+      sawGap = true;
+      continue;
+    }
+    if (sawGap) return interruptedV3Attention("INTERRUPTED_V3_RECORDING_PART_SEQUENCE_INVALID");
+    const sha256 = firstHead.customMetadata?.sha256 ?? "";
+    const expectedMetadata = {
+      sessionId: target.id,
+      byteSize: String(RECORDING_UPLOAD_PART_BYTES),
+      sha256,
+      retentionUntil: target.retention_until,
+    };
+    if (
+      firstHead.size !== RECORDING_UPLOAD_PART_BYTES ||
+      firstHead.httpMetadata?.contentType !== "application/octet-stream" ||
+      !/^[a-f0-9]{64}$/.test(sha256) ||
+      !verifiedRecordingPartSha256(firstHead, sha256) ||
+      !exactCustomMetadata(firstHead.customMetadata, expectedMetadata)
+    ) return interruptedV3Attention("INTERRUPTED_V3_RECORDING_PART_METADATA_INVALID");
+    const part = await bucket.get(key);
+    if (
+      !part || part.etag !== firstHead.etag || part.size !== RECORDING_UPLOAD_PART_BYTES ||
+      part.httpMetadata?.contentType !== "application/octet-stream" ||
+      !exactCustomMetadata(part.customMetadata, expectedMetadata)
+    ) return interruptedV3Attention("INTERRUPTED_V3_RECORDING_PART_CHANGED");
+    let bytes: Uint8Array;
+    try {
+      bytes = await readR2ObjectBytesBounded(part, RECORDING_UPLOAD_PART_BYTES);
+    } catch {
+      return interruptedV3Attention("INTERRUPTED_V3_RECORDING_PART_BODY_INVALID");
+    }
+    const exact = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    if (bufferHex(await crypto.subtle.digest("SHA-256", exact)) !== sha256) {
+      return interruptedV3Attention("INTERRUPTED_V3_RECORDING_PART_DIGEST_INVALID");
+    }
+    const finalHead = await bucket.head(key);
+    if (
+      !finalHead || finalHead.etag !== firstHead.etag ||
+      finalHead.size !== RECORDING_UPLOAD_PART_BYTES ||
+      finalHead.httpMetadata?.contentType !== "application/octet-stream" ||
+      !verifiedRecordingPartSha256(finalHead, sha256) ||
+      !exactCustomMetadata(finalHead.customMetadata, expectedMetadata)
+    ) return interruptedV3Attention("INTERRUPTED_V3_RECORDING_PART_CHANGED");
+    parts.push({ key, byteSize: RECORDING_UPLOAD_PART_BYTES, sha256 });
+  }
+  if (parts.length === 0) return interruptedV3Attention("INTERRUPTED_V3_RECORDING_PART_MISSING");
+  const byteSize = parts.length * RECORDING_UPLOAD_PART_BYTES;
+  const manifest: RecordingPartManifest = {
+    version: 3,
+    contentType: state.contentType,
+    byteSize,
+    audioCoverage: "unverified",
+    parts,
+    recovery: { mode: "interrupted-v3-full-parts" },
+  };
+  return {
+    state: "verified",
+    recording: {
+      state,
+      manifestJson: JSON.stringify(manifest),
+      objectKey: `interviews/${target.id}/recording.interrupted-v3.manifest.json`,
+      byteSize,
+      totalParts: parts.length,
+    },
+  };
+}
+
+async function createInterruptedV3Manifest(input: {
+  bucket: R2Bucket;
+  target: InterruptedV3RecordingTarget;
+  recording: InterruptedV3VerifiedRecording;
+}) {
+  const expectedMetadata = {
+    sessionId: input.target.id,
+    retentionUntil: input.target.retention_until,
+    audioCoverage: "unverified",
+    recordingContentType: input.recording.state.contentType,
+    recoveryMode: "interrupted-v3-full-parts",
+  };
+  let created: R2Object | null = null;
+  try {
+    created = await input.bucket.put(input.recording.objectKey, input.recording.manifestJson, {
+      onlyIf: { etagDoesNotMatch: "*" },
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: expectedMetadata,
+    });
+  } catch {
+    // A lost R2 response is ambiguous. Read the deterministic key and accept
+    // it only if every byte and metadata field proves this exact manifest.
+  }
+  const existing = await input.bucket.get(input.recording.objectKey);
+  const expectedBytes = new TextEncoder().encode(input.recording.manifestJson).byteLength;
+  if (
+    !existing || existing.size !== expectedBytes ||
+    (created && created.etag !== existing.etag) ||
+    existing.httpMetadata?.contentType !== "application/json" ||
+    !exactCustomMetadata(existing.customMetadata, expectedMetadata)
+  ) throw new Error("INTERRUPTED_V3_RECOVERY_MANIFEST_CONFLICT");
+  const bytes = await readR2ObjectBytesBounded(existing, LEGACY_V1_STATE_MAX_BYTES * 8);
+  if (new TextDecoder("utf-8", { fatal: true }).decode(bytes) !== input.recording.manifestJson) {
+    throw new Error("INTERRUPTED_V3_RECOVERY_MANIFEST_CONFLICT");
+  }
+  return { etag: existing.etag };
+}
+
+async function markInterruptedV3ManualAttention(input: {
+  target: InterruptedV3RecordingTarget;
+  claimId: string;
+  claimedAt: string;
+  leaseExpiresAt: string;
+  errorCode: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  if (!await interruptedV3ClaimIsCurrent(input)) return false;
+  const createdAt = new Date().toISOString();
+  const eventId = crypto.randomUUID();
+  const result = await db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json, created_at
+    ) SELECT ?, ?, '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = ?
+          AND claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ? AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = ?
+          AND newer_claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = ?
+          AND terminal.event_type IN (
+            '${INTERRUPTED_V3_RECORDING_RECOVERED_EVENT}',
+            '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )`)
+    .bind(
+      eventId, input.target.id, JSON.stringify({ errorCode: input.errorCode.slice(0, 120) }),
+      createdAt, input.target.id, input.claimedAt, input.claimId, input.leaseExpiresAt,
+      createdAt, input.target.id, input.claimedAt, input.target.id,
+    ).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return false;
+  const readback = await db.prepare(`SELECT 1 AS present FROM interview_audit_events
+    WHERE id = ? AND session_id = ?
+      AND event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}' LIMIT 1`)
+    .bind(eventId, input.target.id).first<{ present: number }>();
+  return Number(readback?.present ?? 0) === 1;
+}
+
+async function finalizeInterruptedV3Recording(input: {
+  target: InterruptedV3RecordingTarget;
+  recording: InterruptedV3VerifiedRecording;
+  manifestEtag: string | undefined;
+  claimId: string;
+  claimedAt: string;
+  leaseExpiresAt: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  const storedAt = new Date().toISOString();
+  const auditDetail = JSON.stringify({
+    sourceVersion: 3,
+    byteSize: input.recording.byteSize,
+    contentType: input.recording.state.contentType,
+    audioCoverage: "unverified",
+    partCount: input.recording.totalParts,
+    verificationMode: "interrupted-v3-full-parts",
+    tailCompleteness: "last_partial_not_received",
+  });
+  const results = await db.batch([
+    db.prepare(`UPDATE interview_sessions SET recording_status = 'stored', updated_at = ?
+      WHERE id = ? AND status = 'in_progress'
+        AND recording_status IN ('uploading', 'failed') AND updated_at = ?
+        AND expires_at = ? AND retention_until = ? AND created_at = ?
+        AND completed_at IS NULL AND transcript_json IS NULL
+        AND evaluation_json IS NULL AND summary IS NULL
+        AND EXISTS (
+          SELECT 1 FROM interview_transcript_drafts draft
+          WHERE draft.session_id = interview_sessions.id AND draft.mode = 'voice'
+            AND draft.sealed_at IS NULL AND draft.transcript_sha256 = ?
+            AND draft.turn_count = ? AND draft.updated_at = ?
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events hold
+          WHERE hold.session_id = interview_sessions.id
+            AND hold.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            )
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events consent
+          WHERE consent.session_id = interview_sessions.id
+            AND consent.event_type = 'consent_recorded' AND json_valid(consent.detail_json)
+            AND json_extract(consent.detail_json, '$.interviewMode') = 'camera'
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events started
+          WHERE started.session_id = interview_sessions.id
+            AND started.event_type = 'interview_started'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_artifacts artifact
+          WHERE artifact.session_id = interview_sessions.id AND artifact.kind = 'recording'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_external_syncs sync WHERE sync.session_id = interview_sessions.id
+        )
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events claim
+          WHERE claim.session_id = interview_sessions.id
+            AND claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+            AND claim.created_at = ? AND json_valid(claim.detail_json)
+            AND json_extract(claim.detail_json, '$.claimId') = ?
+            AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+            AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events newer_claim
+          WHERE newer_claim.session_id = interview_sessions.id
+            AND newer_claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+            AND newer_claim.created_at > ?
+        )`)
+      .bind(
+        storedAt, input.target.id, input.target.updated_at, input.target.expires_at,
+        input.target.retention_until, input.target.created_at, input.target.draft_sha256,
+        input.target.draft_turn_count, input.target.draft_updated_at, input.claimedAt,
+        input.claimId, input.leaseExpiresAt, storedAt, input.claimedAt,
+      ),
+    db.prepare(`INSERT INTO interview_artifacts (
+        id, session_id, kind, object_key, content_type, byte_size, etag,
+        retention_until, created_at
+      ) SELECT ?, ?, 'recording', ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ? AND s.status = 'in_progress' AND s.recording_status = 'stored'
+          AND s.updated_at = ? AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL AND s.evaluation_json IS NULL AND s.summary IS NULL
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = ?
+          AND claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ? AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = ?
+          AND newer_claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = ? AND artifact.kind = 'recording'
+      )`)
+      .bind(
+        crypto.randomUUID(), input.target.id, input.recording.objectKey,
+        input.recording.state.contentType, input.recording.byteSize,
+        input.manifestEtag ?? null, input.target.retention_until, storedAt,
+        input.target.id, storedAt, input.target.id, input.claimedAt, input.claimId,
+        input.leaseExpiresAt, storedAt, input.target.id, input.claimedAt, input.target.id,
+      ),
+    db.prepare(`INSERT INTO interview_audit_events (
+        id, session_id, event_type, actor_type, detail_json, created_at
+      ) SELECT ?, ?, '${INTERRUPTED_V3_RECORDING_RECOVERED_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        WHERE s.id = ? AND s.status = 'in_progress' AND s.recording_status = 'stored'
+          AND s.updated_at = ? AND s.completed_at IS NULL
+          AND s.transcript_json IS NULL AND s.evaluation_json IS NULL AND s.summary IS NULL
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = ? AND artifact.kind = 'recording'
+          AND artifact.object_key = ? AND artifact.content_type = ?
+          AND artifact.byte_size = ? AND artifact.retention_until = ?
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events claim
+        WHERE claim.session_id = ?
+          AND claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND claim.created_at = ? AND json_valid(claim.detail_json)
+          AND json_extract(claim.detail_json, '$.claimId') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') = ?
+          AND json_extract(claim.detail_json, '$.leaseExpiresAt') > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events newer_claim
+        WHERE newer_claim.session_id = ?
+          AND newer_claim.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_EVENT}'
+          AND newer_claim.created_at > ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events recovered
+        WHERE recovered.session_id = ?
+          AND recovered.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERED_EVENT}'
+      )`)
+      .bind(
+        crypto.randomUUID(), input.target.id, auditDetail, storedAt,
+        input.target.id, storedAt, input.target.id, input.recording.objectKey,
+        input.recording.state.contentType, input.recording.byteSize,
+        input.target.retention_until, input.target.id, input.claimedAt, input.claimId,
+        input.leaseExpiresAt, storedAt, input.target.id, input.claimedAt, input.target.id,
+      ),
+  ]);
+  if (results.some((result) => Number(result.meta?.changes ?? 0) !== 1)) {
+    throw new Error("INTERRUPTED_V3_RECORDING_RECOVERY_CLAIM_LOST");
+  }
+  const readback = await db.prepare(`SELECT
+      s.status, s.recording_status, s.transcript_json, s.evaluation_json,
+      s.summary, s.completed_at, artifact.object_key, artifact.content_type,
+      artifact.byte_size, artifact.retention_until, draft.transcript_sha256 AS draft_sha256,
+      draft.turn_count AS draft_turn_count, draft.sealed_at AS draft_sealed_at,
+      EXISTS (
+        SELECT 1 FROM interview_audit_events recovered
+        WHERE recovered.session_id = s.id
+          AND recovered.event_type = '${INTERRUPTED_V3_RECORDING_RECOVERED_EVENT}'
+      ) AS recovery_audit_present
+    FROM interview_sessions s
+    JOIN interview_transcript_drafts draft ON draft.session_id = s.id
+    LEFT JOIN interview_artifacts artifact
+      ON artifact.session_id = s.id AND artifact.kind = 'recording'
+    WHERE s.id = ? LIMIT 1`)
+    .bind(input.target.id)
+    .first<{
+      status: string; recording_status: string; transcript_json: string | null;
+      evaluation_json: string | null; summary: string | null; completed_at: string | null;
+      object_key: string | null; content_type: string | null; byte_size: number | null;
+      retention_until: string | null; draft_sha256: string; draft_turn_count: number;
+      draft_sealed_at: string | null; recovery_audit_present: number;
+    }>();
+  if (
+    readback?.status !== "in_progress" || readback.recording_status !== "stored" ||
+    readback.transcript_json !== null || readback.evaluation_json !== null ||
+    readback.summary !== null || readback.completed_at !== null ||
+    readback.object_key !== input.recording.objectKey ||
+    readback.content_type !== input.recording.state.contentType ||
+    readback.byte_size !== input.recording.byteSize ||
+    readback.retention_until !== input.target.retention_until ||
+    readback.draft_sha256 !== input.target.draft_sha256 ||
+    readback.draft_turn_count !== input.target.draft_turn_count ||
+    readback.draft_sealed_at !== null || Number(readback.recovery_audit_present) !== 1
+  ) throw new Error("INTERRUPTED_V3_RECORDING_RECOVERY_READBACK_MISMATCH");
+}
+
+/**
+ * Recovers only the immutable full 4 MiB prefix of an expired, explicitly held
+ * Version 3 recording. The browser-only tail is never guessed or padded. The
+ * result remains an interrupted technical record: session completion,
+ * transcript sealing, evaluation and Drive archival are intentionally blocked.
+ */
+export async function recoverNextInterruptedV3Recording() {
+  const db = database();
+  const bucket = bindings().RECORDINGS;
+  if (!db || !bucket) throw new Error("INTERVIEW_RECORDING_STORAGE_UNAVAILABLE");
+  const target = await findNextInterruptedV3Recording();
+  if (!target) return { state: "none" } as const;
+  const claim = await claimInterruptedV3Recording(target);
+  if (!claim) return { state: "waiting", sessionId: target.id } as const;
+  let inspection: InterruptedV3Inspection;
+  try {
+    inspection = await inspectInterruptedV3Recording(bucket, target);
+  } catch {
+    return {
+      state: "waiting", sessionId: target.id,
+      errorCode: "INTERRUPTED_V3_RECORDING_STORAGE_RETRY",
+    } as const;
+  }
+  if (inspection.state === "manual_attention") {
+    const marked = await markInterruptedV3ManualAttention({ target, ...claim, errorCode: inspection.errorCode });
+    return marked
+      ? { state: "manual_attention", sessionId: target.id, errorCode: inspection.errorCode } as const
+      : { state: "waiting", sessionId: target.id } as const;
+  }
+  if (!await interruptedV3ClaimIsCurrent({ target, ...claim })) {
+    return { state: "waiting", sessionId: target.id } as const;
+  }
+  let manifest: { etag: string | undefined };
+  try {
+    manifest = await createInterruptedV3Manifest({ bucket, target, recording: inspection.recording });
+  } catch (error) {
+    const errorCode = error instanceof Error ? error.message : "INTERRUPTED_V3_RECORDING_STORAGE_RETRY";
+    if (errorCode !== "INTERRUPTED_V3_RECOVERY_MANIFEST_CONFLICT") {
+      return {
+        state: "waiting", sessionId: target.id,
+        errorCode: "INTERRUPTED_V3_RECORDING_STORAGE_RETRY",
+      } as const;
+    }
+    const marked = await markInterruptedV3ManualAttention({ target, ...claim, errorCode });
+    return marked
+      ? { state: "manual_attention", sessionId: target.id, errorCode } as const
+      : { state: "waiting", sessionId: target.id } as const;
+  }
+  await finalizeInterruptedV3Recording({
+    target, recording: inspection.recording, manifestEtag: manifest.etag, ...claim,
+  });
+  return {
+    state: "stored", sessionId: target.id, byteSize: inspection.recording.byteSize,
+    totalParts: inspection.recording.totalParts, partial: true,
   } as const;
 }
 

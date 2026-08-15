@@ -1,6 +1,7 @@
 import { recoverNextStaleInterviewEvaluation } from "@/lib/interview-evaluation-recovery";
 import {
   findNextInterviewDriveRecoverySession,
+  recoverNextInterruptedV3Recording,
   recoverNextLegacyV1RecordingOrphan,
   recoverNextSealedResumableInterviewRecording,
 } from "@/lib/interview-persistence";
@@ -81,6 +82,20 @@ async function recoverRecording(): Promise<RecoveryStageState> {
     legacyState = "attention";
   }
 
+  let interruptedState: RecoveryStageState;
+  try {
+    const interrupted = await recoverNextInterruptedV3Recording();
+    interruptedState = interrupted.state === "none"
+      ? "idle"
+      : interrupted.state === "stored"
+        ? "advanced"
+        : interrupted.state === "waiting"
+          ? "waiting"
+          : "attention";
+  } catch {
+    interruptedState = "attention";
+  }
+
   // A damaged legacy object must not starve the normal sealed-upload queue,
   // and a repeatedly waiting sealed upload must not starve the legacy queue.
   // Each helper remains independently bounded to at most one successful store.
@@ -98,9 +113,9 @@ async function recoverRecording(): Promise<RecoveryStageState> {
     sealedState = "attention";
   }
 
-  if (legacyState === "advanced" || sealedState === "advanced") return "advanced";
-  if (legacyState === "attention" || sealedState === "attention") return "attention";
-  if (legacyState === "waiting" || sealedState === "waiting") return "waiting";
+  if ([legacyState, interruptedState, sealedState].includes("advanced")) return "advanced";
+  if ([legacyState, interruptedState, sealedState].includes("attention")) return "attention";
+  if ([legacyState, interruptedState, sealedState].includes("waiting")) return "waiting";
   return "idle";
 }
 

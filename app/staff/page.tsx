@@ -40,6 +40,14 @@ type ReviewRecord = {
     detail: Record<string, unknown>;
     createdAt: string;
   }>;
+  transcriptDraft: {
+    mode: "voice" | "text";
+    transcript: TranscriptTurn[];
+    turnCount: number;
+    sealed: boolean;
+    sealedAt: string | null;
+    updatedAt: string;
+  } | null;
   driveSync: {
     status: "pending" | "running" | "completed" | "failed";
     folderUrl: string | null;
@@ -73,6 +81,7 @@ type InterviewListItem = {
   driveTranscriptAvailable: boolean | null;
   driveTranscriptKind: string | null;
   sourceTranscriptVerified: boolean;
+  completionHold: boolean;
 };
 
 type ArchiveHealth = {
@@ -96,6 +105,8 @@ const technicalEventLabels: Record<string, string> = {
   recording_recovery_part_missing: "録画パート不足——応募者の再開または人手確認待ち",
   recording_recovery_manual_attention: "録画復旧を自動終了し人手確認へ移行",
   legacy_recording_recovery_manual_attention: "旧式録画の不足パートを検出——人手確認が必要",
+  interrupted_recording_recovered: "中断時点までに受領済みの録画パートを復旧——末尾欠落の可能性あり",
+  interrupted_recording_recovery_manual_attention: "中断録画を自動復旧できず人手確認が必要",
   device_session_replaced: "端末中断のため元記録を保全し、文字入力の新受付へ継続",
 };
 
@@ -174,6 +185,7 @@ function driveArchiveClass(item: InterviewListItem) {
 }
 
 function interviewInboxStatusLabel(item: InterviewListItem) {
+  if (item.completionHold) return "中断・人手確認";
   if (item.status !== "completed") return interviewStatusLabels[item.status] ?? item.status;
   return isVerifiedInterviewArchive(item) ? "保存確認済み" : "保存未完了";
 }
@@ -736,6 +748,11 @@ export default function StaffReviewPage() {
           </section>
 
           {review.technicalEvents.length > 0 && <div className="staff-message"><strong>進行・技術フラグあり——合否判断前に再確認してください</strong><ul>{review.technicalEvents.map((event, index) => <li key={`${event.type}-${event.createdAt}-${index}`}>{technicalEventLabels[event.type] ?? event.type}</li>)}</ul><p>参加方法や技術的な事象は、応募者の不利益な評価に使用しません。</p></div>}
+          {review.transcriptDraft && !review.transcriptDraft.sealed && <section className="staff-panel">
+            <div className="panel-title"><p>INTERRUPTED DRAFT</p><h2>中断時点までの未確定文字起こし</h2></div>
+            <div className="validation-box"><strong>面接完了・録画照合・評価の根拠には使用できません</strong><p>サーバーが中断前に受領した{review.transcriptDraft.turnCount}ターンの下書きです。末尾欠落や誤認識の可能性があるため、復旧録画と人が照合し、再面接の要否を判断してください。</p></div>
+            <ol className="transcript-list">{review.transcriptDraft.transcript.map((turn) => <li key={turn.id}><strong>{turn.speaker === "candidate" ? "応募者" : "AI面接官"}</strong><span>{turn.text}</span></li>)}</ol>
+          </section>}
           {review.evaluation && !legacyRecordedFallbackSelected && <p className="guardrail-copy"><strong>回答評価は応募者の回答記録を基にした補助情報です。</strong> 合否判断前に、{textInterviewSelected ? "入力された回答" : "録画の実際の発言"}と根拠引用を採用担当者が照合してください。</p>}
           {recordedAutomaticEvaluation && <p className="guardrail-copy"><strong>録画式の自動分析は、自動文字起こし由来・録画未照合です。人手確認が必須で、自動合否は行いません。</strong> 採用担当者が録画の実際の発言と根拠引用を照合し、技術不具合や録画・音声品質を応募者の不利益に扱わないでください。</p>}
           {legacyRecordedFallbackSelected && <p className="guardrail-copy"><strong>録画式は自動評価していません。人手による録画照合が必須です。</strong> 自動文字起こしは回答整理の補助情報であり、録画の実際の発言との一致は未照合です。技術不具合や録画・音声品質を応募者の不利益に扱わないでください。</p>}
