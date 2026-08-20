@@ -12,11 +12,11 @@ function driveRecoveryQuery(source) {
 }
 
 function technicalEvidenceDriveQuery(source) {
-  const start = source.indexOf("export async function findNextInterviewTechnicalEvidenceDriveSession(");
-  const end = source.indexOf("export async function getInterviewRecordingChunk", start);
+  const start = source.indexOf("export async function findInterviewTechnicalEvidenceDriveSessions(");
+  const end = source.indexOf("export async function findNextInterviewTechnicalEvidenceDriveSession", start);
   assert.ok(start >= 0 && end > start, "the technical-evidence selector must remain discoverable");
   const match = source.slice(start, end).match(
-    /const row = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(excludeSessionId, excludeSessionId, failedBefore, pendingBefore, integrityBefore\)/,
+    /const rows = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(failedBefore, pendingBefore, integrityBefore, boundedLimit\)/,
   );
   assert.ok(match, "the exact production technical-evidence query must remain discoverable");
   return match[1];
@@ -111,7 +111,7 @@ test("global Drive recovery skips more than 25 invalid rows without starving val
 test("technical evidence runs before routine completed-archive integrity maintenance", async () => {
   const background = await readFile(new URL("../lib/interview-background-recovery.ts", import.meta.url), "utf8");
   const active = background.indexOf("includeIntegrityRecheck: false");
-  const technical = background.indexOf("findNextInterviewTechnicalEvidenceDriveSession()", active);
+  const technical = background.indexOf("findInterviewTechnicalEvidenceDriveSessions(technicalLimit)", active);
   const maintenance = background.indexOf("includeIntegrityRecheck: true", technical);
   assert.ok(active >= 0 && technical > active && maintenance > technical,
     "active archives, technical evidence, and routine integrity maintenance must stay in that order");
@@ -190,21 +190,12 @@ test("technical evidence recovery selects only stored empty-ASR voice drafts wit
   insert("TD-TECH-NORECORD", { noRecording: true });
   insert("TD-TECH-SEALED-01", { sealed: true });
 
-  const selected = database.prepare(technicalEvidenceDriveQuery(source)).get(
-    null,
-    null,
+  const selected = database.prepare(technicalEvidenceDriveQuery(source)).all(
     "2026-08-20T00:00:00Z",
     "2026-08-20T00:00:00Z",
     "2026-08-20T00:00:00Z",
+    5,
   );
-  assert.equal(selected.id, "TD-TECH-VALID-01");
-  const next = database.prepare(technicalEvidenceDriveQuery(source)).get(
-    selected.id,
-    selected.id,
-    "2026-08-20T00:00:00Z",
-    "2026-08-20T00:00:00Z",
-    "2026-08-20T00:00:00Z",
-  );
-  assert.equal(next.id, "TD-TECH-VALID-02");
+  assert.deepEqual(selected.map((row) => row.id), ["TD-TECH-VALID-01", "TD-TECH-VALID-02"]);
   database.close();
 });

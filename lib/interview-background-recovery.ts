@@ -1,7 +1,7 @@
 import { recoverNextStaleInterviewEvaluation } from "@/lib/interview-evaluation-recovery";
 import {
+  findInterviewTechnicalEvidenceDriveSessions,
   findNextInterviewDriveRecoverySession,
-  findNextInterviewTechnicalEvidenceDriveSession,
   recoverNextInterruptedV3Recording,
   recoverNextLegacyV1RecordingOrphan,
   recoverNextSealedResumableInterviewRecording,
@@ -154,20 +154,16 @@ async function recoverEvaluation(): Promise<RecoveryStageState> {
 
 async function recoverDriveArchive(): Promise<RecoveryStageState> {
   try {
-    // Advance one normal archive and up to two technical-evidence archives
+    // Advance one normal archive and a bounded technical-evidence batch
     // sequentially. This preserves the live candidate path while preventing
     // two durable incident recordings from waiting behind one another for
     // hours. Each session still owns its existing D1 claim and <=4 MiB step.
     const normalSessionId = await findNextInterviewDriveRecoverySession({
       includeIntegrityRecheck: false,
     });
-    const firstTechnicalSessionId = await findNextInterviewTechnicalEvidenceDriveSession();
-    const secondTechnicalSessionId = firstTechnicalSessionId
-      ? await findNextInterviewTechnicalEvidenceDriveSession({
-          excludeSessionId: firstTechnicalSessionId,
-        })
-      : null;
-    const sessionIds = [normalSessionId, firstTechnicalSessionId, secondTechnicalSessionId]
+    const technicalLimit = normalSessionId ? 4 : 5;
+    const technicalSessionIds = await findInterviewTechnicalEvidenceDriveSessions(technicalLimit);
+    const sessionIds = [normalSessionId, ...technicalSessionIds]
       .filter((value): value is string => typeof value === "string");
     if (sessionIds.length === 0) {
       const maintenanceSessionId = await findNextInterviewDriveRecoverySession({
@@ -191,8 +187,9 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
 
 /**
  * Advances a bounded amount of global work per scheduled event. At most one
- * paid answer transcription, one normal Drive chunk, and up to two technical
- * evidence Drive chunks (each <=4 MiB) are attempted. Every
+ * paid answer transcription and at most five Drive chunks (each <=4 MiB) are
+ * attempted. A live archive occupies one slot; technical evidence uses the
+ * remaining four, or all five when there is no live archive. Every
  * mutable stage retains its existing D1 compare-and-set/lease fence, so an
  * overlapping cron, candidate retry, or staff tab cannot duplicate paid work
  * or write the same Drive offset concurrently.
