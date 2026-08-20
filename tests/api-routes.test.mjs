@@ -2091,7 +2091,7 @@ class FakeD1Statement {
       };
     }
     if (this.sql.startsWith("SELECT s.id, s.transcript_json, EXISTS")) {
-      const [failedBefore, pendingBefore, integrityBefore] = this.values;
+      const [failedBefore, pendingBefore, includeIntegrityRecheck, integrityBefore] = this.values;
       return {
         results: [...this.database.sessions.values()]
           .filter((session) => {
@@ -2124,8 +2124,10 @@ class FakeD1Statement {
             }
             return manifest.transcriptAvailable !== true || manifest.transcriptKind !== "actual_transcript" ||
               (session.recording_status === "stored" && manifest.recordingIncluded !== true) ||
-              typeof manifest.integrity?.checkedAt !== "string" ||
-              manifest.integrity.checkedAt <= integrityBefore;
+              (Number(includeIntegrityRecheck) === 1 && (
+                typeof manifest.integrity?.checkedAt !== "string" ||
+                manifest.integrity.checkedAt <= integrityBefore
+              ));
           })
           .sort((left, right) => {
             const leftSync = this.database.externalSyncs.get(left.id);

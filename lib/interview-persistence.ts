@@ -2349,7 +2349,9 @@ const BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS = 24 * 60 * 60 * 1_000;
  * never logged by the caller. `stepInterviewToGoogleDrive` supplies the actual
  * external-sync claim and upload-step lease CAS fences.
  */
-export async function findNextInterviewDriveRecoverySession() {
+export async function findNextInterviewDriveRecoverySession(options: {
+  includeIntegrityRecheck?: boolean;
+} = {}) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
@@ -2357,6 +2359,7 @@ export async function findNextInterviewDriveRecoverySession() {
   const failedBefore = new Date(now - BACKGROUND_DRIVE_FAILED_RETRY_MS).toISOString();
   const pendingBefore = new Date(now - BACKGROUND_DRIVE_PENDING_RETRY_MS).toISOString();
   const integrityBefore = new Date(now - BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS).toISOString();
+  const includeIntegrityRecheck = options.includeIntegrityRecheck === false ? 0 : 1;
   const candidates = await db.prepare(`SELECT
       s.id, s.transcript_json,
       EXISTS (
@@ -2439,8 +2442,10 @@ export async function findNextInterviewDriveRecoverySession() {
           OR COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') != 'actual_transcript'
           OR (s.recording_status = 'stored'
             AND COALESCE(json_extract(d.manifest_json, '$.recordingIncluded'), 0) != 1)
-          OR json_extract(d.manifest_json, '$.integrity.checkedAt') IS NULL
-          OR json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?
+          OR (? = 1 AND (
+            json_extract(d.manifest_json, '$.integrity.checkedAt') IS NULL
+            OR json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?
+          ))
         ))
       )
     ORDER BY CASE
@@ -2458,7 +2463,7 @@ export async function findNextInterviewDriveRecoverySession() {
       COALESCE(d.updated_at, s.completed_at, s.created_at) ASC,
       s.id ASC
     LIMIT 25`)
-    .bind(failedBefore, pendingBefore, integrityBefore)
+    .bind(failedBefore, pendingBefore, includeIntegrityRecheck, integrityBefore)
     .all<{ id: string; transcript_json: string; candidate_transcription_failed: number }>();
 
   for (const candidate of candidates.results ?? []) {

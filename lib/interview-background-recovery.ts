@@ -154,8 +154,13 @@ async function recoverEvaluation(): Promise<RecoveryStageState> {
 
 async function recoverDriveArchive(): Promise<RecoveryStageState> {
   try {
-    const sessionId = await findNextInterviewDriveRecoverySession() ??
-      await findNextInterviewTechnicalEvidenceDriveSession();
+    // New/active archives remain first. A recoverable technical hold must not
+    // sit behind the routine 24-hour integrity scan of every old completed
+    // archive, so only that maintenance tier is deferred until last.
+    const sessionId = await findNextInterviewDriveRecoverySession({
+      includeIntegrityRecheck: false,
+    }) ?? await findNextInterviewTechnicalEvidenceDriveSession() ??
+      await findNextInterviewDriveRecoverySession({ includeIntegrityRecheck: true });
     if (!sessionId) return "idle";
     const result = await stepInterviewToGoogleDrive(sessionId);
     if (result.status !== "completed") return "waiting";

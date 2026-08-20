@@ -5,7 +5,7 @@ import test from "node:test";
 
 function driveRecoveryQuery(source) {
   const match = source.match(
-    /const candidates = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(failedBefore, pendingBefore, integrityBefore\)/,
+    /const candidates = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(failedBefore, pendingBefore, includeIntegrityRecheck, integrityBefore\)/,
   );
   assert.ok(match, "the exact production Drive recovery query must remain discoverable");
   return match[1];
@@ -99,12 +99,22 @@ test("global Drive recovery skips more than 25 invalid rows without starving val
   const rows = database.prepare(driveRecoveryQuery(source)).all(
     "2026-08-12T00:00:00.000Z",
     "2026-08-12T00:05:00.000Z",
+    1,
     "2026-08-11T00:00:00.000Z",
   );
   assert.deepEqual(rows.map((row) => row.id), ["TD-VALID-0001", "TD-RECOVERED-01"]);
   assert.equal(rows.some((row) => row.id.startsWith("TD-BAD-")), false);
   assert.equal(rows.some((row) => row.id === "TD-GAP-000001"), false);
   database.close();
+});
+
+test("technical evidence runs before routine completed-archive integrity maintenance", async () => {
+  const background = await readFile(new URL("../lib/interview-background-recovery.ts", import.meta.url), "utf8");
+  const active = background.indexOf("includeIntegrityRecheck: false");
+  const technical = background.indexOf("findNextInterviewTechnicalEvidenceDriveSession()", active);
+  const maintenance = background.indexOf("includeIntegrityRecheck: true", technical);
+  assert.ok(active >= 0 && technical > active && maintenance > technical,
+    "active archives, technical evidence, and routine integrity maintenance must stay in that order");
 });
 
 test("technical evidence recovery selects only stored empty-ASR voice drafts without harmful holds", async () => {
