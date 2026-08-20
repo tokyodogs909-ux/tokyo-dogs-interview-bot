@@ -60,8 +60,8 @@ test("a completed transcription cannot close a different or unidentified speech 
   assert.equal(realtimeTranscriptIntegrityReady(state), false);
 });
 
-test("transcription failure is sticky even after every known lifecycle closes", () => {
-  const state = sequence([
+test("a failed transcription blocks finalization until an explicit repeated answer succeeds", () => {
+  let state = sequence([
     { type: "input_audio_buffer.committed", item_id: "candidate-gap" },
     { type: "conversation.item.input_audio_transcription.failed", item_id: "candidate-gap" },
     { type: "response.created", response: { id: "resp-after-gap" } },
@@ -69,12 +69,19 @@ test("transcription failure is sticky even after every known lifecycle closes", 
   ]);
   assert.deepEqual(state.pendingCandidateItemIds, []);
   assert.deepEqual(state.pendingResponseIds, []);
-  assert.equal(realtimeTranscriptIntegrityBlocker(state), "transcription_failed");
+  assert.equal(realtimeTranscriptIntegrityBlocker(state), "transcription_repair_required");
+
+  state = reduceRealtimeTranscriptIntegrity(state, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "candidate-repeat",
+    transcript: "先ほどの回答をもう一度お伝えします。",
+  });
+  assert.equal(realtimeTranscriptIntegrityReady(state), true);
 });
 
-test("an empty completed transcription is a sticky lost turn, not a lifecycle close", () => {
+test("an empty completed transcription requires a repeat and a substantive repeat repairs it", () => {
   for (const transcript of ["", "   ", undefined]) {
-    const state = sequence([
+    let state = sequence([
       { type: "input_audio_buffer.speech_started", item_id: "candidate-empty" },
       { type: "input_audio_buffer.speech_stopped", item_id: "candidate-empty" },
       {
@@ -86,10 +93,38 @@ test("an empty completed transcription is a sticky lost turn, not a lifecycle cl
       { type: "response.done", response: { id: "resp-after-empty" } },
     ]);
     assert.deepEqual(state.pendingCandidateItemIds, []);
-    assert.equal(state.transcriptionFailed, true);
-    assert.equal(realtimeTranscriptIntegrityBlocker(state), "transcription_failed");
+    assert.equal(state.transcriptionFailed, false);
+    assert.equal(state.transcriptionRepairRequired, true);
+    assert.equal(realtimeTranscriptIntegrityBlocker(state), "transcription_repair_required");
     assert.equal(realtimeTranscriptIntegrityReady(state), false);
+
+    state = reduceRealtimeTranscriptIntegrity(state, {
+      type: "conversation.item.input_audio_transcription.completed",
+      item_id: "candidate-repeat",
+      transcript: "繰り返した回答です。",
+    });
+    assert.equal(realtimeTranscriptIntegrityReady(state), true);
   }
+});
+
+test("an unidentified transcription completion remains permanently fail closed", () => {
+  const state = sequence([
+    { type: "input_audio_buffer.speech_started" },
+    { type: "conversation.item.input_audio_transcription.completed", transcript: "回答です。" },
+  ]);
+  assert.equal(state.transcriptionFailed, true);
+  assert.equal(realtimeTranscriptIntegrityBlocker(state), "transcription_failed");
+});
+
+test("a candidate typed replacement can explicitly repair one pending transcription gap", () => {
+  let state = sequence([
+    { type: "input_audio_buffer.speech_started", item_id: "candidate-gap" },
+    { type: "input_audio_buffer.speech_stopped", item_id: "candidate-gap" },
+    { type: "conversation.item.input_audio_transcription.completed", item_id: "candidate-gap", transcript: "" },
+  ]);
+  assert.equal(realtimeTranscriptIntegrityBlocker(state), "transcription_repair_required");
+  state = reduceRealtimeTranscriptIntegrity(state, { type: "candidate.transcription_repair.completed" });
+  assert.equal(realtimeTranscriptIntegrityReady(state), true);
 });
 
 test("duplicate identified lifecycle events are idempotent", () => {

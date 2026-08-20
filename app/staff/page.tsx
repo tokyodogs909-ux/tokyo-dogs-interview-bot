@@ -707,7 +707,7 @@ export default function StaffReviewPage() {
             <p>面接完了後、応募者氏名と面接IDの専用フォルダへ、録画・文字起こし・評価データ・PDFレポート・格納結果を保存します。同じ面接IDで再実行しても既存ファイルを更新します。</p>
             <div className="drive-sync-actions">
               <span className={`drive-sync-status drive-sync-${review.driveSync?.status ?? "not-started"}`}>
-                {review.driveSync?.status === "completed" ? review.driveSync.integrityStatus === "drift" ? "差分検出（要確認）" : review.driveSync.integrityStatus !== "verified" ? "照合未完" : review.sourceTranscriptVerified !== true ? "保存未完了（文字起こし要確認）" : review.driveSync.transcriptAvailable !== true || review.driveSync.transcriptKind !== "actual_transcript" ? "保存未完了（文字起こし未格納）" : review.driveSync.recordingIncluded ? "録画を含め格納完了" : textInterviewSelected ? "回答記録を格納完了" : "録画未格納"
+                {review.driveSync?.status === "completed" ? review.driveSync.integrityStatus === "drift" ? "差分検出（要確認）" : review.driveSync.integrityStatus !== "verified" ? "照合未完" : review.driveSync.transcriptKind === "partial_transcript_human_review" ? "技術保留記録を格納（人手確認必須）" : review.sourceTranscriptVerified !== true ? "保存未完了（文字起こし要確認）" : review.driveSync.transcriptAvailable !== true || review.driveSync.transcriptKind !== "actual_transcript" ? "保存未完了（文字起こし未格納）" : review.driveSync.recordingIncluded ? "録画を含め格納完了" : textInterviewSelected ? "回答記録を格納完了" : "録画未格納"
                   : review.driveSync?.status === "running" ? "格納中"
                     : review.driveSync?.status === "pending" ? "格納待ち"
                       : review.driveSync?.status === "failed" ? "要再実行"
@@ -741,6 +741,7 @@ export default function StaffReviewPage() {
                     : "共有範囲未確認"}</p>
             </div>}
             {review.driveSync?.status === "failed" && <p className="guardrail-copy">認証・保存先・通信状態を確認し、再実行してください。応募者の評価状態には影響しません。</p>}
+            {review.driveSync?.status === "completed" && review.driveSync.transcriptKind === "partial_transcript_human_review" && <p className="guardrail-copy"><strong>録画と中断時点までの一部文字起こしを、技術保留記録として格納しています。</strong> 面接完了・自動評価・合否判断の証明ではありません。録画と回答を人が照合し、再面接の要否を判断してください。</p>}
             {review.driveSync?.status === "completed" && review.sourceTranscriptVerified !== true && <p className="guardrail-copy"><strong>元の回答記録に文字起こし欠落または未確認の発言があります。</strong> Driveの表示にかかわらず保存完了とは扱わず、録画と回答を確認してください。</p>}
             {review.driveSync?.status === "completed" && review.sourceTranscriptVerified === true && (review.driveSync.transcriptAvailable !== true || review.driveSync.transcriptKind !== "actual_transcript") && <p className="guardrail-copy"><strong>実際の発言に基づく文字起こしをDriveで確認できていません。</strong> 保存完了とは扱わず、文字起こし処理後に再格納してください。</p>}
             {review.driveSync?.status === "completed" && review.sourceTranscriptVerified === true && review.driveSync.transcriptAvailable === true && review.driveSync.transcriptKind === "actual_transcript" && !review.driveSync.recordingIncluded && !textInterviewSelected && <p className="guardrail-copy"><strong>録画はDriveへ格納されていません。</strong> 文字起こし・評価・PDFのみ格納済みです。録画状態が「stored」になった後に再格納してください。</p>}

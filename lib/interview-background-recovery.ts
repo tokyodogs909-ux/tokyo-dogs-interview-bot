@@ -1,6 +1,7 @@
 import { recoverNextStaleInterviewEvaluation } from "@/lib/interview-evaluation-recovery";
 import {
   findNextInterviewDriveRecoverySession,
+  findNextInterviewTechnicalEvidenceDriveSession,
   recoverNextInterruptedV3Recording,
   recoverNextLegacyV1RecordingOrphan,
   recoverNextSealedResumableInterviewRecording,
@@ -153,7 +154,8 @@ async function recoverEvaluation(): Promise<RecoveryStageState> {
 
 async function recoverDriveArchive(): Promise<RecoveryStageState> {
   try {
-    const sessionId = await findNextInterviewDriveRecoverySession();
+    const sessionId = await findNextInterviewDriveRecoverySession() ??
+      await findNextInterviewTechnicalEvidenceDriveSession();
     if (!sessionId) return "idle";
     const result = await stepInterviewToGoogleDrive(sessionId);
     if (result.status !== "completed") return "waiting";

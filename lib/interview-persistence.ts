@@ -879,6 +879,7 @@ type InterviewContinuityRow = {
   text_started: number;
   recorded_fallback_started: number;
   completion_hold: number;
+  technical_hold: number;
 };
 
 function candidateContinuityTranscript(value: string | null): TranscriptTurn[] {
@@ -917,6 +918,13 @@ async function continuitySnapshotForSession(
         WHERE hold.session_id = s.id AND hold.event_type IN (
           'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
         )) AS completion_hold
+      , EXISTS (SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id
+          AND hold.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(hold.detail_json)
+            THEN json_extract(hold.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+            )) AS technical_hold
     FROM interview_sessions s
     LEFT JOIN interview_transcript_drafts draft ON draft.session_id = s.id
     WHERE s.id = ? LIMIT 1`)
@@ -928,7 +936,11 @@ async function continuitySnapshotForSession(
     : Number(row.recorded_fallback_started) === 1 ? "recorded-fallback" : "voice";
   let action: InterviewContinuitySnapshot["action"];
   if (row.status === "completed") action = "completed";
-  else if (Number(row.completion_hold) === 1 || row.status === "interrupted") action = "held";
+  else if (
+    Number(row.completion_hold) === 1 ||
+    Number(row.technical_hold) === 1 ||
+    row.status === "interrupted"
+  ) action = "held";
   else if (
     ["evaluation_pending", "evaluation_processing"].includes(row.status) ||
     row.recording_status === "stored" ||
@@ -3096,6 +3108,57 @@ export async function getInterviewArchiveSource(sessionId: string) {
   const events = await db.prepare(`SELECT event_type, detail_json, created_at
     FROM interview_audit_events WHERE session_id = ? ORDER BY created_at`)
     .bind(sessionId).all<Record<string, unknown>>();
+  const draft = await db.prepare(`SELECT mode, transcript_json, transcript_sha256,
+      turn_count, sealed_at, updated_at
+    FROM interview_transcript_drafts WHERE session_id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<{
+      mode: string;
+      transcript_json: string;
+      transcript_sha256: string;
+      turn_count: number;
+      sealed_at: string | null;
+      updated_at: string;
+    }>();
+  let transcriptDraft: {
+    mode: string;
+    transcript: TranscriptTurn[];
+    sha256: string;
+    turnCount: number;
+    sealedAt: string | null;
+    updatedAt: string;
+  } | null = null;
+  if (draft && await sha256(draft.transcript_json) === draft.transcript_sha256) {
+    const parsed = parseJson<unknown>(draft.transcript_json, null);
+    if (Array.isArray(parsed) && parsed.length === Number(draft.turn_count)) {
+      const turns = parsed.flatMap((value): TranscriptTurn[] => {
+        if (!value || typeof value !== "object") return [];
+        const turn = value as Partial<TranscriptTurn>;
+        if (
+          typeof turn.id !== "string" ||
+          (turn.speaker !== "candidate" && turn.speaker !== "interviewer") ||
+          typeof turn.text !== "string" ||
+          typeof turn.createdAt !== "string"
+        ) return [];
+        return [{
+          id: turn.id,
+          speaker: turn.speaker,
+          text: turn.text,
+          createdAt: turn.createdAt,
+        }];
+      });
+      if (turns.length === parsed.length) {
+        transcriptDraft = {
+          mode: draft.mode,
+          transcript: turns,
+          sha256: draft.transcript_sha256,
+          turnCount: Number(draft.turn_count),
+          sealedAt: draft.sealed_at,
+          updatedAt: draft.updated_at,
+        };
+      }
+    }
+  }
   const artifact = await db.prepare(`SELECT object_key, content_type, byte_size
     FROM interview_artifacts WHERE session_id = ? AND kind = 'recording'
     ORDER BY created_at DESC LIMIT 1`)
@@ -3131,6 +3194,7 @@ export async function getInterviewArchiveSource(sessionId: string) {
       detail: parseJson<Record<string, unknown>>(event.detail_json, {}),
       createdAt: String(event.created_at ?? ""),
     })),
+    transcriptDraft,
     recording: artifact && storedRecording ? {
       objectKey: artifact.object_key,
       contentType: artifact.content_type,
@@ -3139,6 +3203,90 @@ export async function getInterviewArchiveSource(sessionId: string) {
       etag: storedRecording.etag,
     } : null,
   };
+}
+
+/**
+ * Selects one old voice session whose full recording is durable but whose
+ * otherwise substantive append-only draft was left unsealed by exactly the
+ * recoverable empty-ASR incident. The Drive layer archives it as technical
+ * evidence only; this selector never promotes the interview to completed and
+ * never creates an evaluation.
+ */
+export async function findNextInterviewTechnicalEvidenceDriveSession() {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = Date.now();
+  const failedBefore = new Date(now - BACKGROUND_DRIVE_FAILED_RETRY_MS).toISOString();
+  const pendingBefore = new Date(now - BACKGROUND_DRIVE_PENDING_RETRY_MS).toISOString();
+  const integrityBefore = new Date(now - BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS).toISOString();
+  const row = await db.prepare(`SELECT s.id
+    FROM interview_sessions AS s
+    JOIN interview_transcript_drafts AS draft ON draft.session_id = s.id
+    JOIN interview_artifacts AS recording
+      ON recording.session_id = s.id AND recording.kind = 'recording'
+    LEFT JOIN interview_external_syncs AS d
+      ON d.session_id = s.id AND d.provider = 'google_drive'
+    WHERE s.status = 'in_progress'
+      AND s.recording_status = 'stored'
+      AND s.transcript_json IS NULL
+      AND s.evaluation_json IS NULL
+      AND s.summary IS NULL
+      AND s.completed_at IS NULL
+      AND draft.mode = 'voice'
+      AND draft.sealed_at IS NULL
+      AND draft.turn_count BETWEEN 2 AND 300
+      AND json_valid(draft.transcript_json)
+      AND json_type(draft.transcript_json) = 'array'
+      AND EXISTS (
+        SELECT 1 FROM json_each(draft.transcript_json) AS turn
+        WHERE CASE WHEN turn.type = 'object'
+          THEN json_extract(turn.value, '$.speaker') ELSE NULL END = 'candidate'
+          AND CASE WHEN turn.type = 'object'
+            THEN json_type(turn.value, '$.id') ELSE NULL END = 'text'
+          AND CASE WHEN turn.type = 'object'
+            THEN json_type(turn.value, '$.text') ELSE NULL END = 'text'
+          AND length(trim(COALESCE(CASE WHEN turn.type = 'object'
+            THEN json_extract(turn.value, '$.text') ELSE NULL END, ''))) > 0
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events AS failure
+        WHERE failure.session_id = s.id
+          AND failure.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(failure.detail_json)
+            THEN json_extract(failure.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_EMPTY'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events AS failure
+        WHERE failure.session_id = s.id
+          AND failure.event_type = 'transcription_failed'
+          AND COALESCE(CASE WHEN json_valid(failure.detail_json)
+            THEN json_extract(failure.detail_json, '$.code') ELSE NULL END, '') != 'TRANSCRIPTION_EMPTY'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events AS hold
+        WHERE hold.session_id = s.id AND hold.event_type IN (
+          'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_evaluation_claims AS claim WHERE claim.session_id = s.id
+      )
+      AND (
+        d.session_id IS NULL
+        OR d.status = 'running'
+        OR (d.status = 'failed' AND d.updated_at <= ?)
+        OR (d.status = 'pending' AND d.updated_at <= ?)
+        OR (d.status = 'completed'
+          AND COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') = 'partial_transcript_human_review'
+          AND (json_extract(d.manifest_json, '$.integrity.checkedAt') IS NULL
+            OR json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?))
+      )
+    ORDER BY COALESCE(d.updated_at, draft.updated_at, s.updated_at) ASC, s.id ASC
+    LIMIT 1`)
+    .bind(failedBefore, pendingBefore, integrityBefore)
+    .first<{ id: string }>();
+  return row?.id ?? null;
 }
 
 export async function getInterviewRecordingChunk(input: {

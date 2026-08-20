@@ -37,6 +37,10 @@ import {
   updateDriveUploadStep,
 } from "@/lib/interview-persistence";
 import { hasVerifiedCandidateTranscript } from "@/lib/interview-transcript-verification";
+import {
+  TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
+  technicalEvidenceArchiveTranscript,
+} from "@/lib/interview-technical-evidence";
 
 const FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
@@ -271,27 +275,51 @@ function hasActualCandidateTranscript(source: ArchiveSource) {
   return hasVerifiedCandidateTranscript(source.transcript, source.auditEvents);
 }
 
+function isTechnicalEvidenceArchiveSource(source: ArchiveSource) {
+  return technicalEvidenceArchiveTranscript(source) !== null;
+}
+
+function archiveTranscript(source: ArchiveSource) {
+  return isTechnicalEvidenceArchiveSource(source)
+    ? technicalEvidenceArchiveTranscript(source) ?? []
+    : source.transcript;
+}
+
+function archiveTranscriptKind(source: ArchiveSource) {
+  if (hasActualCandidateTranscript(source)) return "actual_transcript";
+  if (isTechnicalEvidenceArchiveSource(source)) return TECHNICAL_EVIDENCE_TRANSCRIPT_KIND;
+  return "recorded_fallback_placeholder";
+}
+
 function buildTranscriptText(source: ArchiveSource) {
+  const transcript = archiveTranscript(source);
+  const technicalEvidence = isTechnicalEvidenceArchiveSource(source);
   const isTextInterview = source.recordingStatus === "not_applicable";
-  const isRecordedFallbackPlaceholder = source.transcript.some((turn) =>
+  const isRecordedFallbackPlaceholder = transcript.some((turn) =>
     turn.id.startsWith("recorded-fallback-answer-"));
   const lines = [
-    isRecordedFallbackPlaceholder
+    technicalEvidence
+      ? "TOKYO DOGS オンライン一次面接 技術保留記録（一部文字起こし・人手確認必須）"
+      : isRecordedFallbackPlaceholder
       ? "TOKYO DOGS 録画式一次面接 質問記録（文字起こし未実施）"
       : "TOKYO DOGS オンライン一次面接 文字起こし",
     `面接ID: ${source.sessionId}`,
     `応募者氏名: ${source.candidateName}`,
     `雇用形態: ${source.employment}`,
     `入職希望対象店舗: ${source.preferredLocation}`,
-    `面接完了日時: ${japaneseDate(source.completedAt)}`,
-    isRecordedFallbackPlaceholder
+    technicalEvidence
+      ? `技術保留日時: ${japaneseDate(source.updatedAt)}`
+      : `面接完了日時: ${japaneseDate(source.completedAt)}`,
+    technicalEvidence
+      ? "確認区分: 回答音声の一部文字起こし欠落により面接は未完了。以下は受領済みの途中記録であり、録画との人手照合が必要"
+      : isRecordedFallbackPlaceholder
       ? "確認区分: 録画式予備面接の質問記録。応募者の発言本文は文字起こし未実施"
       : isTextInterview
       ? "確認区分: 応募者が文字入力した回答記録（録画なし）"
       : "確認区分: 応募者端末で生成された文字起こし（録画との照合が必要）",
     "",
   ];
-  for (const turn of source.transcript) {
+  for (const turn of transcript) {
     lines.push(`[${japaneseDate(turn.createdAt)}] ${speakerLabel(turn.speaker)}`);
     lines.push(turn.text);
     lines.push("");
@@ -304,6 +332,7 @@ function scoreLabel(score: number | null) {
 }
 
 function buildReportHtml(source: ArchiveSource) {
+  const technicalEvidence = isTechnicalEvidenceArchiveSource(source);
   const isTextInterview = source.recordingStatus === "not_applicable";
   const evaluation = source.evaluation;
   const dimensions = evaluation?.dimensions.map((dimension) => `
@@ -335,10 +364,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Yu Gothic",san
 <tr><th>応募者氏名</th><td>${escapeHtml(source.candidateName)}</td></tr>
 <tr><th>雇用形態</th><td>${escapeHtml(source.employment)}</td></tr>
 <tr><th>入職希望対象店舗</th><td>${escapeHtml(source.preferredLocation)}</td></tr>
-<tr><th>面接完了日時</th><td>${escapeHtml(japaneseDate(source.completedAt))}</td></tr>
+<tr><th>${technicalEvidence ? "技術保留日時" : "面接完了日時"}</th><td>${escapeHtml(japaneseDate(technicalEvidence ? source.updatedAt : source.completedAt))}</td></tr>
 <tr><th>録画状態</th><td>${escapeHtml(source.recordingStatus)}</td></tr>
 </table>
-<p class="notice">${isTextInterview
+<p class="notice">${technicalEvidence
+  ? "本件は回答音声の一部文字起こしを確認できず、面接未完了の技術保留です。録画と途中文字起こしを採用担当者が人手で照合してください。自動評価・合否判断・面接完了の証明には使用できません。通信・録音・文字起こしの不具合を応募者の不利益に使用しません。"
+  : isTextInterview
   ? "本資料は採用担当者の確認資料です。システムは合否を自動決定しません。文字入力方式では映像・音声を取得せず、参加方法の違いを不利益な評価に使用しません。"
   : "本資料は採用担当者の確認資料です。システムは合否を自動決定しません。文字起こしは応募者端末由来のため録画との照合が必要です。通信・録音・文字起こしの不具合や、顔立ち・容姿・表情・声質等を不利益な評価に使用しません。"}</p>
 <h2>回答評価</h2>
@@ -359,6 +390,7 @@ ${humanReviews}
 }
 
 function buildResultJson(source: ArchiveSource) {
+  const transcriptKind = archiveTranscriptKind(source);
   return JSON.stringify({
     schemaVersion: "2026-07-29-v1",
     generatedAt: new Date().toISOString(),
@@ -376,6 +408,9 @@ function buildResultJson(source: ArchiveSource) {
       completedAt: source.completedAt,
     },
     evaluation: source.evaluation,
+    transcriptKind,
+    technicalHold: transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
+    automaticEvaluationPerformed: source.evaluation !== null,
     humanReviews: source.humanReviews,
     technicalEvents: source.auditEvents.filter((event) => [
       "audio_playback_blocked",
@@ -2193,6 +2228,7 @@ function assertArchiveReady(source: ArchiveSource) {
   ].includes(event.type))) {
     throw new Error("INTERVIEW_NOT_READY_FOR_DRIVE_SYNC");
   }
+  if (isTechnicalEvidenceArchiveSource(source)) return;
   if (source.status !== "completed" || !source.evaluation) {
     throw new Error("INTERVIEW_NOT_READY_FOR_DRIVE_SYNC");
   }
@@ -2257,8 +2293,9 @@ async function prepareDriveArchive(
   // assertArchiveReady() runs before any Drive access. Recompute here for the
   // persisted receipt so a future refactor cannot accidentally label a
   // placeholder/interviewer-only transcript as an actual candidate transcript.
-  const transcriptAvailable = hasActualCandidateTranscript(source);
-  const transcriptKind = transcriptAvailable ? "actual_transcript" : "recorded_fallback_placeholder";
+  const transcriptKind = archiveTranscriptKind(source);
+  const transcriptAvailable = transcriptKind === "actual_transcript" ||
+    transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND;
   const resultJson = buildResultJson(source);
   const reportHtml = buildReportHtml(source);
   const transcriptBytes = new TextEncoder().encode(transcript);
@@ -2283,7 +2320,9 @@ async function prepareDriveArchive(
     expectedTranscript: transcriptBytes,
   });
   await reportProgress();
-  const transcriptFileName = transcriptAvailable
+  const transcriptFileName = transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND
+    ? `${filePrefix}_技術保留_一部文字起こし_人手確認必須.txt`
+    : transcriptAvailable
     ? `${filePrefix}_文字起こし.txt`
     : `${filePrefix}_録画式面接_質問記録_文字起こし未実施.txt`;
   const transcriptFile = await uploadSmallFile({
@@ -2441,6 +2480,8 @@ async function finalizeDriveArchive(
     recordingIncluded: Boolean(source.recording),
     transcriptAvailable: prepared.transcriptAvailable,
     transcriptKind: prepared.transcriptKind,
+    technicalHold: prepared.transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
+    automaticEvaluationPerformed: source.evaluation !== null,
     files: uploaded,
   };
   const manifestBody = JSON.stringify(manifest, null, 2);
@@ -2583,8 +2624,11 @@ function completedReceiptSatisfiesSource(
   receipt: GoogleDriveSyncResult,
   source: ArchiveSource,
 ) {
+  const expectedTranscriptKind = archiveTranscriptKind(source);
   const transcriptVerified = receipt.transcriptAvailable === true &&
-    receipt.transcriptKind === "actual_transcript";
+    receipt.transcriptKind === expectedTranscriptKind &&
+    (expectedTranscriptKind === "actual_transcript" ||
+      expectedTranscriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND);
   const recordingVerified = source.recordingStatus === "not_applicable" ||
     (source.recordingStatus === "stored" && receipt.recordingIncluded === true);
   return transcriptVerified && recordingVerified;
@@ -2787,7 +2831,7 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
     // mislabeled while containing only a question placeholder. Cross-check the
     // durable D1 transcript before acknowledging even an otherwise complete
     // Drive receipt.
-    if (!hasActualCandidateTranscript(source)) {
+    if (!hasActualCandidateTranscript(source) && !isTechnicalEvidenceArchiveSource(source)) {
       throw new Error("INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC");
     }
     if (completedReceiptSatisfiesSource(alreadyCompleted, source)) {

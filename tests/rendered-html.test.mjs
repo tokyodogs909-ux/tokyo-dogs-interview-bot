@@ -212,7 +212,8 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(recordingUploadSource, /crypto\.subtle\.digest\("SHA-256"/);
   assert.match(recordingUploadSource, /upload\/start/);
   assert.match(recordingUploadSource, /upload\/complete/);
-  assert.doesNotMatch(source, /Promise\.race\(\[\s*recordingPromiseRef/);
+  assert.match(source, /RECORDER_FINALIZE_TIMEOUT/);
+  assert.match(source, /recordingFinalizeTimedOut[\s\S]*120_000/);
   const recordingUploadIndex = source.indexOf("await uploadRecording(recordingBlob);");
   const finalizationIndex = source.indexOf("await storeInterviewFinalization();", recordingUploadIndex);
   assert.ok(
@@ -491,7 +492,7 @@ test("capped or errored MediaRecorder output cannot be uploaded or receipted as 
     source.indexOf("async function completeInterview(reason: string)"),
     source.indexOf("function handleRealtimeEvent(event: RealtimeEvent)"),
   );
-  assert.match(completion, /const recordingComplete = mode === "text" \|\| recordingCompleteRef\.current;/);
+  assert.match(completion, /const recordingComplete = mode === "text" \|\| \(!recordingFinalizeTimedOut && recordingCompleteRef\.current\);/);
   assert.match(completion, /if \(mode !== "text" && \(!recordingBlob \|\| !recordingComplete\)\) \{/);
 
   const archive = source.slice(
@@ -505,7 +506,7 @@ test("capped or errored MediaRecorder output cannot be uploaded or receipted as 
   );
 });
 
-test("a failed realtime answer transcription keeps voice finalization fail-closed", async () => {
+test("a failed realtime answer transcription requires one explicit repair before finalization", async () => {
   const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(source, /const voiceTranscriptionFailureRef = useRef\(false\);/);
   assert.match(source, /const realtimeTranscriptIntegrityRef = useRef\(initialRealtimeTranscriptIntegrity\(\)\);/);
@@ -515,7 +516,8 @@ test("a failed realtime answer transcription keeps voice finalization fail-close
     source.indexOf("const isAssistantDelta ="),
   );
   assert.match(failedEvent, /applyRealtimeTranscriptIntegrity\(event\);/);
-  assert.match(failedEvent, /voiceTranscriptionFailureRef\.current = true;/);
+  assert.match(failedEvent, /promptCandidateToRepeatForTranscript\(\);/);
+  assert.match(failedEvent, /integrity\.transcriptionFailed[\s\S]*TRANSCRIPTION_ID_MISSING/);
 
   const finalization = source.slice(
     source.indexOf("async function storeInterviewFinalization()"),
@@ -551,7 +553,8 @@ test("server-renders the protected recruiter review entry", async () => {
   assert.match(source, /個人認証済みの本人情報ではありません/);
   assert.match(source, /録画未格納/);
   assert.match(source, /録画を含め格納完了/);
-  assert.match(source, /review\.sourceTranscriptVerified !== true \? "保存未完了（文字起こし要確認）"/);
+  assert.match(source, /review\.driveSync\.transcriptKind === "partial_transcript_human_review" \? "技術保留記録を格納（人手確認必須）"/);
+  assert.match(source, /録画と中断時点までの一部文字起こしを、技術保留記録として格納しています/);
   assert.match(source, /review\.sourceTranscriptVerified === true && review\.driveSync\.recordingIncluded/);
   assert.match(source, /turn\.id\.startsWith\("recorded-transcribed-"\)/);
   assert.match(source, /自動評価なし・人手照合必須/);

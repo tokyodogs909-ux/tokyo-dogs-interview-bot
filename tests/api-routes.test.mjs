@@ -1515,6 +1515,8 @@ class FakeD1Statement {
         recorded_fallback_started: this.database.auditEvents.some((event) =>
           event.session_id === session.id && event.event_type === "recorded_fallback_started") ? 1 : 0,
         completion_hold: hasCompletionHold(this.database, session.id) ? 1 : 0,
+        technical_hold: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && isRealtimeTranscriptionGapEvent(event)) ? 1 : 0,
       };
     }
     if (this.sql.startsWith("SELECT s.id, s.status, s.recording_status") &&
@@ -5648,6 +5650,44 @@ test("candidate continuity cookie resumes text and replaces interrupted media ex
   assert.deepEqual(await absent.json(), { available: false });
 });
 
+test("candidate continuity never labels a known transcription gap as indefinitely processing", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const created = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "技術 保留",
+      employment: "正社員",
+      location: "越谷店",
+      consent: true,
+      interviewMode: "camera",
+    }),
+  }, env);
+  assert.equal(created.status, 201);
+  const payload = await created.json();
+  const cookie = created.headers.get("set-cookie").split(";", 1)[0];
+  const session = database.sessions.get(payload.sessionId);
+  session.status = "in_progress";
+  session.recording_status = "stored";
+  database.auditEvents.push({
+    id: crypto.randomUUID(),
+    session_id: payload.sessionId,
+    event_type: "transcription_failed",
+    actor_type: "candidate",
+    detail_json: JSON.stringify({ code: "TRANSCRIPTION_EMPTY" }),
+    created_at: new Date().toISOString(),
+  });
+
+  const inspected = await request("/api/interviews/resume", {
+    headers: { Cookie: cookie },
+  }, env);
+  assert.equal(inspected.status, 200);
+  const inspectedPayload = await inspected.json();
+  assert.equal(inspectedPayload.snapshot.action, "held");
+  assert.notEqual(inspectedPayload.snapshot.action, "processing");
+});
+
 test("interview session stores the candidate name and protects the recording with a scoped bearer token", async () => {
   process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const database = new FakeD1();
@@ -9297,6 +9337,8 @@ test("realtime endpoint mints a short-lived token with the interview safety sett
     assert.equal(payload.value, "ek_test_ephemeral");
     assert.equal(payload.model, "gpt-realtime-2.1");
     assert.equal(capturedAuthorization, "Bearer test-key-never-returned");
+    assert.equal(capturedBody.session.audio.input.transcription.model, "gpt-4o-transcribe");
+    assert.equal(capturedBody.session.audio.input.transcription.language, "ja");
     assert.equal(capturedBody.session.audio.input.turn_detection.type, "semantic_vad");
     assert.equal(capturedBody.session.audio.input.turn_detection.eagerness, "low");
     assert.equal(capturedBody.session.audio.input.turn_detection.create_response, false);
@@ -9478,6 +9520,7 @@ test("same-origin realtime call authorizes the exact new interview session and p
     assert.equal(response.headers.get("content-type"), "application/sdp");
     assert.equal(await response.text(), "v=0\r\no=test-answer\r\n");
     assert.equal(capturedSession.model, "gpt-realtime-2.1");
+    assert.equal(capturedSession.audio.input.transcription.model, "gpt-4o-transcribe");
     assert.equal(capturedSession.audio.input.turn_detection.type, "semantic_vad");
 
     const rejected = await request("/api/realtime/call", {

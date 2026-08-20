@@ -444,6 +444,7 @@ export default function Home() {
   // never be sealed before its final server events arrive.
   const voiceTranscriptionFailureRef = useRef(false);
   const realtimeTranscriptIntegrityRef = useRef(initialRealtimeTranscriptIntegrity());
+  const transcriptionRepairPromptedRef = useRef(false);
   const completionHoldRef = useRef<CompletionHold>("none");
   const voiceTranscriptSealedRef = useRef(false);
   const queueTimedInterviewActionRef = useRef<(action: TimedInterviewAction) => void>(() => undefined);
@@ -1235,6 +1236,7 @@ export default function Home() {
 
   function resetRealtimeTranscriptIntegrity() {
     voiceTranscriptionFailureRef.current = false;
+    transcriptionRepairPromptedRef.current = false;
     realtimeTranscriptIntegrityRef.current = initialRealtimeTranscriptIntegrity();
   }
 
@@ -1242,12 +1244,42 @@ export default function Home() {
     const next = reduceRealtimeTranscriptIntegrity(realtimeTranscriptIntegrityRef.current, event);
     realtimeTranscriptIntegrityRef.current = next;
     if (next.transcriptionFailed) voiceTranscriptionFailureRef.current = true;
+    if (!next.transcriptionRepairRequired) transcriptionRepairPromptedRef.current = false;
     return next;
   }
 
   function voiceTranscriptCompletionBlocker() {
     if (voiceTranscriptionFailureRef.current) return "transcription_failed";
     return realtimeTranscriptIntegrityBlocker(realtimeTranscriptIntegrityRef.current);
+  }
+
+  function completeCandidateTranscriptionRepair() {
+    const next = reduceRealtimeTranscriptIntegrity(realtimeTranscriptIntegrityRef.current, {
+      type: "candidate.transcription_repair.completed",
+    });
+    realtimeTranscriptIntegrityRef.current = next;
+    transcriptionRepairPromptedRef.current = false;
+  }
+
+  function promptCandidateToRepeatForTranscript() {
+    if (
+      transcriptionRepairPromptedRef.current ||
+      endingRef.current ||
+      completionHoldRef.current !== "none"
+    ) return;
+    transcriptionRepairPromptedRef.current = true;
+    clearCandidateResponseDelay();
+    clearResponseWatchdog();
+    if (isAwaitingResponse()) sendResponseCancel();
+    turnStateRef.current = {
+      ...turnStateRef.current,
+      awaitingResponse: false,
+      candidateTurnPending: false,
+    };
+    const message = "今の回答の文字起こしだけ確認できませんでした。大切な内容を残すため、同じ回答をもう一度お願いします。下の入力欄から文字で補足しても大丈夫です。";
+    setAudioNotice(message);
+    setConnectionState("ready");
+    speakOnDevice(message);
   }
 
   function updateCompletionHold(next: CompletionHold) {
@@ -1460,6 +1492,10 @@ export default function Home() {
 
   function scheduleResponseAfterCandidatePause() {
     clearCandidateResponseDelay();
+    if (realtimeTranscriptIntegrityRef.current.transcriptionRepairRequired) {
+      promptCandidateToRepeatForTranscript();
+      return;
+    }
     if (timedActionRef.current) {
       scheduleTimedVoiceResponse();
       return;
@@ -1469,6 +1505,10 @@ export default function Home() {
     candidateResponseDelayTimerRef.current = window.setTimeout(() => {
       candidateResponseDelayTimerRef.current = null;
       if (endingRef.current || isCandidateSpeaking() || isAwaitingResponse()) return;
+      if (realtimeTranscriptIntegrityRef.current.transcriptionRepairRequired) {
+        promptCandidateToRepeatForTranscript();
+        return;
+      }
       const channel = channelRef.current;
       if (!channel || channel.readyState !== "open") {
         setConnectionState("error");
@@ -3643,7 +3683,18 @@ export default function Home() {
     let interruptedRecordingStored = modeRef.current === "text";
     try {
       if (modeRef.current !== "text") {
-        await (recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current));
+        let recordingFinalizeTimedOut = false;
+        await Promise.race([
+          recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current),
+          new Promise<null>((resolve) => window.setTimeout(() => {
+            recordingFinalizeTimedOut = true;
+            resolve(null);
+          }, 120_000)),
+        ]);
+        if (recordingFinalizeTimedOut) {
+          void reportCandidateEvent("recording_unavailable", "RECORDER_FINALIZE_TIMEOUT");
+          return;
+        }
         const liveUploader = recordingLiveUploaderRef.current;
         if (liveUploader) {
           const audioCoverage = recordingHasBothAudioRef.current === true
@@ -3694,7 +3745,7 @@ export default function Home() {
   async function enterInterviewHold(
     hold: Exclude<CompletionHold, "none">,
     event?: {
-      type: "candidate_requested_stop" | "safety_escalation" | "completion_reason_invalid";
+      type: "candidate_requested_stop" | "safety_escalation" | "completion_reason_invalid" | "transcription_failed";
       code: string;
     },
   ) {
@@ -3748,7 +3799,10 @@ export default function Home() {
       return;
     }
     if (mode === "voice" && voiceTranscriptCompletionBlocker()) {
-      await enterInterviewHold("transcript_incomplete");
+      await enterInterviewHold("transcript_incomplete", {
+        type: "transcription_failed",
+        code: "TRANSCRIPTION_FAILED",
+      });
       return;
     }
     if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
@@ -3772,29 +3826,12 @@ export default function Home() {
       });
     }
     stopRealtime();
-    // MediaRecorder.stop() finalizes its container asynchronously. Do not race it
-    // against a short timer: a large iPhone MP4 can legitimately need more than six
-    // seconds, and discarding that late blob permanently loses an otherwise valid
-    // interview recording.
-    const recordingBlob = await (
-      recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current)
-    );
-    const recordingComplete = mode === "text" || recordingCompleteRef.current;
-    if (mode !== "text" && (!recordingBlob || !recordingComplete)) reportCandidateEvent("recording_unavailable", "NO_RECORDING_AT_COMPLETION");
-    if (mode !== "text" && recordingBlob && recordingComplete && recordingHasBothAudioRef.current !== true) {
-      reportCandidateEvent("recording_unavailable", "REMOTE_AUDIO_UNVERIFIED");
-    }
-    if (mode !== "text" && (!recordingBlob || !recordingComplete)) {
-      setRecordingUploadState("error");
-      setProcessingWarning("完全な録画データを端末で生成できなかったため、面接記録の保存は完了していません。採用担当者へ受付番号をお知らせください。");
-      setStage("review");
-      endingRef.current = false;
-      return;
-    }
+    // Persist the small transcript/answer-count seal before waiting for the
+    // mobile browser to finish its much larger media container. If the tab is
+    // closed during that final stop, scheduled recovery can still prove the
+    // intended completion and finish already-receipted v3 parts.
     if (mode === "recorded-fallback") {
       try {
-        // Seal the candidate's intended answer count before the large recording
-        // upload. Staff recovery may only complete exactly this many answers.
         await sealRecordedFallbackCompletion();
       } catch {
         setRecordingUploadState("error");
@@ -3805,9 +3842,6 @@ export default function Home() {
       }
     } else if (mode === "voice") {
       try {
-        // Persist the actual transcript before the large recording upload. If
-        // the browser closes after the final part, staff recovery can now prove
-        // that this was a cleanly completed voice interview before receipting it.
         await sealVoiceTranscriptCompletion();
       } catch {
         setRecordingUploadState("error");
@@ -3816,6 +3850,34 @@ export default function Home() {
         endingRef.current = false;
         return;
       }
+    }
+    // A browser media finalizer must never leave the candidate on an endless
+    // spinner. Two minutes is deliberately far above normal WebM/MP4 stop time.
+    // On timeout, accepted parts and the completion seal remain available to
+    // server recovery; the candidate sees a hold, never a false success.
+    let recordingFinalizeTimedOut = false;
+    const recordingPromise = recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current);
+    const recordingBlob = mode === "text" ? null : await Promise.race([
+      recordingPromise,
+      new Promise<null>((resolve) => window.setTimeout(() => {
+        recordingFinalizeTimedOut = true;
+        resolve(null);
+      }, 120_000)),
+    ]);
+    const recordingComplete = mode === "text" || (!recordingFinalizeTimedOut && recordingCompleteRef.current);
+    if (recordingFinalizeTimedOut) {
+      void reportCandidateEvent("recording_unavailable", "RECORDER_FINALIZE_TIMEOUT");
+    }
+    if (mode !== "text" && (!recordingBlob || !recordingComplete)) reportCandidateEvent("recording_unavailable", "NO_RECORDING_AT_COMPLETION");
+    if (mode !== "text" && recordingBlob && recordingComplete && recordingHasBothAudioRef.current !== true) {
+      reportCandidateEvent("recording_unavailable", "REMOTE_AUDIO_UNVERIFIED");
+    }
+    if (mode !== "text" && (!recordingBlob || !recordingComplete)) {
+      setRecordingUploadState("error");
+      setProcessingWarning("完全な録画データを端末で生成できなかったため、面接記録の保存は完了していません。採用担当者へ受付番号をお知らせください。");
+      setStage("review");
+      endingRef.current = false;
+      return;
     }
     // Do not let evaluation completion start the Drive archive before the
     // recording artifact is durable. Both operations were awaited eventually,
@@ -3924,14 +3986,18 @@ export default function Home() {
       return;
     }
     if (type === "conversation.item.input_audio_transcription.completed") {
-      applyRealtimeTranscriptIntegrity(event);
+      const integrity = applyRealtimeTranscriptIntegrity(event);
       const text = event.transcript?.trim();
       const itemId = event.item_id?.trim();
-      if (!text || !itemId) {
-        voiceTranscriptionFailureRef.current = true;
+      if (!itemId) {
         setCandidateAudioState("ready");
-        void reportCandidateEvent("transcription_failed", text ? "TRANSCRIPTION_ID_MISSING" : "TRANSCRIPTION_EMPTY");
+        void reportCandidateEvent("transcription_failed", "TRANSCRIPTION_ID_MISSING");
         setAudioNotice("回答音声の最終文字起こしを確認できませんでした。面接を完了扱いにせず、受領済み記録を技術確認に回します。");
+        return;
+      }
+      if (!text) {
+        setCandidateAudioState("ready");
+        promptCandidateToRepeatForTranscript();
         return;
       }
       recordCompletedTurn({
@@ -3940,15 +4006,22 @@ export default function Home() {
         text,
         createdAt: new Date().toISOString(),
       });
+      if (!integrity.transcriptionRepairRequired) {
+        setAudioNotice("");
+        setCandidateAudioState("ready");
+      }
       rearmPendingCompletionWhenVoiceSettled(250);
       return;
     }
     if (type === "conversation.item.input_audio_transcription.failed") {
-      applyRealtimeTranscriptIntegrity(event);
-      voiceTranscriptionFailureRef.current = true;
+      const integrity = applyRealtimeTranscriptIntegrity(event);
       setCandidateAudioState("ready");
-      reportCandidateEvent("transcription_failed", "TRANSCRIPTION_FAILED");
-      setAudioNotice("回答音声の文字起こしを一部確認できませんでした。内容が画面に表示されない場合は、下の入力欄から補足できます。");
+      if (integrity.transcriptionFailed) {
+        void reportCandidateEvent("transcription_failed", "TRANSCRIPTION_ID_MISSING");
+        setAudioNotice("回答音声を面接記録と対応付けられないため技術保留にしました。採用担当者へ受付番号をお知らせください。");
+        return;
+      }
+      promptCandidateToRepeatForTranscript();
       return;
     }
 
@@ -4382,6 +4455,11 @@ export default function Home() {
       // Only a candidate message accepted by the open data channel becomes a
       // completed durable turn. A failed send remains in the input box.
       recordCompletedTurn(candidateTurn);
+      if (realtimeTranscriptIntegrityRef.current.transcriptionRepairRequired) {
+        completeCandidateTranscriptionRepair();
+        setAudioNotice("");
+        setCandidateAudioState("ready");
+      }
       setTextDraft("");
       channel.send(JSON.stringify({ type: "response.create" }));
     } catch {

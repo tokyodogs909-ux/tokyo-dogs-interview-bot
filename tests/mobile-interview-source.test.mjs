@@ -165,12 +165,15 @@ test("voice completion consumes strict pending item and response lifecycle state
     "pending voice events must block before recorder seal/evaluation begins",
   );
   const completed = events.slice(events.indexOf('type === "conversation.item.input_audio_transcription.completed"'));
-  assert.match(completed.slice(0, 1_200), /if \(!text \|\| !itemId\)/);
-  assert.match(completed.slice(0, 1_200), /TRANSCRIPTION_EMPTY/);
+  assert.match(completed.slice(0, 1_500), /if \(!itemId\)/);
+  assert.match(completed.slice(0, 1_500), /if \(!text\)[\s\S]*promptCandidateToRepeatForTranscript\(\)/);
+  assert.doesNotMatch(completed.slice(0, 1_500), /TRANSCRIPTION_EMPTY/);
   assert.ok(
-    completed.indexOf("if (!text || !itemId)") < completed.indexOf("rearmPendingCompletionWhenVoiceSettled(250)"),
-    "empty completed text must become sticky failure before completion can re-arm",
+    completed.indexOf("if (!text)") < completed.indexOf("rearmPendingCompletionWhenVoiceSettled(250)"),
+    "empty completed text must request a repeat before completion can re-arm",
   );
+  assert.match(source, /completeCandidateTranscriptionRepair\(\)/);
+  assert.match(source, /同じ回答をもう一度お願いします/);
 });
 
 test("candidate event UI requires an exact durable receipt and never blindly resends ambiguity", () => {

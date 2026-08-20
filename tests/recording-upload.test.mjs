@@ -523,3 +523,33 @@ test("immutable 409 upload conflicts fail immediately instead of blind retrying"
   );
   assert.equal(attempts, 1);
 });
+
+test("recording upload bounds both a hung request and a stalled response body", async () => {
+  for (const fetcher of [
+    async () => await new Promise(() => undefined),
+    async () => ({
+      ok: true,
+      status: 200,
+      json: async () => await new Promise(() => undefined),
+    }),
+  ]) {
+    let attempts = 0;
+    await assert.rejects(
+      uploadRecordingResumably({
+        blob: new VirtualBlob(1024),
+        sessionId: "TD-TIMEOUT-BOUNDED-TEST",
+        accessToken: "candidate-token",
+        audioCoverage: "unverified",
+        fetcher: async (...args) => {
+          attempts += 1;
+          return await fetcher(...args);
+        },
+        attempts: 1,
+        requestTimeoutMs: 10,
+        sleep: async () => undefined,
+      }),
+      /RECORDING_UPLOAD_REQUEST_TIMEOUT/,
+    );
+    assert.equal(attempts, 1);
+  }
+});

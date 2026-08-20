@@ -333,7 +333,11 @@ export function buildRealtimeSessionConfig(input: {
     audio: {
       input: {
         transcription: {
-          model: "gpt-4o-mini-transcribe",
+          // Prefer the higher-accuracy transcription model for a 20–27 minute
+          // hiring record. A single empty asynchronous ASR event is now
+          // recoverable in the UI, but reducing those events is still the
+          // first line of defence.
+          model: "gpt-4o-transcribe",
           language: "ja",
         },
         noise_reduction: { type: "near_field" },

@@ -44,6 +44,18 @@ test("ambiguous transport failure is held and never blindly resent", async () =>
   assert.equal(request.storedKeys.size, 0);
 });
 
+test("a hung candidate-event request is bounded and never retried", async () => {
+  let calls = 0;
+  const request = input(() => {
+    calls += 1;
+    return new Promise(() => undefined);
+  });
+  request.timeoutMs = 10;
+  assert.deepEqual(await reportCandidateEventOnce(request), { state: "unconfirmed", attempted: true });
+  assert.deepEqual(await reportCandidateEventOnce(request), { state: "unconfirmed", attempted: false });
+  assert.equal(calls, 1);
+});
+
 test("non-2xx and non-exact JSON receipts remain unconfirmed without retry", async () => {
   for (const response of [
     Response.json({ stored: true }, { status: 503 }),
@@ -61,4 +73,3 @@ test("non-2xx and non-exact JSON receipts remain unconfirmed without retry", asy
     assert.equal(request.storedKeys.size, 0);
   }
 });
-
