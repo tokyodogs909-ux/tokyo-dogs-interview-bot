@@ -3217,7 +3217,9 @@ export async function getInterviewArchiveSource(sessionId: string) {
  * evidence only; this selector never promotes the interview to completed and
  * never creates an evaluation.
  */
-export async function findNextInterviewTechnicalEvidenceDriveSession() {
+export async function findNextInterviewTechnicalEvidenceDriveSession(options: {
+  excludeSessionId?: string | null;
+} = {}) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
@@ -3225,6 +3227,7 @@ export async function findNextInterviewTechnicalEvidenceDriveSession() {
   const failedBefore = new Date(now - BACKGROUND_DRIVE_FAILED_RETRY_MS).toISOString();
   const pendingBefore = new Date(now - BACKGROUND_DRIVE_PENDING_RETRY_MS).toISOString();
   const integrityBefore = new Date(now - BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS).toISOString();
+  const excludeSessionId = options.excludeSessionId ?? null;
   const row = await db.prepare(`SELECT s.id
     FROM interview_sessions AS s
     JOIN interview_transcript_drafts AS draft ON draft.session_id = s.id
@@ -3233,6 +3236,7 @@ export async function findNextInterviewTechnicalEvidenceDriveSession() {
     LEFT JOIN interview_external_syncs AS d
       ON d.session_id = s.id AND d.provider = 'google_drive'
     WHERE s.status = 'in_progress'
+      AND (? IS NULL OR s.id != ?)
       AND s.recording_status = 'stored'
       AND s.transcript_json IS NULL
       AND s.evaluation_json IS NULL
@@ -3289,7 +3293,7 @@ export async function findNextInterviewTechnicalEvidenceDriveSession() {
       )
     ORDER BY COALESCE(d.updated_at, draft.updated_at, s.updated_at) ASC, s.id ASC
     LIMIT 1`)
-    .bind(failedBefore, pendingBefore, integrityBefore)
+    .bind(excludeSessionId, excludeSessionId, failedBefore, pendingBefore, integrityBefore)
     .first<{ id: string }>();
   return row?.id ?? null;
 }

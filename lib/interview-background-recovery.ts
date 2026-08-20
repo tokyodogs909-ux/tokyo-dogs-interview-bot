@@ -154,17 +154,36 @@ async function recoverEvaluation(): Promise<RecoveryStageState> {
 
 async function recoverDriveArchive(): Promise<RecoveryStageState> {
   try {
-    // New/active archives remain first. A recoverable technical hold must not
-    // sit behind the routine 24-hour integrity scan of every old completed
-    // archive, so only that maintenance tier is deferred until last.
-    const sessionId = await findNextInterviewDriveRecoverySession({
+    // Advance one normal archive and up to two technical-evidence archives
+    // sequentially. This preserves the live candidate path while preventing
+    // two durable incident recordings from waiting behind one another for
+    // hours. Each session still owns its existing D1 claim and <=4 MiB step.
+    const normalSessionId = await findNextInterviewDriveRecoverySession({
       includeIntegrityRecheck: false,
-    }) ?? await findNextInterviewTechnicalEvidenceDriveSession() ??
-      await findNextInterviewDriveRecoverySession({ includeIntegrityRecheck: true });
-    if (!sessionId) return "idle";
-    const result = await stepInterviewToGoogleDrive(sessionId);
-    if (result.status !== "completed") return "waiting";
-    return result.integrity?.status === "verified" ? "advanced" : "attention";
+    });
+    const firstTechnicalSessionId = await findNextInterviewTechnicalEvidenceDriveSession();
+    const secondTechnicalSessionId = firstTechnicalSessionId
+      ? await findNextInterviewTechnicalEvidenceDriveSession({
+          excludeSessionId: firstTechnicalSessionId,
+        })
+      : null;
+    const sessionIds = [normalSessionId, firstTechnicalSessionId, secondTechnicalSessionId]
+      .filter((value): value is string => typeof value === "string");
+    if (sessionIds.length === 0) {
+      const maintenanceSessionId = await findNextInterviewDriveRecoverySession({
+        includeIntegrityRecheck: true,
+      });
+      if (!maintenanceSessionId) return "idle";
+      sessionIds.push(maintenanceSessionId);
+    }
+    let advanced = false;
+    for (const sessionId of sessionIds) {
+      const result = await stepInterviewToGoogleDrive(sessionId);
+      if (result.status !== "completed") continue;
+      if (result.integrity?.status !== "verified") return "attention";
+      advanced = true;
+    }
+    return advanced ? "advanced" : "waiting";
   } catch {
     return "attention";
   }
@@ -172,7 +191,8 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
 
 /**
  * Advances a bounded amount of global work per scheduled event. At most one
- * paid answer transcription and one <=4 MiB Drive chunk are attempted. Every
+ * paid answer transcription, one normal Drive chunk, and up to two technical
+ * evidence Drive chunks (each <=4 MiB) are attempted. Every
  * mutable stage retains its existing D1 compare-and-set/lease fence, so an
  * overlapping cron, candidate retry, or staff tab cannot duplicate paid work
  * or write the same Drive offset concurrently.

@@ -12,11 +12,11 @@ function driveRecoveryQuery(source) {
 }
 
 function technicalEvidenceDriveQuery(source) {
-  const start = source.indexOf("export async function findNextInterviewTechnicalEvidenceDriveSession()");
+  const start = source.indexOf("export async function findNextInterviewTechnicalEvidenceDriveSession(");
   const end = source.indexOf("export async function getInterviewRecordingChunk", start);
   assert.ok(start >= 0 && end > start, "the technical-evidence selector must remain discoverable");
   const match = source.slice(start, end).match(
-    /const row = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(failedBefore, pendingBefore, integrityBefore\)/,
+    /const row = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(excludeSessionId, excludeSessionId, failedBefore, pendingBefore, integrityBefore\)/,
   );
   assert.ok(match, "the exact production technical-evidence query must remain discoverable");
   return match[1];
@@ -184,16 +184,27 @@ test("technical evidence recovery selects only stored empty-ASR voice drafts wit
     }
   };
   insert("TD-TECH-VALID-01");
+  insert("TD-TECH-VALID-02");
   insert("TD-TECH-IDMISS-1", { code: "TRANSCRIPTION_ID_MISSING" });
   insert("TD-TECH-STOPPED-1", { hold: "candidate_requested_stop" });
   insert("TD-TECH-NORECORD", { noRecording: true });
   insert("TD-TECH-SEALED-01", { sealed: true });
 
   const selected = database.prepare(technicalEvidenceDriveQuery(source)).get(
+    null,
+    null,
     "2026-08-20T00:00:00Z",
     "2026-08-20T00:00:00Z",
     "2026-08-20T00:00:00Z",
   );
   assert.equal(selected.id, "TD-TECH-VALID-01");
+  const next = database.prepare(technicalEvidenceDriveQuery(source)).get(
+    selected.id,
+    selected.id,
+    "2026-08-20T00:00:00Z",
+    "2026-08-20T00:00:00Z",
+    "2026-08-20T00:00:00Z",
+  );
+  assert.equal(next.id, "TD-TECH-VALID-02");
   database.close();
 });
