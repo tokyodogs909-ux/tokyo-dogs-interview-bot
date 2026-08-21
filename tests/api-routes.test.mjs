@@ -4235,8 +4235,10 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     requested_at: "2026-07-29T02:00:00.000Z",
     started_at: "2026-07-29T02:00:00.000Z",
     completed_at: "2026-07-29T02:10:00.000Z",
-    folder_id: "legacy-video-less-folder",
-    folder_url: "https://drive.google.com/drive/folders/legacy-video-less-folder",
+    // The historical receipt already points at the exact candidate folder.
+    // Repairs must reuse that ID rather than creating a replacement folder.
+    folder_id: "folder-3",
+    folder_url: "https://drive.google.com/drive/folders/folder-3",
     manifest_json: JSON.stringify({
       files: {
         transcript: { id: "old-transcript", name: `${session.sessionId}_文字起こし.txt`, size: 100 },
@@ -4698,8 +4700,8 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     assert.equal(database.driveUploadSteps.has(session.sessionId), false, "durable upload capability is removed after exact readback");
     assert.match(database.externalSyncs.get(session.sessionId).folder_url, /^https:\/\/drive\.google\.com\/drive\/folders\/folder-/);
     assert.deepEqual(createdFolderFiles.map((folder) => folder.name),
-      ["2026", "07", `テスト 応募者_${session.sessionId}`],
-      "failed artifact preflights must reuse the canonical hierarchy instead of recreating folders");
+      ["2026", "07"],
+      "failed artifact preflights must reuse the exact persisted candidate folder instead of recreating it");
     assert.deepEqual(new Set(uploadedNames), new Set([
       `${session.sessionId}_文字起こし.txt`,
       `${session.sessionId}_評価データ.json`,
@@ -10482,6 +10484,18 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
             permissions: [{ type: "anyone", role: "writer", allowFileDiscovery: false }],
           });
         }
+        if (href.includes(`/files/${parentId}?`)) {
+          return Response.json({
+            id: parentId,
+            name: "08",
+            mimeType: "application/vnd.google-apps.folder",
+            version: "4",
+            modifiedTime: "2026-08-01T00:00:00.000Z",
+            trashed: false,
+            parents: ["year-folder-integrity"],
+            appProperties: { tokyoDogsInterviewMonth: "2026-08" },
+          });
+        }
         if (href.includes("/files?") && href.includes(encodeURIComponent(folderId))) {
           return Response.json({ files });
         }
@@ -10527,6 +10541,164 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
 
   const receipt = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).integrity;
   const originalVersion = receipt.artifacts.transcript.version;
+  const originalFolderVersion = receipt.folder.version;
+  const originalFolderModifiedTime = receipt.folder.modifiedTime;
+
+  for (const [classificationName, classificationFolderId] of [
+    ["合格", "accepted-folder-integrity"],
+    ["不合格", "rejected-folder-integrity"],
+  ]) {
+    const classifiedManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    classifiedManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+    database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(classifiedManifest);
+    const methods = [];
+    try {
+      globalThis.fetch = async (url, init = {}) => {
+        const href = String(url);
+        if (href.startsWith("https://www.googleapis.com/drive/v3/")) {
+          methods.push(init.method ?? "GET");
+        }
+        if (href === "https://oauth2.googleapis.com/token") {
+          return Response.json({ access_token: "drive-read-token" });
+        }
+        if (href.includes(`/files/${folderId}?`)) return Response.json({
+          id: folderId,
+          name: "candidate",
+          mimeType: "application/vnd.google-apps.folder",
+          version: classificationName === "合格" ? "8" : "9",
+          modifiedTime: classificationName === "合格"
+            ? "2026-08-21T01:00:00.000Z"
+            : "2026-08-21T02:00:00.000Z",
+          trashed: false,
+          parents: [classificationFolderId],
+          appProperties: { tokyoDogsInterviewSession: session.sessionId },
+          permissions: [{ type: "anyone", role: "writer", allowFileDiscovery: false }],
+        });
+        if (href.includes(`/files/${classificationFolderId}?`)) return Response.json({
+          id: classificationFolderId,
+          name: classificationName,
+          mimeType: "application/vnd.google-apps.folder",
+          version: "2",
+          modifiedTime: "2026-08-21T00:00:00.000Z",
+          trashed: false,
+          parents: [parentId],
+          appProperties: {},
+        });
+        if (href.includes("/files?") &&
+          new URL(href).searchParams.get("q")?.includes(`name = '${classificationName}'`)) {
+          return Response.json({ files: [{
+            id: classificationFolderId,
+            name: classificationName,
+            mimeType: "application/vnd.google-apps.folder",
+            trashed: false,
+            parents: [parentId],
+            appProperties: {},
+          }] });
+        }
+        if (href.includes("/files?") && href.includes(encodeURIComponent(folderId))) {
+          return Response.json({ files });
+        }
+        if (href.includes("/report-doc-file/export?")) {
+          return new Response(bodies.report_doc, {
+            headers: { "Content-Length": String(Buffer.byteLength(bodies.report_doc)) },
+          });
+        }
+        const media = files.find((file) => href.includes(`/files/${file.id}?alt=media`));
+        if (media) {
+          const body = bodies[media.appProperties.tokyoDogsArtifact];
+          return new Response(body, {
+            headers: { "Content-Length": String(Buffer.byteLength(body)) },
+          });
+        }
+        throw new Error(`unexpected fetch ${href}`);
+      };
+      const response = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+        headers: {
+          Authorization: "Bearer staff-review-secret",
+          "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+        },
+      }, env);
+      const payload = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(payload));
+      assert.equal(payload.review.driveSync.status, "completed");
+      assert.equal(payload.review.driveSync.integrityStatus, "verified");
+      const preserved = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).integrity;
+      assert.equal(preserved.folder.parentId, parentId);
+      assert.equal(preserved.folder.version, originalFolderVersion);
+      assert.equal(preserved.folder.modifiedTime, originalFolderModifiedTime);
+      assert.deepEqual(new Set(methods), new Set(["GET"]), "manual classification must be read-only");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  {
+    const duplicateManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    duplicateManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+    database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(duplicateManifest);
+    const duplicateFolderId = "duplicate-accepted-folder-integrity";
+    const methods = [];
+    try {
+      globalThis.fetch = async (url, init = {}) => {
+        const href = String(url);
+        if (href.startsWith("https://www.googleapis.com/drive/v3/")) {
+          methods.push(init.method ?? "GET");
+        }
+        if (href === "https://oauth2.googleapis.com/token") {
+          return Response.json({ access_token: "drive-read-token" });
+        }
+        if (href.includes(`/files/${folderId}?`)) return Response.json({
+          id: folderId,
+          name: "candidate",
+          mimeType: "application/vnd.google-apps.folder",
+          version: "10",
+          modifiedTime: "2026-08-21T03:00:00.000Z",
+          trashed: false,
+          parents: ["accepted-folder-integrity"],
+          appProperties: { tokyoDogsInterviewSession: session.sessionId },
+        });
+        if (href.includes("/files/accepted-folder-integrity?")) return Response.json({
+          id: "accepted-folder-integrity",
+          name: "合格",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          parents: [parentId],
+          appProperties: {},
+        });
+        if (href.includes("/files?") && new URL(href).searchParams.get("q")?.includes("name = '合格'")) {
+          return Response.json({ files: [
+            {
+              id: "accepted-folder-integrity",
+              name: "合格",
+              mimeType: "application/vnd.google-apps.folder",
+              parents: [parentId],
+            },
+            {
+              id: duplicateFolderId,
+              name: "合格",
+              mimeType: "application/vnd.google-apps.folder",
+              parents: [parentId],
+            },
+          ] });
+        }
+        throw new Error(`unexpected fetch ${href}`);
+      };
+      const response = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+        headers: {
+          Authorization: "Bearer staff-review-secret",
+          "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+        },
+      }, env);
+      const payload = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(payload));
+      assert.equal(payload.review.driveSync.status, "completed");
+      assert.equal(payload.review.driveSync.integrityStatus, "drift");
+      assert.deepEqual(new Set(methods), new Set(["GET"]));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
   receipt.checkedAt = "2020-01-01T00:00:00.000Z";
   const manifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
   manifest.integrity = receipt;
@@ -10774,6 +10946,127 @@ test("two simultaneous archives create one canonical year/month and distinct can
     assert.equal(new Set(candidates.map((folder) => folder.id)).size, 2);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("a pending archive reuses its exact candidate folder after staff moves it to 合格 or 不合格", async () => {
+  for (const [classificationName, classificationFolderId] of [
+    ["合格", "accepted-manual-folder"],
+    ["不合格", "rejected-manual-folder"],
+  ]) {
+    const originalFetch = globalThis.fetch;
+    const database = new FakeD1();
+    const env = driveSyncEnv(database);
+    const session = await seedCompletedInterview(env, database);
+    const yearFolderId = `year-${classificationFolderId}`;
+    const monthFolderId = `month-${classificationFolderId}`;
+    const candidateFolderId = `candidate-${classificationFolderId}`;
+    const completedAt = database.sessions.get(session.sessionId).completed_at;
+    database.externalSyncs.set(session.sessionId, {
+      provider: "google_drive",
+      status: "pending",
+      requested_at: completedAt,
+      started_at: null,
+      completed_at: null,
+      folder_id: candidateFolderId,
+      folder_url: `https://drive.google.com/drive/folders/${candidateFolderId}`,
+      manifest_json: null,
+      error_code: null,
+      updated_at: completedAt,
+    });
+    const folders = [
+      {
+        id: yearFolderId,
+        name: "2026",
+        mimeType: "application/vnd.google-apps.folder",
+        trashed: false,
+        parents: [DRIVE_ROOT_FOLDER_ID],
+        appProperties: { tokyoDogsKind: "tokyoDogsInterviewYear", tokyoDogsInterviewYear: "2026" },
+      },
+      {
+        id: monthFolderId,
+        name: "07",
+        mimeType: "application/vnd.google-apps.folder",
+        trashed: false,
+        parents: [yearFolderId],
+        appProperties: { tokyoDogsKind: "tokyoDogsInterviewMonth", tokyoDogsInterviewMonth: "2026-07" },
+      },
+      {
+        id: classificationFolderId,
+        name: classificationName,
+        mimeType: "application/vnd.google-apps.folder",
+        trashed: false,
+        parents: [monthFolderId],
+        appProperties: {},
+      },
+      {
+        id: candidateFolderId,
+        name: `candidate_${session.sessionId}`,
+        mimeType: "application/vnd.google-apps.folder",
+        trashed: false,
+        parents: [classificationFolderId],
+        appProperties: {
+          tokyoDogsKind: "tokyoDogsInterviewSession",
+          tokyoDogsInterviewSession: session.sessionId,
+        },
+        webViewLink: `https://drive.google.com/drive/folders/${candidateFolderId}`,
+      },
+    ];
+    let folderCreateCalls = 0;
+    let trustedFolderReads = 0;
+    try {
+      globalThis.fetch = async (url, init = {}) => {
+        const href = String(url);
+        if (href === "https://oauth2.googleapis.com/token") {
+          return Response.json({ access_token: "temporary-google-access-token", expires_in: 3600 });
+        }
+        if (href.includes(`/drive/v3/files/${DRIVE_ROOT_FOLDER_ID}?`)) {
+          return Response.json({
+            id: DRIVE_ROOT_FOLDER_ID,
+            name: "オンライン一次面接_自動格納",
+            mimeType: "application/vnd.google-apps.folder",
+            trashed: false,
+            capabilities: { canAddChildren: true },
+          });
+        }
+        if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
+          const query = new URL(href).searchParams.get("q") ?? "";
+          const parentId = query.match(/^'([^']+)' in parents/)?.[1];
+          if (parentId === candidateFolderId) return Response.json({ files: [] });
+          const requestedClassification = ["合格", "不合格"].find((name) =>
+            query.includes(`name = '${name}'`));
+          if (requestedClassification) {
+            return Response.json({ files: requestedClassification === classificationName
+              ? [folders.find((folder) => folder.id === classificationFolderId)]
+              : [] });
+          }
+          const property = query.match(/appProperties has \{ key='([^']+)' and value='([^']+)' \}/);
+          return Response.json({ files: folders.filter((folder) =>
+            folder.parents?.includes(parentId) &&
+            (!property || folder.appProperties?.[property[1]] === property[2])) });
+        }
+        if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method === "POST") {
+          folderCreateCalls += 1;
+          throw new Error("a manually classified candidate folder must never be recreated");
+        }
+        const folder = folders.find((item) => href.includes(`/drive/v3/files/${item.id}?`));
+        if (folder) {
+          if (folder.id === candidateFolderId) trustedFolderReads += 1;
+          return Response.json(folder);
+        }
+        if (href.startsWith("https://www.googleapis.com/upload/drive/v3/files")) {
+          return Response.json({ error: { code: 400 } }, { status: 400 });
+        }
+        throw new Error(`unexpected request ${href}`);
+      };
+      const response = await requestAdminSync(session.sessionId, env);
+      assert.equal(response.status, 502);
+      assert.equal(folderCreateCalls, 0);
+      assert.ok(trustedFolderReads >= 1, "the persisted exact candidate folder ID must be reused");
+      assert.equal(database.externalSyncs.get(session.sessionId).folder_id, candidateFolderId);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   }
 });
 

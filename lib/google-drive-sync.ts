@@ -59,6 +59,10 @@ const DRIVE_RECORDING_REQUEST_TIMEOUT_MS = 25_000;
 const DRIVE_DUPLICATE_RECORDING_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
 const DRIVE_DUPLICATE_RECORDING_RANGE_BYTES = 4 * 1024 * 1024;
 const DRIVE_INTEGRITY_SMALL_FILE_MAX_BYTES = 8 * 1024 * 1024;
+// These folders are created and managed by staff. The interview bot never
+// classifies a candidate or creates/moves/deletes these folders; it only
+// recognizes an already archived candidate folder after a human moves it.
+const MANUAL_CLASSIFICATION_FOLDER_NAMES = new Set(["合格", "不合格"]);
 
 type DrivePermission = {
   type?: string;
@@ -481,6 +485,178 @@ async function getDriveFolderById(accessToken: string, folderId: string) {
     `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(folderId)}?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,version,modifiedTime,trashed,webViewLink,parents,appProperties")}`,
     accessToken,
   );
+}
+
+async function listExactNamedFolders(
+  accessToken: string,
+  parentId: string,
+  name: string,
+) {
+  const params = new URLSearchParams({
+    q: `'${driveQueryValue(parentId)}' in parents and trashed = false and mimeType = '${FOLDER_MIME_TYPE}' and name = '${driveQueryValue(name)}'`,
+    pageSize: "3",
+    spaces: "drive",
+    supportsAllDrives: "true",
+    includeItemsFromAllDrives: "true",
+    fields: "nextPageToken,files(id,name,mimeType,version,modifiedTime,trashed,webViewLink,parents,appProperties)",
+  });
+  const result = await driveJson<DriveFilePage>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
+  if (result.nextPageToken || (result.files?.length ?? 0) > 1) {
+    throw new Error("GOOGLE_DRIVE_CLASSIFICATION_FOLDER_DUPLICATE");
+  }
+  return result.files ?? [];
+}
+
+/**
+ * Verifies that a session folder is either directly under its canonical month
+ * or exactly one level below the staff-managed 合格/不合格 folder. No Drive
+ * mutation is performed here. Unexpected nesting and duplicate classification
+ * folders stay fail-closed.
+ */
+async function verifyCandidateFolderLocation(input: {
+  accessToken: string;
+  folder: DriveFile;
+  sessionId: string;
+  canonicalMonthId?: string;
+}) {
+  if (
+    input.folder.mimeType !== FOLDER_MIME_TYPE ||
+    input.folder.trashed === true ||
+    input.folder.parents?.length !== 1 ||
+    input.folder.appProperties?.tokyoDogsInterviewSession !== input.sessionId
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+  }
+  const currentParentId = input.folder.parents[0];
+  if (input.canonicalMonthId && currentParentId === input.canonicalMonthId) {
+    return { canonicalMonthId: input.canonicalMonthId, manuallyClassified: false };
+  }
+
+  const currentParent = await getDriveFolderById(input.accessToken, currentParentId);
+  if (
+    currentParent.mimeType === FOLDER_MIME_TYPE &&
+    currentParent.trashed !== true &&
+    currentParent.parents?.length === 1 &&
+    typeof currentParent.name === "string" &&
+    MANUAL_CLASSIFICATION_FOLDER_NAMES.has(currentParent.name)
+  ) {
+    const canonicalMonthId = currentParent.parents[0];
+    if (input.canonicalMonthId && canonicalMonthId !== input.canonicalMonthId) {
+      throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+    }
+    const exactClassificationFolders = await listExactNamedFolders(
+      input.accessToken,
+      canonicalMonthId,
+      currentParent.name,
+    );
+    if (
+      exactClassificationFolders.length !== 1 ||
+      exactClassificationFolders[0].id !== currentParent.id
+    ) {
+      throw new Error("GOOGLE_DRIVE_CLASSIFICATION_FOLDER_DUPLICATE");
+    }
+    return { canonicalMonthId, manuallyClassified: true };
+  }
+
+  if (input.canonicalMonthId) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+  }
+  return { canonicalMonthId: currentParentId, manuallyClassified: false };
+}
+
+async function canonicalMonthFromStoredParent(
+  accessToken: string,
+  storedParentId: string,
+) {
+  const storedParent = await getDriveFolderById(accessToken, storedParentId);
+  if (
+    storedParent.mimeType === FOLDER_MIME_TYPE &&
+    storedParent.trashed !== true &&
+    storedParent.parents?.length === 1 &&
+    typeof storedParent.name === "string" &&
+    MANUAL_CLASSIFICATION_FOLDER_NAMES.has(storedParent.name)
+  ) {
+    const monthId = storedParent.parents[0];
+    const exact = await listExactNamedFolders(accessToken, monthId, storedParent.name);
+    if (exact.length !== 1 || exact[0].id !== storedParent.id) {
+      throw new Error("GOOGLE_DRIVE_CLASSIFICATION_FOLDER_DUPLICATE");
+    }
+    return monthId;
+  }
+  return storedParentId;
+}
+
+async function listAllowedCandidateFolderMatches(input: {
+  accessToken: string;
+  canonicalMonthId: string;
+  sessionId: string;
+}) {
+  const propertyKey = "tokyoDogsInterviewSession";
+  const matches = await listExactFolders(
+    input.accessToken,
+    input.canonicalMonthId,
+    propertyKey,
+    input.sessionId,
+  );
+  for (const classificationName of MANUAL_CLASSIFICATION_FOLDER_NAMES) {
+    const classificationFolders = await listExactNamedFolders(
+      input.accessToken,
+      input.canonicalMonthId,
+      classificationName,
+    );
+    if (classificationFolders.length === 0) continue;
+    matches.push(...await listExactFolders(
+      input.accessToken,
+      classificationFolders[0].id,
+      propertyKey,
+      input.sessionId,
+    ));
+  }
+  return matches;
+}
+
+async function resolveCandidateArchiveFolder(input: {
+  accessToken: string;
+  canonicalMonthId: string;
+  sessionId: string;
+  name: string;
+  trustedFolderId?: string | null;
+}) {
+  if (!input.trustedFolderId) {
+    return await ensureFolder(
+      input.accessToken,
+      input.canonicalMonthId,
+      input.name,
+      "tokyoDogsInterviewSession",
+      input.sessionId,
+    );
+  }
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(input.trustedFolderId)) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+  }
+  const folder = await getDriveFolderById(input.accessToken, input.trustedFolderId);
+  if (folder.id !== input.trustedFolderId) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+  }
+  await verifyCandidateFolderLocation({
+    accessToken: input.accessToken,
+    folder,
+    sessionId: input.sessionId,
+    canonicalMonthId: input.canonicalMonthId,
+  });
+  const matches = await listAllowedCandidateFolderMatches({
+    accessToken: input.accessToken,
+    canonicalMonthId: input.canonicalMonthId,
+    sessionId: input.sessionId,
+  });
+  const matchingIds = new Set(matches.map((match) => match.id));
+  if (
+    matchingIds.size > 1 ||
+    [...matchingIds].some((folderId) => folderId !== input.trustedFolderId)
+  ) {
+    throw new Error("GOOGLE_DRIVE_HIERARCHY_DUPLICATE");
+  }
+  return folder;
 }
 
 function assertHierarchyFolder(input: {
@@ -1623,9 +1799,17 @@ async function verifyDriveArchive(input: {
     folder.id !== input.folder.id ||
     folder.mimeType !== FOLDER_MIME_TYPE ||
     folder.trashed === true ||
-    !exactDriveParent(folder, input.expectedParentId) ||
     folder.appProperties?.tokyoDogsInterviewSession !== input.sessionId
   ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+  }
+  const location = await verifyCandidateFolderLocation({
+    accessToken: input.accessToken,
+    folder,
+    sessionId: input.sessionId,
+    canonicalMonthId: input.expectedParentId,
+  });
+  if (location.canonicalMonthId !== input.expectedParentId) {
     throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
   }
   const folderVersion = safeDriveVersion(folder);
@@ -1984,6 +2168,7 @@ export function googleDriveIntegrityFailureStatus(error: unknown) {
     code === "GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH" ||
     code === "GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH" ||
     code === "GOOGLE_DRIVE_RECORDING_SIZE_MISMATCH" ||
+    code === "GOOGLE_DRIVE_CLASSIFICATION_FOLDER_DUPLICATE" ||
     code === "GOOGLE_DRIVE_API_404" ||
     code === "GOOGLE_DRIVE_API_410"
   ) return "drift" as const;
@@ -2011,18 +2196,44 @@ export async function readGoogleDriveArchiveIntegritySnapshot(input: {
     `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.folderId)}?supportsAllDrives=true&fields=${encodeURIComponent(fields)}`,
     accessToken,
   );
-  const parentId = input.previous?.folder.parentId ?? (
-    folder.parents?.length === 1 ? folder.parents[0] : null
-  );
   if (
     folder.id !== input.folderId ||
     folder.mimeType !== FOLDER_MIME_TYPE ||
     folder.trashed === true ||
-    !parentId || !exactDriveParent(folder, parentId) ||
     folder.appProperties?.tokyoDogsInterviewSession !== input.sessionId
   ) {
     throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
   }
+  let location;
+  try {
+    location = await verifyCandidateFolderLocation({
+      accessToken,
+      folder,
+      sessionId: input.sessionId,
+      canonicalMonthId: input.previous?.folder.parentId,
+    });
+  } catch (error) {
+    // A receipt produced before this compatibility change may itself contain
+    // 合格/不合格 as the stored parent. Resolve its month only when a later
+    // human move changes the parent again. All duplicate/location errors stay
+    // fail-closed and are never reinterpreted.
+    if (
+      !input.previous ||
+      safeErrorCode(error) !== "GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH"
+    ) throw error;
+    const canonicalMonthId = await canonicalMonthFromStoredParent(
+      accessToken,
+      input.previous.folder.parentId,
+    );
+    if (canonicalMonthId === input.previous.folder.parentId) throw error;
+    location = await verifyCandidateFolderLocation({
+      accessToken,
+      folder,
+      sessionId: input.sessionId,
+      canonicalMonthId,
+    });
+  }
+  const parentId = input.previous?.folder.parentId ?? location.canonicalMonthId;
   const required: DriveArtifactKey[] = [
     "transcript", "evaluation_json", "report_doc", "report_pdf", "manifest",
   ];
@@ -2068,8 +2279,16 @@ export async function readGoogleDriveArchiveIntegritySnapshot(input: {
     folder: {
       fileId: folder.id,
       parentId,
-      version: safeDriveVersion(folder),
-      modifiedTime: safeDriveModifiedTime(folder),
+      // A staff classification move changes only the candidate folder's
+      // parent/version/modifiedTime. Preserve the original folder receipt in
+      // that one explicitly allowed case while still re-reading and hashing
+      // every archived artifact below it.
+      version: location.manuallyClassified && input.previous
+        ? input.previous.folder.version
+        : safeDriveVersion(folder),
+      modifiedTime: location.manuallyClassified && input.previous
+        ? input.previous.folder.modifiedTime
+        : safeDriveModifiedTime(folder),
     },
     artifacts: Object.fromEntries(artifactEntries),
   };
@@ -2282,13 +2501,14 @@ async function prepareDriveArchive(
     reportProgress,
   });
   await reportProgress();
-  const candidateFolder = await ensureFolder(
+  const existingSync = await getExternalSyncStatus(source.sessionId);
+  const candidateFolder = await resolveCandidateArchiveFolder({
     accessToken,
-    monthFolder.id,
-    `${safeFolderSegment(source.candidateName)}_${source.sessionId}`,
-    "tokyoDogsInterviewSession",
-    source.sessionId,
-  );
+    canonicalMonthId: monthFolder.id,
+    sessionId: source.sessionId,
+    name: `${safeFolderSegment(source.candidateName)}_${source.sessionId}`,
+    trustedFolderId: existingSync?.folderId,
+  });
   const transcript = buildTranscriptText(source);
   // assertArchiveReady() runs before any Drive access. Recompute here for the
   // persisted receipt so a future refactor cannot accidentally label a
