@@ -12,6 +12,7 @@ import {
   signedInvitesRequired,
 } from "@/lib/interview-invite";
 import { secureServerSecretMatch, serverSecretReadiness } from "@/lib/server-secret-auth";
+import { INTERVIEW_REPORT_PRESENTATION_VERSION } from "@/lib/interview-review-summary.js";
 
 type InterviewBindings = {
   DB?: D1Database;
@@ -2490,6 +2491,83 @@ export async function findNextInterviewDriveRecoverySession(options: {
     if (hasVerifiedCandidateTranscript(transcript, failures)) return candidate.id;
   }
   return null;
+}
+
+/**
+ * Selects a small, bounded set of otherwise complete archives whose recruiter
+ * report predates the current question/answer presentation. Only sessions with
+ * an actual candidate transcript are returned; technical holds and legacy
+ * placeholders remain untouched.
+ */
+export async function findInterviewReportPresentationRefreshSessions(limit = 2) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const safeLimit = Math.max(0, Math.min(2, Math.trunc(limit)));
+  if (safeLimit === 0) return [];
+  const candidates = await db.prepare(`SELECT
+      s.id, s.transcript_json,
+      EXISTS (
+        SELECT 1 FROM interview_audit_events AS ta
+        WHERE ta.session_id = s.id
+          AND ta.event_type = 'transcription_failed'
+          AND CASE WHEN json_valid(ta.detail_json)
+            THEN json_extract(ta.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+            )
+      ) AS candidate_transcription_failed
+    FROM interview_sessions AS s
+    INNER JOIN interview_external_syncs AS d
+      ON d.session_id = s.id AND d.provider = 'google_drive'
+    WHERE s.status = 'completed'
+      AND s.recording_status IN ('stored', 'not_applicable')
+      AND d.status = 'completed'
+      AND COALESCE(json_extract(d.manifest_json, '$.transcriptAvailable'), 0) = 1
+      AND COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') = 'actual_transcript'
+      AND (s.recording_status = 'not_applicable'
+        OR COALESCE(json_extract(d.manifest_json, '$.recordingIncluded'), 0) = 1)
+      AND COALESCE(json_extract(d.manifest_json, '$.reportPresentationVersion'), '') != ?
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events hold
+        WHERE hold.session_id = s.id AND hold.event_type IN (
+          'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+        )
+      )
+      AND s.transcript_json IS NOT NULL
+      AND json_valid(s.transcript_json)
+      AND json_type(s.transcript_json) = 'array'
+    ORDER BY COALESCE(d.completed_at, d.updated_at, s.completed_at, s.created_at) ASC, s.id ASC
+    LIMIT 10`)
+    .bind(INTERVIEW_REPORT_PRESENTATION_VERSION)
+    .all<{ id: string; transcript_json: string; candidate_transcription_failed: number }>();
+
+  const selected: string[] = [];
+  for (const candidate of candidates.results ?? []) {
+    const decoded = parseJson<unknown>(candidate.transcript_json, null);
+    if (!Array.isArray(decoded)) continue;
+    const transcript = decoded.slice(0, 300).flatMap((value): TranscriptTurn[] => {
+      if (!value || typeof value !== "object") return [];
+      const turn = value as Partial<TranscriptTurn>;
+      if (
+        typeof turn.id !== "string" ||
+        (turn.speaker !== "candidate" && turn.speaker !== "interviewer") ||
+        typeof turn.text !== "string"
+      ) return [];
+      return [{
+        id: turn.id.slice(0, 120),
+        speaker: turn.speaker,
+        text: turn.text.replace(/\0/g, "").trim().slice(0, 5_000),
+        createdAt: typeof turn.createdAt === "string" ? turn.createdAt.slice(0, 40) : "",
+      }];
+    });
+    const failures = Number(candidate.candidate_transcription_failed ?? 0) === 1
+      ? [{ type: "transcription_failed", detail: { code: "TRANSCRIPTION_FAILED" } }]
+      : [];
+    if (!hasVerifiedCandidateTranscript(transcript, failures)) continue;
+    selected.push(candidate.id);
+    if (selected.length >= safeLimit) break;
+  }
+  return selected;
 }
 
 export async function requestExternalSync(sessionId: string) {

@@ -2090,6 +2090,48 @@ class FakeD1Statement {
           }),
       };
     }
+    if (this.sql.startsWith("SELECT s.id, s.transcript_json, EXISTS") &&
+      this.sql.includes("reportPresentationVersion")) {
+      const [reportPresentationVersion] = this.values;
+      return {
+        results: [...this.database.sessions.values()]
+          .filter((session) => {
+            if (session.status !== "completed" || !["stored", "not_applicable"].includes(session.recording_status)) return false;
+            if (hasCompletionHold(this.database, session.id)) return false;
+            const sync = this.database.externalSyncs.get(session.id);
+            if (!sync || sync.status !== "completed") return false;
+            let manifest;
+            let transcript;
+            try {
+              manifest = JSON.parse(sync.manifest_json ?? "{}");
+              transcript = JSON.parse(session.transcript_json ?? "[]");
+            } catch {
+              return false;
+            }
+            if (manifest.transcriptAvailable !== true || manifest.transcriptKind !== "actual_transcript") return false;
+            if (session.recording_status === "stored" && manifest.recordingIncluded !== true) return false;
+            if (manifest.reportPresentationVersion === reportPresentationVersion) return false;
+            return Array.isArray(transcript) && transcript.some((turn) =>
+              turn?.speaker === "candidate" && typeof turn.text === "string" && turn.text.trim()) &&
+              !transcript.some((turn) => turn?.speaker === "candidate" &&
+                String(turn.id ?? "").startsWith("recorded-fallback-answer-"));
+          })
+          .sort((left, right) => {
+            const leftSync = this.database.externalSyncs.get(left.id);
+            const rightSync = this.database.externalSyncs.get(right.id);
+            return String(leftSync?.completed_at ?? leftSync?.updated_at ?? left.completed_at ?? left.created_at)
+              .localeCompare(String(rightSync?.completed_at ?? rightSync?.updated_at ?? right.completed_at ?? right.created_at)) ||
+              left.id.localeCompare(right.id);
+          })
+          .slice(0, 10)
+          .map((session) => ({
+            id: session.id,
+            transcript_json: session.transcript_json,
+            candidate_transcription_failed: this.database.auditEvents.some((event) =>
+              event.session_id === session.id && isRealtimeTranscriptionGapEvent(event)) ? 1 : 0,
+          })),
+      };
+    }
     if (this.sql.startsWith("SELECT s.id, s.transcript_json, EXISTS")) {
       const [failedBefore, pendingBefore, includeIntegrityRecheck, integrityBefore] = this.values;
       return {
@@ -4741,15 +4783,61 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     assert.equal(legacyDuplicateFile.appProperties.tokyoDogsArtifact, "legacy_duplicate_transcript");
     assert.equal(legacyDuplicateFile.appProperties.tokyoDogsLegacyArtifact, "transcript");
     const completedManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    assert.equal(completedManifest.reportPresentationVersion, "2026-08-23-v1");
     assert.equal(completedManifest.files.transcript.id, canonicalTranscript.id,
       "the current-run canonical file must remain the durable receipt");
+    const reportDocument = uploadedDriveFiles.find((file) =>
+      file.appProperties?.tokyoDogsArtifact === "report_doc");
+    assert.ok(reportDocument);
+    const reportDocumentText = new TextDecoder().decode(reportDocument.body);
+    assert.match(reportDocumentText, /受験者の要点/);
+    assert.match(reportDocumentText, /価値観・考え方/);
+    assert.match(reportDocumentText, /質問事項からの返答（1組）/);
+    assert.match(reportDocumentText, /自己紹介をお願いします。/);
+    assert.match(reportDocumentText, /接客経験があります。/);
     const responseText = JSON.stringify(payload);
     assert.equal(responseText.includes("google-client-secret"), false);
     assert.equal(responseText.includes("google-refresh-token"), false);
     assert.equal(responseText.includes("temporary-google-access-token"), false);
 
-    const driveCallsBeforeIdempotentRead = uploadedNames.length + recordingUploadRanges.length + createdFolders.length;
+    // A pre-presentation-version completed receipt refreshes only the five
+    // small artifacts. It must preserve the canonical recording and never
+    // open or write a resumable media upload again.
+    const legacyPresentationReceipt = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    delete legacyPresentationReceipt.reportPresentationVersion;
+    database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(legacyPresentationReceipt);
+    const artifactsBeforePresentationRefresh = artifactUploadRequests.length;
+    const recordingRangesBeforePresentationRefresh = [...recordingUploadRanges];
+    const uploadedNamesBeforePresentationRefresh = uploadedNames.length;
     recordingDataPutsThisApiCall = 0;
+    const presentationRefresh = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.deepEqual(await presentationRefresh.json(), {
+      stored: true,
+      recordingIncluded: true,
+      transcriptAvailable: true,
+      transcriptKind: "actual_transcript",
+    });
+    assert.equal(recordingDataPutsThisApiCall, 0);
+    assert.deepEqual(recordingUploadRanges, recordingRangesBeforePresentationRefresh,
+      "a report-only refresh must never replay recording bytes");
+    assert.equal(uploadedNames.length - uploadedNamesBeforePresentationRefresh, 5,
+      "the report-only refresh updates the four small source artifacts and manifest");
+    const presentationRefreshArtifacts = artifactUploadRequests.slice(artifactsBeforePresentationRefresh);
+    assert.deepEqual(presentationRefreshArtifacts.map((call) => call.artifact).sort(),
+      ["evaluation_json", "manifest", "report_doc", "report_pdf", "transcript"]);
+    assert.equal(presentationRefreshArtifacts.every((call) => call.method === "PATCH"), true,
+      "a report-only refresh must reuse every canonical Drive file ID");
+    assert.equal(JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).reportPresentationVersion,
+      "2026-08-23-v1");
+
+    const driveCallsBeforeIdempotentRead = uploadedNames.length + recordingUploadRanges.length + createdFolders.length;
     const replay = await request("/api/interviews/archive", {
       method: "POST",
       headers: {
@@ -4758,15 +4846,10 @@ test("candidate archive fails closed before writes for a mismatched transcript d
       },
       body: JSON.stringify({ sessionId: session.sessionId }),
     }, env);
-    assert.deepEqual(await replay.json(), {
-      stored: true,
-      recordingIncluded: true,
-      transcriptAvailable: true,
-      transcriptKind: "actual_transcript",
-    });
+    assert.equal(replay.status, 200);
     assert.equal(recordingDataPutsThisApiCall, 0);
     assert.equal(uploadedNames.length + recordingUploadRanges.length + createdFolders.length, driveCallsBeforeIdempotentRead,
-      "a completed receipt must be an exact D1 readback, not another Drive write");
+      "a current completed receipt must be an exact D1 readback, not another Drive write");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -10456,6 +10539,7 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
       recordingIncluded: false,
       transcriptAvailable: true,
       transcriptKind: "actual_transcript",
+      reportPresentationVersion: "2026-08-23-v1",
     }),
     error_code: null,
     updated_at: stored.completed_at,
@@ -10822,6 +10906,7 @@ test("background Drive recovery prioritizes pending work before one stale comple
       recordingIncluded: false,
       transcriptAvailable: true,
       transcriptKind: "actual_transcript",
+      reportPresentationVersion: "2026-08-23-v1",
       integrity: {
         schemaVersion: "2026-08-14-v1",
         status: "verified",
@@ -11540,6 +11625,7 @@ test("completed recorded-answer transcripts supersede an earlier realtime transc
       recordingIncluded: false,
       transcriptAvailable: true,
       transcriptKind: "actual_transcript",
+      reportPresentationVersion: "2026-08-23-v1",
     }),
     error_code: null,
     updated_at: "2026-07-29T02:01:00.000Z",

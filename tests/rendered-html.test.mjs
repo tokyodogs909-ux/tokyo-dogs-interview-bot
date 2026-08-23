@@ -570,6 +570,12 @@ test("server-renders the protected recruiter review entry", async () => {
   assert.match(source, /差分検出（要確認）/);
   assert.match(source, /現状維持・リンク保有者が編集可能/);
   assert.match(source, /保存完了は音声品質の確認完了を意味しません/);
+  assert.match(source, /受験者の要点/);
+  assert.match(source, /価値観・考え方/);
+  assert.match(source, /質問事項からの返答/);
+  assert.match(source, /発言を言い換えず、面接順の質問・確認と応募者回答/);
+  assert.match(source, /時系列の全文議事録を確認/);
+  assert.match(source, /この要約は合否判断ではありません/);
   assert.match(source, /候補者を検索/);
   assert.match(source, /面接IDを直接指定/);
   assert.match(source, /navigator\.clipboard\.writeText/);

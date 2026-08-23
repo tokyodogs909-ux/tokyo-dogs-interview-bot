@@ -41,6 +41,12 @@ import {
   TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
   technicalEvidenceArchiveTranscript,
 } from "@/lib/interview-technical-evidence";
+import {
+  INTERVIEW_REPORT_PRESENTATION_VERSION,
+  buildCandidateReviewOutline,
+  buildCandidateValueHighlights,
+  buildInterviewQuestionAnswers,
+} from "@/lib/interview-review-summary.js";
 
 const FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
@@ -164,6 +170,7 @@ export type GoogleDriveSyncResult = {
   recordingIncluded: boolean;
   transcriptAvailable: boolean;
   transcriptKind: string;
+  reportPresentationVersion: string;
   integrity?: GoogleDriveArchiveIntegrity;
 };
 
@@ -339,6 +346,18 @@ function buildReportHtml(source: ArchiveSource) {
   const technicalEvidence = isTechnicalEvidenceArchiveSource(source);
   const isTextInterview = source.recordingStatus === "not_applicable";
   const evaluation = source.evaluation;
+  const questionAnswers = buildInterviewQuestionAnswers(archiveTranscript(source));
+  const valueHighlights = buildCandidateValueHighlights(evaluation);
+  const outline = buildCandidateReviewOutline(evaluation);
+  const questionAnswerHtml = questionAnswers.length
+    ? questionAnswers.map((item) => `<section class="qa">
+      <h3>Q${item.number}. ${escapeHtml(item.question)}</h3>
+      <p>${escapeHtml(item.answer)}</p>
+    </section>`).join("")
+    : "<p>質問と実回答の組み合わせを確認できません。未確定記録または録画を人が確認してください。</p>";
+  const valueHighlightsHtml = valueHighlights.length
+    ? `<div class="value-grid">${valueHighlights.map((item) => `<section><h3>${escapeHtml(item.label)}</h3><p>${escapeHtml(item.text)}</p>${item.evidenceCount > 0 ? `<small>回答根拠 ${item.evidenceCount}件</small>` : ""}</section>`).join("")}</div>`
+    : "<p>回答根拠を伴う価値観・考え方の要約は未作成です。</p>";
   const dimensions = evaluation?.dimensions.map((dimension) => `
     <section>
       <h3>${escapeHtml(dimension.name)} — ${scoreLabel(dimension.score)}</h3>
@@ -361,7 +380,7 @@ function buildReportHtml(source: ArchiveSource) {
   return `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><title>TOKYO DOGS オンライン一次面接レポート</title>
 <style>
-body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Yu Gothic",sans-serif;color:#12324b;line-height:1.65;margin:42px}h1{font-size:24px;border-bottom:3px solid #0c4168;padding-bottom:12px}h2{font-size:18px;margin-top:30px;background:#e8f4fb;padding:9px 12px}h3{font-size:15px;margin-bottom:5px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #b7c8d3;padding:8px;text-align:left;vertical-align:top}th{width:28%;background:#f4f8fa}section{break-inside:avoid}footer{margin-top:32px;font-size:11px;color:#526c7e}.notice{border:1px solid #8fb4ca;background:#f5fbff;padding:12px}</style></head><body>
+body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Yu Gothic",sans-serif;color:#12324b;line-height:1.65;margin:42px}h1{font-size:24px;border-bottom:3px solid #0c4168;padding-bottom:12px}h2{font-size:18px;margin-top:30px;background:#e8f4fb;padding:9px 12px}h3{font-size:15px;margin-bottom:5px;white-space:pre-line}table{border-collapse:collapse;width:100%}th,td{border:1px solid #b7c8d3;padding:8px;text-align:left;vertical-align:top}th{width:28%;background:#f4f8fa}section{break-inside:avoid}footer{margin-top:32px;font-size:11px;color:#526c7e}.notice{border:1px solid #8fb4ca;background:#f5fbff;padding:12px}.value-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.value-grid section,.qa{border:1px solid #c7d9e3;border-radius:8px;padding:10px 12px;margin:0 0 10px}.value-grid p,.qa p{margin:5px 0;white-space:pre-line}.value-grid small{color:#526c7e}.qa h3{color:#0c4168;margin-top:0}.candidate-summary{font-size:14px;font-weight:600}</style></head><body>
 <h1>TOKYO DOGS オンライン一次面接レポート</h1>
 <table>
 <tr><th>面接ID</th><td>${escapeHtml(source.sessionId)}</td></tr>
@@ -376,6 +395,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Yu Gothic",san
   : isTextInterview
   ? "本資料は採用担当者の確認資料です。システムは合否を自動決定しません。文字入力方式では映像・音声を取得せず、参加方法の違いを不利益な評価に使用しません。"
   : "本資料は採用担当者の確認資料です。システムは合否を自動決定しません。文字起こしは応募者端末由来のため録画との照合が必要です。通信・録音・文字起こしの不具合や、顔立ち・容姿・表情・声質等を不利益な評価に使用しません。"}</p>
+<h2>受験者の要点</h2>
+<p class="candidate-summary">${escapeHtml(outline.summary)}</p>
+<h3>価値観・考え方</h3>
+${valueHighlightsHtml}
+<p><strong>強み:</strong> ${escapeHtml(outline.strengths.join(" / ") || "未確認")}</p>
+<p><strong>希望条件:</strong> ${escapeHtml(outline.conditions.join(" / ") || "未確認")}</p>
+<p><strong>追加確認:</strong> ${escapeHtml(outline.missingTopics.join(" / ") || "なし")}</p>
+<p><strong>懸念・要確認:</strong> ${escapeHtml(outline.concerns.join(" / ") || "なし")}</p>
+<h2>質問事項からの返答（${questionAnswers.length}組）</h2>
+<p>面接順の質問・確認と応募者回答を、発言を言い換えずに整理しています。</p>
+${questionAnswerHtml}
 <h2>回答評価</h2>
 <p>${escapeHtml(evaluation?.summary || "回答評価は未作成です。")}</p>
 ${evaluation?.evidenceValidationWarnings.length
@@ -395,8 +425,10 @@ ${humanReviews}
 
 function buildResultJson(source: ArchiveSource) {
   const transcriptKind = archiveTranscriptKind(source);
+  const questionAnswers = buildInterviewQuestionAnswers(archiveTranscript(source));
   return JSON.stringify({
-    schemaVersion: "2026-07-29-v1",
+    schemaVersion: "2026-08-23-v2",
+    reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
     generatedAt: new Date().toISOString(),
     interview: {
       sessionId: source.sessionId,
@@ -412,6 +444,9 @@ function buildResultJson(source: ArchiveSource) {
       completedAt: source.completedAt,
     },
     evaluation: source.evaluation,
+    candidateReviewOutline: buildCandidateReviewOutline(source.evaluation),
+    candidateValueHighlights: buildCandidateValueHighlights(source.evaluation),
+    questionAnswers,
     transcriptKind,
     technicalHold: transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
     automaticEvaluationPerformed: source.evaluation !== null,
@@ -2692,7 +2727,8 @@ async function finalizeDriveArchive(
     await persistPreparedContext(prepared);
   }
   const manifest = {
-    schemaVersion: "2026-07-29-v1",
+    schemaVersion: "2026-08-23-v2",
+    reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
     generatedAt: new Date().toISOString(),
     sessionId: source.sessionId,
     rootFolderId: prepared.rootFolderId,
@@ -2760,6 +2796,7 @@ async function finalizeDriveArchive(
     recordingIncluded: Boolean(source.recording),
     transcriptAvailable: prepared.transcriptAvailable,
     transcriptKind: prepared.transcriptKind,
+    reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
     integrity: verified.integrity,
   };
 }
@@ -2780,6 +2817,9 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
           recordingIncluded: current.manifest?.recordingIncluded === true,
           transcriptAvailable: current.manifest?.transcriptAvailable === true,
           transcriptKind: typeof current.manifest?.transcriptKind === "string" ? current.manifest.transcriptKind : "unknown",
+          reportPresentationVersion: typeof current.manifest?.reportPresentationVersion === "string"
+            ? current.manifest.reportPresentationVersion
+            : "unknown",
           integrity: current.manifest?.integrity as GoogleDriveArchiveIntegrity | undefined,
         };
       }
@@ -2801,6 +2841,7 @@ async function syncInterviewToGoogleDriveOnce(sessionId: string): Promise<Google
           recordingIncluded: lastCompleted.recordingIncluded,
           transcriptAvailable: lastCompleted.transcriptAvailable,
           transcriptKind: lastCompleted.transcriptKind,
+          reportPresentationVersion: lastCompleted.reportPresentationVersion,
           integrity: lastCompleted.integrity,
         },
       });
@@ -2836,6 +2877,9 @@ function completedResultFromStatus(status: NonNullable<Awaited<ReturnType<typeof
     recordingIncluded: status.manifest?.recordingIncluded === true,
     transcriptAvailable: status.manifest?.transcriptAvailable === true,
     transcriptKind: typeof status.manifest?.transcriptKind === "string" ? status.manifest.transcriptKind : "unknown",
+    reportPresentationVersion: typeof status.manifest?.reportPresentationVersion === "string"
+      ? status.manifest.reportPresentationVersion
+      : "unknown",
     integrity: status.manifest?.integrity as GoogleDriveArchiveIntegrity | undefined,
   };
 }
@@ -2852,6 +2896,75 @@ function completedReceiptSatisfiesSource(
   const recordingVerified = source.recordingStatus === "not_applicable" ||
     (source.recordingStatus === "stored" && receipt.recordingIncluded === true);
   return transcriptVerified && recordingVerified;
+}
+
+/**
+ * Refreshes only the five small presentation artifacts of an already verified
+ * archive. The durable recording is resolved by its exact canonical Drive ID
+ * and is never uploaded or content-PATCHed again. This is used when a report
+ * layout improves while the underlying interview evidence remains unchanged.
+ */
+async function refreshCompletedDriveReportPresentation(
+  sessionId: string,
+  source: ArchiveSource,
+): Promise<GoogleDriveArchiveStepResult> {
+  await requestExternalSync(sessionId);
+  const startedAt = await claimExternalSync(sessionId);
+  if (!startedAt) return pendingStep({ phase: "busy" });
+  const claimHeartbeat = startDriveClaimHeartbeat(sessionId, startedAt);
+  try {
+    assertArchiveReady(source);
+    await claimHeartbeat.reportProgress();
+    const accessToken = await fetchGoogleDriveAccessToken();
+    const prepared = await prepareDriveArchive(source, accessToken, claimHeartbeat.reportProgress);
+    let recordingFile: DriveFile | null = null;
+    if (source.recording) {
+      const recordingId = prepared.artifactTargetIds.recording;
+      if (typeof recordingId !== "string") {
+        throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+      }
+      await claimHeartbeat.reportProgress();
+      const children = await listFolderChildren(accessToken, prepared.candidateFolder.id);
+      recordingFile = children.find((file) => file.id === recordingId) ?? null;
+      const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
+      if (!recordingFile || !recordingFileMatchesTrustedUpload({
+        file: recordingFile,
+        folderId: prepared.candidateFolder.id,
+        name: `${source.sessionId}_面接録画.${extension}`,
+        contentType: source.recording.contentType,
+        byteSize: source.recording.byteSize,
+      })) {
+        throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+      }
+    }
+    const result = await finalizeDriveArchive(
+      source,
+      accessToken,
+      prepared,
+      recordingFile,
+      claimHeartbeat.reportProgress,
+    );
+    await claimHeartbeat.stop();
+    const retryRequested = await completeExternalSync({
+      sessionId,
+      startedAt,
+      folderId: result.folderId,
+      folderUrl: result.folderUrl,
+      manifest: {
+        files: result.uploaded,
+        recordingIncluded: result.recordingIncluded,
+        transcriptAvailable: result.transcriptAvailable,
+        transcriptKind: result.transcriptKind,
+        reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
+        integrity: result.integrity,
+      },
+    });
+    return retryRequested ? { ...result, status: "pending" } : result;
+  } catch (error) {
+    await claimHeartbeat.stop().catch(() => undefined);
+    await failExternalSync({ sessionId, startedAt, errorCode: safeErrorCode(error) });
+    throw error;
+  }
 }
 
 function pendingStep(input: {
@@ -3019,6 +3132,7 @@ async function completeSteppedArchive(input: {
       recordingIncluded: result.recordingIncluded,
       transcriptAvailable: input.prepared.transcriptAvailable,
       transcriptKind: input.prepared.transcriptKind,
+      reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
       integrity: result.integrity,
     },
     driveUploadStepLeaseToken: input.leaseToken,
@@ -3055,6 +3169,9 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
       throw new Error("INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC");
     }
     if (completedReceiptSatisfiesSource(alreadyCompleted, source)) {
+      if (alreadyCompleted.reportPresentationVersion !== INTERVIEW_REPORT_PRESENTATION_VERSION) {
+        return await refreshCompletedDriveReportPresentation(sessionId, source);
+      }
       await revalidateCompletedGoogleDriveArchive(sessionId);
       const refreshed = await getExternalSyncStatus(sessionId);
       return refreshed ? completedResultFromStatus(refreshed) ?? alreadyCompleted : alreadyCompleted;
@@ -3157,6 +3274,7 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
             recordingIncluded: false,
             transcriptAvailable: prepared.transcriptAvailable,
             transcriptKind: prepared.transcriptKind,
+            reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
             integrity: result.integrity,
           },
         });

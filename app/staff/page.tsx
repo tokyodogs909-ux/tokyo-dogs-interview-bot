@@ -9,6 +9,11 @@ import {
 } from "@/lib/interview";
 import { isVerifiedInterviewArchive } from "@/lib/drive-recovery.js";
 import { RECORDED_TRANSCRIPT_EVALUATION_WARNING } from "@/lib/recorded-evaluation-marker";
+import {
+  buildCandidateReviewOutline,
+  buildCandidateValueHighlights,
+  buildInterviewQuestionAnswers,
+} from "@/lib/interview-review-summary.js";
 
 type VideoScore = {
   name: (typeof VIDEO_REVIEW_DIMENSIONS)[number]["name"];
@@ -354,10 +359,10 @@ export default function StaffReviewPage() {
           body: JSON.stringify({ sessionId: targetSessionId }),
         });
         if (!response.ok) {
-          setCompletionNotice("Drive自動復旧を完了できない記録があります。「Driveへ再格納」で再確認してください。");
+          setCompletionNotice("Drive自動復旧を完了できない記録があります。「Drive・レポートを更新」で再確認してください。");
         }
       } catch {
-        setCompletionNotice("Drive自動復旧を完了できない記録があります。「Driveへ再格納」で再確認してください。");
+        setCompletionNotice("Drive自動復旧を完了できない記録があります。「Drive・レポートを更新」で再確認してください。");
       } finally {
         driveRecoveryInFlightRef.current.delete(targetSessionId);
       }
@@ -513,6 +518,24 @@ export default function StaffReviewPage() {
   const recordedFallbackSelected = isRecordedFallbackReview(review);
   const recordedAutomaticEvaluation = hasRecordedAutomaticEvaluation(review);
   const legacyRecordedFallbackSelected = recordedFallbackSelected && !recordedAutomaticEvaluation;
+  const reviewTranscript = review?.transcript.length
+    ? review.transcript
+    : review?.transcriptDraft?.transcript ?? [];
+  const questionAnswers = buildInterviewQuestionAnswers(reviewTranscript);
+  const visibleQuestionAnswers = questionAnswers.slice(0, 8);
+  const remainingQuestionAnswers = questionAnswers.slice(8);
+  const valueHighlights = buildCandidateValueHighlights(review?.evaluation ?? null);
+  const reviewOutline = buildCandidateReviewOutline(review?.evaluation ?? null);
+  const interviewModeLabel = textInterviewSelected
+    ? "文字入力"
+    : recordedFallbackSelected
+      ? "録画式"
+      : "通常音声";
+  const transcriptStatusLabel = review?.sourceTranscriptVerified
+    ? "実回答の議事録あり"
+    : review?.transcriptDraft && !review.transcriptDraft.sealed
+      ? "中断時点の未確定記録"
+      : "議事録未確認";
   const normalizedFilter = listFilter.normalize("NFKC").trim().toLowerCase();
   const filteredInterviews = (recentInterviews ?? []).filter((item) => !normalizedFilter || [
     item.candidateName,
@@ -636,7 +659,7 @@ export default function StaffReviewPage() {
           <li><strong>2. 面接完了後に一覧を確認</strong><span>担当者表示名（自己申告）と共通アクセスキーを入力し、「候補者一覧を表示」を押します。</span></li>
           <li><strong>3. 保存完了を確認</strong><span>通常面接は「面接完了・録画保存済み・Drive格納済み」、文字入力方式は「面接完了・Drive格納済み」を確認します。</span></li>
         </ol>
-        <p className="staff-operation-alert"><strong>「要確認」がある場合</strong> 候補者を不利に評価せず、記録を開いて技術フラグを確認してください。Driveだけが未完了の場合は「Driveへ再格納」を押します。</p>
+        <p className="staff-operation-alert"><strong>「要確認」がある場合</strong> 候補者を不利に評価せず、記録を開いて技術フラグを確認してください。Driveまたはレポートだけが未完了の場合は「Drive・レポートを更新」を押します。</p>
       </section>
 
       <section className="staff-login">
@@ -674,7 +697,7 @@ export default function StaffReviewPage() {
               {archiveHealth.attention > 0 && (
                 <small>{archiveHealth.autoRecoveryScheduled > 0
                   ? `${archiveHealth.autoRecoveryScheduled}件を復旧対象として確認しました。サーバーの定期復旧でも処理を継続します。`
-                  : `${archiveHealth.attention}件は復旧の待機中または自動再実行の対象外です。「Driveへ再格納」で状態を確認してください。`}</small>
+                  : `${archiveHealth.attention}件は復旧の待機中または自動再実行の対象外です。「Drive・レポートを更新」で状態を確認してください。`}</small>
               )}
             </div>
           )}
@@ -702,6 +725,44 @@ export default function StaffReviewPage() {
         <section className="staff-review">
           <div className="staff-meta"><div><span>氏名</span><strong>{review.candidateName || "旧テスト記録"}</strong></div><div><span>面接ID</span><strong>{review.sessionId}</strong></div><div><span>雇用形態</span><strong>{review.employment}</strong></div><div><span>入職希望対象店舗</span><strong>{review.location}</strong></div><div><span>保存見直し</span><strong>{formatRetentionDate(review.retentionUntil)}</strong></div><div><span>状態</span><strong>{review.status}</strong></div></div>
 
+          <section className="staff-panel candidate-brief-panel">
+            <div className="panel-title"><p>CANDIDATE BRIEF</p><h2>受験者の要点</h2></div>
+            <div className="candidate-brief-status" aria-label="面接記録の要点">
+              <div><span>参加方法</span><strong>{interviewModeLabel}</strong></div>
+              <div><span>質問・回答</span><strong>{questionAnswers.length > 0 ? `${questionAnswers.length}組` : "未確認"}</strong></div>
+              <div><span>議事録</span><strong>{transcriptStatusLabel}</strong></div>
+              <div><span>分析</span><strong>{review.evaluation ? "回答根拠あり" : "未作成"}</strong></div>
+              <div><span>録画</span><strong>{recordingStatusLabels[review.recordingStatus] ?? review.recordingStatus}</strong></div>
+              <div><span>Drive</span><strong>{review.driveSync?.status === "completed" && review.driveSync.integrityStatus === "verified" ? "格納・照合済み" : "要確認"}</strong></div>
+            </div>
+            <div className="candidate-brief-columns">
+              <div>
+                <h3>価値観・考え方</h3>
+                <p className="candidate-brief-summary">{reviewOutline.summary}</p>
+                {valueHighlights.length > 0 ? <div className="candidate-value-grid">
+                  {valueHighlights.map((item) => <article key={item.label}><span>{item.label}</span><p>{item.text}</p>{item.evidenceCount > 0 && <small>回答根拠 {item.evidenceCount}件</small>}</article>)}
+                </div> : <div className="candidate-brief-empty">回答根拠を伴う価値観・考え方の要約は未作成です。議事録と録画を人が確認してください。</div>}
+              </div>
+              <div className="candidate-checkpoints">
+                <h3>確認ポイント</h3>
+                <dl>
+                  <div><dt>強み</dt><dd>{reviewOutline.strengths.length ? reviewOutline.strengths.join(" / ") : "未確認"}</dd></div>
+                  <div><dt>希望条件</dt><dd>{reviewOutline.conditions.length ? reviewOutline.conditions.join(" / ") : "未確認"}</dd></div>
+                  <div><dt>追加確認</dt><dd>{reviewOutline.missingTopics.length ? reviewOutline.missingTopics.join(" / ") : "なし"}</dd></div>
+                  <div><dt>懸念・要確認</dt><dd>{reviewOutline.concerns.length ? reviewOutline.concerns.join(" / ") : "なし"}</dd></div>
+                </dl>
+              </div>
+            </div>
+            <div className="candidate-question-heading"><div><h3>質問事項からの返答</h3><p>発言を言い換えず、面接順の質問・確認と応募者回答を並べています。</p></div><span>{questionAnswers.length}組</span></div>
+            {visibleQuestionAnswers.length > 0 ? <div className="candidate-question-list">
+              {visibleQuestionAnswers.map((item) => <article key={`${item.number}-${item.answerTurnIds.join("-")}`}><span>Q{item.number}</span><div><strong>{item.question}</strong><p>{item.answer}</p></div></article>)}
+            </div> : <div className="candidate-brief-empty">質問と実回答の組み合わせを確認できません。未確定記録がある場合は技術保留欄をご確認ください。</div>}
+            {remainingQuestionAnswers.length > 0 && <details className="candidate-question-more"><summary>残り{remainingQuestionAnswers.length}組の質問・回答を表示</summary><div className="candidate-question-list">
+              {remainingQuestionAnswers.map((item) => <article key={`${item.number}-${item.answerTurnIds.join("-")}`}><span>Q{item.number}</span><div><strong>{item.question}</strong><p>{item.answer}</p></div></article>)}
+            </div></details>}
+            <p className="guardrail-copy"><strong>この要約は合否判断ではありません。</strong> 文字起こし内の回答と既存評価を整理した補助表示です。通常音声・録画式は、採用判断前に保存録画と照合してください。</p>
+          </section>
+
           <section className="staff-panel drive-sync-panel">
             <div className="panel-title"><p>GOOGLE DRIVE ARCHIVE</p><h2>面接記録の自動格納</h2></div>
             <p>面接完了後、応募者氏名と面接IDの専用フォルダへ、録画・文字起こし・評価データ・PDFレポート・格納結果を保存します。同じ面接IDで再実行しても既存ファイルを更新します。</p>
@@ -715,7 +776,7 @@ export default function StaffReviewPage() {
               </span>
               {review.driveSync?.folderUrl && <a href={review.driveSync.folderUrl} target="_blank" rel="noreferrer">保存フォルダを開く ↗</a>}
               <button className="secondary-action" onClick={() => void syncGoogleDrive()} disabled={state === "syncing" || review.status !== "completed"}>
-                {state === "syncing" ? "格納中…" : "Driveへ再格納"}
+                {state === "syncing" ? "更新中…" : "Drive・レポートを更新"}
               </button>
             </div>
             {review.driveSync?.status === "completed" && <div className="validation-box">
@@ -783,7 +844,7 @@ export default function StaffReviewPage() {
 
           {legacyRecordedFallbackSelected ? <section className="staff-panel evaluation-panel"><div className="panel-title"><p>録画式予備面接</p><h2>自動評価なし・人手照合必須</h2></div><p className="evaluation-summary">回答音声の自動文字起こしは保存されていますが、録画の実際の発言との一致は未照合です。録画と下の文字起こしを採用担当者が照合してから判断してください。技術不具合や録画・音声品質は応募者の評価に使用しません。</p></section> : review.evaluation ? <section className="staff-panel evaluation-panel"><div className="panel-title"><p>{recordedAutomaticEvaluation ? "録画式・回答根拠付き自動分析（録画未照合）" : "回答根拠付き評価"}</p><h2>{recommendationLabels[review.evaluation.recommendation]}</h2></div><p className="evaluation-summary">{review.evaluation.summary}</p>{review.evaluation.evidenceValidationWarnings.length > 0 && <div className="validation-box"><strong>評価本文の要確認事項（{review.evaluation.evidenceValidationWarnings.length}件）</strong><ul>{review.evaluation.evidenceValidationWarnings.map((warning) => <li key={warning}>{warning}</li>)}</ul><p>これらの指摘がある評価は「人による要確認」として扱い、該当箇所を確認してから判断してください。</p></div>}<div className="score-grid">{review.evaluation.dimensions.map((dimension) => <article className="score-card" key={dimension.name}><div className="score-card-head"><div><span>確信度 {dimension.confidence}</span><h3>{dimension.name}</h3></div><strong>{dimension.score ?? "—"}<small>/5</small></strong></div><p>{dimension.rationale}</p><div className="evidence-list">{dimension.evidence.length ? dimension.evidence.map((evidence) => <blockquote key={`${dimension.name}-${evidence.turnId}-${evidence.quote}`}><span>文字起こし内一致（録画未照合）</span>「{evidence.quote}」<small>{evidence.relevance}</small></blockquote>) : <div className="no-evidence">有効な回答根拠なし</div>}</div></article>)}</div></section> : <div className="staff-message">回答評価は未作成です。文字起こしを採用担当者が確認してください。</div>}
 
-          <details className="transcript-details"><summary>文字起こしを確認（{review.transcript.length}件）</summary><div>{review.transcript.map((turn) => <article key={turn.id}><span>{turn.speaker === "interviewer" ? "オンライン採用担当者 茂木" : "応募者"}</span><p>{turn.text}</p></article>)}</div></details>
+          <details className="transcript-details"><summary>時系列の全文議事録を確認（{review.transcript.length}件）</summary><div>{review.transcript.map((turn) => <article key={turn.id}><span>{turn.speaker === "interviewer" ? "オンライン採用担当者 茂木" : "応募者"}</span><p>{turn.text}</p></article>)}</div></details>
 
           {review.humanReviews.length > 0 && <section className="staff-panel"><div className="panel-title"><p>担当者表示名記録（自己申告）</p><h2>映像評価の保存状況</h2></div><div className="human-review-list">{review.humanReviews.map((item) => <div key={item.reviewerName}><strong>{item.reviewerName}</strong><span>{item.videoScores.filter((score) => score.score !== null).length}/{VIDEO_REVIEW_DIMENSIONS.length}項目確認</span><p>{item.overallNote || "総合メモなし"}</p></div>)}</div></section>}
         </section>

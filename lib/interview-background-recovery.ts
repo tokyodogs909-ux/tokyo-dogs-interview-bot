@@ -1,6 +1,7 @@
 import { recoverNextStaleInterviewEvaluation } from "@/lib/interview-evaluation-recovery";
 import {
   findInterviewTechnicalEvidenceDriveSessions,
+  findInterviewReportPresentationRefreshSessions,
   findNextInterviewDriveRecoverySession,
   recoverNextInterruptedV3Recording,
   recoverNextLegacyV1RecordingOrphan,
@@ -161,9 +162,13 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
     const normalSessionId = await findNextInterviewDriveRecoverySession({
       includeIntegrityRecheck: false,
     });
-    const technicalLimit = normalSessionId ? 4 : 5;
+    const reportRefreshSessionIds = await findInterviewReportPresentationRefreshSessions(2);
+    const technicalLimit = Math.max(
+      0,
+      5 - (normalSessionId ? 1 : 0) - reportRefreshSessionIds.length,
+    );
     const technicalSessionIds = await findInterviewTechnicalEvidenceDriveSessions(technicalLimit);
-    const sessionIds = [normalSessionId, ...technicalSessionIds]
+    const sessionIds = [normalSessionId, ...technicalSessionIds, ...reportRefreshSessionIds]
       .filter((value): value is string => typeof value === "string");
     if (sessionIds.length === 0) {
       const maintenanceSessionId = await findNextInterviewDriveRecoverySession({
@@ -188,8 +193,9 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
 /**
  * Advances a bounded amount of global work per scheduled event. At most one
  * paid answer transcription and at most five Drive chunks (each <=4 MiB) are
- * attempted. A live archive occupies one slot; technical evidence uses the
- * remaining four, or all five when there is no live archive. Every
+ * attempted. A live archive occupies one slot; at most two report-only
+ * presentation refreshes reuse the canonical recording without uploading it;
+ * technical evidence uses the remaining slots. Every
  * mutable stage retains its existing D1 compare-and-set/lease fence, so an
  * overlapping cron, candidate retry, or staff tab cannot duplicate paid work
  * or write the same Drive offset concurrently.
