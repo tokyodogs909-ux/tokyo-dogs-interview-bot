@@ -4783,7 +4783,7 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     assert.equal(legacyDuplicateFile.appProperties.tokyoDogsArtifact, "legacy_duplicate_transcript");
     assert.equal(legacyDuplicateFile.appProperties.tokyoDogsLegacyArtifact, "transcript");
     const completedManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
-    assert.equal(completedManifest.reportPresentationVersion, "2026-08-23-v1");
+    assert.equal(completedManifest.reportPresentationVersion, "2026-08-23-v2");
     assert.equal(completedManifest.files.transcript.id, canonicalTranscript.id,
       "the current-run canonical file must remain the durable receipt");
     const reportDocument = uploadedDriveFiles.find((file) =>
@@ -4835,7 +4835,7 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     assert.equal(presentationRefreshArtifacts.every((call) => call.method === "PATCH"), true,
       "a report-only refresh must reuse every canonical Drive file ID");
     assert.equal(JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).reportPresentationVersion,
-      "2026-08-23-v1");
+      "2026-08-23-v2");
 
     const driveCallsBeforeIdempotentRead = uploadedNames.length + recordingUploadRanges.length + createdFolders.length;
     const replay = await request("/api/interviews/archive", {
@@ -10539,7 +10539,7 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
       recordingIncluded: false,
       transcriptAvailable: true,
       transcriptKind: "actual_transcript",
-      reportPresentationVersion: "2026-08-23-v1",
+      reportPresentationVersion: "2026-08-23-v2",
     }),
     error_code: null,
     updated_at: stored.completed_at,
@@ -10906,7 +10906,7 @@ test("background Drive recovery prioritizes pending work before one stale comple
       recordingIncluded: false,
       transcriptAvailable: true,
       transcriptKind: "actual_transcript",
-      reportPresentationVersion: "2026-08-23-v1",
+      reportPresentationVersion: "2026-08-23-v2",
       integrity: {
         schemaVersion: "2026-08-14-v1",
         status: "verified",
@@ -11625,7 +11625,7 @@ test("completed recorded-answer transcripts supersede an earlier realtime transc
       recordingIncluded: false,
       transcriptAvailable: true,
       transcriptKind: "actual_transcript",
-      reportPresentationVersion: "2026-08-23-v1",
+      reportPresentationVersion: "2026-08-23-v2",
     }),
     error_code: null,
     updated_at: "2026-07-29T02:01:00.000Z",

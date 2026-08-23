@@ -56,7 +56,6 @@ test("shows only evidence-backed value highlights and keeps unconfirmed dimensio
   };
   assert.deepEqual(buildCandidateValueHighlights(evaluation), [
     { label: "責任感・誠実さ", text: "問題発生時にすぐ報告すると説明しています。", evidenceCount: 1 },
-    { label: "希望条件・確認事項", text: "土日勤務は相談可能", evidenceCount: 0 },
   ]);
   assert.deepEqual(buildCandidateReviewOutline(evaluation), {
     summary: "報告と安全確認を大切にしています。",

@@ -525,6 +525,7 @@ export default function StaffReviewPage() {
   const visibleQuestionAnswers = questionAnswers.slice(0, 8);
   const remainingQuestionAnswers = questionAnswers.slice(8);
   const valueHighlights = buildCandidateValueHighlights(review?.evaluation ?? null);
+  const evidenceBackedAnalysis = valueHighlights.length > 0;
   const reviewOutline = buildCandidateReviewOutline(review?.evaluation ?? null);
   const interviewModeLabel = textInterviewSelected
     ? "文字入力"
@@ -731,7 +732,7 @@ export default function StaffReviewPage() {
               <div><span>参加方法</span><strong>{interviewModeLabel}</strong></div>
               <div><span>質問・回答</span><strong>{questionAnswers.length > 0 ? `${questionAnswers.length}組` : "未確認"}</strong></div>
               <div><span>議事録</span><strong>{transcriptStatusLabel}</strong></div>
-              <div><span>分析</span><strong>{review.evaluation ? "回答根拠あり" : "未作成"}</strong></div>
+              <div><span>分析</span><strong>{evidenceBackedAnalysis ? "回答根拠あり" : review.evaluation ? "人手確認" : "未作成"}</strong></div>
               <div><span>録画</span><strong>{recordingStatusLabels[review.recordingStatus] ?? review.recordingStatus}</strong></div>
               <div><span>Drive</span><strong>{review.driveSync?.status === "completed" && review.driveSync.integrityStatus === "verified" ? "格納・照合済み" : "要確認"}</strong></div>
             </div>
