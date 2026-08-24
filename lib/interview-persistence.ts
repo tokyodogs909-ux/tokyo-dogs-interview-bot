@@ -2594,7 +2594,8 @@ export async function requestExternalSync(sessionId: string) {
     session_id, provider, status, requested_at, updated_at
   ) VALUES (?, 'google_drive', 'pending', ?, ?)
   ON CONFLICT(session_id, provider) DO UPDATE SET
-    requested_at = excluded.requested_at,
+    requested_at = CASE WHEN interview_external_syncs.status = 'running'
+      THEN interview_external_syncs.requested_at ELSE excluded.requested_at END,
     status = CASE WHEN interview_external_syncs.status = 'running' THEN 'running' ELSE 'pending' END,
     updated_at = CASE WHEN interview_external_syncs.status = 'running'
       THEN interview_external_syncs.updated_at ELSE excluded.updated_at END`)

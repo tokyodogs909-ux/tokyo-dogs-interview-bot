@@ -675,7 +675,7 @@ class FakeD1Statement {
       this.database.externalSyncs.set(sessionId, {
         provider: "google_drive",
         status: stillRunning ? "running" : "pending",
-        requested_at: requestedAt,
+        requested_at: stillRunning ? current.requested_at : requestedAt,
         started_at: current?.started_at ?? null,
         completed_at: current?.completed_at ?? null,
         folder_id: current?.folder_id ?? null,
@@ -11832,6 +11832,8 @@ test("a Google Drive archive still reporting progress is never restarted underne
     const sync = database.externalSyncs.get(session.sessionId);
     assert.equal(sync.status, "running");
     assert.equal(sync.started_at, thirtyMinutesAgo, "the live claim must stay with its owner");
+    assert.equal(sync.requested_at, thirtyMinutesAgo,
+      "a redundant poll must not schedule a second full archive after the live owner completes");
   } finally {
     globalThis.fetch = originalFetch;
   }

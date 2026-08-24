@@ -920,6 +920,87 @@ async function readSmallDriveFile(input: {
   return bytes;
 }
 
+/**
+ * A completed manifest is a durable Drive-side receipt that the recording was
+ * already finalized once. When a redundant request arrives after that point,
+ * adopt the exact tagged recording and let finalizeDriveArchive re-read every
+ * artifact instead of opening another large resumable upload.
+ *
+ * Metadata alone is deliberately insufficient: the receipt must name the same
+ * session, folder, transcript mode and canonical recording ID/size. Any
+ * mismatch fails closed and preserves both the R2 source and Drive evidence.
+ */
+async function finalizedRecordingFromDriveManifest(input: {
+  accessToken: string;
+  source: ArchiveSource;
+  prepared: PreparedDriveArchive;
+}) {
+  if (!input.source.recording) return null;
+  const recordingId = input.prepared.artifactTargetIds.recording;
+  const manifestId = input.prepared.artifactTargetIds.manifest;
+  if (typeof recordingId !== "string" || typeof manifestId !== "string") return null;
+
+  const children = await listFolderChildren(input.accessToken, input.prepared.candidateFolder.id);
+  const recording = children.find((file) => file.id === recordingId);
+  const manifest = children.find((file) => file.id === manifestId);
+  const extension = input.source.recording.contentType.includes("mp4") ? "mp4" : "webm";
+  const recordingName = `${input.source.sessionId}_面接録画.${extension}`;
+  if (
+    !recording || !recordingFileMatchesTrustedUpload({
+      file: recording,
+      folderId: input.prepared.candidateFolder.id,
+      name: recordingName,
+      contentType: input.source.recording.contentType,
+      byteSize: input.source.recording.byteSize,
+    }) ||
+    !manifest || manifest.trashed === true ||
+    manifest.name !== `${input.source.sessionId}_格納結果.json` ||
+    manifest.mimeType !== "application/json" ||
+    !exactDriveParent(manifest, input.prepared.candidateFolder.id) ||
+    manifest.appProperties?.tokyoDogsArtifact !== "manifest" ||
+    manifest.appProperties?.tokyoDogsProvider !== DRIVE_PROVIDER
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+
+  const bytes = await readSmallDriveFile({
+    accessToken: input.accessToken,
+    file: manifest,
+    maximumBytes: 64 * 1024,
+  });
+  let receipt: Record<string, unknown>;
+  try {
+    const decoded = JSON.parse(new TextDecoder().decode(bytes));
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw new Error();
+    receipt = decoded as Record<string, unknown>;
+  } catch {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const files = receipt.files && typeof receipt.files === "object" && !Array.isArray(receipt.files)
+    ? receipt.files as Record<string, unknown>
+    : null;
+  const recorded = files?.recording && typeof files.recording === "object" && !Array.isArray(files.recording)
+    ? files.recording as Record<string, unknown>
+    : null;
+  if (
+    receipt.schemaVersion !== "2026-08-23-v2" ||
+    receipt.sessionId !== input.source.sessionId ||
+    receipt.rootFolderId !== input.prepared.rootFolderId ||
+    receipt.folderId !== input.prepared.candidateFolder.id ||
+    receipt.recordingIncluded !== true ||
+    receipt.transcriptAvailable !== input.prepared.transcriptAvailable ||
+    receipt.transcriptKind !== input.prepared.transcriptKind ||
+    receipt.technicalHold !== (input.prepared.transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND) ||
+    receipt.automaticEvaluationPerformed !== (input.source.evaluation !== null) ||
+    recorded?.id !== recordingId ||
+    recorded?.name !== recordingName ||
+    Number(recorded?.size) !== input.source.recording.byteSize
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  return recording;
+}
+
 async function sha256Bytes(bytes: Uint8Array) {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes).buffer));
   return Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("");
@@ -3280,6 +3361,35 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
         });
         return result;
       }
+      const finalizedRecording = await finalizedRecordingFromDriveManifest({
+        accessToken,
+        source,
+        prepared,
+      });
+      if (finalizedRecording) {
+        const result = await finalizeDriveArchive(
+          source,
+          accessToken,
+          prepared,
+          finalizedRecording,
+          reportProgress,
+        );
+        const retryRequested = await completeExternalSync({
+          sessionId,
+          startedAt,
+          folderId: result.folderId,
+          folderUrl: result.folderUrl,
+          manifest: {
+            files: result.uploaded,
+            recordingIncluded: true,
+            transcriptAvailable: prepared.transcriptAvailable,
+            transcriptKind: prepared.transcriptKind,
+            reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
+            integrity: result.integrity,
+          },
+        });
+        return retryRequested ? { ...result, status: "pending" } : result;
+      }
       const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
       const recordingName = `${source.sessionId}_面接録画.${extension}`;
       const uploadLocation = await initiateRecordingUpload({
@@ -3372,6 +3482,26 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
         accessToken,
         prepared,
         recordingFile: step.recordingFile as DriveFile,
+        reportProgress,
+        leaseToken,
+      });
+      leaseHeld = false;
+      return result;
+    }
+
+    const finalizedRecording = await finalizedRecordingFromDriveManifest({
+      accessToken,
+      source,
+      prepared,
+    });
+    if (finalizedRecording) {
+      const result = await completeSteppedArchive({
+        sessionId,
+        startedAt: step.startedAt,
+        source,
+        accessToken,
+        prepared,
+        recordingFile: finalizedRecording,
         reportProgress,
         leaseToken,
       });
