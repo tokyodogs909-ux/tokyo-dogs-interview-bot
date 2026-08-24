@@ -936,24 +936,41 @@ async function finalizedRecordingFromDriveManifest(input: {
   prepared: PreparedDriveArchive;
 }) {
   if (!input.source.recording) return null;
-  const recordingId = input.prepared.artifactTargetIds.recording;
-  const manifestId = input.prepared.artifactTargetIds.manifest;
-  if (typeof recordingId !== "string" || typeof manifestId !== "string") return null;
-
   const children = await listFolderChildren(input.accessToken, input.prepared.candidateFolder.id);
-  const recording = children.find((file) => file.id === recordingId);
-  const manifest = children.find((file) => file.id === manifestId);
+  const recordings = children.filter((file) =>
+    file.appProperties?.tokyoDogsArtifact === "recording" &&
+    file.appProperties?.tokyoDogsProvider === DRIVE_PROVIDER,
+  );
+  const manifests = children.filter((file) =>
+    file.appProperties?.tokyoDogsArtifact === "manifest" &&
+    file.appProperties?.tokyoDogsProvider === DRIVE_PROVIDER,
+  );
+  if (recordings.length === 0 || manifests.length === 0) return null;
+  if (recordings.length !== 1 || manifests.length !== 1) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const recording = recordings[0];
+  const manifest = manifests[0];
+  const trustedRecordingId = input.prepared.artifactTargetIds.recording;
+  const trustedManifestId = input.prepared.artifactTargetIds.manifest;
+  if (
+    (typeof trustedRecordingId === "string" && recording.id !== trustedRecordingId) ||
+    (typeof trustedManifestId === "string" && manifest.id !== trustedManifestId)
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const recordingId = recording.id;
   const extension = input.source.recording.contentType.includes("mp4") ? "mp4" : "webm";
   const recordingName = `${input.source.sessionId}_面接録画.${extension}`;
   if (
-    !recording || !recordingFileMatchesTrustedUpload({
+    !recordingFileMatchesTrustedUpload({
       file: recording,
       folderId: input.prepared.candidateFolder.id,
       name: recordingName,
       contentType: input.source.recording.contentType,
       byteSize: input.source.recording.byteSize,
     }) ||
-    !manifest || manifest.trashed === true ||
+    manifest.trashed === true ||
     manifest.name !== `${input.source.sessionId}_格納結果.json` ||
     manifest.mimeType !== "application/json" ||
     !exactDriveParent(manifest, input.prepared.candidateFolder.id) ||
