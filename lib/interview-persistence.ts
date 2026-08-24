@@ -2350,8 +2350,9 @@ const BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS = 24 * 60 * 60 * 1_000;
  * never logged by the caller. `stepInterviewToGoogleDrive` supplies the actual
  * external-sync claim and upload-step lease CAS fences.
  */
-export async function findNextInterviewDriveRecoverySession(options: {
+export async function findInterviewDriveRecoverySessions(options: {
   includeIntegrityRecheck?: boolean;
+  limit?: number;
 } = {}) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
@@ -2361,6 +2362,7 @@ export async function findNextInterviewDriveRecoverySession(options: {
   const pendingBefore = new Date(now - BACKGROUND_DRIVE_PENDING_RETRY_MS).toISOString();
   const integrityBefore = new Date(now - BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS).toISOString();
   const includeIntegrityRecheck = options.includeIntegrityRecheck === false ? 0 : 1;
+  const safeLimit = Math.max(1, Math.min(3, Math.trunc(options.limit ?? 1)));
   const candidates = await db.prepare(`SELECT
       s.id, s.transcript_json,
       EXISTS (
@@ -2467,6 +2469,7 @@ export async function findNextInterviewDriveRecoverySession(options: {
     .bind(failedBefore, pendingBefore, includeIntegrityRecheck, integrityBefore)
     .all<{ id: string; transcript_json: string; candidate_transcription_failed: number }>();
 
+  const selected: string[] = [];
   for (const candidate of candidates.results ?? []) {
     const decoded = parseJson<unknown>(candidate.transcript_json, null);
     if (!Array.isArray(decoded)) continue;
@@ -2488,9 +2491,17 @@ export async function findNextInterviewDriveRecoverySession(options: {
     const failures = Number(candidate.candidate_transcription_failed ?? 0) === 1
       ? [{ type: "transcription_failed", detail: { code: "TRANSCRIPTION_FAILED" } }]
       : [];
-    if (hasVerifiedCandidateTranscript(transcript, failures)) return candidate.id;
+    if (!hasVerifiedCandidateTranscript(transcript, failures)) continue;
+    selected.push(candidate.id);
+    if (selected.length >= safeLimit) break;
   }
-  return null;
+  return selected;
+}
+
+export async function findNextInterviewDriveRecoverySession(options: {
+  includeIntegrityRecheck?: boolean;
+} = {}) {
+  return (await findInterviewDriveRecoverySessions({ ...options, limit: 1 }))[0] ?? null;
 }
 
 /**
@@ -3338,14 +3349,18 @@ export async function findInterviewTechnicalEvidenceDriveSessions(limit = 1) {
         WHERE failure.session_id = s.id
           AND failure.event_type = 'transcription_failed'
           AND CASE WHEN json_valid(failure.detail_json)
-            THEN json_extract(failure.detail_json, '$.code') ELSE NULL END = 'TRANSCRIPTION_EMPTY'
+            THEN json_extract(failure.detail_json, '$.code') ELSE NULL END IN (
+              'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_ID_MISSING'
+            )
       )
       AND NOT EXISTS (
         SELECT 1 FROM interview_audit_events AS failure
         WHERE failure.session_id = s.id
           AND failure.event_type = 'transcription_failed'
           AND COALESCE(CASE WHEN json_valid(failure.detail_json)
-            THEN json_extract(failure.detail_json, '$.code') ELSE NULL END, '') != 'TRANSCRIPTION_EMPTY'
+            THEN json_extract(failure.detail_json, '$.code') ELSE NULL END, '') NOT IN (
+              'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_ID_MISSING'
+            )
       )
       AND NOT EXISTS (
         SELECT 1 FROM interview_audit_events AS hold

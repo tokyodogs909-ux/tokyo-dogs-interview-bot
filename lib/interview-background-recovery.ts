@@ -2,6 +2,7 @@ import { recoverNextStaleInterviewEvaluation } from "@/lib/interview-evaluation-
 import {
   findInterviewTechnicalEvidenceDriveSessions,
   findInterviewReportPresentationRefreshSessions,
+  findInterviewDriveRecoverySessions,
   findNextInterviewDriveRecoverySession,
   recoverNextInterruptedV3Recording,
   recoverNextLegacyV1RecordingOrphan,
@@ -155,21 +156,25 @@ async function recoverEvaluation(): Promise<RecoveryStageState> {
 
 async function recoverDriveArchive(): Promise<RecoveryStageState> {
   try {
-    // Advance one normal archive and a bounded technical-evidence batch
+    // Advance up to three normal archives and a bounded technical-evidence batch
     // sequentially. This preserves the live candidate path while preventing
-    // two durable incident recordings from waiting behind one another for
+    // three simultaneous candidate recordings from waiting behind one another for
     // hours. Each session still owns its existing D1 claim and <=4 MiB step.
-    const normalSessionId = await findNextInterviewDriveRecoverySession({
+    const normalSessionIds = await findInterviewDriveRecoverySessions({
       includeIntegrityRecheck: false,
+      limit: 3,
     });
-    const reportRefreshSessionIds = await findInterviewReportPresentationRefreshSessions(2);
+    const reportRefreshLimit = Math.max(0, Math.min(2, 5 - normalSessionIds.length));
+    const reportRefreshSessionIds = await findInterviewReportPresentationRefreshSessions(reportRefreshLimit);
     const technicalLimit = Math.max(
       0,
-      5 - (normalSessionId ? 1 : 0) - reportRefreshSessionIds.length,
+      5 - normalSessionIds.length - reportRefreshSessionIds.length,
     );
     const technicalSessionIds = await findInterviewTechnicalEvidenceDriveSessions(technicalLimit);
-    const sessionIds = [normalSessionId, ...technicalSessionIds, ...reportRefreshSessionIds]
-      .filter((value): value is string => typeof value === "string");
+    const sessionIds = [...new Set(
+      [...normalSessionIds, ...technicalSessionIds, ...reportRefreshSessionIds]
+        .filter((value): value is string => typeof value === "string"),
+    )];
     if (sessionIds.length === 0) {
       const maintenanceSessionId = await findNextInterviewDriveRecoverySession({
         includeIntegrityRecheck: true,
@@ -178,12 +183,23 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
       sessionIds.push(maintenanceSessionId);
     }
     let advanced = false;
+    let attention = false;
     for (const sessionId of sessionIds) {
-      const result = await stepInterviewToGoogleDrive(sessionId);
-      if (result.status !== "completed") continue;
-      if (result.integrity?.status !== "verified") return "attention";
-      advanced = true;
+      try {
+        const result = await stepInterviewToGoogleDrive(sessionId);
+        if (result.status !== "completed") continue;
+        if (result.integrity?.status !== "verified") {
+          attention = true;
+          continue;
+        }
+        advanced = true;
+      } catch {
+        // One candidate's Drive fault must not starve the other bounded slots.
+        // The per-session sync claim records its own safe error code.
+        attention = true;
+      }
     }
+    if (attention) return "attention";
     return advanced ? "advanced" : "waiting";
   } catch {
     return "attention";
@@ -193,7 +209,7 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
 /**
  * Advances a bounded amount of global work per scheduled event. At most one
  * paid answer transcription and at most five Drive chunks (each <=4 MiB) are
- * attempted. A live archive occupies one slot; at most two report-only
+ * attempted. Up to three live archives occupy one slot each; at most two report-only
  * presentation refreshes reuse the canonical recording without uploading it;
  * technical evidence uses the remaining slots. Every
  * mutable stage retains its existing D1 compare-and-set/lease fence, so an

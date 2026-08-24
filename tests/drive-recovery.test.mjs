@@ -29,12 +29,13 @@ test("Drive recovery retries only absent or cooled-down archives and caps backgr
   const items = [
     interview("TD-MISSING", { driveStatus: null, driveUpdatedAt: null }),
     interview("TD-FAILED-OLD", { driveStatus: "failed", driveUpdatedAt: "2026-08-03T05:40:00.000Z" }),
+    interview("TD-MISSING-THREE", { driveStatus: null, driveUpdatedAt: null }),
     interview("TD-FAILED-NEW", { driveStatus: "failed", driveUpdatedAt: "2026-08-03T05:55:00.000Z" }),
     interview("TD-PENDING-NEW", { driveStatus: "pending", driveUpdatedAt: "2026-08-03T05:58:00.000Z" }),
     interview("TD-RUNNING-LIVE", { driveStatus: "running", driveUpdatedAt: "2026-08-03T05:50:00.000Z" }),
     interview("TD-COMPLETE"),
   ];
-  assert.deepEqual(planDriveRecovery(items, now), ["TD-MISSING", "TD-FAILED-OLD"]);
+  assert.deepEqual(planDriveRecovery(items, now), ["TD-MISSING", "TD-FAILED-OLD", "TD-MISSING-THREE"]);
 });
 
 test("Drive recovery repairs completed camera archives that omitted a now-stored recording", () => {

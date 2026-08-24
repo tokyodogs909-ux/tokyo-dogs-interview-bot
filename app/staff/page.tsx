@@ -85,6 +85,7 @@ type InterviewListItem = {
   driveRecordingIncluded: boolean | null;
   driveTranscriptAvailable: boolean | null;
   driveTranscriptKind: string | null;
+  driveIntegrityStatus: "verified" | "drift" | "unknown" | null;
   sourceTranscriptVerified: boolean;
   completionHold: boolean;
 };
@@ -167,6 +168,11 @@ function driveArchiveLabel(item: InterviewListItem) {
   if (item.driveStatus === "running") return "Drive格納中";
   if (item.driveStatus === "pending") return "Drive格納待ち";
   if (item.driveStatus !== "completed") return "Drive未格納";
+  if (
+    item.driveTranscriptKind === "partial_transcript_human_review" &&
+    item.driveRecordingIncluded === true &&
+    item.driveIntegrityStatus === "verified"
+  ) return "技術保留資料をDrive保全済み（人手確認）";
   if (item.sourceTranscriptVerified !== true) return "保存未完了（文字起こし要確認）";
   if (item.driveTranscriptAvailable !== true || item.driveTranscriptKind !== "actual_transcript") {
     return "保存未完了（文字起こし未格納）";
@@ -192,6 +198,10 @@ function driveArchiveClass(item: InterviewListItem) {
 
 function interviewInboxStatusLabel(item: InterviewListItem) {
   if (item.completionHold) return "中断・人手確認";
+  if (
+    item.driveStatus === "completed" &&
+    item.driveTranscriptKind === "partial_transcript_human_review"
+  ) return "技術保留・人手確認";
   if (item.status !== "completed") return interviewStatusLabels[item.status] ?? item.status;
   return isVerifiedInterviewArchive(item) ? "保存確認済み" : "保存未完了";
 }
@@ -349,7 +359,7 @@ export default function StaffReviewPage() {
   }
 
   async function recoverDriveArchives(sessionIds: string[]) {
-    for (const targetSessionId of sessionIds.slice(0, 2)) {
+    for (const targetSessionId of sessionIds.slice(0, 3)) {
       if (driveRecoveryInFlightRef.current.has(targetSessionId)) continue;
       driveRecoveryInFlightRef.current.add(targetSessionId);
       try {

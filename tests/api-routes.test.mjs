@@ -9626,7 +9626,7 @@ test("same-origin realtime call authorizes the exact new interview session and p
   }
 });
 
-test("different candidates can hold isolated realtime calls at the same time", async () => {
+test("three candidates can hold isolated realtime calls at the same time", async () => {
   process.env.OPENAI_API_KEY = "test-key-never-returned";
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database };
@@ -9635,31 +9635,28 @@ test("different candidates can hold isolated realtime calls at the same time", a
     headers: { "Content-Type": "application/json", "CF-Connecting-IP": "203.0.113.70" },
     body: JSON.stringify({ candidateName, employment: "正社員", location, consent: true }),
   }, env);
-  const [firstSessionResponse, secondSessionResponse] = await Promise.all([
+  const sessionResponses = await Promise.all([
     createCandidate("並行試験 一郎", "越谷店"),
     createCandidate("並行試験 二郎", "所沢店"),
+    createCandidate("並行試験 三郎", "浦和店"),
   ]);
-  assert.equal(firstSessionResponse.status, 201);
-  assert.equal(secondSessionResponse.status, 201);
-  const [firstSession, secondSession] = await Promise.all([
-    firstSessionResponse.json(),
-    secondSessionResponse.json(),
-  ]);
-  assert.notEqual(firstSession.sessionId, secondSession.sessionId);
-  assert.notEqual(firstSession.accessToken, secondSession.accessToken);
+  assert.deepEqual(sessionResponses.map((response) => response.status), [201, 201, 201]);
+  const sessions = await Promise.all(sessionResponses.map((response) => response.json()));
+  assert.equal(new Set(sessions.map((session) => session.sessionId)).size, 3);
+  assert.equal(new Set(sessions.map((session) => session.accessToken)).size, 3);
 
   const originalFetch = globalThis.fetch;
   const upstreamSessions = [];
-  let releaseBothCalls;
-  const bothCallsArrived = new Promise((resolve) => { releaseBothCalls = resolve; });
+  let releaseAllCalls;
+  const allCallsArrived = new Promise((resolve) => { releaseAllCalls = resolve; });
   try {
     globalThis.fetch = async (url, init) => {
       const upstreamRequest = normalizedFetchRequest(url, init);
       assert.equal(upstreamRequest.url, "https://api.openai.com/v1/realtime/calls");
       const form = await upstreamRequest.clone().formData();
       upstreamSessions.push(JSON.parse(form.get("session")));
-      if (upstreamSessions.length === 2) releaseBothCalls();
-      await bothCallsArrived;
+      if (upstreamSessions.length === 3) releaseAllCalls();
+      await allCallsArrived;
       return new Response("v=0\r\no=parallel-answer\r\n", {
         status: 200,
         headers: { "Content-Type": "application/sdp" },
@@ -9674,12 +9671,12 @@ test("different candidates can hold isolated realtime calls at the same time", a
       },
       body: "v=0\r\no=parallel-offer\r\n",
     }, env);
-    const [firstCall, secondCall] = await Promise.all([call(firstSession), call(secondSession)]);
-    assert.equal(firstCall.status, 200);
-    assert.equal(secondCall.status, 200);
-    assert.equal(upstreamSessions.length, 2);
-    assert.equal(database.sessions.get(firstSession.sessionId).status, "in_progress");
-    assert.equal(database.sessions.get(secondSession.sessionId).status, "in_progress");
+    const calls = await Promise.all(sessions.map(call));
+    assert.deepEqual(calls.map((response) => response.status), [200, 200, 200]);
+    assert.equal(upstreamSessions.length, 3);
+    for (const session of sessions) {
+      assert.equal(database.sessions.get(session.sessionId).status, "in_progress");
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -9726,6 +9723,90 @@ function modelEvaluation({ invalidEvidence = false } = {}) {
     conditions: ["勤務条件は採用担当者が最終確認する"],
   };
 }
+
+test("three voice transcripts and evidence-bound evaluations remain isolated under concurrent completion", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const sessions = await Promise.all([
+    createTestInterviewSession(env, "正社員", "越谷店", { candidateName: "同時評価 一郎" }),
+    createTestInterviewSession(env, "正社員", "所沢店", { candidateName: "同時評価 二郎" }),
+    createTestInterviewSession(env, "正社員", "浦和店", { candidateName: "同時評価 三郎" }),
+  ]);
+  const transcripts = sessions.map((_session, candidateIndex) => candidateTurns.map((turn, turnIndex) => ({
+    ...turn,
+    id: `candidate-${candidateIndex + 1}-turn-${turnIndex + 1}`,
+    text: `応募者${candidateIndex + 1}の回答: ${turn.text}`,
+  })));
+  for (const session of sessions) database.sessions.get(session.sessionId).status = "in_progress";
+  await Promise.all(sessions.map((session, index) =>
+    storeAndSealVoiceTranscript(env, session, transcripts[index])));
+
+  const originalFetch = globalThis.fetch;
+  let evaluationCalls = 0;
+  try {
+    globalThis.fetch = async (url, init) => {
+      const upstreamRequest = normalizedFetchRequest(url, init);
+      assert.equal(upstreamRequest.url, "https://api.openai.com/v1/responses");
+      const body = await upstreamRequest.clone().json();
+      const input = JSON.parse(body.input[0].content[0].text);
+      const candidateIndex = transcripts.findIndex((transcript) => transcript[0].id === input.transcript[0].id);
+      assert.notEqual(candidateIndex, -1, "the model request must contain one exact candidate transcript");
+      assert.deepEqual(input.transcript, transcripts[candidateIndex]);
+      evaluationCalls += 1;
+      const evaluation = {
+        ...modelEvaluation(),
+        summary: `応募者${candidateIndex + 1}の回答だけを評価しました。`,
+        dimensions: dimensionNames.map((name, turnIndex) => ({
+          name,
+          score: 4,
+          confidence: "medium",
+          rationale: "本人の回答に具体的な行動根拠があります。",
+          evidence: [{
+            quote: transcripts[candidateIndex][turnIndex].text.slice(0, 42),
+            turnId: transcripts[candidateIndex][turnIndex].id,
+            relevance: "本人の行動を示す回答です。",
+          }],
+        })),
+      };
+      return Response.json({
+        output: [{
+          type: "message",
+          content: [{ type: "output_text", text: JSON.stringify(evaluation) }],
+        }],
+      });
+    };
+    const responses = await Promise.all(sessions.map((session, index) => request("/api/evaluate", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${session.accessToken}`,
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: ["越谷店", "所沢店", "浦和店"][index],
+        transcript: transcripts[index],
+      }),
+    }, env)));
+    assert.deepEqual(responses.map((response) => response.status), [200, 200, 200]);
+    assert.equal(evaluationCalls, 3);
+    for (const [index, session] of sessions.entries()) {
+      const stored = database.sessions.get(session.sessionId);
+      assert.equal(stored.status, "completed");
+      assert.deepEqual(JSON.parse(stored.transcript_json), transcripts[index]);
+      const evaluation = JSON.parse(stored.evaluation_json);
+      assert.equal(evaluation.summary, `応募者${index + 1}の回答だけを評価しました。`);
+      assert.equal(evaluation.humanReviewRequired, true);
+      assert.equal(evaluation.dimensions.every((dimension) =>
+        dimension.evidence.every((item) => item.turnId.startsWith(`candidate-${index + 1}-`))), true);
+      assert.equal(database.externalSyncs.has(session.sessionId), false,
+        "evaluation completion must not pre-create or cross-link another candidate's Drive claim");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
   const database = new FakeD1();
@@ -10451,8 +10532,13 @@ function driveSyncEnv(database) {
   };
 }
 
-async function seedCompletedInterview(env, database) {
-  const session = await createTestInterviewSession(env, "正社員", "越谷店");
+async function seedCompletedInterview(env, database, options = {}) {
+  const session = await createTestInterviewSession(
+    env,
+    "正社員",
+    options.location ?? "越谷店",
+    options,
+  );
   const stored = database.sessions.get(session.sessionId);
   stored.status = "completed";
   // These claim-fencing tests do not exercise a recording upload. Model them as
@@ -10874,25 +10960,34 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
   });
 });
 
-test("background Drive recovery prioritizes pending work before one stale completed integrity receipt", async () => {
+test("background Drive recovery advances three pending interviews before stale integrity maintenance", async () => {
   const originalFetch = globalThis.fetch;
   const database = new FakeD1();
   const env = driveSyncEnv(database);
-  const pending = await seedCompletedInterview(env, database);
-  const stale = await seedCompletedInterview(env, database);
-  const old = "2026-08-01T00:00:00.000Z";
-  database.externalSyncs.set(pending.sessionId, {
-    provider: "google_drive",
-    status: "pending",
-    requested_at: old,
-    started_at: null,
-    completed_at: null,
-    folder_id: null,
-    folder_url: null,
-    manifest_json: null,
-    error_code: null,
-    updated_at: old,
+  const pending = await Promise.all([
+    seedCompletedInterview(env, database, { candidateName: "復旧並行 一郎", location: "越谷店" }),
+    seedCompletedInterview(env, database, { candidateName: "復旧並行 二郎", location: "所沢店" }),
+    seedCompletedInterview(env, database, { candidateName: "復旧並行 三郎", location: "浦和店" }),
+  ]);
+  const stale = await seedCompletedInterview(env, database, {
+    candidateName: "整合性監査 対象",
+    location: "春日部店",
   });
+  const old = "2026-08-01T00:00:00.000Z";
+  for (const session of pending) {
+    database.externalSyncs.set(session.sessionId, {
+      provider: "google_drive",
+      status: "pending",
+      requested_at: old,
+      started_at: null,
+      completed_at: null,
+      folder_id: null,
+      folder_url: null,
+      manifest_json: null,
+      error_code: null,
+      updated_at: old,
+    });
+  }
   database.externalSyncs.set(stale.sessionId, {
     provider: "google_drive",
     status: "completed",
@@ -10944,8 +11039,12 @@ test("background Drive recovery prioritizes pending work before one stale comple
       throw new Error(`unexpected fetch ${href}`);
     };
     await scheduleInterviewRecovery(env);
-    assert.equal(database.externalSyncs.get(pending.sessionId).status, "failed",
-      "pending archive work must not be starved by integrity scanning");
+    const attemptedReceipts = pending.map((session) =>
+      database.externalSyncs.get(session.sessionId));
+    assert.equal(attemptedReceipts.every((receipt) => receipt.updated_at !== old), true,
+      "all three pending archives must be claimed or safely deferred in the same tick");
+    assert.equal(attemptedReceipts.every((receipt) => receipt.status === "failed"), true,
+      "one archive failure must not prevent the other two bounded attempts");
     assert.equal(database.externalSyncs.get(stale.sessionId).status, "completed");
 
     await scheduleInterviewRecovery(env);
@@ -10959,11 +11058,12 @@ test("background Drive recovery prioritizes pending work before one stale comple
   }
 });
 
-test("two simultaneous archives create one canonical year/month and distinct candidate folders", async () => {
+test("three simultaneous archives create one canonical year/month and distinct candidate folders", async () => {
   const originalFetch = globalThis.fetch;
   const database = new FakeD1();
   const env = driveSyncEnv(database);
-  const [first, second] = await Promise.all([
+  const sessions = await Promise.all([
+    seedCompletedInterview(env, database),
     seedCompletedInterview(env, database),
     seedCompletedInterview(env, database),
   ]);
@@ -11015,20 +11115,17 @@ test("two simultaneous archives create one canonical year/month and distinct can
       throw new Error("stop after hierarchy verification");
     };
 
-    const responses = await Promise.all([
-      requestAdminSync(first.sessionId, env),
-      requestAdminSync(second.sessionId, env),
-    ]);
-    assert.deepEqual(responses.map((response) => response.status), [502, 502]);
+    const responses = await Promise.all(sessions.map((session) => requestAdminSync(session.sessionId, env)));
+    assert.deepEqual(responses.map((response) => response.status), [502, 502, 502]);
     const years = folders.filter((folder) => folder.appProperties?.tokyoDogsInterviewYear === "2026");
     const months = folders.filter((folder) => folder.appProperties?.tokyoDogsInterviewMonth === "2026-07");
     const candidates = folders.filter((folder) => folder.appProperties?.tokyoDogsInterviewSession);
     assert.equal(years.length, 1);
     assert.equal(months.length, 1);
-    assert.equal(candidates.length, 2);
+    assert.equal(candidates.length, 3);
     assert.deepEqual(new Set(candidates.map((folder) => folder.appProperties.tokyoDogsInterviewSession)),
-      new Set([first.sessionId, second.sessionId]));
-    assert.equal(new Set(candidates.map((folder) => folder.id)).size, 2);
+      new Set(sessions.map((session) => session.sessionId)));
+    assert.equal(new Set(candidates.map((folder) => folder.id)).size, 3);
   } finally {
     globalThis.fetch = originalFetch;
   }

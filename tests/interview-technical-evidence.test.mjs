@@ -29,10 +29,16 @@ function eligibleSource() {
   };
 }
 
-test("only a stored historic empty-ASR voice draft is eligible for a technical evidence archive", () => {
+test("only a stored draft with a known transcription fault is eligible for a technical evidence archive", () => {
   const source = eligibleSource();
   assert.equal(TECHNICAL_EVIDENCE_TRANSCRIPT_KIND, "partial_transcript_human_review");
   assert.equal(technicalEvidenceArchiveTranscript(source), source.transcriptDraft.transcript);
+
+  for (const code of ["TRANSCRIPTION_EMPTY", "TRANSCRIPTION_FAILED", "TRANSCRIPTION_ID_MISSING"]) {
+    const knownFailure = structuredClone(source);
+    knownFailure.auditEvents[0].detail.code = code;
+    assert.equal(technicalEvidenceArchiveTranscript(knownFailure), knownFailure.transcriptDraft.transcript);
+  }
 
   for (const mutate of [
     (value) => { value.recordingStatus = "uploading"; },
@@ -41,7 +47,8 @@ test("only a stored historic empty-ASR voice draft is eligible for a technical e
     (value) => { value.evaluation = {}; },
     (value) => { value.transcriptDraft.sealedAt = "2026-08-20T00:02:00Z"; },
     (value) => { value.transcriptDraft.transcript[1].text = ""; },
-    (value) => { value.auditEvents[0].detail.code = "TRANSCRIPTION_ID_MISSING"; },
+    (value) => { value.auditEvents[0].detail.code = "UNKNOWN_TRANSCRIPTION_ERROR"; },
+    (value) => { value.auditEvents.push({ type: "transcription_failed", detail: { code: "UNKNOWN_TRANSCRIPTION_ERROR" } }); },
     (value) => { value.auditEvents.push({ type: "candidate_requested_stop", detail: {} }); },
   ]) {
     const value = structuredClone(source);

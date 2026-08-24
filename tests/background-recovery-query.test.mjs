@@ -117,7 +117,7 @@ test("technical evidence runs before routine completed-archive integrity mainten
     "active archives, technical evidence, and routine integrity maintenance must stay in that order");
 });
 
-test("technical evidence recovery selects only stored empty-ASR voice drafts without harmful holds", async () => {
+test("technical evidence recovery selects stored drafts with known transcription faults without harmful holds", async () => {
   const source = await readFile(new URL("../lib/interview-persistence.ts", import.meta.url), "utf8");
   const database = new DatabaseSync(":memory:");
   database.exec(`
@@ -184,8 +184,9 @@ test("technical evidence recovery selects only stored empty-ASR voice drafts wit
     }
   };
   insert("TD-TECH-VALID-01");
-  insert("TD-TECH-VALID-02");
+  insert("TD-TECH-VALID-02", { code: "TRANSCRIPTION_FAILED" });
   insert("TD-TECH-IDMISS-1", { code: "TRANSCRIPTION_ID_MISSING" });
+  insert("TD-TECH-UNKNOWN-1", { code: "UNKNOWN_TRANSCRIPTION_ERROR" });
   insert("TD-TECH-STOPPED-1", { hold: "candidate_requested_stop" });
   insert("TD-TECH-NORECORD", { noRecording: true });
   insert("TD-TECH-SEALED-01", { sealed: true });
@@ -196,6 +197,10 @@ test("technical evidence recovery selects only stored empty-ASR voice drafts wit
     "2026-08-20T00:00:00Z",
     5,
   );
-  assert.deepEqual(selected.map((row) => row.id), ["TD-TECH-VALID-01", "TD-TECH-VALID-02"]);
+  assert.deepEqual(selected.map((row) => row.id), [
+    "TD-TECH-IDMISS-1",
+    "TD-TECH-VALID-01",
+    "TD-TECH-VALID-02",
+  ]);
   database.close();
 });
