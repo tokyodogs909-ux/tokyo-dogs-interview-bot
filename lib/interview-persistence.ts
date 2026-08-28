@@ -3,6 +3,10 @@ import {
   type InterviewEvaluation,
   type TranscriptTurn,
 } from "@/lib/interview";
+import {
+  decideExternalSyncFailure,
+  EXTERNAL_SYNC_MAX_FAILURES,
+} from "@/lib/drive-retry-policy.js";
 import { hasVerifiedCandidateTranscript } from "@/lib/interview-transcript-verification";
 import {
   assertSignedInviteConfigured,
@@ -293,6 +297,8 @@ function recoveryTechnicalLastError(value: unknown) {
     "GOOGLE_DRIVE_SYNC_CLAIM_LOST",
     "GOOGLE_DRIVE_SYNC_DEFERRED",
     "GOOGLE_DRIVE_SYNC_FAILED",
+    "GOOGLE_DRIVE_SYNC_MANUAL_ATTENTION_REQUIRED",
+    "GOOGLE_DRIVE_SYNC_STALE_MANUAL_ATTENTION",
     "GOOGLE_DRIVE_TOKEN_REFRESH_RECONNECT_REQUIRED",
     "GOOGLE_DRIVE_TOKEN_REFRESH_TRANSIENT",
     "GOOGLE_DRIVE_UPLOAD_CAPABILITY_INVALID",
@@ -539,10 +545,28 @@ async function ensureSchema(db: D1Database) {
       folder_url TEXT,
       manifest_json TEXT,
       error_code TEXT,
+      failure_count INTEGER DEFAULT 0 NOT NULL,
+      next_retry_at TEXT,
+      retry_blocked_at TEXT,
+      retry_block_reason TEXT,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
       UNIQUE(session_id, provider)
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_external_syncs_status_idx ON interview_external_syncs (status)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_operational_alerts (
+      session_id TEXT PRIMARY KEY NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+      alert_type TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      status TEXT DEFAULT 'open' NOT NULL,
+      code TEXT NOT NULL,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      occurrence_count INTEGER DEFAULT 1 NOT NULL,
+      resolved_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_operational_alerts_status_idx ON interview_operational_alerts (status, severity, last_seen_at)"),
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_drive_upload_steps (
       session_id TEXT PRIMARY KEY NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
       started_at TEXT NOT NULL,
@@ -595,6 +619,85 @@ async function ensureSchema(db: D1Database) {
     "candidate_name",
     "ALTER TABLE interview_sessions ADD COLUMN candidate_name TEXT DEFAULT '' NOT NULL",
   );
+
+  const externalSyncColumns = await db.prepare("PRAGMA table_info(interview_external_syncs)")
+    .all<{ name: string }>();
+  const existingExternalSyncColumns = new Set(
+    (externalSyncColumns.results ?? []).map((column) => column.name),
+  );
+  const addExternalSyncColumnIfMissing = async (name: string, sql: string) => {
+    if (existingExternalSyncColumns.has(name)) return;
+    try {
+      await db.prepare(sql).run();
+      existingExternalSyncColumns.add(name);
+    } catch (error) {
+      const refreshed = await db.prepare("PRAGMA table_info(interview_external_syncs)")
+        .all<{ name: string }>();
+      if (!(refreshed.results ?? []).some((column) => column.name === name)) throw error;
+      existingExternalSyncColumns.add(name);
+    }
+  };
+  await addExternalSyncColumnIfMissing(
+    "failure_count",
+    "ALTER TABLE interview_external_syncs ADD COLUMN failure_count INTEGER DEFAULT 0 NOT NULL",
+  );
+  await addExternalSyncColumnIfMissing(
+    "next_retry_at",
+    "ALTER TABLE interview_external_syncs ADD COLUMN next_retry_at TEXT",
+  );
+  await addExternalSyncColumnIfMissing(
+    "retry_blocked_at",
+    "ALTER TABLE interview_external_syncs ADD COLUMN retry_blocked_at TEXT",
+  );
+  await addExternalSyncColumnIfMissing(
+    "retry_block_reason",
+    "ALTER TABLE interview_external_syncs ADD COLUMN retry_block_reason TEXT",
+  );
+  await db.prepare("CREATE INDEX IF NOT EXISTS interview_external_syncs_retry_idx ON interview_external_syncs (status, next_retry_at, retry_blocked_at)").run();
+
+  // Production remediation (2026-08-28): the legacy OAuth migration left 22
+  // archives repeating an immutable 404 and seven older jobs stranded. Preserve
+  // the existing receipts, stop every 404 immediately, and give only the seven
+  // non-404 jobs one final fenced attempt. These UPDATEs are intentionally
+  // idempotent, bounded by the old-job cutoff, and never delete or upload data.
+  const now = new Date().toISOString();
+  const legacyCutoff = "2026-08-27T00:00:00.000Z";
+  await db.batch([
+    db.prepare(`UPDATE interview_external_syncs SET
+      failure_count = CASE WHEN failure_count < 4 THEN 4 ELSE failure_count END,
+      next_retry_at = NULL,
+      retry_blocked_at = COALESCE(retry_blocked_at, ?),
+      retry_block_reason = COALESCE(retry_block_reason, error_code, 'GOOGLE_DRIVE_PERMANENT_FAILURE')
+      WHERE provider = 'google_drive'
+        AND error_code IN ('GOOGLE_DRIVE_API_404', 'GOOGLE_DRIVE_API_410')
+        AND retry_blocked_at IS NULL`).bind(now),
+    db.prepare(`UPDATE interview_external_syncs SET
+      status = 'pending', started_at = NULL, completed_at = NULL,
+      failure_count = 3, next_retry_at = ?, error_code = NULL, updated_at = ?
+      WHERE provider = 'google_drive' AND retry_blocked_at IS NULL
+        AND failure_count = 0 AND updated_at < ?
+        AND (status = 'running' OR error_code = 'GOOGLE_DRIVE_RESUMABLE_UPLOAD_524')`)
+      .bind(now, now, legacyCutoff),
+    db.prepare(`INSERT OR IGNORE INTO interview_operational_alerts (
+      session_id, alert_type, severity, status, code,
+      first_seen_at, last_seen_at, occurrence_count, created_at, updated_at
+    ) SELECT session_id, 'google_drive_save_failure', 'critical', 'open',
+        COALESCE(retry_block_reason, error_code, 'GOOGLE_DRIVE_SAVE_FAILED'),
+        ?, ?, 1, ?, ?
+      FROM interview_external_syncs
+      WHERE provider = 'google_drive' AND retry_blocked_at IS NOT NULL`)
+      .bind(now, now, now, now),
+    db.prepare(`INSERT OR IGNORE INTO interview_operational_alerts (
+      session_id, alert_type, severity, status, code,
+      first_seen_at, last_seen_at, occurrence_count, created_at, updated_at
+    ) SELECT session_id, 'google_drive_save_failure', 'warning', 'open',
+        'GOOGLE_DRIVE_LEGACY_SAFE_RECOVERY_SCHEDULED',
+        ?, ?, 1, ?, ?
+      FROM interview_external_syncs
+      WHERE provider = 'google_drive' AND failure_count = 3
+        AND status = 'pending' AND retry_blocked_at IS NULL`)
+      .bind(now, now, now, now),
+  ]);
 }
 
 const PUBLIC_ENTRY_WINDOW_MS = 6 * 60 * 60 * 1_000;
@@ -2186,6 +2289,10 @@ export type ExternalSyncStatus = {
   folderUrl: string | null;
   manifest: Record<string, unknown> | null;
   errorCode: string | null;
+  failureCount: number;
+  nextRetryAt: string | null;
+  retryBlockedAt: string | null;
+  retryBlockReason: string | null;
   updatedAt: string;
 };
 
@@ -2201,6 +2308,10 @@ type ExternalSyncRow = {
   folder_url: string | null;
   manifest_json: string | null;
   error_code: string | null;
+  failure_count: number;
+  next_retry_at: string | null;
+  retry_blocked_at: string | null;
+  retry_block_reason: string | null;
   updated_at: string;
 };
 
@@ -2221,6 +2332,10 @@ function safeExternalSyncStatus(row: ExternalSyncRow | null): ExternalSyncStatus
     folderUrl: row.folder_url,
     manifest,
     errorCode: row.error_code,
+    failureCount: Math.max(0, Math.trunc(Number(row.failure_count) || 0)),
+    nextRetryAt: row.next_retry_at,
+    retryBlockedAt: row.retry_blocked_at,
+    retryBlockReason: row.retry_block_reason,
     updatedAt: row.updated_at,
   };
 }
@@ -2230,7 +2345,8 @@ export async function getExternalSyncStatus(sessionId: string) {
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
   const row = await db.prepare(`SELECT provider, status, requested_at, started_at, completed_at,
-    folder_id, folder_url, manifest_json, error_code, updated_at
+    folder_id, folder_url, manifest_json, error_code, failure_count, next_retry_at,
+    retry_blocked_at, retry_block_reason, updated_at
     FROM interview_external_syncs WHERE session_id = ? AND provider = 'google_drive' LIMIT 1`)
     .bind(sessionId).first<ExternalSyncRow>();
   return safeExternalSyncStatus(row);
@@ -2261,7 +2377,8 @@ export async function claimExternalSyncIntegrityCheck(sessionId: string) {
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
   const row = await db.prepare(`SELECT provider, status, requested_at, started_at, completed_at,
-    folder_id, folder_url, manifest_json, error_code, updated_at
+    folder_id, folder_url, manifest_json, error_code, failure_count, next_retry_at,
+    retry_blocked_at, retry_block_reason, updated_at
     FROM interview_external_syncs
     WHERE session_id = ? AND provider = 'google_drive' LIMIT 1`)
     .bind(sessionId).first<ExternalSyncRow>();
@@ -2437,10 +2554,13 @@ export async function findInterviewDriveRecoverySessions(options: {
       )
       AND (
         d.session_id IS NULL
-        OR d.status = 'running'
-        OR (d.status = 'failed' AND d.updated_at <= ?)
-        OR (d.status = 'pending' AND d.updated_at <= ?)
-        OR (d.status = 'completed' AND (
+        OR (d.retry_blocked_at IS NULL AND (
+          d.status = 'running'
+          OR (d.status = 'failed' AND d.updated_at <= ?
+            AND (d.next_retry_at IS NULL OR datetime(d.next_retry_at) <= datetime('now')))
+          OR (d.status = 'pending' AND d.updated_at <= ?
+            AND (d.next_retry_at IS NULL OR datetime(d.next_retry_at) <= datetime('now')))
+          OR (d.status = 'completed' AND (
           COALESCE(json_extract(d.manifest_json, '$.transcriptAvailable'), 0) != 1
           OR COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') != 'actual_transcript'
           OR (s.recording_status = 'stored'
@@ -2448,6 +2568,7 @@ export async function findInterviewDriveRecoverySessions(options: {
           OR (? = 1 AND (
             json_extract(d.manifest_json, '$.integrity.checkedAt') IS NULL
             OR json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?
+          ))
           ))
         ))
       )
@@ -2595,9 +2716,16 @@ export async function requestExternalSync(sessionId: string) {
   ) VALUES (?, 'google_drive', 'pending', ?, ?)
   ON CONFLICT(session_id, provider) DO UPDATE SET
     requested_at = CASE WHEN interview_external_syncs.status = 'running'
+        OR interview_external_syncs.retry_blocked_at IS NOT NULL
+        OR (interview_external_syncs.next_retry_at IS NOT NULL AND interview_external_syncs.next_retry_at > excluded.requested_at)
       THEN interview_external_syncs.requested_at ELSE excluded.requested_at END,
-    status = CASE WHEN interview_external_syncs.status = 'running' THEN 'running' ELSE 'pending' END,
+    status = CASE WHEN interview_external_syncs.status = 'running'
+        OR interview_external_syncs.retry_blocked_at IS NOT NULL
+        OR (interview_external_syncs.next_retry_at IS NOT NULL AND interview_external_syncs.next_retry_at > excluded.requested_at)
+      THEN interview_external_syncs.status ELSE 'pending' END,
     updated_at = CASE WHEN interview_external_syncs.status = 'running'
+        OR interview_external_syncs.retry_blocked_at IS NOT NULL
+        OR (interview_external_syncs.next_retry_at IS NOT NULL AND interview_external_syncs.next_retry_at > excluded.requested_at)
       THEN interview_external_syncs.updated_at ELSE excluded.updated_at END`)
     .bind(sessionId, now, now).run();
   const staleBefore = new Date(Date.now() - EXTERNAL_SYNC_STALE_AFTER_MS).toISOString();
@@ -2607,14 +2735,57 @@ export async function requestExternalSync(sessionId: string) {
   // owner has not reported progress (heartbeatExternalSync) for the whole stale
   // window, i.e. when it really is dead rather than merely slow.
   const recovered = await db.prepare(`UPDATE interview_external_syncs SET
-    status = 'pending', started_at = NULL, completed_at = NULL,
-    error_code = NULL, updated_at = ?
+    failure_count = failure_count + 1,
+    status = CASE WHEN failure_count + 1 >= ? THEN 'failed' ELSE 'pending' END,
+    started_at = NULL, completed_at = NULL,
+    error_code = CASE WHEN failure_count + 1 >= ?
+      THEN 'GOOGLE_DRIVE_SYNC_STALE_MANUAL_ATTENTION' ELSE NULL END,
+    next_retry_at = CASE WHEN failure_count + 1 >= ? THEN NULL ELSE ? END,
+    retry_blocked_at = CASE WHEN failure_count + 1 >= ? THEN ? ELSE NULL END,
+    retry_block_reason = CASE WHEN failure_count + 1 >= ?
+      THEN 'GOOGLE_DRIVE_SYNC_STALE_MANUAL_ATTENTION' ELSE NULL END,
+    updated_at = ?
     WHERE session_id = ? AND provider = 'google_drive' AND status = 'running'
-      AND started_at IS NOT NULL AND updated_at <= ?`)
-    .bind(now, sessionId, staleBefore).run();
+      AND retry_blocked_at IS NULL AND started_at IS NOT NULL AND updated_at <= ?`)
+    .bind(
+      EXTERNAL_SYNC_MAX_FAILURES,
+      EXTERNAL_SYNC_MAX_FAILURES,
+      EXTERNAL_SYNC_MAX_FAILURES,
+      now,
+      EXTERNAL_SYNC_MAX_FAILURES,
+      now,
+      EXTERNAL_SYNC_MAX_FAILURES,
+      now,
+      sessionId,
+      staleBefore,
+    ).run();
   if (Number(recovered.meta?.changes ?? 0) === 1) {
-    await db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'google_drive_sync_stale_recovered', 'system', ?)")
-      .bind(crypto.randomUUID(), sessionId, JSON.stringify({ staleBefore })).run();
+    const recoveredStatus = await db.prepare(`SELECT status, failure_count, retry_blocked_at
+      FROM interview_external_syncs WHERE session_id = ? AND provider = 'google_drive' LIMIT 1`)
+      .bind(sessionId).first<{ status: string; failure_count: number; retry_blocked_at: string | null }>();
+    const blocked = Boolean(recoveredStatus?.retry_blocked_at);
+    await db.batch([
+      db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'google_drive_sync_stale_recovered', 'system', ?)")
+        .bind(crypto.randomUUID(), sessionId, JSON.stringify({ staleBefore, blocked })),
+      db.prepare(`INSERT INTO interview_operational_alerts (
+        session_id, alert_type, severity, status, code,
+        first_seen_at, last_seen_at, occurrence_count, created_at, updated_at
+      ) VALUES (?, 'google_drive_save_failure', ?, 'open', ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        alert_type = excluded.alert_type, severity = excluded.severity,
+        status = 'open', code = excluded.code, last_seen_at = excluded.last_seen_at,
+        occurrence_count = interview_operational_alerts.occurrence_count + 1,
+        resolved_at = NULL, updated_at = excluded.updated_at`)
+        .bind(
+          sessionId,
+          blocked ? "critical" : "warning",
+          blocked ? "GOOGLE_DRIVE_SYNC_STALE_MANUAL_ATTENTION" : "GOOGLE_DRIVE_SYNC_STALE_RECOVERED",
+          now,
+          now,
+          now,
+          now,
+        ),
+    ]);
   }
   return now;
 }
@@ -2640,8 +2811,10 @@ export async function claimExternalSync(sessionId: string) {
   const startedAt = new Date().toISOString();
   const result = await db.prepare(`UPDATE interview_external_syncs SET
     status = 'running', started_at = ?, completed_at = NULL, error_code = NULL, updated_at = ?
-    WHERE session_id = ? AND provider = 'google_drive' AND status = 'pending'`)
-    .bind(startedAt, startedAt, sessionId).run();
+    WHERE session_id = ? AND provider = 'google_drive' AND status = 'pending'
+      AND retry_blocked_at IS NULL
+      AND (next_retry_at IS NULL OR next_retry_at <= ?)`)
+    .bind(startedAt, startedAt, sessionId, startedAt).run();
   return Number(result.meta?.changes ?? 0) === 1 ? startedAt : null;
 }
 
@@ -2670,7 +2843,9 @@ export async function completeExternalSync(input: {
     db.prepare(`UPDATE interview_external_syncs SET
       status = CASE WHEN requested_at > ? THEN 'pending' ELSE 'completed' END,
       completed_at = CASE WHEN requested_at > ? THEN NULL ELSE ? END,
-      folder_id = ?, folder_url = ?, manifest_json = ?, error_code = NULL, updated_at = ?
+      folder_id = ?, folder_url = ?, manifest_json = ?, error_code = NULL,
+      failure_count = 0, next_retry_at = NULL, retry_blocked_at = NULL,
+      retry_block_reason = NULL, updated_at = ?
       WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?${driveStepLeaseFence}`)
       .bind(
         input.startedAt,
@@ -2699,6 +2874,22 @@ export async function completeExternalSync(input: {
         input.startedAt,
         ...driveStepLeaseBindings,
       ),
+    db.prepare(`UPDATE interview_operational_alerts SET
+      status = 'resolved', resolved_at = ?, updated_at = ?
+      WHERE session_id = ? AND alert_type = 'google_drive_save_failure'
+        AND EXISTS (
+          SELECT 1 FROM interview_external_syncs sync
+          WHERE sync.session_id = ? AND sync.provider = 'google_drive'
+            AND sync.started_at = ? AND sync.status = 'completed'
+        )${driveStepLeaseFence}`)
+      .bind(
+        now,
+        now,
+        input.sessionId,
+        input.sessionId,
+        input.startedAt,
+        ...driveStepLeaseBindings,
+      ),
   ]);
   if (Number(results[0]?.meta?.changes ?? 0) !== 1) {
     throw new Error(input.driveUploadStepLeaseToken
@@ -2715,30 +2906,118 @@ export async function failExternalSync(input: {
 }) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
-  const now = new Date().toISOString();
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
+  const current = await getExternalSyncStatus(input.sessionId);
+  if (!current || current.status !== "running" || current.startedAt !== input.startedAt) return;
+  const { failureCount, blocked, nextRetryAt } = decideExternalSyncFailure(
+    input.errorCode,
+    current.failureCount,
+    nowDate.getTime(),
+  );
+  const errorCode = input.errorCode.slice(0, 120);
   // The UPDATE is fenced on started_at, so a worker whose claim was already
   // reclaimed changes nothing. Its audit row must be suppressed the same way, or
   // the log would report a failure against a sync another worker now owns.
   await db.batch([
     db.prepare(`UPDATE interview_external_syncs SET
-      status = 'failed', error_code = ?, updated_at = ?
-      WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?`)
-      .bind(input.errorCode.slice(0, 120), now, input.sessionId, input.startedAt),
+      status = 'failed', error_code = ?, failure_count = ?, next_retry_at = ?,
+      retry_blocked_at = ?, retry_block_reason = ?, updated_at = ?
+      WHERE session_id = ? AND provider = 'google_drive' AND status = 'running'
+        AND started_at = ?`)
+      .bind(
+        errorCode,
+        failureCount,
+        nextRetryAt,
+        blocked ? now : null,
+        blocked ? errorCode : null,
+        now,
+        input.sessionId,
+        input.startedAt,
+      ),
     db.prepare(`INSERT INTO interview_audit_events (
       id, session_id, event_type, actor_type, detail_json
     ) SELECT ?, ?, 'google_drive_sync_failed', 'system', ?
       WHERE EXISTS (
         SELECT 1 FROM interview_external_syncs
-        WHERE session_id = ? AND provider = 'google_drive' AND started_at = ?
+        WHERE session_id = ? AND provider = 'google_drive' AND status = 'failed'
+          AND started_at = ? AND error_code = ? AND failure_count = ? AND updated_at = ?
       )`)
       .bind(
         crypto.randomUUID(),
         input.sessionId,
-        JSON.stringify({ errorCode: input.errorCode.slice(0, 120) }),
+        JSON.stringify({ errorCode, failureCount, blocked, nextRetryAt }),
         input.sessionId,
         input.startedAt,
+        errorCode,
+        failureCount,
+        now,
+      ),
+    db.prepare(`INSERT INTO interview_operational_alerts (
+      session_id, alert_type, severity, status, code,
+      first_seen_at, last_seen_at, occurrence_count, created_at, updated_at
+    ) SELECT ?, 'google_drive_save_failure', ?, 'open', ?, ?, ?, 1, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_external_syncs
+        WHERE session_id = ? AND provider = 'google_drive' AND status = 'failed'
+          AND started_at = ? AND error_code = ? AND failure_count = ?
+      )
+      ON CONFLICT(session_id) DO UPDATE SET
+        alert_type = excluded.alert_type, severity = excluded.severity,
+        status = 'open', code = excluded.code, last_seen_at = excluded.last_seen_at,
+        occurrence_count = interview_operational_alerts.occurrence_count + 1,
+        resolved_at = NULL, updated_at = excluded.updated_at`)
+      .bind(
+        input.sessionId,
+        blocked ? "critical" : "warning",
+        errorCode,
+        now,
+        now,
+        now,
+        now,
+        input.sessionId,
+        input.startedAt,
+        errorCode,
+        failureCount,
       ),
   ]);
+}
+
+/**
+ * Releases one durable Drive hold for an explicit authenticated staff action.
+ * The counter is kept at max-1, so the attempt either completes or returns to
+ * a blocked alert after exactly one failure. Background/candidate requests can
+ * never call this path and therefore cannot recreate a retry loop.
+ */
+export async function releaseExternalSyncRetryHold(input: {
+  sessionId: string;
+  reviewer: AuthorizedReviewer;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = new Date().toISOString();
+  const result = await db.prepare(`UPDATE interview_external_syncs SET
+    status = 'pending', started_at = NULL, completed_at = NULL,
+    error_code = NULL, failure_count = ?, next_retry_at = ?,
+    retry_blocked_at = NULL, retry_block_reason = NULL, updated_at = ?
+    WHERE session_id = ? AND provider = 'google_drive'
+      AND retry_blocked_at IS NOT NULL`)
+    .bind(EXTERNAL_SYNC_MAX_FAILURES - 1, now, now, input.sessionId).run();
+  if (Number(result.meta?.changes ?? 0) !== 1) return false;
+  await db.batch([
+    db.prepare(`INSERT INTO interview_staff_audit_events (
+      id, reviewer_name, event_type, detail_json
+    ) VALUES (?, ?, 'google_drive_retry_hold_released', ?)`)
+      .bind(crypto.randomUUID(), input.reviewer, JSON.stringify({ sessionId: input.sessionId })),
+    db.prepare(`UPDATE interview_operational_alerts SET
+      severity = 'warning', status = 'open',
+      code = 'GOOGLE_DRIVE_EXPLICIT_SINGLE_RETRY', last_seen_at = ?,
+      resolved_at = NULL, updated_at = ?
+      WHERE session_id = ? AND alert_type = 'google_drive_save_failure'`)
+      .bind(now, now, input.sessionId),
+  ]);
+  return true;
 }
 
 export async function deferExternalSync(input: {
@@ -3374,13 +3653,17 @@ export async function findInterviewTechnicalEvidenceDriveSessions(limit = 1) {
       )
       AND (
         d.session_id IS NULL
-        OR d.status = 'running'
-        OR (d.status = 'failed' AND d.updated_at <= ?)
-        OR (d.status = 'pending' AND d.updated_at <= ?)
-        OR (d.status = 'completed'
-          AND COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') = 'partial_transcript_human_review'
-          AND (json_extract(d.manifest_json, '$.integrity.checkedAt') IS NULL
-            OR json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?))
+        OR (d.retry_blocked_at IS NULL AND (
+          d.status = 'running'
+          OR (d.status = 'failed' AND d.updated_at <= ?
+            AND (d.next_retry_at IS NULL OR datetime(d.next_retry_at) <= datetime('now')))
+          OR (d.status = 'pending' AND d.updated_at <= ?
+            AND (d.next_retry_at IS NULL OR datetime(d.next_retry_at) <= datetime('now')))
+          OR (d.status = 'completed'
+            AND COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') = 'partial_transcript_human_review'
+            AND (json_extract(d.manifest_json, '$.integrity.checkedAt') IS NULL
+              OR json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?))
+        ))
       )
     ORDER BY COALESCE(d.updated_at, draft.updated_at, s.updated_at) ASC, s.id ASC
     LIMIT ?`)
@@ -3589,6 +3872,14 @@ export type InterviewListItem = {
   driveTranscriptAvailable: boolean | null;
   driveTranscriptKind: string | null;
   driveIntegrityStatus: "verified" | "drift" | "unknown" | null;
+  driveFailureCount: number;
+  driveNextRetryAt: string | null;
+  driveRetryBlockedAt: string | null;
+  driveRetryBlockReason: string | null;
+  driveAlertStatus: "open" | "resolved" | null;
+  driveAlertSeverity: "warning" | "critical" | null;
+  driveAlertCode: string | null;
+  driveAlertLastSeenAt: string | null;
   sourceTranscriptVerified: boolean;
   completionHold: boolean;
 };
@@ -3651,10 +3942,16 @@ export async function listInterviewSummaryPage(
           )
     ) AS candidate_transcription_failed,
     d.status AS drive_status, d.folder_url AS drive_folder_url, d.updated_at AS drive_updated_at,
-    d.manifest_json AS drive_manifest_json
+    d.manifest_json AS drive_manifest_json, d.failure_count AS drive_failure_count,
+    d.next_retry_at AS drive_next_retry_at, d.retry_blocked_at AS drive_retry_blocked_at,
+    d.retry_block_reason AS drive_retry_block_reason,
+    alert.status AS drive_alert_status, alert.severity AS drive_alert_severity,
+    alert.code AS drive_alert_code, alert.last_seen_at AS drive_alert_last_seen_at
     FROM interview_sessions AS s
     LEFT JOIN interview_external_syncs AS d
-      ON d.session_id = s.id AND d.provider = 'google_drive'`;
+      ON d.session_id = s.id AND d.provider = 'google_drive'
+    LEFT JOIN interview_operational_alerts AS alert
+      ON alert.session_id = s.id AND alert.alert_type = 'google_drive_save_failure'`;
   const rows = options.cursor
     ? await db.prepare(`${select}
         WHERE s.created_at < ? OR (s.created_at = ? AND s.id < ?)
@@ -3702,6 +3999,20 @@ export async function listInterviewSummaryPage(
         ))
         ? (driveManifest.integrity as Record<string, unknown>).status as "verified" | "drift" | "unknown"
         : driveManifest ? "unknown" : null,
+      driveFailureCount: Math.max(0, Math.trunc(Number(row.drive_failure_count) || 0)),
+      driveNextRetryAt: typeof row.drive_next_retry_at === "string" ? row.drive_next_retry_at : null,
+      driveRetryBlockedAt: typeof row.drive_retry_blocked_at === "string" ? row.drive_retry_blocked_at : null,
+      driveRetryBlockReason: typeof row.drive_retry_block_reason === "string" ? row.drive_retry_block_reason : null,
+      driveAlertStatus: row.drive_alert_status === "open" || row.drive_alert_status === "resolved"
+        ? row.drive_alert_status
+        : null,
+      driveAlertSeverity: row.drive_alert_severity === "warning" || row.drive_alert_severity === "critical"
+        ? row.drive_alert_severity
+        : null,
+      driveAlertCode: typeof row.drive_alert_code === "string" ? row.drive_alert_code : null,
+      driveAlertLastSeenAt: typeof row.drive_alert_last_seen_at === "string"
+        ? row.drive_alert_last_seen_at
+        : null,
       sourceTranscriptVerified,
       completionHold: Number(row.completion_hold ?? 0) === 1,
     };

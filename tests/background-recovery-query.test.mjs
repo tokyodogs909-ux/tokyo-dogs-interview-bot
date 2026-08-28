@@ -56,7 +56,9 @@ test("global Drive recovery skips more than 25 invalid rows without starving val
       provider TEXT NOT NULL,
       status TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      manifest_json TEXT
+      manifest_json TEXT,
+      next_retry_at TEXT,
+      retry_blocked_at TEXT
     );
   `);
 
@@ -154,7 +156,9 @@ test("technical evidence recovery selects stored drafts with known transcription
       provider TEXT NOT NULL,
       status TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      manifest_json TEXT
+      manifest_json TEXT,
+      next_retry_at TEXT,
+      retry_blocked_at TEXT
     );
   `);
   const turns = JSON.stringify([

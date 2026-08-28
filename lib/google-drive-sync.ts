@@ -3255,6 +3255,12 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
   }
 
   let current = await getExternalSyncStatus(sessionId);
+  if (current?.retryBlockedAt) {
+    // A permanent or exhausted failure is a durable operational hold. Never
+    // reopen it from candidate polling, staff polling, or cron: doing so caused
+    // the production 404 storm and could create duplicate Drive artifacts.
+    throw new Error("GOOGLE_DRIVE_SYNC_MANUAL_ATTENTION_REQUIRED");
+  }
   const alreadyCompleted = current ? completedResultFromStatus(current) : null;
   if (alreadyCompleted) {
     const source = await getInterviewArchiveSource(sessionId);

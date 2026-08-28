@@ -28,13 +28,16 @@ export async function POST(request: Request) {
       code === "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC" ||
       code === "INTERVIEW_RECORDING_ARTIFACT_MISSING" ||
       code === "INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC";
+    const manualAttention = code === "GOOGLE_DRIVE_SYNC_MANUAL_ATTENTION_REQUIRED";
     const status = code === "INTERVIEW_NOT_FOUND" ? 404
       : code.includes("CONFIGURATION") || code.includes("AUTH_UNCONFIGURED") ? 503
-        : archiveNotReady ? 409
+        : archiveNotReady || manualAttention ? 409
           : 502;
     return noStoreJson({
       error: code === "INTERVIEW_NOT_FOUND"
         ? "該当するオンライン一次面接記録がありません。"
+        : manualAttention
+          ? "この記録は重複防止のため自動再試行を停止しています。既存のDriveフォルダと保存失敗通知を確認してください。"
         : archiveNotReady
           ? "評価と録画の保存完了後にGoogle Driveへ格納できます。"
           : code.includes("CONFIGURATION")

@@ -124,10 +124,31 @@ export const interviewExternalSyncs = sqliteTable("interview_external_syncs", {
   folderUrl: text("folder_url"),
   manifestJson: text("manifest_json"),
   errorCode: text("error_code"),
+  failureCount: integer("failure_count").notNull().default(0),
+  nextRetryAt: text("next_retry_at"),
+  retryBlockedAt: text("retry_blocked_at"),
+  retryBlockReason: text("retry_block_reason"),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [
   uniqueIndex("interview_external_syncs_session_provider_unique").on(table.sessionId, table.provider),
   index("interview_external_syncs_status_idx").on(table.status),
+  index("interview_external_syncs_retry_idx").on(table.status, table.nextRetryAt, table.retryBlockedAt),
+]);
+
+export const interviewOperationalAlerts = sqliteTable("interview_operational_alerts", {
+  sessionId: text("session_id").primaryKey().references(() => interviewSessions.id, { onDelete: "cascade" }),
+  alertType: text("alert_type").notNull(),
+  severity: text("severity").notNull(),
+  status: text("status").notNull().default("open"),
+  code: text("code").notNull(),
+  firstSeenAt: text("first_seen_at").notNull(),
+  lastSeenAt: text("last_seen_at").notNull(),
+  occurrenceCount: integer("occurrence_count").notNull().default(1),
+  resolvedAt: text("resolved_at"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("interview_operational_alerts_status_idx").on(table.status, table.severity, table.lastSeenAt),
 ]);
 
 export const interviewDriveUploadSteps = sqliteTable("interview_drive_upload_steps", {

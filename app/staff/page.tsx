@@ -66,6 +66,10 @@ type ReviewRecord = {
     integrityCheckedAt: string | null;
     integrityErrorCode: string | null;
     sharingRisk: "anyone_writer" | "anyone_reader" | "restricted" | "unknown";
+    failureCount: number;
+    nextRetryAt: string | null;
+    retryBlockedAt: string | null;
+    retryBlockReason: string | null;
   } | null;
 };
 
@@ -86,6 +90,14 @@ type InterviewListItem = {
   driveTranscriptAvailable: boolean | null;
   driveTranscriptKind: string | null;
   driveIntegrityStatus: "verified" | "drift" | "unknown" | null;
+  driveFailureCount: number;
+  driveNextRetryAt: string | null;
+  driveRetryBlockedAt: string | null;
+  driveRetryBlockReason: string | null;
+  driveAlertStatus: "open" | "resolved" | null;
+  driveAlertSeverity: "warning" | "critical" | null;
+  driveAlertCode: string | null;
+  driveAlertLastSeenAt: string | null;
   sourceTranscriptVerified: boolean;
   completionHold: boolean;
 };
@@ -96,6 +108,8 @@ type ArchiveHealth = {
   processing: number;
   attention: number;
   autoRecoveryScheduled: number;
+  blocked: number;
+  openAlerts: number;
 };
 
 const technicalEventLabels: Record<string, string> = {
@@ -164,6 +178,7 @@ function formatRetentionDate(value: string) {
 }
 
 function driveArchiveLabel(item: InterviewListItem) {
+  if (item.driveRetryBlockedAt) return "自動再試行停止・要確認";
   if (item.driveStatus === "failed") return "Drive要確認";
   if (item.driveStatus === "running") return "Drive格納中";
   if (item.driveStatus === "pending") return "Drive格納待ち";
@@ -184,6 +199,7 @@ function driveArchiveLabel(item: InterviewListItem) {
 }
 
 function driveArchiveClass(item: InterviewListItem) {
+  if (item.driveRetryBlockedAt || item.driveAlertStatus === "open") return "attention";
   if (
     item.driveStatus === "completed" &&
     (item.sourceTranscriptVerified !== true || item.driveTranscriptAvailable !== true || item.driveTranscriptKind !== "actual_transcript")
@@ -253,6 +269,8 @@ export default function StaffReviewPage() {
   const pollInterviewListRef = useRef<() => Promise<void>>(async () => undefined);
   const driveRecoveryInFlightRef = useRef(new Set<string>());
   const transcriptionRecoveryInFlightRef = useRef(false);
+  const knownOpenDriveAlertsRef = useRef(new Set<string>());
+  const driveAlertMonitorInitializedRef = useRef(false);
 
   useEffect(() => () => {
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
@@ -338,6 +356,24 @@ export default function StaffReviewPage() {
       };
     } catch {
       // The in-page notice remains available when an OS-level notification is blocked.
+    }
+  }
+
+  function showBrowserStorageFailureNotification(items: InterviewListItem[]) {
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    try {
+      const notification = new Notification("TOKYO DOGS｜面接記録の保存要確認", {
+        body: items.length === 1
+          ? `${items[0].candidateName || "氏名未登録"}さんのDrive保存を自動停止しました。運営画面を確認してください。`
+          : `${items.length}件のDrive保存を自動停止しました。運営画面を確認してください。`,
+        tag: `interview-drive-alert-${items.map((item) => item.sessionId).join("-")}`,
+      });
+      notification.onclick = () => {
+        window.focus();
+        notification.close();
+      };
+    } catch {
+      // The persistent in-page alert remains authoritative.
     }
   }
 
@@ -434,6 +470,19 @@ export default function StaffReviewPage() {
       if (!options.append) setArchiveHealth(data.archiveHealth ?? null);
       setNotificationPermission(typeof Notification === "undefined" ? "unavailable" : Notification.permission);
       if (!options.append) {
+        const openDriveAlerts = data.interviews.filter((item) => item.driveAlertStatus === "open");
+        if (!driveAlertMonitorInitializedRef.current) {
+          knownOpenDriveAlertsRef.current = new Set(openDriveAlerts.map((item) => item.sessionId));
+          driveAlertMonitorInitializedRef.current = true;
+        } else {
+          const newlyOpenedAlerts = openDriveAlerts.filter((item) =>
+            !knownOpenDriveAlertsRef.current.has(item.sessionId));
+          openDriveAlerts.forEach((item) => knownOpenDriveAlertsRef.current.add(item.sessionId));
+          if (newlyOpenedAlerts.length > 0) {
+            setCompletionNotice(`保存要確認：${newlyOpenedAlerts.length}件のDrive自動再試行を停止しました。候補者記録を確認してください。`);
+            showBrowserStorageFailureNotification(newlyOpenedAlerts);
+          }
+        }
         const completedItems = data.interviews.filter((item) => isVerifiedInterviewArchive(item) && item.completedAt);
         if (!completionMonitorInitializedRef.current) {
           knownCompletedIdsRef.current = new Set(completedItems.map((item) => item.sessionId));
@@ -503,6 +552,8 @@ export default function StaffReviewPage() {
     setArchiveHealth(null);
     completionMonitorInitializedRef.current = false;
     knownCompletedIdsRef.current.clear();
+    knownOpenDriveAlertsRef.current.clear();
+    driveAlertMonitorInitializedRef.current = false;
     setNewCompletedIds(new Set());
     setCompletionNotice("");
     setListFilter("");
@@ -582,7 +633,10 @@ export default function StaffReviewPage() {
     setState("syncing");
     setMessage("");
     try {
-      const response = await fetch("/api/staff/google-drive/sync", {
+      const releasingHold = Boolean(review.driveSync?.retryBlockedAt);
+      const response = await fetch(releasingHold
+        ? "/api/staff/google-drive/retry"
+        : "/api/staff/google-drive/sync", {
         method: "POST",
         headers: { ...authHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId: review.sessionId }),
@@ -621,6 +675,10 @@ export default function StaffReviewPage() {
           integrityCheckedAt: data.result?.integrity?.checkedAt ?? current.driveSync?.integrityCheckedAt ?? null,
           integrityErrorCode: data.result?.integrity?.errorCode ?? current.driveSync?.integrityErrorCode ?? null,
           sharingRisk: data.result?.integrity?.sharingRisk ?? current.driveSync?.sharingRisk ?? "unknown",
+          failureCount: data.result?.status === "completed" ? 0 : current.driveSync?.failureCount ?? 0,
+          nextRetryAt: null,
+          retryBlockedAt: null,
+          retryBlockReason: null,
         },
       } : current);
       setState("ready");
@@ -706,7 +764,9 @@ export default function StaffReviewPage() {
                 <span>面接完了 {archiveHealth.completedInterviews}件・Drive格納済み {archiveHealth.stored}件{archiveHealth.processing > 0 ? `・処理中 ${archiveHealth.processing}件` : ""}</span>
               </div>
               {archiveHealth.attention > 0 && (
-                <small>{archiveHealth.autoRecoveryScheduled > 0
+                <small>{archiveHealth.blocked > 0
+                  ? `${archiveHealth.blocked}件は重複防止のため自動再試行を停止し、保存失敗通知へ移しました。既存のDriveフォルダを確認してください。`
+                  : archiveHealth.autoRecoveryScheduled > 0
                   ? `${archiveHealth.autoRecoveryScheduled}件を復旧対象として確認しました。サーバーの定期復旧でも処理を継続します。`
                   : `${archiveHealth.attention}件は復旧の待機中または自動再実行の対象外です。「Drive・レポートを更新」で状態を確認してください。`}</small>
               )}
@@ -779,7 +839,8 @@ export default function StaffReviewPage() {
             <p>面接完了後、応募者氏名と面接IDの専用フォルダへ、録画・文字起こし・評価データ・PDFレポート・格納結果を保存します。同じ面接IDで再実行しても既存ファイルを更新します。</p>
             <div className="drive-sync-actions">
               <span className={`drive-sync-status drive-sync-${review.driveSync?.status ?? "not-started"}`}>
-                {review.driveSync?.status === "completed" ? review.driveSync.integrityStatus === "drift" ? "差分検出（要確認）" : review.driveSync.integrityStatus !== "verified" ? "照合未完" : review.driveSync.transcriptKind === "partial_transcript_human_review" ? "技術保留記録を格納（人手確認必須）" : review.sourceTranscriptVerified !== true ? "保存未完了（文字起こし要確認）" : review.driveSync.transcriptAvailable !== true || review.driveSync.transcriptKind !== "actual_transcript" ? "保存未完了（文字起こし未格納）" : review.driveSync.recordingIncluded ? "録画を含め格納完了" : textInterviewSelected ? "回答記録を格納完了" : "録画未格納"
+                {review.driveSync?.retryBlockedAt ? "自動再試行停止・要確認"
+                  : review.driveSync?.status === "completed" ? review.driveSync.integrityStatus === "drift" ? "差分検出（要確認）" : review.driveSync.integrityStatus !== "verified" ? "照合未完" : review.driveSync.transcriptKind === "partial_transcript_human_review" ? "技術保留記録を格納（人手確認必須）" : review.sourceTranscriptVerified !== true ? "保存未完了（文字起こし要確認）" : review.driveSync.transcriptAvailable !== true || review.driveSync.transcriptKind !== "actual_transcript" ? "保存未完了（文字起こし未格納）" : review.driveSync.recordingIncluded ? "録画を含め格納完了" : textInterviewSelected ? "回答記録を格納完了" : "録画未格納"
                   : review.driveSync?.status === "running" ? "格納中"
                     : review.driveSync?.status === "pending" ? "格納待ち"
                       : review.driveSync?.status === "failed" ? "要再実行"
@@ -787,7 +848,7 @@ export default function StaffReviewPage() {
               </span>
               {review.driveSync?.folderUrl && <a href={review.driveSync.folderUrl} target="_blank" rel="noreferrer">保存フォルダを開く ↗</a>}
               <button className="secondary-action" onClick={() => void syncGoogleDrive()} disabled={state === "syncing" || review.status !== "completed"}>
-                {state === "syncing" ? "更新中…" : "Drive・レポートを更新"}
+                {state === "syncing" ? "更新中…" : review.driveSync?.retryBlockedAt ? "安全に1回だけ再試行" : "Drive・レポートを更新"}
               </button>
             </div>
             {review.driveSync?.status === "completed" && <div className="validation-box">
@@ -812,7 +873,9 @@ export default function StaffReviewPage() {
                     ? "制限付き共有"
                     : "共有範囲未確認"}</p>
             </div>}
-            {review.driveSync?.status === "failed" && <p className="guardrail-copy">認証・保存先・通信状態を確認し、再実行してください。応募者の評価状態には影響しません。</p>}
+            {review.driveSync?.retryBlockedAt
+              ? <p className="guardrail-copy"><strong>重複防止のため自動再試行を停止しています。</strong> 既存のDriveフォルダを確認後、必要な場合だけ「安全に1回だけ再試行」を押してください。失敗した場合は自動で再停止し、応募者の評価状態には影響しません。</p>
+              : review.driveSync?.status === "failed" && <p className="guardrail-copy">次回再試行まで待機しています。自動連続実行は行わず、応募者の評価状態には影響しません。</p>}
             {review.driveSync?.status === "completed" && review.driveSync.transcriptKind === "partial_transcript_human_review" && <p className="guardrail-copy"><strong>録画と中断時点までの一部文字起こしを、技術保留記録として格納しています。</strong> 面接完了・自動評価・合否判断の証明ではありません。録画と回答を人が照合し、再面接の要否を判断してください。</p>}
             {review.driveSync?.status === "completed" && review.sourceTranscriptVerified !== true && <p className="guardrail-copy"><strong>元の回答記録に文字起こし欠落または未確認の発言があります。</strong> Driveの表示にかかわらず保存完了とは扱わず、録画と回答を確認してください。</p>}
             {review.driveSync?.status === "completed" && review.sourceTranscriptVerified === true && (review.driveSync.transcriptAvailable !== true || review.driveSync.transcriptKind !== "actual_transcript") && <p className="guardrail-copy"><strong>実際の発言に基づく文字起こしをDriveで確認できていません。</strong> 保存完了とは扱わず、文字起こし処理後に再格納してください。</p>}

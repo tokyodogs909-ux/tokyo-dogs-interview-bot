@@ -6,8 +6,27 @@ import {
   planRecordingRecovery,
   summarizeDriveArchives,
 } from "../lib/drive-recovery.js";
+import { decideExternalSyncFailure } from "../lib/drive-retry-policy.js";
 
 const now = Date.parse("2026-08-03T06:00:00.000Z");
+
+test("Drive retry policy blocks 404 immediately and caps transient retries", () => {
+  assert.deepEqual(decideExternalSyncFailure("GOOGLE_DRIVE_API_404", 0, now), {
+    failureCount: 1,
+    blocked: true,
+    nextRetryAt: null,
+  });
+  assert.deepEqual(decideExternalSyncFailure("GOOGLE_DRIVE_RESUMABLE_UPLOAD_524", 3, now), {
+    failureCount: 4,
+    blocked: true,
+    nextRetryAt: null,
+  });
+  assert.deepEqual(decideExternalSyncFailure("GOOGLE_DRIVE_API_503", 0, now), {
+    failureCount: 1,
+    blocked: false,
+    nextRetryAt: "2026-08-03T06:10:00.000Z",
+  });
+});
 
 function interview(sessionId, patch = {}) {
   return {
@@ -21,6 +40,9 @@ function interview(sessionId, patch = {}) {
     driveIntegrityStatus: "verified",
     sourceTranscriptVerified: true,
     driveUpdatedAt: "2026-08-03T05:59:00.000Z",
+    driveNextRetryAt: null,
+    driveRetryBlockedAt: null,
+    driveAlertStatus: null,
     ...patch,
   };
 }
@@ -72,6 +94,27 @@ test("Drive recovery advances every running step but ignores unfinished intervie
   assert.deepEqual(planDriveRecovery(items, now), ["TD-RUNNING-LIVE", "TD-RUNNING-STALE"]);
 });
 
+test("Drive recovery never reopens a blocked archive and honors durable backoff", () => {
+  const items = [
+    interview("TD-404-BLOCKED", {
+      driveStatus: "failed",
+      driveUpdatedAt: "2026-08-03T05:00:00.000Z",
+      driveRetryBlockedAt: "2026-08-03T05:10:00.000Z",
+    }),
+    interview("TD-503-WAIT", {
+      driveStatus: "failed",
+      driveUpdatedAt: "2026-08-03T05:00:00.000Z",
+      driveNextRetryAt: "2026-08-03T06:10:00.000Z",
+    }),
+    interview("TD-503-DUE", {
+      driveStatus: "failed",
+      driveUpdatedAt: "2026-08-03T05:00:00.000Z",
+      driveNextRetryAt: "2026-08-03T05:50:00.000Z",
+    }),
+  ];
+  assert.deepEqual(planDriveRecovery(items, now), ["TD-503-DUE"]);
+});
+
 test("recording recovery finalizes only stale interrupted completed uploads", () => {
   const items = [
     interview("TD-UPLOAD-STALE", {
@@ -111,6 +154,8 @@ test("Drive archive health separates stored, processing, and attention records",
     stored: 1,
     processing: 1,
     attention: 1,
+    blocked: 0,
+    openAlerts: 0,
     autoRecoveryScheduled: 1,
   });
 });
@@ -125,6 +170,8 @@ test("Drive archive health does not call a video-less camera archive stored", ()
     stored: 1,
     processing: 0,
     attention: 1,
+    blocked: 0,
+    openAlerts: 0,
     autoRecoveryScheduled: 1,
   });
 });

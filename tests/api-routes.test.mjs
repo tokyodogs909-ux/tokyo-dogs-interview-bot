@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { createLiveRecordingUploader, RECORDING_UPLOAD_PART_BYTES } from "../lib/recording-upload.js";
 
 // vinext evaluates the worker module at import time. Set a non-secret fixture
 // before that import so server-side credential helpers are testable regardless of
@@ -672,18 +673,24 @@ class FakeD1Statement {
       const [sessionId, requestedAt, updatedAt] = this.values;
       const current = this.database.externalSyncs.get(sessionId);
       const stillRunning = current?.status === "running";
+      const blocked = Boolean(current?.retry_blocked_at);
+      const waiting = Boolean(current?.next_retry_at && current.next_retry_at > requestedAt);
       this.database.externalSyncs.set(sessionId, {
         provider: "google_drive",
-        status: stillRunning ? "running" : "pending",
-        requested_at: stillRunning ? current.requested_at : requestedAt,
+        status: stillRunning || blocked || waiting ? current.status : "pending",
+        requested_at: stillRunning || blocked || waiting ? current.requested_at : requestedAt,
         started_at: current?.started_at ?? null,
         completed_at: current?.completed_at ?? null,
         folder_id: current?.folder_id ?? null,
         folder_url: current?.folder_url ?? null,
         manifest_json: current?.manifest_json ?? null,
         error_code: current?.error_code ?? null,
+        failure_count: current?.failure_count ?? 0,
+        next_retry_at: current?.next_retry_at ?? null,
+        retry_blocked_at: current?.retry_blocked_at ?? null,
+        retry_block_reason: current?.retry_block_reason ?? null,
         // A running claim keeps its own heartbeat; only a settled row is refreshed.
-        updated_at: stillRunning ? current.updated_at : updatedAt,
+        updated_at: stillRunning || blocked || waiting ? current.updated_at : updatedAt,
       });
       changes = 1;
     } else if (this.sql.startsWith("UPDATE interview_external_syncs SET manifest_json = ?")) {
@@ -710,12 +717,32 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = 'running'")) {
       const [startedAt, updatedAt, sessionId] = this.values;
       const sync = this.database.externalSyncs.get(sessionId);
-      if (sync?.status === "pending") {
+      if (sync?.status === "pending" && !sync.retry_blocked_at &&
+        (!sync.next_retry_at || sync.next_retry_at <= startedAt)) {
         Object.assign(sync, {
           status: "running",
           started_at: startedAt,
           completed_at: null,
           error_code: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_external_syncs SET failure_count = failure_count + 1")) {
+      const [maxForStatus, , , retryAt, , blockedAt, , updatedAt, sessionId, staleBefore] = this.values;
+      const sync = this.database.externalSyncs.get(sessionId);
+      if (sync?.status === "running" && sync.started_at && !sync.retry_blocked_at && sync.updated_at <= staleBefore) {
+        const failureCount = (sync.failure_count ?? 0) + 1;
+        const blocked = failureCount >= maxForStatus;
+        Object.assign(sync, {
+          status: blocked ? "failed" : "pending",
+          started_at: null,
+          completed_at: null,
+          error_code: blocked ? "GOOGLE_DRIVE_SYNC_STALE_MANUAL_ATTENTION" : null,
+          failure_count: failureCount,
+          next_retry_at: blocked ? null : retryAt,
+          retry_blocked_at: blocked ? blockedAt : null,
+          retry_block_reason: blocked ? "GOOGLE_DRIVE_SYNC_STALE_MANUAL_ATTENTION" : null,
           updated_at: updatedAt,
         });
         changes = 1;
@@ -732,6 +759,31 @@ class FakeD1Statement {
           started_at: null,
           completed_at: null,
           error_code: null,
+          failure_count: 0,
+          next_retry_at: null,
+          retry_blocked_at: null,
+          retry_block_reason: null,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("UPDATE interview_external_syncs SET status = 'pending'") &&
+      this.sql.includes("failure_count = ?") &&
+      this.sql.includes("retry_blocked_at IS NOT NULL")
+    ) {
+      const [failureCount, nextRetryAt, updatedAt, sessionId] = this.values;
+      const sync = this.database.externalSyncs.get(sessionId);
+      if (sync?.retry_blocked_at) {
+        Object.assign(sync, {
+          status: "pending",
+          started_at: null,
+          completed_at: null,
+          error_code: null,
+          failure_count: failureCount,
+          next_retry_at: nextRetryAt,
+          retry_blocked_at: null,
+          retry_block_reason: null,
           updated_at: updatedAt,
         });
         changes = 1;
@@ -775,15 +827,28 @@ class FakeD1Statement {
           folder_url: folderUrl,
           manifest_json: manifestJson,
           error_code: null,
+          failure_count: 0,
+          next_retry_at: null,
+          retry_blocked_at: null,
+          retry_block_reason: null,
           updated_at: updatedAt,
         });
         changes = 1;
       }
     } else if (this.sql.startsWith("UPDATE interview_external_syncs SET status = 'failed'")) {
-      const [errorCode, updatedAt, sessionId, expectedStartedAt] = this.values;
+      const [errorCode, failureCount, nextRetryAt, retryBlockedAt, retryBlockReason,
+        updatedAt, sessionId, expectedStartedAt] = this.values;
       const sync = this.database.externalSyncs.get(sessionId);
-      if (sync?.started_at === expectedStartedAt) {
-        Object.assign(sync, { status: "failed", error_code: errorCode, updated_at: updatedAt });
+      if (sync?.status === "running" && sync.started_at === expectedStartedAt) {
+        Object.assign(sync, {
+          status: "failed",
+          error_code: errorCode,
+          failure_count: failureCount,
+          next_retry_at: nextRetryAt,
+          retry_blocked_at: retryBlockedAt,
+          retry_block_reason: retryBlockReason,
+          updated_at: updatedAt,
+        });
         changes = 1;
       }
     } else if (this.sql.startsWith("INSERT INTO interview_drive_upload_steps")) {
@@ -2154,9 +2219,16 @@ class FakeD1Statement {
               String(turn.id ?? "").startsWith("recorded-fallback-answer-"))) return false;
             const sync = this.database.externalSyncs.get(session.id);
             if (!sync) return true;
+            if (sync.retry_blocked_at) return false;
             if (sync.status === "running") return true;
-            if (sync.status === "failed") return sync.updated_at <= failedBefore;
-            if (sync.status === "pending") return sync.updated_at <= pendingBefore;
+            if (sync.status === "failed") {
+              return (!sync.next_retry_at || sync.next_retry_at <= new Date().toISOString()) &&
+                sync.updated_at <= failedBefore;
+            }
+            if (sync.status === "pending") {
+              return (!sync.next_retry_at || sync.next_retry_at <= new Date().toISOString()) &&
+                sync.updated_at <= pendingBefore;
+            }
             if (sync.status !== "completed") return false;
             let manifest;
             try {
@@ -4206,6 +4278,7 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     DB: database,
     RECORDINGS: recordings,
     INTERVIEW_ADMIN_TOKEN: "interview-admin-secret",
+    INTERVIEW_STAFF_TOKEN: "staff-review-secret",
     GOOGLE_DRIVE_CLIENT_ID: "google-client-id",
     GOOGLE_DRIVE_CLIENT_SECRET: "google-client-secret",
     GOOGLE_DRIVE_REFRESH_TOKEN: "google-refresh-token",
@@ -4617,9 +4690,13 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     createdFolders.length = 0;
 
     legacyDuplicateFile.size = String(uploadedTranscriptBytes.byteLength - 1);
-    const differentDeclaredSize = await request("/api/interviews/archive", {
+    const differentDeclaredSize = await request("/api/staff/google-drive/retry", {
       method: "POST",
-      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ sessionId: session.sessionId }),
     }, env);
     assert.equal(differentDeclaredSize.status, 502);
@@ -4636,9 +4713,13 @@ test("candidate archive fails closed before writes for a mismatched transcript d
       name: `${session.sessionId}_3件目文字起こし.txt`,
       appProperties: { ...legacyDuplicateFile.appProperties },
     });
-    const threeTranscripts = await request("/api/interviews/archive", {
+    const threeTranscripts = await request("/api/staff/google-drive/retry", {
       method: "POST",
-      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ sessionId: session.sessionId }),
     }, env);
     assert.equal(threeTranscripts.status, 502);
@@ -4666,9 +4747,13 @@ test("candidate archive fails closed before writes for a mismatched transcript d
       parents: ["folder-3"],
       appProperties: { tokyoDogsArtifact: "evaluation_json", tokyoDogsProvider: "google_drive" },
     });
-    const duplicatedOtherArtifact = await request("/api/interviews/archive", {
+    const duplicatedOtherArtifact = await request("/api/staff/google-drive/retry", {
       method: "POST",
-      headers: { Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json" },
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ sessionId: session.sessionId }),
     }, env);
     assert.equal(duplicatedOtherArtifact.status, 502);
@@ -4678,6 +4763,17 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     blockingDriveFiles.length = 0;
     nextFile = 0;
     createdFolders.length = 0;
+
+    const releasedForSafeRepair = await request("/api/staff/google-drive/retry", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.equal(releasedForSafeRepair.status, 200);
 
     let payload = null;
     let archiveApiCalls = 0;
@@ -5932,6 +6028,8 @@ test("staff inbox lists recent candidates with one shared login and records list
     stored: 1,
     processing: 0,
     attention: 0,
+    blocked: 0,
+    openAlerts: 0,
     autoRecoveryScheduled: 0,
   });
   assert.equal(database.staffAuditEvents.length, 1);
@@ -8852,6 +8950,120 @@ test("Version 3 recording streams full parts, seals final metadata by CAS, and o
   assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
 });
 
+test("three live recording clients preserve isolated bytes across lost receipts and a finalization failure", { timeout: 15_000 }, async () => {
+  process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const sessions = await Promise.all([0, 1, 2].map((index) =>
+    createTestInterviewSession(env, "正社員", "越谷店", { candidateName: `録画並行試験 ${index + 1}` })));
+  const uploadIds = sessions.map((_session, index) => `three-live-recording-upload-${index + 1}`);
+  for (const session of sessions) database.sessions.get(session.sessionId).status = "in_progress";
+
+  // The common URL does not grant access to another candidate's upload, even
+  // when the candidates start from the same network at exactly the same time.
+  const crossed = await Promise.all(sessions.map((session, index) =>
+    request("/api/interviews/recording/upload/start", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${sessions[(index + 1) % 3].accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        uploadId: uploadIds[index],
+        contentType: "video/webm",
+        partSize: RECORDING_UPLOAD_PART_BYTES,
+        uploadVersion: 3,
+      }),
+    }, env)));
+  assert.deepEqual(crossed.map((response) => response.status), [401, 401, 401]);
+  assert.equal(recordings.objects.size, 0);
+
+  const firstPartArrivals = new Set();
+  let releaseFirstParts;
+  const firstPartsReady = new Promise((resolve) => { releaseFirstParts = resolve; });
+  const partAttempts = [0, 0, 0];
+  const completeAttempts = [0, 0, 0];
+  const firstCandidatePartReceipts = [];
+  let rejectedManifestOnce = false;
+  const originalPut = recordings.put.bind(recordings);
+  recordings.put = async (key, body, options) => {
+    if (!rejectedManifestOnce && key === `interviews/${sessions[1].sessionId}/recording.manifest.json`) {
+      rejectedManifestOnce = true;
+      throw new Error("synthetic temporary manifest failure");
+    }
+    return originalPut(key, body, options);
+  };
+  const fetcher = async (path, init) => {
+    const headers = new Headers(init.headers);
+    const index = sessions.findIndex((session) => session.sessionId === headers.get("X-Interview-Session"));
+    assert.notEqual(index, -1);
+    assert.equal(headers.get("Authorization"), `Bearer ${sessions[index].accessToken}`);
+    assert.equal(headers.get("X-Recording-Upload-Id"), uploadIds[index]);
+    const isFirstPart = path.endsWith("/part") && headers.get("X-Recording-Part-Index") === "0";
+    if (isFirstPart) {
+      partAttempts[index] += 1;
+      firstPartArrivals.add(index);
+      if (firstPartArrivals.size === 3) releaseFirstParts();
+      await firstPartsReady;
+    }
+    if (path.endsWith("/complete")) completeAttempts[index] += 1;
+    const response = await request(path, init, env);
+    if (index === 0 && isFirstPart) {
+      firstCandidatePartReceipts.push(await response.clone().json());
+      if (partAttempts[index] === 1) {
+        assert.equal(response.status, 200);
+        // Storage succeeded but its acknowledgement was lost. The real client
+        // must resend the exact part, and the server must recognize the replay.
+        return Response.json({ error: "synthetic lost acknowledgement" }, { status: 503 });
+      }
+    }
+    return response;
+  };
+  const uploaders = sessions.map((session, index) => createLiveRecordingUploader({
+    ...session,
+    uploadId: uploadIds[index],
+    contentType: index === 2 ? "video/mp4" : "video/webm",
+    fetcher,
+    sleep: async () => undefined,
+  }));
+  const bytes = sessions.map((_session, index) =>
+    new Uint8Array(RECORDING_UPLOAD_PART_BYTES + 123 + index).fill(41 + index));
+  await Promise.all(uploaders.map((uploader) => uploader.start()));
+  uploaders.forEach((uploader, index) => uploader.append(new Blob([bytes[index]])));
+  const receipts = await Promise.all(uploaders.map((uploader) => uploader.finalize("both")));
+  assert.equal(receipts.every((receipt) => receipt.stored === true), true);
+  assert.equal(firstPartArrivals.size, 3, "all candidates must be sending before any first part returns");
+  assert.deepEqual(partAttempts, [2, 1, 1]);
+  assert.deepEqual(completeAttempts, [1, 2, 1]);
+  assert.equal(firstCandidatePartReceipts[1].duplicate, true);
+  assert.equal(rejectedManifestOnce, true);
+  assert.equal(database.artifacts.length, 3, "retries must not create extra recordings");
+
+  for (const [index, session] of sessions.entries()) {
+    assert.equal(database.sessions.get(session.sessionId).recording_status, "stored");
+    assert.equal(database.sessions.get(session.sessionId).status, "in_progress",
+      "recording storage alone must not pretend the interview or Drive archive is complete");
+    assert.equal(database.externalSyncs.has(session.sessionId), false);
+    const object = recordings.objects.get(`interviews/${session.sessionId}/recording.manifest.json`);
+    const manifest = JSON.parse(new TextDecoder().decode(object.body));
+    assert.equal(manifest.version, 3);
+    assert.equal(manifest.byteSize, bytes[index].byteLength);
+    assert.equal(manifest.parts.length, 2);
+    assert.equal(manifest.parts.every((part) => part.key.startsWith(`interviews/${session.sessionId}/`)), true);
+    const playback = await request(`/api/staff/recording?sessionId=${session.sessionId}`, {
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("採用担当"),
+      },
+    }, env);
+    assert.equal(playback.status, 200);
+    assert.deepEqual(new Uint8Array(await playback.arrayBuffer()), bytes[index],
+      "each assembled recording must match that candidate's exact bytes");
+  }
+});
+
 test("completed transcript drafts are append-only, exact-sealed, and separate from the final transcript", async () => {
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
@@ -11286,10 +11498,11 @@ test("a lost hierarchy create response records uncertainty and never issues a se
     const first = await requestAdminSync(session.sessionId, env);
     assert.equal(first.status, 502);
     const second = await requestAdminSync(session.sessionId, env);
-    assert.equal(second.status, 502);
+    assert.equal(second.status, 200, "a backoff response must not replay an uncertain create");
     assert.equal(createCalls, 1, "an uncertain POST must never be replayed automatically");
     assert.equal(database.externalSyncs.get(session.sessionId).error_code,
-      "GOOGLE_DRIVE_HIERARCHY_CREATION_UNCERTAIN");
+      "GOOGLE_DRIVE_SYNC_FAILED");
+    assert.ok(database.externalSyncs.get(session.sessionId).next_retry_at);
     const yearNode = database.driveHierarchyNodes.get(`year:${DRIVE_ROOT_FOLDER_ID}:2026`);
     assert.ok(yearNode.creation_attempted_at);
     assert.equal(yearNode.canonical_folder_id, null);
