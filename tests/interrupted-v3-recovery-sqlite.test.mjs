@@ -49,7 +49,13 @@ class SqliteD1 {
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
       const results = [];
-      for (const statement of statements) results.push(await statement.run());
+      // D1 executes a batch atomically. Keep the in-memory compatibility
+      // layer synchronous inside the transaction as well, so concurrently
+      // scheduled recovery stages cannot enter the same SQLite transaction.
+      for (const statement of statements) {
+        const result = this.sqlite.prepare(statement.sql).run(...statement.values);
+        results.push({ success: true, meta: { changes: Number(result.changes) } });
+      }
       this.sqlite.exec("COMMIT");
       return results;
     } catch (error) {
@@ -232,6 +238,172 @@ test("real SQLite executes interrupted v3 claim and final fences atomically", as
     const draft = db.sqlite.prepare(`SELECT transcript_sha256, turn_count, sealed_at
       FROM interview_transcript_drafts WHERE session_id = ?`).get(sessionId);
     assert.deepEqual({ ...draft }, { transcript_sha256: draftSha256, turn_count: 2, sealed_at: null });
+  } finally {
+    db.close();
+  }
+});
+
+test("an expired exact sealed voice draft is recovered without completing an unsealed recording", async () => {
+  const db = new SqliteD1();
+  const recordings = new MemoryR2();
+  const env = {
+    ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) },
+    DB: db,
+    RECORDINGS: recordings,
+  };
+  try {
+    await scheduled(env); // create the production runtime schema
+    const validSessionId = "TD-SQLITE-SEALED-VOICE-01";
+    const blockedSessionId = "TD-SQLITE-SEALED-GAP-01";
+    const createdAt = "2026-08-20T08:00:00.000Z";
+    const sealedAt = "2026-08-20T08:25:00.000Z";
+    const expiresAt = "2026-08-20T10:00:00.000Z";
+    const retentionUntil = "2027-08-20T08:00:00.000Z";
+    const transcript = JSON.stringify([
+      { id: "ai-1", speaker: "interviewer", text: "Question", createdAt },
+      { id: "candidate-1", speaker: "candidate", text: "Answer", createdAt: sealedAt },
+    ]);
+    const transcriptSha256 = sha256Hex(new TextEncoder().encode(transcript));
+    for (const sessionId of [blockedSessionId, validSessionId]) {
+      db.sqlite.prepare(`INSERT INTO interview_sessions (
+        id, access_token_hash, candidate_name, employment, preferred_location,
+        consent_version, consented_at, status, recording_status, expires_at,
+        retention_until, created_at, updated_at
+      ) VALUES (?, ?, '', 'fixture', 'fixture', 'fixture-consent', ?, 'in_progress',
+        'uploading', ?, ?, ?, ?)`)
+        .run(sessionId, `fixture-token-${sessionId}`, createdAt, expiresAt, retentionUntil, createdAt, sealedAt);
+      db.sqlite.prepare(`INSERT INTO interview_transcript_drafts (
+        session_id, mode, transcript_json, transcript_sha256, turn_count, sealed_at,
+        created_at, updated_at
+      ) VALUES (?, 'voice', ?, ?, 2, ?, ?, ?)`)
+        .run(sessionId, transcript, transcriptSha256, sealedAt, createdAt, sealedAt);
+    }
+    db.sqlite.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json, created_at
+    ) VALUES (?, ?, 'transcription_failed', 'candidate', ?, ?)`)
+      .run("sealed-gap-audit", blockedSessionId, JSON.stringify({ code: "TRANSCRIPTION_EMPTY" }), sealedAt);
+    await recordings.put(
+      `interviews/${validSessionId}/recording-parts/upload.json`,
+      JSON.stringify({
+        version: 3,
+        sessionId: validSessionId,
+        uploadId: "sqliteorphanedvoiceupload01",
+        contentType: "video/webm",
+        partSize: 4 * 1024 * 1024,
+        byteSize: null,
+        totalParts: null,
+        audioCoverage: null,
+        sealedAt: null,
+        retentionUntil,
+        createdAt: "2026-08-20T08:00:05.000Z",
+      }),
+      {
+        httpMetadata: { contentType: "application/json" },
+        customMetadata: { sessionId: validSessionId, retentionUntil },
+      },
+    );
+
+    await scheduled(env);
+
+    const valid = db.sqlite.prepare(`SELECT status, recording_status, transcript_json,
+      evaluation_json, summary, completed_at FROM interview_sessions WHERE id = ?`).get(validSessionId);
+    assert.deepEqual({ ...valid }, {
+      status: "in_progress",
+      recording_status: "uploading",
+      transcript_json: transcript,
+      evaluation_json: null,
+      summary: null,
+      completed_at: null,
+    });
+    const seals = db.sqlite.prepare(`SELECT event_type, actor_type FROM interview_audit_events
+      WHERE session_id = ? AND event_type IN (
+        'voice_transcript_sealed', 'orphaned_sealed_voice_draft_recovered'
+      ) ORDER BY event_type`).all(validSessionId);
+    assert.deepEqual(seals.map((row) => ({ ...row })), [
+      { event_type: "orphaned_sealed_voice_draft_recovered", actor_type: "system" },
+      { event_type: "voice_transcript_sealed", actor_type: "candidate" },
+    ]);
+    let missing = db.sqlite.prepare(`SELECT COUNT(*) AS count FROM interview_audit_events
+      WHERE session_id = ? AND event_type = 'recording_recovery_part_missing'`).get(validSessionId);
+    assert.equal(missing.count, 0, "the newly recovered transcript gets one activity grace interval");
+    assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM interview_artifacts WHERE session_id = ?")
+      .get(validSessionId).count, 0);
+    assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM interview_external_syncs WHERE session_id = ?")
+      .get(validSessionId).count, 0);
+
+    const blocked = db.sqlite.prepare(`SELECT transcript_json, evaluation_json, completed_at
+      FROM interview_sessions WHERE id = ?`).get(blockedSessionId);
+    assert.deepEqual({ ...blocked }, { transcript_json: null, evaluation_json: null, completed_at: null });
+    assert.equal(db.sqlite.prepare(`SELECT COUNT(*) AS count FROM interview_audit_events
+      WHERE session_id = ? AND event_type = 'voice_transcript_sealed'`).get(blockedSessionId).count, 0);
+
+    db.sqlite.prepare("UPDATE interview_sessions SET updated_at = ? WHERE id = ?")
+      .run(sealedAt, validSessionId);
+    await scheduled(env);
+    missing = db.sqlite.prepare(`SELECT COUNT(*) AS count FROM interview_audit_events
+      WHERE session_id = ? AND event_type = 'recording_recovery_part_missing'`).get(validSessionId);
+    assert.equal(missing.count, 1, "the next recovery tick exposes the missing recording tail");
+    assert.equal(db.sqlite.prepare(`SELECT COUNT(*) AS count FROM interview_audit_events
+      WHERE session_id = ? AND event_type = 'orphaned_sealed_voice_draft_recovered'`)
+      .get(validSessionId).count, 1, "the sealed transcript recovery remains idempotent");
+  } finally {
+    db.close();
+  }
+});
+
+test("a recording receipt followed by a lost voice-seal request completes from the exact sealed draft", async () => {
+  const db = new SqliteD1();
+  const recordings = new MemoryR2();
+  const env = {
+    ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) },
+    DB: db,
+    RECORDINGS: recordings,
+  };
+  try {
+    await scheduled(env);
+    const sessionId = "TD-SQLITE-SEALED-STORED-1";
+    const createdAt = "2026-08-20T08:00:00.000Z";
+    const sealedAt = "2026-08-20T08:25:00.000Z";
+    const transcript = JSON.stringify([
+      { id: "ai-1", speaker: "interviewer", text: "Question", createdAt },
+      { id: "candidate-1", speaker: "candidate", text: "Answer", createdAt: sealedAt },
+    ]);
+    const transcriptSha256 = sha256Hex(new TextEncoder().encode(transcript));
+    db.sqlite.prepare(`INSERT INTO interview_sessions (
+      id, access_token_hash, candidate_name, employment, preferred_location,
+      consent_version, consented_at, status, recording_status, expires_at,
+      retention_until, created_at, updated_at
+    ) VALUES (?, ?, '', 'fixture', 'fixture', 'fixture-consent', ?, 'in_progress',
+      'stored', '2026-08-20T10:00:00.000Z', '2027-08-20T08:00:00.000Z', ?, ?)`)
+      .run(sessionId, "fixture-stored-token", createdAt, createdAt, sealedAt);
+    db.sqlite.prepare(`INSERT INTO interview_transcript_drafts (
+      session_id, mode, transcript_json, transcript_sha256, turn_count, sealed_at,
+      created_at, updated_at
+    ) VALUES (?, 'voice', ?, ?, 2, ?, ?, ?)`)
+      .run(sessionId, transcript, transcriptSha256, sealedAt, createdAt, sealedAt);
+    db.sqlite.prepare(`INSERT INTO interview_artifacts (
+      id, session_id, kind, object_key, content_type, byte_size, etag,
+      retention_until, created_at
+    ) VALUES (?, ?, 'recording', ?, 'video/webm', 4194304, 'fixture-etag',
+      '2027-08-20T08:00:00.000Z', ?)`)
+      .run("stored-recording-artifact", sessionId, `interviews/${sessionId}/recording.manifest.json`, sealedAt);
+
+    await scheduled(env);
+
+    const session = db.sqlite.prepare(`SELECT status, recording_status, transcript_json,
+      evaluation_json, summary, completed_at FROM interview_sessions WHERE id = ?`).get(sessionId);
+    assert.equal(session.status, "completed");
+    assert.equal(session.recording_status, "stored");
+    assert.equal(session.transcript_json, transcript);
+    assert.ok(typeof session.evaluation_json === "string" && session.evaluation_json.length > 0);
+    assert.ok(typeof session.summary === "string" && session.summary.length > 0);
+    assert.ok(typeof session.completed_at === "string" && session.completed_at.length > 0);
+    assert.equal(db.sqlite.prepare(`SELECT COUNT(*) AS count FROM interview_audit_events
+      WHERE session_id = ? AND event_type = 'orphaned_sealed_voice_draft_recovered'`).get(sessionId).count, 1);
+    assert.equal(db.sqlite.prepare(`SELECT COUNT(*) AS count FROM interview_evaluation_claims
+      WHERE session_id = ?`).get(sessionId).count, 0, "the completed claim is released");
+    assert.equal(db.sqlite.prepare(`SELECT COUNT(*) AS count FROM interview_audit_events
+      WHERE session_id = ? AND event_type = 'evaluation_saved'`).get(sessionId).count, 1);
   } finally {
     db.close();
   }

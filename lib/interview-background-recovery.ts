@@ -4,6 +4,7 @@ import {
   findInterviewReportPresentationRefreshSessions,
   findInterviewDriveRecoverySessions,
   findNextInterviewDriveRecoverySession,
+  recoverNextOrphanedSealedVoiceDraft,
   recoverNextInterruptedV3Recording,
   recoverNextLegacyV1RecordingOrphan,
   recoverNextSealedResumableInterviewRecording,
@@ -71,6 +72,18 @@ export type InterviewBackgroundRecoverySummary = {
 };
 
 async function recoverRecording(): Promise<RecoveryStageState> {
+  let sealedDraftState: RecoveryStageState;
+  try {
+    const sealedDraft = await recoverNextOrphanedSealedVoiceDraft();
+    sealedDraftState = sealedDraft.state === "none"
+      ? "idle"
+      : sealedDraft.state === "sealed"
+        ? "advanced"
+        : "attention";
+  } catch {
+    sealedDraftState = "attention";
+  }
+
   let legacyState: RecoveryStageState;
   try {
     const legacy = await recoverNextLegacyV1RecordingOrphan();
@@ -116,9 +129,9 @@ async function recoverRecording(): Promise<RecoveryStageState> {
     sealedState = "attention";
   }
 
-  if ([legacyState, interruptedState, sealedState].includes("advanced")) return "advanced";
-  if ([legacyState, interruptedState, sealedState].includes("attention")) return "attention";
-  if ([legacyState, interruptedState, sealedState].includes("waiting")) return "waiting";
+  if ([sealedDraftState, legacyState, interruptedState, sealedState].includes("advanced")) return "advanced";
+  if ([sealedDraftState, legacyState, interruptedState, sealedState].includes("attention")) return "attention";
+  if ([sealedDraftState, legacyState, interruptedState, sealedState].includes("waiting")) return "waiting";
   return "idle";
 }
 

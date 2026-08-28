@@ -401,9 +401,13 @@ test("candidate receipt stays fail-closed until the server verifies the final Dr
     "the exact fallback answer count must be durably sealed before recording upload and staff recovery",
   );
   assert.ok(
-    completion.indexOf("await sealVoiceTranscriptCompletion();") >= 0 &&
-      completion.indexOf("await sealVoiceTranscriptCompletion();") < completion.indexOf("await uploadRecording(recordingBlob);"),
-    "a clean actual voice transcript must be durably sealed before the large recording upload",
+    completion.indexOf('await sealDurableTranscriptDraft("voice");') >= 0 &&
+      completion.indexOf('await sealDurableTranscriptDraft("voice");') < completion.indexOf("await uploadRecording(recordingBlob);"),
+    "the exact voice draft must be durable before the recording upload",
+  );
+  assert.ok(
+    completion.indexOf("await uploadRecording(recordingBlob);") < completion.indexOf("await storeInterviewFinalization();"),
+    "the durable recording must precede canonical voice sealing and evaluation",
   );
   assert.match(source, /\/api\/interviews\/recorded\/seal/);
   const voiceSeal = source.slice(
@@ -425,9 +429,9 @@ test("candidate receipt stays fail-closed until the server verifies the final Dr
   );
   assert.ok(
     retryRecordingWithSeal.indexOf('mode === "voice"') >= 0 &&
-      retryRecordingWithSeal.indexOf("await sealVoiceTranscriptCompletion();") <
+      retryRecordingWithSeal.indexOf('await sealDurableTranscriptDraft("voice");') <
         retryRecordingWithSeal.indexOf("await uploadRecording(blob);"),
-    "recording retries must replay the lightweight transcript seal before media upload",
+    "recording retries must preserve the exact draft before media upload",
   );
 
   // Recorded fallback is receipted only after answer-audio transcription and

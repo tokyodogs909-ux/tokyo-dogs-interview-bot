@@ -71,12 +71,27 @@ test("durable recording and transcript receipts precede final completion", () =>
       voiceSeal.indexOf("/api/interviews/voice/transcript/seal"),
   );
   const finalization = functionBody("async function storeInterviewFinalization()", "function setArchiveCompletionMessage()");
+  assert.match(finalization, /if \(mode === "voice"\) await sealVoiceTranscriptCompletion\(\)/);
   assert.ok(
     finalization.indexOf("await sealDurableTranscriptDraft(\"text\")") <
       finalization.indexOf("await requestEvaluation()"),
   );
   assert.match(source, /completedTranscriptRef/);
   assert.match(source, /recordCompletedTurn/);
+  const completion = functionBody(
+    "async function completeInterview(reason: string)",
+    "function handleRealtimeEvent(event: RealtimeEvent)",
+  );
+  assert.ok(
+    completion.indexOf('await sealDurableTranscriptDraft("voice")') <
+      completion.indexOf("await uploadRecording(recordingBlob)"),
+    "the exact voice draft must be durable before recording finalization",
+  );
+  assert.ok(
+    completion.indexOf("await uploadRecording(recordingBlob)") <
+      completion.indexOf("await storeInterviewFinalization()"),
+    "the recording receipt must precede the canonical voice seal and evaluation",
+  );
 });
 
 test("candidate stop, safety escalation, and unknown reasons are technical holds outside receipt flow", () => {

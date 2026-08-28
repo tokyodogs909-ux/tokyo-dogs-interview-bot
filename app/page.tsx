@@ -3579,7 +3579,7 @@ export default function Home() {
     }
     setStage("evaluating");
     try {
-      if (mode === "voice") await sealVoiceTranscriptCompletion();
+      if (mode === "voice") await sealDurableTranscriptDraft("voice");
       if (mode === "recorded-fallback") await sealRecordedFallbackCompletion(true);
       await uploadRecording(blob);
     } catch {
@@ -3826,10 +3826,11 @@ export default function Home() {
       });
     }
     stopRealtime();
-    // Persist the small transcript/answer-count seal before waiting for the
-    // mobile browser to finish its much larger media container. If the tab is
-    // closed during that final stop, scheduled recovery can still prove the
-    // intended completion and finish already-receipted v3 parts.
+    // Persist the small append-only transcript draft before waiting for the
+    // mobile browser to finish its media container. The canonical voice seal
+    // comes only after the recording receipt below: if this request boundary is
+    // interrupted, scheduled recovery can promote the exact sealed draft while
+    // never evaluating an interview whose recording is still incomplete.
     if (mode === "recorded-fallback") {
       try {
         await sealRecordedFallbackCompletion();
@@ -3842,10 +3843,10 @@ export default function Home() {
       }
     } else if (mode === "voice") {
       try {
-        await sealVoiceTranscriptCompletion();
+        await sealDurableTranscriptDraft("voice");
       } catch {
         setRecordingUploadState("error");
-        setProcessingWarning("回答の文字起こしを確定できませんでした。下のボタンから再試行してください。");
+        setProcessingWarning("回答の文字起こしを保全できませんでした。下のボタンから再試行してください。");
         setStage("review");
         endingRef.current = false;
         return;

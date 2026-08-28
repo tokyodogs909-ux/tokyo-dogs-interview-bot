@@ -128,6 +128,7 @@ const technicalEventLabels: Record<string, string> = {
   legacy_recording_recovery_manual_attention: "旧式録画の不足パートを検出——人手確認が必要",
   interrupted_recording_recovered: "中断時点までに受領済みの録画パートを復旧——末尾欠落の可能性あり",
   interrupted_recording_recovery_manual_attention: "中断録画を自動復旧できず人手確認が必要",
+  orphaned_sealed_voice_draft_recovered: "終了時の通信中断から文字起こしを復旧——録画の保存状態を要確認",
   device_session_replaced: "端末中断のため元記録を保全し、文字入力の新受付へ継続",
 };
 

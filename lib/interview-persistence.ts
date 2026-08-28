@@ -1593,6 +1593,158 @@ export async function sealVoiceInterviewTranscript(input: {
   throw new Error("VOICE_TRANSCRIPT_SEAL_NOT_READY");
 }
 
+const ORPHANED_SEALED_VOICE_DRAFT_RECOVERED_EVENT =
+  "orphaned_sealed_voice_draft_recovered";
+
+/**
+ * Promotes one exact append-only voice draft whose candidate request was lost
+ * after the draft seal. Expiry is the ownership hand-off: while the candidate
+ * token is live, only that browser may finish the canonical seal. This helper
+ * never evaluates, completes, or archives the interview; those stages remain
+ * gated on a separately verified recording receipt.
+ */
+export async function recoverNextOrphanedSealedVoiceDraft() {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const now = new Date().toISOString();
+  const target = await db.prepare(`SELECT
+      s.id, draft.transcript_json, draft.transcript_sha256,
+      draft.turn_count, draft.sealed_at
+    FROM interview_sessions s
+    JOIN interview_transcript_drafts draft ON draft.session_id = s.id
+    WHERE s.status = 'in_progress'
+      AND s.recording_status IN ('uploading', 'failed', 'stored')
+      AND s.expires_at <= ?
+      AND s.completed_at IS NULL
+      AND s.transcript_json IS NULL
+      AND s.evaluation_json IS NULL
+      AND s.summary IS NULL
+      AND draft.mode = 'voice'
+      AND draft.sealed_at IS NOT NULL
+      AND draft.turn_count BETWEEN 1 AND 300
+      AND json_valid(draft.transcript_json)
+      AND json_type(draft.transcript_json) = 'array'
+      AND EXISTS (
+        SELECT 1 FROM json_each(draft.transcript_json) turn
+        WHERE json_extract(turn.value, '$.speaker') = 'candidate'
+          AND json_type(turn.value, '$.id') = 'text'
+          AND json_type(turn.value, '$.text') = 'text'
+          AND length(trim(json_extract(turn.value, '$.text'))) > 0
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events mode
+        WHERE mode.session_id = s.id AND mode.event_type = 'recorded_fallback_started'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events seal
+        WHERE seal.session_id = s.id AND seal.event_type = 'voice_transcript_sealed'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events blocked
+        WHERE blocked.session_id = s.id
+          AND (
+            blocked.event_type IN (
+              'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
+            )
+            OR (
+              blocked.event_type = 'transcription_failed'
+              AND CASE WHEN json_valid(blocked.detail_json)
+                THEN json_extract(blocked.detail_json, '$.code') ELSE NULL END IN (
+                  'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
+                )
+            )
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_session_replacements replacement
+        WHERE replacement.source_session_id = s.id
+      )
+    ORDER BY draft.sealed_at ASC, s.id ASC
+    LIMIT 1`)
+    .bind(now)
+    .first<{
+      id: string;
+      transcript_json: string;
+      transcript_sha256: string;
+      turn_count: number;
+      sealed_at: string;
+    }>();
+  if (!target) return { state: "none" } as const;
+  const transcript = parseJson<TranscriptTurn[]>(target.transcript_json, []);
+  if (
+    !Array.isArray(transcript) || transcript.length !== Number(target.turn_count) ||
+    await sha256(target.transcript_json) !== target.transcript_sha256
+  ) {
+    return { state: "attention", sessionId: target.id } as const;
+  }
+  await sealVoiceInterviewTranscript({ sessionId: target.id, transcript });
+  const recoveredAt = new Date().toISOString();
+  await db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json, created_at
+    ) SELECT ?, ?, '${ORPHANED_SEALED_VOICE_DRAFT_RECOVERED_EVENT}', 'system', ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions s
+        JOIN interview_transcript_drafts draft ON draft.session_id = s.id
+        WHERE s.id = ? AND s.status = 'in_progress'
+          AND s.transcript_json = draft.transcript_json
+          AND draft.transcript_sha256 = ? AND draft.turn_count = ?
+          AND draft.sealed_at = ?
+          AND EXISTS (
+            SELECT 1 FROM interview_audit_events seal
+            WHERE seal.session_id = s.id AND seal.event_type = 'voice_transcript_sealed'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events recovered
+        WHERE recovered.session_id = ?
+          AND recovered.event_type = '${ORPHANED_SEALED_VOICE_DRAFT_RECOVERED_EVENT}'
+      )`)
+    .bind(
+      crypto.randomUUID(), target.id,
+      JSON.stringify({
+        transcriptSha256: target.transcript_sha256,
+        turnCount: Number(target.turn_count),
+        source: "sealed_draft_request_loss",
+      }),
+      recoveredAt, target.id, target.transcript_sha256, Number(target.turn_count),
+      target.sealed_at, target.id,
+    ).run();
+  const readback = await db.prepare(`SELECT s.status, s.recording_status,
+      s.transcript_json, s.evaluation_json, s.summary, s.completed_at,
+      EXISTS (
+        SELECT 1 FROM interview_audit_events seal
+        WHERE seal.session_id = s.id AND seal.event_type = 'voice_transcript_sealed'
+      ) AS voice_transcript_sealed,
+      EXISTS (
+        SELECT 1 FROM interview_audit_events recovered
+        WHERE recovered.session_id = s.id
+          AND recovered.event_type = '${ORPHANED_SEALED_VOICE_DRAFT_RECOVERED_EVENT}'
+      ) AS recovery_audit_present
+    FROM interview_sessions s WHERE s.id = ? LIMIT 1`)
+    .bind(target.id)
+    .first<{
+      status: string;
+      recording_status: string;
+      transcript_json: string | null;
+      evaluation_json: string | null;
+      summary: string | null;
+      completed_at: string | null;
+      voice_transcript_sealed: number;
+      recovery_audit_present: number;
+    }>();
+  if (
+    readback?.status !== "in_progress" || readback.transcript_json !== target.transcript_json ||
+    readback.evaluation_json !== null || readback.summary !== null ||
+    readback.completed_at !== null || Number(readback.voice_transcript_sealed) !== 1 ||
+    Number(readback.recovery_audit_present) !== 1
+  ) throw new Error("ORPHANED_VOICE_DRAFT_RECOVERY_READBACK_MISMATCH");
+  return {
+    state: "sealed", sessionId: target.id,
+    recordingStatus: readback.recording_status,
+  } as const;
+}
+
 export async function claimInterviewRecordingUpload(sessionId: string) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
@@ -3771,6 +3923,7 @@ export async function getInterviewReview(sessionId: string, reviewer: Authorized
       'reasonable_accommodation_text_selected', 'recording_recovery_part_missing',
       'recording_recovery_manual_attention', 'legacy_recording_recovery_manual_attention',
       'interrupted_recording_recovered', 'interrupted_recording_recovery_manual_attention',
+      '${ORPHANED_SEALED_VOICE_DRAFT_RECOVERED_EVENT}',
       'device_session_replaced'
     ) ORDER BY created_at`)
     .bind(sessionId)
