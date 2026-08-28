@@ -3732,11 +3732,10 @@ export async function getInterviewArchiveSource(sessionId: string) {
 }
 
 /**
- * Selects one old voice session whose full recording is durable but whose
- * otherwise substantive append-only draft was left unsealed by exactly the
- * recoverable empty-ASR incident. The Drive layer archives it as technical
- * evidence only; this selector never promotes the interview to completed and
- * never creates an evaluation.
+ * Selects evidence-only voice sessions for Drive: either a durable recording
+ * with a recoverable transcript gap, or an exact sealed transcript whose final
+ * recording bytes never arrived after expiry. Neither path promotes the
+ * interview to completed or creates an evaluation.
  */
 export async function findInterviewTechnicalEvidenceDriveSessions(limit = 1) {
   const db = database();
@@ -3746,23 +3745,19 @@ export async function findInterviewTechnicalEvidenceDriveSessions(limit = 1) {
   const failedBefore = new Date(now - BACKGROUND_DRIVE_FAILED_RETRY_MS).toISOString();
   const pendingBefore = new Date(now - BACKGROUND_DRIVE_PENDING_RETRY_MS).toISOString();
   const integrityBefore = new Date(now - BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS).toISOString();
+  const recordingMissingBefore = new Date(now - RECORDING_RECOVERY_EXPIRY_GRACE_MS).toISOString();
   const boundedLimit = Math.max(1, Math.min(5, Math.trunc(limit)));
   const rows = await db.prepare(`SELECT s.id
     FROM interview_sessions AS s
     JOIN interview_transcript_drafts AS draft ON draft.session_id = s.id
-    JOIN interview_artifacts AS recording
-      ON recording.session_id = s.id AND recording.kind = 'recording'
     LEFT JOIN interview_external_syncs AS d
       ON d.session_id = s.id AND d.provider = 'google_drive'
     WHERE s.status = 'in_progress'
-      AND s.recording_status = 'stored'
-      AND s.transcript_json IS NULL
       AND s.evaluation_json IS NULL
       AND s.summary IS NULL
       AND s.completed_at IS NULL
       AND draft.mode = 'voice'
-      AND draft.sealed_at IS NULL
-      AND draft.turn_count BETWEEN 2 AND 300
+      AND draft.turn_count BETWEEN 1 AND 300
       AND json_valid(draft.transcript_json)
       AND json_type(draft.transcript_json) = 'array'
       AND EXISTS (
@@ -3776,23 +3771,64 @@ export async function findInterviewTechnicalEvidenceDriveSessions(limit = 1) {
           AND length(trim(COALESCE(CASE WHEN turn.type = 'object'
             THEN json_extract(turn.value, '$.text') ELSE NULL END, ''))) > 0
       )
-      AND EXISTS (
-        SELECT 1 FROM interview_audit_events AS failure
-        WHERE failure.session_id = s.id
-          AND failure.event_type = 'transcription_failed'
-          AND CASE WHEN json_valid(failure.detail_json)
-            THEN json_extract(failure.detail_json, '$.code') ELSE NULL END IN (
-              'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_ID_MISSING'
-            )
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM interview_audit_events AS failure
-        WHERE failure.session_id = s.id
-          AND failure.event_type = 'transcription_failed'
-          AND COALESCE(CASE WHEN json_valid(failure.detail_json)
-            THEN json_extract(failure.detail_json, '$.code') ELSE NULL END, '') NOT IN (
-              'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_ID_MISSING'
-            )
+      AND (
+        (
+          s.recording_status = 'stored'
+          AND s.transcript_json IS NULL
+          AND draft.sealed_at IS NULL
+          AND draft.turn_count >= 2
+          AND EXISTS (
+            SELECT 1 FROM interview_artifacts AS recording
+            WHERE recording.session_id = s.id AND recording.kind = 'recording'
+          )
+          AND EXISTS (
+            SELECT 1 FROM interview_audit_events AS failure
+            WHERE failure.session_id = s.id
+              AND failure.event_type = 'transcription_failed'
+              AND CASE WHEN json_valid(failure.detail_json)
+                THEN json_extract(failure.detail_json, '$.code') ELSE NULL END IN (
+                  'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_ID_MISSING'
+                )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM interview_audit_events AS failure
+            WHERE failure.session_id = s.id
+              AND failure.event_type = 'transcription_failed'
+              AND COALESCE(CASE WHEN json_valid(failure.detail_json)
+                THEN json_extract(failure.detail_json, '$.code') ELSE NULL END, '') NOT IN (
+                  'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_ID_MISSING'
+                )
+          )
+        )
+        OR (
+          s.recording_status IN ('uploading', 'failed')
+          AND s.expires_at <= ?
+          AND s.transcript_json IS NOT NULL
+          AND s.transcript_json = draft.transcript_json
+          AND draft.sealed_at IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM interview_artifacts AS recording
+            WHERE recording.session_id = s.id AND recording.kind = 'recording'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM interview_audit_events AS failure
+            WHERE failure.session_id = s.id AND failure.event_type = 'transcription_failed'
+          )
+          AND EXISTS (
+            SELECT 1 FROM interview_audit_events AS seal
+            WHERE seal.session_id = s.id AND seal.event_type = 'voice_transcript_sealed'
+          )
+          AND EXISTS (
+            SELECT 1 FROM interview_audit_events AS recovered
+            WHERE recovered.session_id = s.id
+              AND recovered.event_type = '${ORPHANED_SEALED_VOICE_DRAFT_RECOVERED_EVENT}'
+          )
+          AND EXISTS (
+            SELECT 1 FROM interview_audit_events AS missing
+            WHERE missing.session_id = s.id
+              AND missing.event_type = '${RECORDING_RECOVERY_MISSING_EVENT}'
+          )
+        )
       )
       AND NOT EXISTS (
         SELECT 1 FROM interview_audit_events AS hold
@@ -3819,7 +3855,7 @@ export async function findInterviewTechnicalEvidenceDriveSessions(limit = 1) {
       )
     ORDER BY COALESCE(d.updated_at, draft.updated_at, s.updated_at) ASC, s.id ASC
     LIMIT ?`)
-    .bind(failedBefore, pendingBefore, integrityBefore, boundedLimit)
+    .bind(recordingMissingBefore, failedBefore, pendingBefore, integrityBefore, boundedLimit)
     .all<{ id: string }>();
   return (rows.results ?? []).map((row) => row.id);
 }

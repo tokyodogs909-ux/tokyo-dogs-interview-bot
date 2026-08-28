@@ -39,6 +39,7 @@ import {
 import { hasVerifiedCandidateTranscript } from "@/lib/interview-transcript-verification";
 import {
   TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
+  technicalEvidenceArchiveReason,
   technicalEvidenceArchiveTranscript,
 } from "@/lib/interview-technical-evidence";
 import {
@@ -297,20 +298,23 @@ function archiveTranscript(source: ArchiveSource) {
 }
 
 function archiveTranscriptKind(source: ArchiveSource) {
-  if (hasActualCandidateTranscript(source)) return "actual_transcript";
   if (isTechnicalEvidenceArchiveSource(source)) return TECHNICAL_EVIDENCE_TRANSCRIPT_KIND;
+  if (hasActualCandidateTranscript(source)) return "actual_transcript";
   return "recorded_fallback_placeholder";
 }
 
 function buildTranscriptText(source: ArchiveSource) {
   const transcript = archiveTranscript(source);
   const technicalEvidence = isTechnicalEvidenceArchiveSource(source);
+  const technicalReason = technicalEvidenceArchiveReason(source);
   const isTextInterview = source.recordingStatus === "not_applicable";
   const isRecordedFallbackPlaceholder = transcript.some((turn) =>
     turn.id.startsWith("recorded-fallback-answer-"));
   const lines = [
     technicalEvidence
-      ? "TOKYO DOGS オンライン一次面接 技術保留記録（一部文字起こし・人手確認必須）"
+      ? technicalReason === "recording_missing"
+        ? "TOKYO DOGS オンライン一次面接 技術保留記録（録画未受領・人手確認必須）"
+        : "TOKYO DOGS オンライン一次面接 技術保留記録（一部文字起こし・人手確認必須）"
       : isRecordedFallbackPlaceholder
       ? "TOKYO DOGS 録画式一次面接 質問記録（文字起こし未実施）"
       : "TOKYO DOGS オンライン一次面接 文字起こし",
@@ -322,7 +326,9 @@ function buildTranscriptText(source: ArchiveSource) {
       ? `技術保留日時: ${japaneseDate(source.updatedAt)}`
       : `面接完了日時: ${japaneseDate(source.completedAt)}`,
     technicalEvidence
-      ? "確認区分: 回答音声の一部文字起こし欠落により面接は未完了。以下は受領済みの途中記録であり、録画との人手照合が必要"
+      ? technicalReason === "recording_missing"
+        ? "確認区分: 面接終了時の通信中断により録画を最後まで受領できず、面接は技術保留。以下はハッシュ照合済みの完全な文字起こし記録だが、録画との人手照合はできない"
+        : "確認区分: 回答音声の一部文字起こし欠落により面接は未完了。以下は受領済みの途中記録であり、録画との人手照合が必要"
       : isRecordedFallbackPlaceholder
       ? "確認区分: 録画式予備面接の質問記録。応募者の発言本文は文字起こし未実施"
       : isTextInterview
@@ -344,6 +350,7 @@ function scoreLabel(score: number | null) {
 
 function buildReportHtml(source: ArchiveSource) {
   const technicalEvidence = isTechnicalEvidenceArchiveSource(source);
+  const technicalReason = technicalEvidenceArchiveReason(source);
   const isTextInterview = source.recordingStatus === "not_applicable";
   const evaluation = source.evaluation;
   const questionAnswers = buildInterviewQuestionAnswers(archiveTranscript(source));
@@ -391,7 +398,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Yu Gothic",san
 <tr><th>録画状態</th><td>${escapeHtml(source.recordingStatus)}</td></tr>
 </table>
 <p class="notice">${technicalEvidence
-  ? "本件は回答音声の一部文字起こしを確認できず、面接未完了の技術保留です。録画と途中文字起こしを採用担当者が人手で照合してください。自動評価・合否判断・面接完了の証明には使用できません。通信・録音・文字起こしの不具合を応募者の不利益に使用しません。"
+  ? technicalReason === "recording_missing"
+    ? "本件は面接終了時の通信中断により録画を最後まで受領できなかった技術保留です。文字起こしはハッシュ照合済みの完全な記録ですが、録画との照合はできません。自動評価・合否判断・面接完了の証明には使用せず、通信不具合を応募者の不利益に使用しないでください。"
+    : "本件は回答音声の一部文字起こしを確認できず、面接未完了の技術保留です。録画と途中文字起こしを採用担当者が人手で照合してください。自動評価・合否判断・面接完了の証明には使用できません。通信・録音・文字起こしの不具合を応募者の不利益に使用しません。"
   : isTextInterview
   ? "本資料は採用担当者の確認資料です。システムは合否を自動決定しません。文字入力方式では映像・音声を取得せず、参加方法の違いを不利益な評価に使用しません。"
   : "本資料は採用担当者の確認資料です。システムは合否を自動決定しません。文字起こしは応募者端末由来のため録画との照合が必要です。通信・録音・文字起こしの不具合や、顔立ち・容姿・表情・声質等を不利益な評価に使用しません。"}</p>
@@ -449,6 +458,7 @@ function buildResultJson(source: ArchiveSource) {
     questionAnswers,
     transcriptKind,
     technicalHold: transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
+    technicalHoldReason: technicalEvidenceArchiveReason(source),
     automaticEvaluationPerformed: source.evaluation !== null,
     humanReviews: source.humanReviews,
     technicalEvents: source.auditEvents.filter((event) => [
@@ -461,6 +471,9 @@ function buildResultJson(source: ArchiveSource) {
       "completion_reason_invalid",
       "time_limit_reached",
       "reasonable_accommodation_text_selected",
+      "orphaned_sealed_voice_draft_recovered",
+      "recording_recovery_part_missing",
+      "recording_recovery_manual_attention",
     ].includes(event.type)),
     humanDecisionRequired: true,
   }, null, 2);
@@ -2674,7 +2687,7 @@ async function prepareDriveArchive(
   });
   await reportProgress();
   const transcriptFileName = transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND
-    ? `${filePrefix}_技術保留_一部文字起こし_人手確認必須.txt`
+    ? `${filePrefix}_技術保留_受領済み文字起こし_人手確認必須.txt`
     : transcriptAvailable
     ? `${filePrefix}_文字起こし.txt`
     : `${filePrefix}_録画式面接_質問記録_文字起こし未実施.txt`;
@@ -2991,8 +3004,10 @@ function completedReceiptSatisfiesSource(
     receipt.transcriptKind === expectedTranscriptKind &&
     (expectedTranscriptKind === "actual_transcript" ||
       expectedTranscriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND);
-  const recordingVerified = source.recordingStatus === "not_applicable" ||
-    (source.recordingStatus === "stored" && receipt.recordingIncluded === true);
+  const recordingVerified = isTechnicalEvidenceArchiveSource(source)
+    ? receipt.recordingIncluded === Boolean(source.recording)
+    : source.recordingStatus === "not_applicable" ||
+      (source.recordingStatus === "stored" && receipt.recordingIncluded === true);
   return transcriptVerified && recordingVerified;
 }
 

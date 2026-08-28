@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
+  technicalEvidenceArchiveReason,
   technicalEvidenceArchiveTranscript,
 } from "../lib/interview-technical-evidence.js";
 
@@ -32,6 +33,7 @@ function eligibleSource() {
 test("only a stored draft with a known transcription fault is eligible for a technical evidence archive", () => {
   const source = eligibleSource();
   assert.equal(TECHNICAL_EVIDENCE_TRANSCRIPT_KIND, "partial_transcript_human_review");
+  assert.equal(technicalEvidenceArchiveReason(source), "transcription_gap");
   assert.equal(technicalEvidenceArchiveTranscript(source), source.transcriptDraft.transcript);
 
   for (const code of ["TRANSCRIPTION_EMPTY", "TRANSCRIPTION_FAILED", "TRANSCRIPTION_ID_MISSING"]) {
@@ -57,10 +59,52 @@ test("only a stored draft with a known transcription fault is eligible for a tec
   }
 });
 
+test("an exact recovered transcript is archived as a recording-missing hold without inventing video", () => {
+  const transcript = [
+    { id: "assistant-1", speaker: "interviewer", text: "質問です", createdAt: "2026-08-20T00:00:00Z" },
+    { id: "candidate-1", speaker: "candidate", text: "回答です", createdAt: "2026-08-20T00:01:00Z" },
+  ];
+  const source = {
+    status: "in_progress",
+    recordingStatus: "uploading",
+    recording: null,
+    transcript,
+    evaluation: null,
+    completedAt: null,
+    transcriptDraft: {
+      mode: "voice",
+      transcript: structuredClone(transcript),
+      turnCount: transcript.length,
+      sealedAt: "2026-08-20T00:02:00Z",
+    },
+    auditEvents: [
+      { type: "voice_transcript_sealed", detail: {} },
+      { type: "orphaned_sealed_voice_draft_recovered", detail: {} },
+      { type: "recording_recovery_part_missing", detail: {} },
+    ],
+  };
+  assert.equal(technicalEvidenceArchiveReason(source), "recording_missing");
+  assert.equal(technicalEvidenceArchiveTranscript(source), source.transcript);
+
+  for (const mutate of [
+    (value) => { value.recording = { byteSize: 1 }; },
+    (value) => { value.transcript[1].text = "different"; },
+    (value) => { value.transcriptDraft.sealedAt = null; },
+    (value) => { value.auditEvents = value.auditEvents.filter((event) => event.type !== "recording_recovery_part_missing"); },
+    (value) => { value.auditEvents.push({ type: "transcription_failed", detail: { code: "TRANSCRIPTION_EMPTY" } }); },
+    (value) => { value.auditEvents.push({ type: "safety_escalation", detail: {} }); },
+  ]) {
+    const value = structuredClone(source);
+    mutate(value);
+    assert.equal(technicalEvidenceArchiveTranscript(value), null);
+  }
+});
+
 test("Drive renders eligible evidence as a non-evaluated technical hold, never a completed transcript", async () => {
   const source = await readFile(new URL("../lib/google-drive-sync.ts", import.meta.url), "utf8");
   assert.match(source, /TECHNICAL_EVIDENCE_TRANSCRIPT_KIND/);
-  assert.match(source, /技術保留記録（一部文字起こし・人手確認必須）/);
+  assert.match(source, /録画未受領・人手確認必須/);
+  assert.match(source, /ハッシュ照合済みの完全な文字起こし記録/);
   assert.match(source, /面接未完了の技術保留/);
   assert.match(source, /technicalHold: transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND/);
   assert.match(source, /automaticEvaluationPerformed: source\.evaluation !== null/);

@@ -16,10 +16,12 @@ function technicalEvidenceDriveQuery(source) {
   const end = source.indexOf("export async function findNextInterviewTechnicalEvidenceDriveSession", start);
   assert.ok(start >= 0 && end > start, "the technical-evidence selector must remain discoverable");
   const match = source.slice(start, end).match(
-    /const rows = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(failedBefore, pendingBefore, integrityBefore, boundedLimit\)/,
+    /const rows = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(recordingMissingBefore, failedBefore, pendingBefore, integrityBefore, boundedLimit\)/,
   );
   assert.ok(match, "the exact production technical-evidence query must remain discoverable");
-  return match[1];
+  return match[1]
+    .replaceAll("${ORPHANED_SEALED_VOICE_DRAFT_RECOVERED_EVENT}", "orphaned_sealed_voice_draft_recovered")
+    .replaceAll("${RECORDING_RECOVERY_MISSING_EVENT}", "recording_recovery_part_missing");
 }
 
 function insertSession(database, id, transcript, createdAt) {
@@ -131,6 +133,7 @@ test("technical evidence recovery selects stored drafts with known transcription
       evaluation_json TEXT,
       summary TEXT,
       completed_at TEXT,
+      expires_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
     CREATE TABLE interview_transcript_drafts (
@@ -168,9 +171,15 @@ test("technical evidence recovery selects stored drafts with known transcription
   const insert = (id, options = {}) => {
     database.prepare(`INSERT INTO interview_sessions (
       id, status, recording_status, transcript_json, evaluation_json, summary,
-      completed_at, updated_at
-    ) VALUES (?, 'in_progress', ?, NULL, NULL, NULL, NULL, ?)`)
-      .run(id, options.recordingStatus ?? "stored", "2026-08-19T00:00:00Z");
+      completed_at, expires_at, updated_at
+    ) VALUES (?, 'in_progress', ?, ?, NULL, NULL, NULL, ?, ?)`)
+      .run(
+        id,
+        options.recordingStatus ?? "stored",
+        options.canonical ? turns : null,
+        options.expiresAt ?? "2026-08-18T00:00:00Z",
+        "2026-08-19T00:00:00Z",
+      );
     database.prepare(`INSERT INTO interview_transcript_drafts (
       session_id, mode, transcript_json, turn_count, sealed_at, updated_at
     ) VALUES (?, 'voice', ?, 2, ?, '2026-08-19T00:00:00Z')`)
@@ -178,10 +187,22 @@ test("technical evidence recovery selects stored drafts with known transcription
     if (!options.noRecording) {
       database.prepare("INSERT INTO interview_artifacts (session_id, kind) VALUES (?, 'recording')").run(id);
     }
-    database.prepare(`INSERT INTO interview_audit_events (
-      session_id, event_type, detail_json
-    ) VALUES (?, 'transcription_failed', ?)`)
-      .run(id, JSON.stringify({ code: options.code ?? "TRANSCRIPTION_EMPTY" }));
+    if (options.canonical) {
+      for (const eventType of [
+        "voice_transcript_sealed",
+        "orphaned_sealed_voice_draft_recovered",
+        "recording_recovery_part_missing",
+      ]) {
+        database.prepare(`INSERT INTO interview_audit_events (
+          session_id, event_type, detail_json
+        ) VALUES (?, ?, '{}')`).run(id, eventType);
+      }
+    } else {
+      database.prepare(`INSERT INTO interview_audit_events (
+        session_id, event_type, detail_json
+      ) VALUES (?, 'transcription_failed', ?)`)
+        .run(id, JSON.stringify({ code: options.code ?? "TRANSCRIPTION_EMPTY" }));
+    }
     if (options.hold) {
       database.prepare("INSERT INTO interview_audit_events (session_id, event_type, detail_json) VALUES (?, ?, '{}')")
         .run(id, options.hold);
@@ -194,8 +215,15 @@ test("technical evidence recovery selects stored drafts with known transcription
   insert("TD-TECH-STOPPED-1", { hold: "candidate_requested_stop" });
   insert("TD-TECH-NORECORD", { noRecording: true });
   insert("TD-TECH-SEALED-01", { sealed: true });
+  insert("TD-TECH-REC-MISS", {
+    canonical: true,
+    noRecording: true,
+    recordingStatus: "uploading",
+    sealed: true,
+  });
 
   const selected = database.prepare(technicalEvidenceDriveQuery(source)).all(
+    "2026-08-20T00:00:00Z",
     "2026-08-20T00:00:00Z",
     "2026-08-20T00:00:00Z",
     "2026-08-20T00:00:00Z",
@@ -203,6 +231,7 @@ test("technical evidence recovery selects stored drafts with known transcription
   );
   assert.deepEqual(selected.map((row) => row.id), [
     "TD-TECH-IDMISS-1",
+    "TD-TECH-REC-MISS",
     "TD-TECH-VALID-01",
     "TD-TECH-VALID-02",
   ]);
