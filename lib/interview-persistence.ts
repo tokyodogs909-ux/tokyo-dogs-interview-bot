@@ -698,6 +698,45 @@ async function ensureSchema(db: D1Database) {
         AND status = 'pending' AND retry_blocked_at IS NULL`)
       .bind(now, now, now, now),
   ]);
+
+  // Production cleanup (2026-08-30): the seven non-404 rows above were all
+  // internal load-test sessions. They contain no candidate turn and therefore
+  // can never satisfy the fail-closed archive selector. Leaving them pending
+  // made every five-minute recovery tick report a false warning forever. Stop
+  // only these exact opaque test sessions without touching their recordings,
+  // manifests, Drive files, or any real candidate archive. The fence makes the
+  // cleanup idempotent and prevents an already-advanced row from being changed.
+  const legacyInternalTestSyncIds = [
+    "TD-MSDBA40Q-KMVOJLY",
+    "TD-MSPL61HF-IZ2MGBE",
+    "TD-MSPRV9WG-DDJSHHA",
+    "TD-MSPTXC5K-AGILMOE",
+    "TD-MSPUE6WH-UO4NBWY",
+    "TD-MSPUO8TN-1ROUTVS",
+    "TD-MSPUZ58S-5K6KGOG",
+  ] as const;
+  const internalTestPlaceholders = legacyInternalTestSyncIds.map(() => "?").join(", ");
+  const excludedInternalTests = await db.prepare(`UPDATE interview_external_syncs SET
+      status = 'failed', started_at = NULL, completed_at = NULL,
+      error_code = 'GOOGLE_DRIVE_INTERNAL_TEST_ARCHIVE_EXCLUDED',
+      failure_count = CASE WHEN failure_count < 4 THEN 4 ELSE failure_count END,
+      next_retry_at = NULL, retry_blocked_at = ?,
+      retry_block_reason = 'GOOGLE_DRIVE_INTERNAL_TEST_ARCHIVE_EXCLUDED', updated_at = ?
+    WHERE provider = 'google_drive' AND session_id IN (${internalTestPlaceholders})
+      AND status = 'pending' AND failure_count = 3
+      AND retry_blocked_at IS NULL
+      AND next_retry_at = '2026-08-28T04:23:41.130Z'`)
+    .bind(now, now, ...legacyInternalTestSyncIds).run();
+  if (Number(excludedInternalTests.meta?.changes ?? 0) > 0) {
+    await db.prepare(`UPDATE interview_operational_alerts SET
+        severity = 'warning', status = 'resolved',
+        code = 'GOOGLE_DRIVE_INTERNAL_TEST_ARCHIVE_EXCLUDED',
+        resolved_at = COALESCE(resolved_at, ?), updated_at = ?
+      WHERE session_id IN (${internalTestPlaceholders})
+        AND alert_type = 'google_drive_save_failure'
+        AND status = 'open'`)
+      .bind(now, now, ...legacyInternalTestSyncIds).run();
+  }
 }
 
 const PUBLIC_ENTRY_WINDOW_MS = 6 * 60 * 60 * 1_000;
