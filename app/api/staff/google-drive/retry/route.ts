@@ -15,7 +15,10 @@ export async function POST(request: Request) {
     if (!reviewer) {
       return noStoreJson({ error: "採用担当者の認証を確認できませんでした。" }, { status: 401 });
     }
-    const body = await readBoundedJsonBody<{ sessionId?: unknown }>(request, { maxBytes: 4_000 });
+    const body = await readBoundedJsonBody<{
+      sessionId?: unknown;
+      confirmMissingRecordingAcrossDrive?: unknown;
+    }>(request, { maxBytes: 4_000 });
     if (!body.ok) {
       return noStoreJson({ error: "入力内容を確認できませんでした。" }, { status: body.status });
     }
@@ -24,6 +27,14 @@ export async function POST(request: Request) {
       : "";
     if (!/^TD-[A-Z0-9-]{6,40}$/.test(sessionId)) {
       return noStoreJson({ error: "面接IDを確認してください。" }, { status: 400 });
+    }
+    if (body.value.confirmMissingRecordingAcrossDrive === true) {
+      // This route resumes only an already-consumed, exact-snapshot repair
+      // grant. A second confirmation must not release the durable hold before
+      // stepInterviewToGoogleDrive rejects it as stale/duplicate authority.
+      return noStoreJson({
+        error: "動画欠落の確認はすでに受付済みです。「安全に1回だけ再試行」を使用してください。",
+      }, { status: 409 });
     }
     const released = await releaseExternalSyncRetryHold({ sessionId, reviewer });
     if (!released) {

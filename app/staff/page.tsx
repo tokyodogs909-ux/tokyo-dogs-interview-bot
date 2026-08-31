@@ -629,7 +629,11 @@ export default function StaffReviewPage() {
     }
   }
 
-  async function syncGoogleDrive(options: { successPrefix?: string; failurePrefix?: string } = {}) {
+  async function syncGoogleDrive(options: {
+    successPrefix?: string;
+    failurePrefix?: string;
+    confirmMissingRecordingAcrossDrive?: boolean;
+  } = {}) {
     if (!review) return;
     setState("syncing");
     setMessage("");
@@ -640,7 +644,11 @@ export default function StaffReviewPage() {
         : "/api/staff/google-drive/sync", {
         method: "POST",
         headers: { ...authHeaders(), "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: review.sessionId }),
+        body: JSON.stringify({
+          sessionId: review.sessionId,
+          confirmMissingRecordingAcrossDrive:
+            options.confirmMissingRecordingAcrossDrive === true,
+        }),
       });
       const data = (await response.json()) as {
         synced?: boolean;
@@ -851,6 +859,21 @@ export default function StaffReviewPage() {
               <button className="secondary-action" onClick={() => void syncGoogleDrive()} disabled={state === "syncing" || review.status !== "completed"}>
                 {state === "syncing" ? "更新中…" : review.driveSync?.retryBlockedAt ? "安全に1回だけ再試行" : "Drive・レポートを更新"}
               </button>
+              {review.driveSync?.integrityErrorCode === "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING" &&
+                <button
+                  className="secondary-action"
+                  onClick={() => {
+                    const confirmed = window.confirm(
+                      "Drive全体とゴミ箱に、この面接IDの動画が残っていないことを確認しましたか？ 確認済みの場合だけ、保存済み原本から動画のみを復旧します。",
+                    );
+                    if (confirmed) void syncGoogleDrive({
+                      confirmMissingRecordingAcrossDrive: true,
+                    });
+                  }}
+                  disabled={state === "syncing" || review.status !== "completed"}
+                >
+                  {state === "syncing" ? "復旧中…" : "動画欠落を確認して復旧"}
+                </button>}
             </div>
             {review.driveSync?.status === "completed" && <div className="validation-box">
               <strong>Drive整合性：{review.driveSync.integrityStatus === "verified"

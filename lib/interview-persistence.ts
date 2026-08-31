@@ -276,12 +276,16 @@ function recoveryTechnicalLastError(value: unknown) {
     "GOOGLE_DRIVE_ACCOUNT_LOOKUP_FAILED",
     "GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH",
     "GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH",
+    "GOOGLE_DRIVE_ARCHIVE_RECORDING_MOVED_MANUAL_ATTENTION",
+    "GOOGLE_DRIVE_ARCHIVE_RECORDING_TRASHED_RESTORE_REQUIRED",
     "GOOGLE_DRIVE_ENCRYPTION_SECRET_MISSING",
     "GOOGLE_DRIVE_MANAGED_ROOT_CREATE_FAILED",
     "GOOGLE_DRIVE_MANAGED_ROOT_LOOKUP_FAILED",
     "GOOGLE_DRIVE_OAUTH_CLIENT_MISSING",
     "GOOGLE_DRIVE_OAUTH_NOT_CONNECTED",
     "GOOGLE_DRIVE_RECORDING_SIZE_MISMATCH",
+    "GOOGLE_DRIVE_RECORDING_REPAIR_INIT_UNCONFIRMED",
+    "GOOGLE_DRIVE_RECORDING_REPAIR_CONFIRMATION_REQUIRED",
     "GOOGLE_DRIVE_RECORDING_SOURCE_SIZE_MISMATCH",
     "GOOGLE_DRIVE_REFRESH_TOKEN_DECRYPT_FAILED",
     "GOOGLE_DRIVE_REFRESH_TOKEN_INVALID",
@@ -587,6 +591,18 @@ async function ensureSchema(db: D1Database) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_drive_upload_steps_lease_idx ON interview_drive_upload_steps (lease_expires_at)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_drive_recording_repair_authorizations (
+      session_id TEXT PRIMARY KEY NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+      nonce_hash TEXT NOT NULL UNIQUE,
+      old_file_id TEXT NOT NULL,
+      archive_completed_at TEXT NOT NULL,
+      manifest_sha256 TEXT NOT NULL,
+      reviewer_name TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_drive_recording_repair_authorizations_expiry_idx ON interview_drive_recording_repair_authorizations (expires_at, consumed_at)"),
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_drive_hierarchy_nodes (
       node_key TEXT PRIMARY KEY NOT NULL,
       canonical_folder_id TEXT,
@@ -2631,16 +2647,79 @@ export async function finishExternalSyncIntegrityCheck(input: {
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   const manifest = { ...input.manifest };
   delete manifest[DRIVE_INTEGRITY_CHECK_KEY];
-  const result = await db.prepare(`UPDATE interview_external_syncs SET manifest_json = ?
-    WHERE session_id = ? AND provider = 'google_drive' AND status = 'completed'
-      AND completed_at = ? AND manifest_json = ?`)
-    .bind(
-      JSON.stringify(manifest),
-      input.claim.sessionId,
-      input.claim.completedAt,
-      input.claim.claimedManifestJson,
-    ).run();
-  if (Number(result.meta?.changes ?? 0) !== 1) {
+  const storedIntegrity = manifest.integrity && typeof manifest.integrity === "object"
+    ? manifest.integrity as Record<string, unknown>
+    : null;
+  const integrityStatus = ["verified", "drift", "unknown"].includes(String(storedIntegrity?.status))
+    ? String(storedIntegrity?.status)
+    : "unknown";
+  const integrityCode = typeof storedIntegrity?.errorCode === "string"
+    ? storedIntegrity.errorCode.slice(0, 120)
+    : integrityStatus === "verified"
+      ? "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_VERIFIED"
+      : "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_UNCONFIRMED";
+  const manifestJson = JSON.stringify(manifest);
+  const now = new Date().toISOString();
+  const statements = [
+    db.prepare(`UPDATE interview_external_syncs SET manifest_json = ?
+      WHERE session_id = ? AND provider = 'google_drive' AND status = 'completed'
+        AND completed_at = ? AND manifest_json = ?`)
+      .bind(
+        manifestJson,
+        input.claim.sessionId,
+        input.claim.completedAt,
+        input.claim.claimedManifestJson,
+      ),
+  ];
+  if (integrityStatus === "verified") {
+    statements.push(db.prepare(`UPDATE interview_operational_alerts SET
+        status = 'resolved', resolved_at = COALESCE(resolved_at, ?), updated_at = ?
+      WHERE session_id = ? AND alert_type = 'google_drive_archive_integrity'
+        AND EXISTS (
+          SELECT 1 FROM interview_external_syncs sync
+          WHERE sync.session_id = ? AND sync.provider = 'google_drive'
+            AND sync.status = 'completed' AND sync.completed_at = ?
+            AND sync.manifest_json = ?
+        )`)
+      .bind(
+        now,
+        now,
+        input.claim.sessionId,
+        input.claim.sessionId,
+        input.claim.completedAt,
+        manifestJson,
+      ));
+  } else {
+    statements.push(db.prepare(`INSERT INTO interview_operational_alerts (
+        session_id, alert_type, severity, status, code,
+        first_seen_at, last_seen_at, occurrence_count, created_at, updated_at
+      ) SELECT ?, 'google_drive_archive_integrity', ?, 'open', ?, ?, ?, 1, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_external_syncs sync
+        WHERE sync.session_id = ? AND sync.provider = 'google_drive'
+          AND sync.status = 'completed' AND sync.completed_at = ?
+          AND sync.manifest_json = ?
+      )
+      ON CONFLICT(session_id) DO UPDATE SET
+        alert_type = excluded.alert_type, severity = excluded.severity,
+        status = 'open', code = excluded.code, last_seen_at = excluded.last_seen_at,
+        occurrence_count = interview_operational_alerts.occurrence_count + 1,
+        resolved_at = NULL, updated_at = excluded.updated_at`)
+      .bind(
+        input.claim.sessionId,
+        integrityStatus === "drift" ? "critical" : "warning",
+        integrityCode,
+        now,
+        now,
+        now,
+        now,
+        input.claim.sessionId,
+        input.claim.completedAt,
+        manifestJson,
+      ));
+  }
+  const results = await db.batch(statements);
+  if (Number(results[0]?.meta?.changes ?? 0) !== 1) {
     throw new Error("GOOGLE_DRIVE_INTEGRITY_CHECK_CLAIM_LOST");
   }
 }
@@ -3067,7 +3146,9 @@ export async function completeExternalSync(input: {
       ),
     db.prepare(`UPDATE interview_operational_alerts SET
       status = 'resolved', resolved_at = ?, updated_at = ?
-      WHERE session_id = ? AND alert_type = 'google_drive_save_failure'
+      WHERE session_id = ? AND alert_type IN (
+        'google_drive_save_failure', 'google_drive_archive_integrity'
+      )
         AND EXISTS (
           SELECT 1 FROM interview_external_syncs sync
           WHERE sync.session_id = ? AND sync.provider = 'google_drive'
@@ -3209,6 +3290,243 @@ export async function releaseExternalSyncRetryHold(input: {
       .bind(now, now, input.sessionId),
   ]);
   return true;
+}
+
+/**
+ * Records the authenticated, human confirmation required before replacing a
+ * recording whose old Drive ID returns an ambiguous 404/410. This does not
+ * reopen the sync or write to Drive; the fenced step claim remains the sole
+ * authority that can start one replacement upload.
+ */
+export async function createMissingRecordingRepairAuthorization(input: {
+  sessionId: string;
+  reviewer: AuthorizedReviewer;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const eligible = await db.prepare(`SELECT manifest_json, completed_at
+    FROM interview_external_syncs
+    WHERE session_id = ? AND provider = 'google_drive'
+      AND status = 'completed' AND completed_at IS NOT NULL
+      AND COALESCE(json_extract(manifest_json, '$.recordingIncluded'), 0) = 1
+      AND COALESCE(json_extract(manifest_json, '$.integrity.status'), '') = 'drift'
+      AND COALESCE(json_extract(manifest_json, '$.integrity.errorCode'), '') =
+        'GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING'
+      AND json_extract(manifest_json, '$._integrityCheck') IS NULL
+    LIMIT 1`)
+    .bind(input.sessionId)
+    .first<{ manifest_json: string; completed_at: string }>();
+  if (!eligible) return false;
+  const manifest = parseJson<Record<string, unknown> | null>(eligible.manifest_json, null);
+  const files = manifest?.files && typeof manifest.files === "object" &&
+    !Array.isArray(manifest.files) ? manifest.files as Record<string, unknown> : null;
+  const integrity = manifest?.integrity && typeof manifest.integrity === "object" &&
+    !Array.isArray(manifest.integrity)
+    ? manifest.integrity as Record<string, unknown>
+    : null;
+  const artifacts = integrity?.artifacts && typeof integrity.artifacts === "object" &&
+    !Array.isArray(integrity.artifacts)
+    ? integrity.artifacts as Record<string, unknown>
+    : null;
+  const recordingFile = files?.recording && typeof files.recording === "object"
+    ? files.recording as Record<string, unknown>
+    : null;
+  const recordingIntegrity = artifacts?.recording && typeof artifacts.recording === "object"
+    ? artifacts.recording as Record<string, unknown>
+    : null;
+  const oldFileId = typeof recordingFile?.fileId === "string"
+    ? recordingFile.fileId
+    : typeof recordingFile?.id === "string" ? recordingFile.id : null;
+  if (
+    !oldFileId || !/^[A-Za-z0-9_-]{1,200}$/.test(oldFileId) ||
+    recordingIntegrity?.fileId !== oldFileId
+  ) return false;
+  const nonce = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+  const nonceHash = await sha256(nonce);
+  const manifestSha256 = await sha256(eligible.manifest_json);
+  const now = new Date();
+  const createdAt = now.toISOString();
+  const expiresAt = new Date(now.getTime() + 10 * 60 * 1_000).toISOString();
+  const inserted = await db.prepare(`INSERT INTO interview_drive_recording_repair_authorizations (
+    session_id, nonce_hash, old_file_id, archive_completed_at, manifest_sha256,
+    reviewer_name, expires_at, consumed_at, created_at
+  ) SELECT ?, ?, ?, ?, ?, ?, ?, NULL, ?
+  WHERE EXISTS (
+    SELECT 1 FROM interview_external_syncs sync
+    WHERE sync.session_id = ? AND sync.provider = 'google_drive'
+      AND sync.status = 'completed' AND sync.completed_at = ?
+      AND sync.manifest_json = ?
+  )
+  ON CONFLICT(session_id) DO UPDATE SET
+    nonce_hash = excluded.nonce_hash,
+    old_file_id = excluded.old_file_id,
+    archive_completed_at = excluded.archive_completed_at,
+    manifest_sha256 = excluded.manifest_sha256,
+    reviewer_name = excluded.reviewer_name,
+    expires_at = excluded.expires_at,
+    consumed_at = NULL,
+    created_at = excluded.created_at
+  WHERE interview_drive_recording_repair_authorizations.consumed_at IS NULL
+    OR interview_drive_recording_repair_authorizations.manifest_sha256 <>
+      excluded.manifest_sha256
+    OR interview_drive_recording_repair_authorizations.archive_completed_at <>
+      excluded.archive_completed_at
+    OR interview_drive_recording_repair_authorizations.old_file_id <>
+      excluded.old_file_id`)
+    .bind(
+      input.sessionId,
+      nonceHash,
+      oldFileId,
+      eligible.completed_at,
+      manifestSha256,
+      input.reviewer,
+      expiresAt,
+      createdAt,
+      input.sessionId,
+      eligible.completed_at,
+      eligible.manifest_json,
+    )
+    .run();
+  if (Number(inserted.meta?.changes ?? 0) !== 1) return false;
+  await db.prepare(`INSERT INTO interview_staff_audit_events (
+    id, reviewer_name, event_type, detail_json
+  ) VALUES (?, ?, 'google_drive_missing_recording_repair_authorized', ?)`)
+    .bind(
+      crypto.randomUUID(),
+      input.reviewer,
+      JSON.stringify({ sessionId: input.sessionId, expiresAt }),
+    )
+    .run();
+  return { nonce };
+}
+
+export async function consumeMissingRecordingRepairAuthorization(input: {
+  sessionId: string;
+  nonce: string;
+}) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const nonceHash = await sha256(input.nonce);
+  const authorization = await db.prepare(`SELECT nonce_hash, old_file_id,
+      archive_completed_at, manifest_sha256, expires_at, consumed_at
+    FROM interview_drive_recording_repair_authorizations
+    WHERE session_id = ? LIMIT 1`)
+    .bind(input.sessionId)
+    .first<{
+      nonce_hash: string;
+      old_file_id: string;
+      archive_completed_at: string;
+      manifest_sha256: string;
+      expires_at: string;
+      consumed_at: string | null;
+    }>();
+  const sync = await db.prepare(`SELECT manifest_json, completed_at
+    FROM interview_external_syncs
+    WHERE session_id = ? AND provider = 'google_drive' AND status = 'completed'
+    LIMIT 1`)
+    .bind(input.sessionId)
+    .first<{ manifest_json: string; completed_at: string }>();
+  const now = new Date().toISOString();
+  if (
+    !authorization || !sync || authorization.consumed_at !== null ||
+    authorization.nonce_hash !== nonceHash || authorization.expires_at <= now ||
+    authorization.archive_completed_at !== sync.completed_at ||
+    authorization.manifest_sha256 !== await sha256(sync.manifest_json)
+  ) return false;
+  const manifest = parseJson<Record<string, unknown> | null>(sync.manifest_json, null);
+  const files = manifest?.files && typeof manifest.files === "object" &&
+    !Array.isArray(manifest.files) ? manifest.files as Record<string, unknown> : null;
+  const recording = files?.recording && typeof files.recording === "object"
+    ? files.recording as Record<string, unknown>
+    : null;
+  const fileId = typeof recording?.fileId === "string"
+    ? recording.fileId
+    : typeof recording?.id === "string" ? recording.id : null;
+  if (fileId !== authorization.old_file_id) return false;
+  const consumed = await db.prepare(`UPDATE interview_drive_recording_repair_authorizations
+    SET consumed_at = ?
+    WHERE session_id = ? AND nonce_hash = ? AND consumed_at IS NULL AND expires_at > ?
+      AND archive_completed_at = ? AND manifest_sha256 = ?
+      AND EXISTS (
+        SELECT 1 FROM interview_external_syncs sync
+        WHERE sync.session_id = ? AND sync.provider = 'google_drive'
+          AND sync.status = 'completed' AND sync.completed_at = ?
+          AND sync.manifest_json = ?
+      )`)
+    .bind(
+      now,
+      input.sessionId,
+      nonceHash,
+      now,
+      authorization.archive_completed_at,
+      authorization.manifest_sha256,
+      input.sessionId,
+      sync.completed_at,
+      sync.manifest_json,
+    )
+    .run();
+  return Number(consumed.meta?.changes ?? 0) === 1;
+}
+
+/**
+ * Confirms that an explicitly consumed recording-repair grant still belongs to
+ * the exact immutable archive receipt being repaired. A consumed grant is not
+ * governed by the short confirmation expiry: once accepted, it remains usable
+ * only while the byte-for-byte manifest (including the old recording ID) is
+ * unchanged. This lets a fenced pending/running/failed repair resume after a
+ * transient Worker or Drive failure without asking a candidate request to
+ * recreate authority, while a changed manifest automatically invalidates it.
+ */
+export async function hasDurableMissingRecordingRepairAuthorization(
+  sessionId: string,
+) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const authorization = await db.prepare(`SELECT old_file_id, archive_completed_at,
+      manifest_sha256, consumed_at
+    FROM interview_drive_recording_repair_authorizations
+    WHERE session_id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<{
+      old_file_id: string;
+      archive_completed_at: string;
+      manifest_sha256: string;
+      consumed_at: string | null;
+    }>();
+  const sync = await db.prepare(`SELECT status, manifest_json, completed_at
+    FROM interview_external_syncs
+    WHERE session_id = ? AND provider = 'google_drive'
+      AND status IN ('completed', 'pending', 'running', 'failed')
+    LIMIT 1`)
+    .bind(sessionId)
+    .first<{ status: string; manifest_json: string; completed_at: string | null }>();
+  if (!authorization?.consumed_at || !sync?.manifest_json) return false;
+  if (
+    sync.status === "completed" &&
+    authorization.archive_completed_at !== sync.completed_at
+  ) return false;
+  if (authorization.manifest_sha256 !== await sha256(sync.manifest_json)) return false;
+  const manifest = parseJson<Record<string, unknown> | null>(sync.manifest_json, null);
+  const files = manifest?.files && typeof manifest.files === "object" &&
+    !Array.isArray(manifest.files) ? manifest.files as Record<string, unknown> : null;
+  const recording = files?.recording && typeof files.recording === "object" &&
+    !Array.isArray(files.recording) ? files.recording as Record<string, unknown> : null;
+  const integrity = manifest?.integrity && typeof manifest.integrity === "object" &&
+    !Array.isArray(manifest.integrity)
+    ? manifest.integrity as Record<string, unknown>
+    : null;
+  const fileId = typeof recording?.fileId === "string"
+    ? recording.fileId
+    : typeof recording?.id === "string" ? recording.id : null;
+  return (
+    manifest?.recordingIncluded === true &&
+    integrity?.status === "drift" &&
+    integrity?.errorCode === "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING" &&
+    fileId === authorization.old_file_id
+  );
 }
 
 export async function deferExternalSync(input: {
@@ -4179,7 +4497,9 @@ export async function listInterviewSummaryPage(
     LEFT JOIN interview_external_syncs AS d
       ON d.session_id = s.id AND d.provider = 'google_drive'
     LEFT JOIN interview_operational_alerts AS alert
-      ON alert.session_id = s.id AND alert.alert_type = 'google_drive_save_failure'`;
+      ON alert.session_id = s.id AND alert.alert_type IN (
+        'google_drive_save_failure', 'google_drive_archive_integrity'
+      )`;
   const rows = options.cursor
     ? await db.prepare(`${select}
         WHERE s.created_at < ? OR (s.created_at = ? AND s.id < ?)

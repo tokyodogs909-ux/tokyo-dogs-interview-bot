@@ -54,14 +54,32 @@ export async function POST(request: Request) {
     const code = error instanceof Error ? error.message : "";
     const safeCode = /^[A-Z0-9_:-]{3,120}$/.test(code) ? code : "INTERVIEW_ARCHIVE_FAILED";
     console.error("interview_archive_failed", { code: safeCode });
+    if (
+      code === "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT" ||
+      code === "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_UNCONFIRMED"
+    ) {
+      const integrityStatus = code === "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT"
+        ? "drift"
+        : "unknown";
+      return noStoreJson({
+        stored: false,
+        integrityStatus,
+        errorCode: code,
+        retryable: integrityStatus === "unknown",
+      }, { status: integrityStatus === "drift" ? 409 : 503 });
+    }
     const archiveNotReady = code === "INTERVIEW_NOT_READY_FOR_DRIVE_SYNC" ||
       code === "INTERVIEW_RECORDING_NOT_READY_FOR_DRIVE_SYNC" ||
       code === "INTERVIEW_RECORDING_ARTIFACT_MISSING" ||
       code === "INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC";
+    const staffRepairRequired =
+      code === "GOOGLE_DRIVE_RECORDING_REPAIR_CONFIRMATION_REQUIRED";
     return noStoreJson({
-      error: archiveNotReady
+      error: staffRepairRequired
+        ? "録画の保存差分を検出しました。重複防止のため自動作成せず、採用担当者の確認へ引き継ぎました。"
+        : archiveNotReady
         ? "録画と面接記録の保存完了後に社内格納できます。"
         : "面接記録の社内格納を完了できませんでした。採用担当者が保存状態を確認します。",
-    }, { status: archiveNotReady ? 409 : 502 });
+    }, { status: archiveNotReady || staffRepairRequired ? 409 : 502 });
   }
 }

@@ -16,6 +16,8 @@ import {
   claimExternalSync,
   claimExternalSyncIntegrityCheck,
   completeExternalSync,
+  consumeMissingRecordingRepairAuthorization,
+  createMissingRecordingRepairAuthorization,
   deferExternalSync,
   deleteDriveUploadStep,
   failExternalSync,
@@ -24,6 +26,7 @@ import {
   getExternalSyncStatus,
   getInterviewArchiveSource,
   getInterviewRecordingChunk,
+  hasDurableMissingRecordingRepairAuthorization,
   heartbeatExternalSync,
   initializeDriveUploadStep,
   markDriveHierarchyNodeCreationAttempt,
@@ -35,7 +38,9 @@ import {
   setDriveHierarchyNodeCanonicalFolder,
   updateDriveUploadStepContext,
   updateDriveUploadStep,
+  type AuthorizedReviewer,
 } from "@/lib/interview-persistence";
+import { recordingReplacementBlockCode } from "@/lib/drive-recovery.js";
 import { hasVerifiedCandidateTranscript } from "@/lib/interview-transcript-verification";
 import {
   TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
@@ -66,6 +71,12 @@ const DRIVE_RECORDING_REQUEST_TIMEOUT_MS = 25_000;
 const DRIVE_DUPLICATE_RECORDING_FALLBACK_MAX_BYTES = 16 * 1024 * 1024;
 const DRIVE_DUPLICATE_RECORDING_RANGE_BYTES = 4 * 1024 * 1024;
 const DRIVE_INTEGRITY_SMALL_FILE_MAX_BYTES = 8 * 1024 * 1024;
+const DRIVE_RECORDING_MISSING_CODE = "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING";
+const DRIVE_RECORDING_MOVED_CODE = "GOOGLE_DRIVE_ARCHIVE_RECORDING_MOVED_MANUAL_ATTENTION";
+const DRIVE_RECORDING_TRASHED_CODE =
+  "GOOGLE_DRIVE_ARCHIVE_RECORDING_TRASHED_RESTORE_REQUIRED";
+const DRIVE_RECORDING_REPAIR_CONFIRMATION_REQUIRED =
+  "GOOGLE_DRIVE_RECORDING_REPAIR_CONFIRMATION_REQUIRED";
 // These folders are created and managed by staff. The interview bot never
 // classifies a candidate or creates/moves/deletes these folders; it only
 // recognizes an already archived candidate folder after a human moves it.
@@ -123,6 +134,7 @@ type PreparedDriveArchive = {
   expectedContentHashes: Partial<Record<DriveArtifactKey, string>>;
   expectedContentSizes: Partial<Record<DriveArtifactKey, number>>;
   sharingRisk: DriveSharingRisk;
+  recordingRepairHistory?: Array<Record<string, unknown>>;
 };
 
 export type DriveArtifactKey =
@@ -553,6 +565,41 @@ async function listExactNamedFolders(
     throw new Error("GOOGLE_DRIVE_CLASSIFICATION_FOLDER_DUPLICATE");
   }
   return result.files ?? [];
+}
+
+async function listGlobalRecordingCandidates(input: {
+  accessToken: string;
+  sessionId: string;
+}) {
+  const baseQueries = [
+    `name contains '${driveQueryValue(input.sessionId)}' and mimeType contains 'video/'`,
+    `appProperties has { key='tokyoDogsInterviewSession' and value='${driveQueryValue(input.sessionId)}' } and appProperties has { key='tokyoDogsArtifact' and value='recording' }`,
+  ];
+  const pages = await Promise.all(baseQueries.flatMap((baseQuery) =>
+    [false, true].map(async (trashed) => {
+      const params = new URLSearchParams({
+        q: `${baseQuery} and trashed = ${trashed ? "true" : "false"}`,
+        pageSize: "10",
+        spaces: "drive",
+        supportsAllDrives: "true",
+        includeItemsFromAllDrives: "true",
+        fields: "nextPageToken,files(id,name,mimeType,size,sha256Checksum,version,modifiedTime,trashed,parents,appProperties)",
+      });
+      const page = await driveJson<DriveFilePage>(
+        `${DRIVE_API_ENDPOINT}/files?${params}`,
+        input.accessToken,
+      );
+      if (page.nextPageToken) {
+        throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+      }
+      return page.files ?? [];
+    })),
+  );
+  const unique = new Map<string, DriveFile>();
+  for (const file of pages.flat()) {
+    if (typeof file.id === "string" && file.id) unique.set(file.id, file);
+  }
+  return [...unique.values()];
 }
 
 /**
@@ -1628,6 +1675,7 @@ async function uploadRecording(input: {
     appProperties: {
       tokyoDogsArtifact: "recording",
       tokyoDogsProvider: DRIVE_PROVIDER,
+      tokyoDogsInterviewSession: input.sessionId,
     },
   };
   if (!targetFileId) metadata.parents = [input.folderId];
@@ -1758,6 +1806,7 @@ async function initiateRecordingUpload(input: {
   name: string;
   contentType: string;
   byteSize: number;
+  sessionId: string;
   targetFileId?: string | null;
 }) {
   const targetFileId = input.targetFileId === undefined
@@ -1768,6 +1817,7 @@ async function initiateRecordingUpload(input: {
     appProperties: {
       tokyoDogsArtifact: "recording",
       tokyoDogsProvider: DRIVE_PROVIDER,
+      tokyoDogsInterviewSession: input.sessionId,
     },
   };
   if (!targetFileId) metadata.parents = [input.folderId];
@@ -2313,6 +2363,9 @@ export function googleDriveIntegrityFailureStatus(error: unknown) {
   if (
     code === "GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH" ||
     code === "GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH" ||
+    code === DRIVE_RECORDING_MISSING_CODE ||
+    code === DRIVE_RECORDING_MOVED_CODE ||
+    code === DRIVE_RECORDING_TRASHED_CODE ||
     code === "GOOGLE_DRIVE_RECORDING_SIZE_MISMATCH" ||
     code === "GOOGLE_DRIVE_CLASSIFICATION_FOLDER_DUPLICATE" ||
     code === "GOOGLE_DRIVE_API_404" ||
@@ -2395,6 +2448,9 @@ export async function readGoogleDriveArchiveIntegritySnapshot(input: {
     }
     const expectedId = previousId ?? storedId;
     const matches = byArtifact.get(artifactKey) ?? [];
+    if (artifactKey === "recording" && expectedId && matches.length === 0) {
+      throw new Error(DRIVE_RECORDING_MISSING_CODE);
+    }
     if (
       !expectedId || matches.length !== 1 || matches[0].id !== expectedId ||
       matches[0].trashed === true || !exactDriveParent(matches[0], folder.id) ||
@@ -2494,9 +2550,12 @@ export async function revalidateCompletedGoogleDriveArchive(sessionId: string) {
   } catch (error) {
     const status = googleDriveIntegrityFailureStatus(error);
     const checkedAt = new Date().toISOString();
+    const sourceErrorCode = safeErrorCode(error);
     const errorCode = status === "drift"
-      ? "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT"
-      : safeErrorCode(error);
+      ? sourceErrorCode === DRIVE_RECORDING_MISSING_CODE || sourceErrorCode === DRIVE_RECORDING_MOVED_CODE
+        ? sourceErrorCode
+        : "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT"
+      : sourceErrorCode;
     const integrity = previous
       ? { ...previous, status, checkedAt, errorCode }
       : {
@@ -2850,6 +2909,7 @@ async function finalizeDriveArchive(
     technicalHold: prepared.transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,
     automaticEvaluationPerformed: source.evaluation !== null,
     files: uploaded,
+    recordingRepairHistory: prepared.recordingRepairHistory,
   };
   const manifestBody = JSON.stringify(manifest, null, 2);
   const manifestBytes = new TextEncoder().encode(manifestBody);
@@ -3009,6 +3069,275 @@ function completedReceiptSatisfiesSource(
     : source.recordingStatus === "not_applicable" ||
       (source.recordingStatus === "stored" && receipt.recordingIncluded === true);
   return transcriptVerified && recordingVerified;
+}
+
+function completedReceiptNeedsRecordingRepair(
+  status: NonNullable<Awaited<ReturnType<typeof getExternalSyncStatus>>>,
+  source: ArchiveSource,
+) {
+  if (source.recordingStatus !== "stored" || !source.recording) return false;
+  if (status.manifest?.recordingIncluded !== true) return false;
+  const integrity = storedGoogleDriveIntegrity(status.manifest?.integrity);
+  return integrity?.status === "drift" &&
+    integrity.errorCode === DRIVE_RECORDING_MISSING_CODE &&
+    Boolean(integrity.artifacts.recording);
+}
+
+function sameDriveArtifactIntegrityReceipt(
+  left: DriveArtifactIntegrityReceipt | undefined,
+  right: DriveArtifactIntegrityReceipt | undefined,
+) {
+  return Boolean(
+    left && right &&
+    left.fileId === right.fileId &&
+    left.mimeType === right.mimeType &&
+    left.size === right.size &&
+    left.version === right.version &&
+    left.modifiedTime === right.modifiedTime &&
+    left.contentSha256 === right.contentSha256 &&
+    left.fingerprintSource === right.fingerprintSource,
+  );
+}
+
+function verifiedSmallArtifactsUnchanged(
+  stored: GoogleDriveArchiveIntegrity,
+  observed: GoogleDriveArchiveIntegrity,
+) {
+  if (
+    stored.folder.fileId !== observed.folder.fileId ||
+    stored.folder.parentId !== observed.folder.parentId
+  ) return false;
+  const required: DriveArtifactKey[] = [
+    "transcript", "evaluation_json", "report_doc", "report_pdf", "manifest",
+  ];
+  return required.every((key) =>
+    sameDriveArtifactIntegrityReceipt(stored.artifacts[key], observed.artifacts[key]));
+}
+
+function driveManifestFiles(value: unknown) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+/**
+ * Builds a recording-only repair plan without writing any of the four human
+ * review artifacts. It is deliberately stricter than a normal archive:
+ * every prior small-file receipt must still match, the old on-Drive manifest
+ * must identify the same canonical recording, and no active recording or
+ * same-named file may remain in the candidate folder. Moved and trashed files
+ * are manual-attention conditions; replacement is allowed only after an
+ * authenticated confirmation plus zero active/trash matches across Drive.
+ */
+async function prepareRecordingOnlyDriveRepair(input: {
+  source: ArchiveSource;
+  status: NonNullable<Awaited<ReturnType<typeof getExternalSyncStatus>>>;
+  accessToken: string;
+  reportProgress: DriveSyncProgress;
+  confirmedMissingAcrossDrive: boolean;
+}): Promise<PreparedDriveArchive> {
+  const { source, status, accessToken, reportProgress } = input;
+  if (
+    !source.recording || source.recordingStatus !== "stored" ||
+    !status.folderId || !status.folderUrl ||
+    status.manifest?.recordingIncluded !== true
+  ) {
+    throw new Error("GOOGLE_DRIVE_RECORDING_REPAIR_SOURCE_INVALID");
+  }
+  const stored = storedGoogleDriveIntegrity(status.manifest.integrity);
+  const files = driveManifestFiles(status.manifest.files);
+  const storedRecording = stored?.artifacts.recording;
+  const storedRecordingId = files ? receiptFileId(files, "recording") : null;
+  if (
+    !stored || stored.status !== "drift" || !files || !storedRecording ||
+    storedRecordingId !== storedRecording.fileId ||
+    storedRecording.size !== source.recording.byteSize ||
+    storedRecording.mimeType !== source.recording.contentType ||
+    storedRecording.fingerprintSource !== "sha256Checksum"
+  ) {
+    throw new Error("GOOGLE_DRIVE_RECORDING_REPAIR_RECEIPT_INVALID");
+  }
+
+  await reportProgress();
+  const candidateFolder = await getDriveFolderById(accessToken, status.folderId);
+  if (
+    candidateFolder.id !== status.folderId ||
+    candidateFolder.mimeType !== FOLDER_MIME_TYPE ||
+    candidateFolder.trashed === true ||
+    candidateFolder.appProperties?.tokyoDogsInterviewSession !== source.sessionId
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+  }
+  const expectedName = `${source.sessionId}_面接録画.${source.recording.contentType.includes("mp4") ? "mp4" : "webm"}`;
+  await reportProgress();
+  const children = await listFolderChildren(accessToken, status.folderId);
+  const activeRecordingCandidates = children.filter((file) =>
+    file.name === expectedName ||
+    ["recording", "legacy_duplicate_recording"].includes(
+      file.appProperties?.tokyoDogsArtifact ?? "",
+    ));
+  if (activeRecordingCandidates.length > 0) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+
+  let oldRecording: DriveFile | null = null;
+  let oldRecordingReadErrorCode: string | null = null;
+  try {
+    oldRecording = await driveJson<DriveFile>(
+      `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(storedRecording.fileId)}` +
+      `?supportsAllDrives=true&fields=${encodeURIComponent("id,name,mimeType,size,sha256Checksum,version,modifiedTime,trashed,parents,appProperties")}`,
+      accessToken,
+    );
+  } catch (error) {
+    const code = safeErrorCode(error);
+    oldRecordingReadErrorCode = code;
+  }
+  const initialBlockCode = recordingReplacementBlockCode({
+    oldRecording,
+    oldReadErrorCode: oldRecordingReadErrorCode,
+    expectedFolderId: status.folderId,
+    confirmedMissingAcrossDrive: input.confirmedMissingAcrossDrive,
+    globalCandidates: null,
+  });
+  if (initialBlockCode) throw new Error(initialBlockCode);
+  if (oldRecordingReadErrorCode) {
+    await reportProgress();
+    const globalCandidates = await listGlobalRecordingCandidates({
+      accessToken,
+      sessionId: source.sessionId,
+    });
+    const globalBlockCode = recordingReplacementBlockCode({
+      oldRecording: null,
+      oldReadErrorCode: oldRecordingReadErrorCode,
+      expectedFolderId: status.folderId,
+      confirmedMissingAcrossDrive: input.confirmedMissingAcrossDrive,
+      globalCandidates,
+    });
+    if (globalBlockCode) throw new Error(globalBlockCode);
+  }
+
+  const storedSmall: GoogleDriveArchiveIntegrity = {
+    ...stored,
+    status: "verified",
+    errorCode: null,
+    artifacts: Object.fromEntries(Object.entries(stored.artifacts)
+      .filter(([key]) => key !== "recording")),
+  };
+  await reportProgress();
+  const observedSmall = await readGoogleDriveArchiveIntegritySnapshot({
+    sessionId: source.sessionId,
+    folderId: status.folderId,
+    files,
+    recordingIncluded: false,
+    previous: storedSmall,
+    accessToken,
+  });
+  if (!verifiedSmallArtifactsUnchanged(storedSmall, observedSmall)) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+
+  const manifestId = receiptFileId(files, "manifest");
+  const manifestFile = children.find((file) => file.id === manifestId);
+  if (!manifestFile || manifestFile.appProperties?.tokyoDogsArtifact !== "manifest") {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const manifestBytes = await readSmallDriveFile({
+    accessToken,
+    file: manifestFile,
+    maximumBytes: 64 * 1024,
+  });
+  let archivedManifest: Record<string, unknown>;
+  try {
+    const decoded = JSON.parse(new TextDecoder().decode(manifestBytes));
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw new Error();
+    archivedManifest = decoded as Record<string, unknown>;
+  } catch {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+  const archivedFiles = driveManifestFiles(archivedManifest.files);
+  if (
+    archivedManifest.sessionId !== source.sessionId ||
+    archivedManifest.folderId !== status.folderId ||
+    archivedManifest.recordingIncluded !== true ||
+    !archivedFiles || receiptFileId(archivedFiles, "recording") !== storedRecording.fileId
+  ) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+  }
+
+  await reportProgress();
+  const root = await validateGoogleDriveRoot(accessToken);
+  if (archivedManifest.rootFolderId !== root.id) {
+    throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
+  }
+  const byArtifact = indexDriveArtifacts(children);
+  const required: DriveArtifactKey[] = [
+    "transcript", "evaluation_json", "report_doc", "report_pdf", "manifest",
+  ];
+  const canonical = Object.fromEntries(required.map((key) => {
+    const expectedId = receiptFileId(files, key);
+    const matches = (byArtifact.get(key) ?? []).filter((file) => file.id === expectedId);
+    if (matches.length !== 1) throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    return [key, matches[0]];
+  })) as Record<Exclude<DriveArtifactKey, "recording">, DriveFile>;
+  const uploaded: GoogleDriveSyncResult["uploaded"] = {
+    transcript: fileSummary(canonical.transcript, canonical.transcript.name || `${source.sessionId}_文字起こし.txt`),
+    evaluation: fileSummary(canonical.evaluation_json, canonical.evaluation_json.name || `${source.sessionId}_評価データ.json`),
+    reportDocument: fileSummary(canonical.report_doc, canonical.report_doc.name || `${source.sessionId}_オンライン一次面接レポート`),
+    reportPdf: fileSummary(canonical.report_pdf, canonical.report_pdf.name || `${source.sessionId}_オンライン一次面接レポート.pdf`),
+    manifest: fileSummary(canonical.manifest, canonical.manifest.name || `${source.sessionId}_格納結果.json`),
+  };
+  const expectedContentHashes: Partial<Record<DriveArtifactKey, string>> = {};
+  const expectedContentSizes: Partial<Record<DriveArtifactKey, number>> = {};
+  for (const key of required) {
+    const receipt = observedSmall.artifacts[key];
+    if (!receipt) throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
+    expectedContentHashes[key] = receipt.contentSha256;
+    // A native Google Doc reports a Drive logical size, whereas integrity
+    // verification hashes its exported plain-text representation. The receipt
+    // does not store that export byte length, so constrain the hash/ID/version
+    // here and leave byte-size comparison to binary/text file artifacts.
+    if (key !== "report_doc" && receipt.size !== null) {
+      expectedContentSizes[key] = receipt.size;
+    }
+  }
+  return {
+    rootFolderId: root.id,
+    expectedParentId: observedSmall.folder.parentId,
+    candidateFolder,
+    folderUrl: status.folderUrl,
+    uploaded,
+    artifactTargetIds: {
+      transcript: canonical.transcript.id,
+      evaluation_json: canonical.evaluation_json.id,
+      report_doc: canonical.report_doc.id,
+      report_pdf: canonical.report_pdf.id,
+      manifest: canonical.manifest.id,
+      recording: null,
+    },
+    transcriptDuplicateId: null,
+    recordingDuplicateProof: null,
+    transcriptAvailable: status.manifest.transcriptAvailable === true,
+    transcriptKind: typeof status.manifest.transcriptKind === "string"
+      ? status.manifest.transcriptKind
+      : "unknown",
+    expectedContentHashes,
+    expectedContentSizes,
+    sharingRisk: observedSmall.sharingRisk === "unknown"
+      ? root.sharingRisk
+      : observedSmall.sharingRisk,
+    recordingRepairHistory: [
+      ...(Array.isArray(status.manifest.recordingRepairHistory)
+        ? status.manifest.recordingRepairHistory.slice(-4).filter((entry) =>
+            entry && typeof entry === "object" && !Array.isArray(entry)) as Array<Record<string, unknown>>
+        : []),
+      {
+        detectedAt: stored.checkedAt,
+        previousFile: files.recording,
+        previousIntegrity: storedRecording,
+        reason: DRIVE_RECORDING_MISSING_CODE,
+      },
+    ],
+  };
 }
 
 /**
@@ -3185,6 +3514,10 @@ function preparedArchiveFromContext(value: Record<string, unknown>): PreparedDri
     expectedContentHashes,
     expectedContentSizes,
     sharingRisk,
+    recordingRepairHistory: Array.isArray(value.recordingRepairHistory)
+      ? value.recordingRepairHistory.slice(-5).filter((entry) =>
+          entry && typeof entry === "object" && !Array.isArray(entry)) as Array<Record<string, unknown>>
+      : undefined,
   };
 }
 
@@ -3203,6 +3536,7 @@ function preparedArchiveContext(prepared: PreparedDriveArchive): Record<string, 
     expectedContentHashes: prepared.expectedContentHashes,
     expectedContentSizes: prepared.expectedContentSizes,
     sharingRisk: prepared.sharingRisk,
+    recordingRepairHistory: prepared.recordingRepairHistory,
   };
 }
 
@@ -3247,6 +3581,7 @@ async function completeSteppedArchive(input: {
       transcriptKind: input.prepared.transcriptKind,
       reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
       integrity: result.integrity,
+      recordingRepairHistory: input.prepared.recordingRepairHistory,
     },
     driveUploadStepLeaseToken: input.leaseToken,
   });
@@ -3264,12 +3599,29 @@ async function completeSteppedArchive(input: {
  * cancellation or browser retry resumes the same Google upload instead of
  * replaying a 70 MB transfer inside one public HTTP request.
  */
-export async function stepInterviewToGoogleDrive(sessionId: string): Promise<GoogleDriveArchiveStepResult> {
+export async function stepInterviewToGoogleDrive(
+  sessionId: string,
+  options: {
+    confirmMissingRecordingAcrossDrive?: boolean;
+    missingRecordingRepairReviewer?: AuthorizedReviewer;
+  } = {},
+): Promise<GoogleDriveArchiveStepResult> {
   if ((await missingGoogleDriveConfiguration()).length > 0) {
     throw new Error("GOOGLE_DRIVE_CONFIGURATION_MISSING");
   }
 
   let current = await getExternalSyncStatus(sessionId);
+  let recordingRepairAuthorized = false;
+  let recordingRepairPrepared: PreparedDriveArchive | null = null;
+  let recordingRepairAccessToken: string | null = null;
+  const durableCompletedRepairAuthorization = current?.status === "completed"
+    ? await hasDurableMissingRecordingRepairAuthorization(sessionId)
+    : false;
+  if (options.confirmMissingRecordingAcrossDrive === true && current?.status !== "completed") {
+    // A second click must not turn into an extra upload-advancing request. The
+    // already authorized fenced repair is advanced by the normal poll path.
+    throw new Error(DRIVE_RECORDING_REPAIR_CONFIRMATION_REQUIRED);
+  }
   if (current?.retryBlockedAt) {
     // A permanent or exhausted failure is a durable operational hold. Never
     // reopen it from candidate polling, staff polling, or cron: doing so caused
@@ -3288,12 +3640,72 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
       throw new Error("INTERVIEW_TRANSCRIPT_NOT_READY_FOR_DRIVE_SYNC");
     }
     if (completedReceiptSatisfiesSource(alreadyCompleted, source)) {
-      if (alreadyCompleted.reportPresentationVersion !== INTERVIEW_REPORT_PRESENTATION_VERSION) {
-        return await refreshCompletedDriveReportPresentation(sessionId, source);
+      // If the worker stopped immediately after consuming the exact grant, the
+      // completed receipt is still the same raw manifest. Do not rewrite its
+      // checkedAt and invalidate that durable proof; the stricter repair
+      // preflight below re-reads Drive, trash, R2, and all five small artifacts.
+      if (!durableCompletedRepairAuthorization) {
+        await revalidateCompletedGoogleDriveArchive(sessionId);
       }
-      await revalidateCompletedGoogleDriveArchive(sessionId);
       const refreshed = await getExternalSyncStatus(sessionId);
-      return refreshed ? completedResultFromStatus(refreshed) ?? alreadyCompleted : alreadyCompleted;
+      const refreshedResult = refreshed ? completedResultFromStatus(refreshed) : null;
+      if (refreshedResult?.integrity?.status === "verified") {
+        if (refreshedResult.reportPresentationVersion !== INTERVIEW_REPORT_PRESENTATION_VERSION) {
+          return await refreshCompletedDriveReportPresentation(sessionId, source);
+        }
+        return refreshedResult;
+      }
+      if (refreshed && completedReceiptNeedsRecordingRepair(refreshed, source)) {
+        // The existing completed receipt remains the immutable repair proof in
+        // manifest_json. Perform every Drive/R2/small-artifact preflight while
+        // the receipt is still completed and before creating or consuming the
+        // one-time authorization. A transient read failure therefore performs
+        // zero Drive writes and cannot strand a consumed grant.
+        assertArchiveReady(source);
+        const accessToken = await fetchGoogleDriveAccessToken();
+        recordingRepairAccessToken = accessToken;
+        recordingRepairPrepared = await prepareRecordingOnlyDriveRepair({
+          source,
+          status: refreshed,
+          accessToken,
+          reportProgress: async () => {},
+          confirmedMissingAcrossDrive: true,
+        });
+        if (durableCompletedRepairAuthorization) {
+          // Resume only the already-consumed grant tied to this exact completed
+          // manifest/old recording ID. This closes the consume→pending crash
+          // window without minting or consuming a second authorization.
+          recordingRepairAuthorized = true;
+        } else {
+          if (
+            options.confirmMissingRecordingAcrossDrive !== true ||
+            typeof options.missingRecordingRepairReviewer !== "string" ||
+            !options.missingRecordingRepairReviewer
+          ) {
+            throw new Error(DRIVE_RECORDING_REPAIR_CONFIRMATION_REQUIRED);
+          }
+          // Authorization is created only after the latest integrity
+          // revalidation and every read-only preflight has succeeded. Its CAS
+          // binds to the current manifest hash, not a stale checkedAt.
+          const authorization = await createMissingRecordingRepairAuthorization({
+            sessionId,
+            reviewer: options.missingRecordingRepairReviewer,
+          });
+          if (!authorization || !await consumeMissingRecordingRepairAuthorization({
+            sessionId,
+            nonce: authorization.nonce,
+          })) {
+            throw new Error(DRIVE_RECORDING_REPAIR_CONFIRMATION_REQUIRED);
+          }
+          recordingRepairAuthorized = true;
+        }
+        await requestExternalSync(sessionId);
+        current = await getExternalSyncStatus(sessionId);
+      } else {
+        throw new Error(refreshedResult?.integrity?.status === "unknown"
+          ? "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_UNCONFIRMED"
+          : "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT");
+      }
     }
 
     // A legacy completed row can describe a five-file archive created before
@@ -3379,8 +3791,22 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
           totalBytes: adopted.totalBytes,
         });
       }
-      const accessToken = await fetchGoogleDriveAccessToken();
-      const prepared = await prepareDriveArchive(source, accessToken, reportProgress);
+      const accessToken = recordingRepairAccessToken ??
+        await fetchGoogleDriveAccessToken();
+      const recordingOnlyRepair = Boolean(current && completedReceiptNeedsRecordingRepair(current, source));
+      if (recordingOnlyRepair && !recordingRepairAuthorized) {
+        recordingRepairAuthorized =
+          await hasDurableMissingRecordingRepairAuthorization(sessionId);
+      }
+      const prepared = recordingOnlyRepair
+        ? recordingRepairPrepared ?? await prepareRecordingOnlyDriveRepair({
+            source,
+            status: current as NonNullable<Awaited<ReturnType<typeof getExternalSyncStatus>>>,
+            accessToken,
+            reportProgress,
+            confirmedMissingAcrossDrive: recordingRepairAuthorized,
+          })
+        : await prepareDriveArchive(source, accessToken, reportProgress);
       if (!source.recording) {
         const result = await finalizeDriveArchive(source, accessToken, prepared, null, reportProgress);
         await completeExternalSync({
@@ -3395,6 +3821,7 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
             transcriptKind: prepared.transcriptKind,
             reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
             integrity: result.integrity,
+            recordingRepairHistory: prepared.recordingRepairHistory,
           },
         });
         return result;
@@ -3424,20 +3851,39 @@ export async function stepInterviewToGoogleDrive(sessionId: string): Promise<Goo
             transcriptKind: prepared.transcriptKind,
             reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
             integrity: result.integrity,
+            recordingRepairHistory: prepared.recordingRepairHistory,
           },
         });
         return retryRequested ? { ...result, status: "pending" } : result;
       }
       const extension = source.recording.contentType.includes("mp4") ? "mp4" : "webm";
       const recordingName = `${source.sessionId}_面接録画.${extension}`;
-      const uploadLocation = await initiateRecordingUpload({
-        accessToken,
-        folderId: prepared.candidateFolder.id,
-        name: recordingName,
-        contentType: source.recording.contentType,
-        byteSize: source.recording.byteSize,
-        targetFileId: prepared.artifactTargetIds.recording,
-      });
+      let uploadLocation: string;
+      try {
+        uploadLocation = await initiateRecordingUpload({
+          accessToken,
+          folderId: prepared.candidateFolder.id,
+          name: recordingName,
+          contentType: source.recording.contentType,
+          byteSize: source.recording.byteSize,
+          sessionId: source.sessionId,
+          targetFileId: prepared.artifactTargetIds.recording,
+        });
+      } catch (error) {
+        const code = safeErrorCode(error);
+        if (
+          recordingOnlyRepair &&
+          (/^GOOGLE_DRIVE_RESUMABLE_INIT_(?:429|500|502|503|504|524)$/.test(code) ||
+            code === "GOOGLE_DRIVE_SYNC_FAILED")
+        ) {
+          // A timeout/5xx after the repair's first POST cannot prove whether
+          // Google created a resumable session. Do not issue another INIT from
+          // candidate or cron polling; hold for one explicit staff retry, whose
+          // strict preflight rechecks Drive-wide active/trash candidates first.
+          throw new Error("GOOGLE_DRIVE_RECORDING_REPAIR_INIT_UNCONFIRMED");
+        }
+        throw error;
+      }
       const encrypted = await encryptGoogleDriveUploadCapability(uploadLocation, sessionId);
       step = await initializeDriveUploadStep({
         sessionId,

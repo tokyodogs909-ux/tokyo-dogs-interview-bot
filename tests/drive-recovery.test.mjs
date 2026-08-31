@@ -4,6 +4,7 @@ import {
   isVerifiedInterviewArchive,
   planDriveRecovery,
   planRecordingRecovery,
+  recordingReplacementBlockCode,
   summarizeDriveArchives,
 } from "../lib/drive-recovery.js";
 import { decideExternalSyncFailure } from "../lib/drive-retry-policy.js";
@@ -26,6 +27,55 @@ test("Drive retry policy blocks 404 immediately and caps transient retries", () 
     blocked: false,
     nextRetryAt: "2026-08-03T06:10:00.000Z",
   });
+});
+
+test("recording replacement stays fail-closed for ambiguous, moved, trashed, and denied reads", () => {
+  const base = {
+    oldRecording: null,
+    expectedFolderId: "candidate-folder",
+    confirmedMissingAcrossDrive: false,
+    globalCandidates: null,
+  };
+  assert.equal(recordingReplacementBlockCode({
+    ...base,
+    oldReadErrorCode: "GOOGLE_DRIVE_API_404",
+  }), "GOOGLE_DRIVE_RECORDING_REPAIR_CONFIRMATION_REQUIRED");
+  assert.equal(recordingReplacementBlockCode({
+    ...base,
+    oldReadErrorCode: "GOOGLE_DRIVE_API_410",
+  }), "GOOGLE_DRIVE_RECORDING_REPAIR_CONFIRMATION_REQUIRED");
+  assert.equal(recordingReplacementBlockCode({
+    ...base,
+    oldReadErrorCode: "GOOGLE_DRIVE_API_403",
+  }), "GOOGLE_DRIVE_API_403");
+  assert.equal(recordingReplacementBlockCode({
+    ...base,
+    oldReadErrorCode: null,
+    oldRecording: { trashed: true, parents: ["candidate-folder"] },
+  }), "GOOGLE_DRIVE_ARCHIVE_RECORDING_TRASHED_RESTORE_REQUIRED");
+  assert.equal(recordingReplacementBlockCode({
+    ...base,
+    oldReadErrorCode: null,
+    oldRecording: { trashed: false, parents: ["other-folder"] },
+  }), "GOOGLE_DRIVE_ARCHIVE_RECORDING_MOVED_MANUAL_ATTENTION");
+  assert.equal(recordingReplacementBlockCode({
+    ...base,
+    oldReadErrorCode: "GOOGLE_DRIVE_API_404",
+    confirmedMissingAcrossDrive: true,
+    globalCandidates: [{ trashed: false }],
+  }), "GOOGLE_DRIVE_ARCHIVE_RECORDING_MOVED_MANUAL_ATTENTION");
+  assert.equal(recordingReplacementBlockCode({
+    ...base,
+    oldReadErrorCode: "GOOGLE_DRIVE_API_404",
+    confirmedMissingAcrossDrive: true,
+    globalCandidates: [{ trashed: true }],
+  }), "GOOGLE_DRIVE_ARCHIVE_RECORDING_TRASHED_RESTORE_REQUIRED");
+  assert.equal(recordingReplacementBlockCode({
+    ...base,
+    oldReadErrorCode: "GOOGLE_DRIVE_API_404",
+    confirmedMissingAcrossDrive: true,
+    globalCandidates: [],
+  }), null);
 });
 
 function interview(sessionId, patch = {}) {
@@ -67,6 +117,31 @@ test("Drive recovery repairs completed camera archives that omitted a now-stored
     interview("TD-UPLOAD-IN-PROGRESS", { recordingStatus: "uploading", driveRecordingIncluded: false }),
   ];
   assert.deepEqual(planDriveRecovery(items, now), ["TD-VIDEO-MISSING"]);
+});
+
+test("Drive recovery never auto-reopens a completed archive whose recording disappeared", () => {
+  const items = [
+    interview("TD-VIDEO-DRIFT", {
+      driveIntegrityStatus: "drift",
+      driveAlertCode: "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING",
+    }),
+    interview("TD-TEXT-DRIFT", {
+      recordingStatus: "not_applicable",
+      driveRecordingIncluded: false,
+      driveIntegrityStatus: "drift",
+    }),
+    interview("TD-OTHER-DRIFT", {
+      driveIntegrityStatus: "drift",
+      driveAlertCode: "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT",
+    }),
+    interview("TD-VIDEO-UNKNOWN", { driveIntegrityStatus: "unknown" }),
+    interview("TD-VIDEO-DRIFT-BLOCKED", {
+      driveIntegrityStatus: "drift",
+      driveAlertCode: "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING",
+      driveRetryBlockedAt: "2026-08-03T05:10:00.000Z",
+    }),
+  ];
+  assert.deepEqual(planDriveRecovery(items, now), []);
 });
 
 test("Drive recovery repairs a legacy transcript receipt only when the durable source is actual", () => {

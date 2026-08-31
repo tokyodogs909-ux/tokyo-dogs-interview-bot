@@ -706,6 +706,66 @@ class FakeD1Statement {
         sync.manifest_json = manifestJson;
         changes = 1;
       }
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_operational_alerts") &&
+      this.sql.includes("'google_drive_archive_integrity'")
+    ) {
+      const [sessionId, severity, code, firstSeenAt, lastSeenAt, createdAt, updatedAt,
+        syncSessionId, completedAt, manifestJson] = this.values;
+      const sync = this.database.externalSyncs.get(syncSessionId);
+      if (
+        sessionId === syncSessionId && sync?.status === "completed" &&
+        sync.completed_at === completedAt && sync.manifest_json === manifestJson
+      ) {
+        const existing = this.database.operationalAlerts.get(sessionId);
+        this.database.operationalAlerts.set(sessionId, {
+          session_id: sessionId,
+          alert_type: "google_drive_archive_integrity",
+          severity,
+          status: "open",
+          code,
+          first_seen_at: existing?.first_seen_at ?? firstSeenAt,
+          last_seen_at: lastSeenAt,
+          occurrence_count: (existing?.occurrence_count ?? 0) + 1,
+          resolved_at: null,
+          created_at: existing?.created_at ?? createdAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("UPDATE interview_operational_alerts SET") &&
+      this.sql.includes("alert_type = 'google_drive_archive_integrity'")
+    ) {
+      const [resolvedAt, updatedAt, sessionId, syncSessionId, completedAt, manifestJson] = this.values;
+      const alert = this.database.operationalAlerts.get(sessionId);
+      const sync = this.database.externalSyncs.get(syncSessionId);
+      if (
+        alert?.alert_type === "google_drive_archive_integrity" &&
+        sync?.status === "completed" && sync.completed_at === completedAt &&
+        sync.manifest_json === manifestJson
+      ) {
+        Object.assign(alert, { status: "resolved", resolved_at: alert.resolved_at ?? resolvedAt, updated_at: updatedAt });
+        changes = 1;
+      }
+    } else if (
+      this.sql.startsWith("UPDATE interview_operational_alerts SET") &&
+      this.sql.includes("alert_type IN")
+    ) {
+      const [resolvedAt, updatedAt, sessionId, syncSessionId, expectedStartedAt] = this.values;
+      const alert = this.database.operationalAlerts.get(sessionId);
+      const sync = this.database.externalSyncs.get(syncSessionId);
+      if (
+        alert && ["google_drive_save_failure", "google_drive_archive_integrity"].includes(alert.alert_type) &&
+        sync?.status === "completed" && sync.started_at === expectedStartedAt
+      ) {
+        Object.assign(alert, {
+          status: "resolved",
+          resolved_at: resolvedAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
     } else if (this.sql.startsWith("UPDATE interview_external_syncs SET updated_at")) {
       const [updatedAt, sessionId, expectedStartedAt] = this.values;
       const sync = this.database.externalSyncs.get(sessionId);
@@ -1496,11 +1556,58 @@ class FakeD1Statement {
         created_at: new Date().toISOString(),
         session_id: sessionId,
       });
+    } else if (this.sql.startsWith("INSERT INTO interview_drive_recording_repair_authorizations")) {
+      const [sessionId, nonceHash, oldFileId, archiveCompletedAt, manifestSha256,
+        reviewerName, expiresAt, createdAt, syncSessionId, syncCompletedAt,
+        syncManifestJson] = this.values;
+      const sync = this.database.externalSyncs.get(syncSessionId);
+      const current = this.database.driveRecordingRepairAuthorizations.get(sessionId);
+      const exactCompletedSnapshot = sessionId === syncSessionId &&
+        sync?.status === "completed" && sync.completed_at === syncCompletedAt &&
+        sync.manifest_json === syncManifestJson;
+      const replaceable = !current || current.consumed_at === null ||
+        current.manifest_sha256 !== manifestSha256 ||
+        current.archive_completed_at !== archiveCompletedAt ||
+        current.old_file_id !== oldFileId;
+      if (exactCompletedSnapshot && replaceable) {
+        this.database.driveRecordingRepairAuthorizations.set(sessionId, {
+          session_id: sessionId,
+          nonce_hash: nonceHash,
+          old_file_id: oldFileId,
+          archive_completed_at: archiveCompletedAt,
+          manifest_sha256: manifestSha256,
+          reviewer_name: reviewerName,
+          expires_at: expiresAt,
+          consumed_at: null,
+          created_at: createdAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("UPDATE interview_drive_recording_repair_authorizations SET consumed_at")) {
+      const [consumedAt, sessionId, nonceHash, comparedAt, archiveCompletedAt,
+        manifestSha256, syncSessionId, syncCompletedAt, syncManifestJson] = this.values;
+      const authorization = this.database.driveRecordingRepairAuthorizations.get(sessionId);
+      const sync = this.database.externalSyncs.get(syncSessionId);
+      if (authorization && authorization.nonce_hash === nonceHash &&
+        authorization.consumed_at === null && authorization.expires_at > comparedAt &&
+        authorization.archive_completed_at === archiveCompletedAt &&
+        authorization.manifest_sha256 === manifestSha256 &&
+        sync?.status === "completed" && sync.completed_at === syncCompletedAt &&
+        sync.manifest_json === syncManifestJson) {
+        authorization.consumed_at = consumedAt;
+        changes = 1;
+        if (this.database.throwAfterRepairAuthorizationConsume) {
+          this.database.throwAfterRepairAuthorizationConsume = false;
+          throw new Error("synthetic crash after repair authorization consume");
+        }
+      }
     } else if (this.sql.startsWith("INSERT INTO interview_staff_audit_events")) {
       const [, reviewerName, detailJson] = this.values;
+      const eventType = this.sql.match(/VALUES \(\?, \?, '([^']+)'/)?.[1] ??
+        "interview_list_opened";
       this.database.staffAuditEvents.push({
         reviewer_name: reviewerName,
-        event_type: "interview_list_opened",
+        event_type: eventType,
         detail_json: detailJson,
         created_at: new Date().toISOString(),
       });
@@ -1534,6 +1641,37 @@ class FakeD1Statement {
   }
 
   async first() {
+    if (this.sql.startsWith("SELECT manifest_json, completed_at FROM interview_external_syncs")) {
+      const sync = this.database.externalSyncs.get(this.values[0]);
+      if (!sync || sync.status !== "completed" || !sync.completed_at) return null;
+      if (this.sql.includes("GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING")) {
+        const manifest = JSON.parse(sync.manifest_json ?? "null");
+        if (manifest?.recordingIncluded !== true ||
+          manifest?.integrity?.status !== "drift" ||
+          manifest?.integrity?.errorCode !== "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING" ||
+          manifest?._integrityCheck) return null;
+      }
+      return { manifest_json: sync.manifest_json, completed_at: sync.completed_at };
+    }
+    if (this.sql.startsWith("SELECT nonce_hash, old_file_id")) {
+      return this.database.driveRecordingRepairAuthorizations.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT old_file_id, archive_completed_at")) {
+      const authorization = this.database.driveRecordingRepairAuthorizations.get(this.values[0]);
+      if (!authorization) return null;
+      return {
+        old_file_id: authorization.old_file_id,
+        archive_completed_at: authorization.archive_completed_at,
+        manifest_sha256: authorization.manifest_sha256,
+        consumed_at: authorization.consumed_at,
+      };
+    }
+    if (this.sql.startsWith("SELECT status, manifest_json, completed_at FROM interview_external_syncs")) {
+      const sync = this.database.externalSyncs.get(this.values[0]);
+      return sync && ["completed", "pending", "running", "failed"].includes(sync.status)
+        ? { status: sync.status, manifest_json: sync.manifest_json, completed_at: sync.completed_at }
+        : null;
+    }
     if (this.sql.startsWith("SELECT EXISTS (SELECT 1 FROM interview_audit_events hold") &&
       this.sql.includes("AS transcription_gap")) {
       const sessionId = this.values[0];
@@ -2238,6 +2376,9 @@ class FakeD1Statement {
             }
             return manifest.transcriptAvailable !== true || manifest.transcriptKind !== "actual_transcript" ||
               (session.recording_status === "stored" && manifest.recordingIncluded !== true) ||
+              (session.recording_status === "stored" &&
+                manifest.integrity?.status === "drift" &&
+                manifest.integrity?.errorCode === "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING") ||
               (Number(includeIntegrityRecheck) === 1 && (
                 typeof manifest.integrity?.checkedAt !== "string" ||
                 manifest.integrity.checkedAt <= integrityBefore
@@ -2253,7 +2394,10 @@ class FakeD1Statement {
               let manifest = {};
               try { manifest = JSON.parse(sync?.manifest_json ?? "{}"); } catch {}
               const incomplete = manifest.transcriptAvailable !== true || manifest.transcriptKind !== "actual_transcript" ||
-                (session.recording_status === "stored" && manifest.recordingIncluded !== true);
+                (session.recording_status === "stored" && manifest.recordingIncluded !== true) ||
+                (session.recording_status === "stored" &&
+                  manifest.integrity?.status === "drift" &&
+                  manifest.integrity?.errorCode === "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING");
               return incomplete ? 3 : 4;
             };
             return priority(leftSync, left) - priority(rightSync, right) ||
@@ -2285,6 +2429,7 @@ class FakeD1Statement {
           .slice(0, limit)
           .map((session) => {
             const sync = this.database.externalSyncs.get(session.id);
+            const alert = this.database.operationalAlerts.get(session.id);
             return {
               id: session.id,
               candidate_name: session.candidate_name,
@@ -2303,6 +2448,14 @@ class FakeD1Statement {
               drive_folder_url: sync?.folder_url ?? null,
               drive_updated_at: sync?.updated_at ?? null,
               drive_manifest_json: sync?.manifest_json ?? null,
+              drive_failure_count: sync?.failure_count ?? 0,
+              drive_next_retry_at: sync?.next_retry_at ?? null,
+              drive_retry_blocked_at: sync?.retry_blocked_at ?? null,
+              drive_retry_block_reason: sync?.retry_block_reason ?? null,
+              drive_alert_status: alert?.status ?? null,
+              drive_alert_severity: alert?.severity ?? null,
+              drive_alert_code: alert?.code ?? null,
+              drive_alert_last_seen_at: alert?.last_seen_at ?? null,
             };
           }),
       };
@@ -2371,7 +2524,9 @@ class FakeD1 {
     this.invites = new Map();
     this.publicEntries = [];
     this.externalSyncs = new Map();
+    this.operationalAlerts = new Map();
     this.driveUploadSteps = new Map();
+    this.driveRecordingRepairAuthorizations = new Map();
     this.driveHierarchyNodes = new Map();
     this.evaluationClaims = new Map();
     this.transcriptDrafts = new Map();
@@ -2382,6 +2537,7 @@ class FakeD1 {
     this.externalHeartbeatCount = 0;
     this.beforeExternalSyncComplete = null;
     this.beforeDriveUploadStepDelete = null;
+    this.throwAfterRepairAuthorizationConsume = false;
   }
 
   prepare(sql) {
@@ -4432,6 +4588,9 @@ test("candidate archive fails closed before writes for a mismatched transcript d
   let replacedRecordingUploadLocation = false;
   let recordingCommittedBytes = 0;
   let recordingDataPutsThisApiCall = 0;
+  const deletedRecordingIds = new Set();
+  let injectRepairGlobalSearchFailure = false;
+  let injectRepairUploadInitiationFailure = false;
   try {
     globalThis.fetch = async (url, init = {}) => {
       const href = String(url);
@@ -4465,18 +4624,33 @@ test("candidate archive fails closed before writes for a mismatched transcript d
           permissions: [{ type: "anyone", role: "writer", allowFileDiscovery: false }],
         });
       }
+      if ([...deletedRecordingIds].some((id) => href.includes(`/drive/v3/files/${id}?`))) {
+        return Response.json({ error: { code: 404 } }, { status: 404 });
+      }
       const createdFolder = createdFolderFiles.find((folder) =>
         href.includes(`/drive/v3/files/${folder.id}?`));
       if (createdFolder) return Response.json(createdFolder);
       if (href.startsWith("https://www.googleapis.com/drive/v3/files?") && init.method !== "POST") {
         const query = new URL(href).searchParams.get("q") ?? "";
         const isFolderChildrenReadback = query === "'folder-3' in parents and trashed = false";
+        const isGlobalRecordingSearch = query.includes(session.sessionId) &&
+          (query.includes("mimeType contains 'video/'") ||
+            query.includes("tokyoDogsArtifact") && query.includes("recording"));
+        const searchTrashed = query.includes("trashed = true");
         const parentId = query.match(/^'([^']+)' in parents/)?.[1];
         const property = query.match(/appProperties has \{ key='([^']+)' and value='([^']+)' \}/);
         folderListDebug.push({ query, uploadedCount: uploadedDriveFiles.length, isFolderChildrenReadback });
+        if (isGlobalRecordingSearch && injectRepairGlobalSearchFailure) {
+          injectRepairGlobalSearchFailure = false;
+          return Response.json({ error: { code: 503 } }, { status: 503 });
+        }
         return Response.json({
           files: isFolderChildrenReadback
             ? [...uploadedDriveFiles, legacyDuplicateFile, ...blockingDriveFiles]
+            : isGlobalRecordingSearch
+              ? uploadedDriveFiles.filter((file) =>
+                  file.appProperties?.tokyoDogsArtifact === "recording" &&
+                  (file.trashed === true) === searchTrashed)
             : createdFolderFiles.filter((folder) =>
                 folder.parents?.includes(parentId) &&
                 (!property || folder.appProperties?.[property[1]] === property[2])),
@@ -4565,6 +4739,10 @@ test("candidate archive fails closed before writes for a mismatched transcript d
         });
       }
       if (href.includes("uploadType=resumable")) {
+        if (injectRepairUploadInitiationFailure) {
+          injectRepairUploadInitiationFailure = false;
+          return Response.json({ error: { code: 503 } }, { status: 503 });
+        }
         const metadata = JSON.parse(String(init.body));
         recordingMetadata = metadata;
         uploadedNames.push(metadata.name);
@@ -4946,6 +5124,339 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     assert.equal(recordingDataPutsThisApiCall, 0);
     assert.equal(uploadedNames.length + recordingUploadRanges.length + createdFolders.length, driveCallsBeforeIdempotentRead,
       "a current completed receipt must be an exact D1 readback, not another Drive write");
+
+    // If a previously verified recording later disappears, candidate polling
+    // detects and alerts but must not interpret an ambiguous Drive 404 as proof
+    // of deletion. Only an authenticated, one-time staff confirmation may
+    // reopen the recording-only resumable upload.
+    const beforeDeletionReceipt = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    beforeDeletionReceipt.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+    database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(beforeDeletionReceipt);
+    const deletedRecordingIndex = uploadedDriveFiles.findIndex((file) =>
+      file.appProperties?.tokyoDogsArtifact === "recording");
+    assert.notEqual(deletedRecordingIndex, -1);
+    const [deletedRecording] = uploadedDriveFiles.splice(deletedRecordingIndex, 1);
+    deletedRecordingIds.add(deletedRecording.id);
+    recordingCommittedBytes = 0;
+    recordingUploadFinished = false;
+    replacedRecordingUploadLocation = false;
+    const repairArtifactRequestsBefore = artifactUploadRequests.length;
+    const repairUploadedNamesBefore = uploadedNames.length;
+    const repairRangesBefore = recordingUploadRanges.length;
+    const immutableArtifactsBeforeRepair = uploadedDriveFiles
+      .filter((file) => [
+        "transcript", "evaluation_json", "report_doc", "report_pdf",
+      ].includes(file.appProperties?.tokyoDogsArtifact))
+      .map((file) => ({
+        id: file.id,
+        artifact: file.appProperties.tokyoDogsArtifact,
+        version: file.version,
+        size: file.size,
+        body: file.body ? Buffer.from(file.body).toString("base64") : null,
+      }));
+
+    recordingDataPutsThisApiCall = 0;
+    const mutationsBeforeCandidateDetection = uploadedNames.length +
+      recordingUploadRanges.length + artifactUploadRequests.length + createdFolders.length;
+    const candidateDetection = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    const candidateDetectionPayload = await candidateDetection.json();
+    assert.equal(candidateDetection.status, 409, JSON.stringify({
+      candidateDetectionPayload,
+      sync: database.externalSyncs.get(session.sessionId),
+      alert: database.operationalAlerts.get(session.sessionId),
+      files: uploadedDriveFiles.map((file) => ({
+        id: file.id,
+        artifact: file.appProperties?.tokyoDogsArtifact,
+        version: file.version,
+        size: file.size,
+      })),
+    }));
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
+    assert.equal(database.driveUploadSteps.has(session.sessionId), false);
+    assert.equal(uploadedNames.length + recordingUploadRanges.length +
+      artifactUploadRequests.length + createdFolders.length,
+    mutationsBeforeCandidateDetection,
+    "ambiguous 404 detection must perform zero Drive mutations");
+    const preAuthorizationInbox = await request("/api/staff/interviews?poll=1", {
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+      },
+    }, env);
+    const preAuthorizationInboxPayload = await preAuthorizationInbox.json();
+    assert.equal(preAuthorizationInbox.status, 200, JSON.stringify(preAuthorizationInboxPayload));
+    assert.deepEqual(preAuthorizationInboxPayload.driveRecoverySessionIds, [],
+      "a completed archive with a later missing recording must never enter automatic recovery");
+
+    // A transient failure during the Drive-wide read-only preflight must not
+    // consume authority, reopen D1, or perform any Drive mutation. The same
+    // explicit staff action can then be retried safely.
+    injectRepairGlobalSearchFailure = true;
+    const mutationsBeforeFailedRepairPreflight = uploadedNames.length +
+      recordingUploadRanges.length + artifactUploadRequests.length + createdFolders.length;
+    const failedRepairPreflight = await request("/api/staff/google-drive/sync", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        confirmMissingRecordingAcrossDrive: true,
+      }),
+    }, env);
+    assert.equal(failedRepairPreflight.status, 502);
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
+    assert.equal(database.driveRecordingRepairAuthorizations.has(session.sessionId), false,
+      "read-only preflight failure must happen before authorization creation/consumption");
+    assert.equal(uploadedNames.length + recordingUploadRanges.length +
+      artifactUploadRequests.length + createdFolders.length,
+    mutationsBeforeFailedRepairPreflight,
+    "a transient repair preflight failure must perform zero Drive mutations");
+
+    // Force the next staff request past the integrity cooldown. Success proves
+    // that authorization binds to the post-revalidation manifest hash rather
+    // than the stale checkedAt that existed when the action began.
+    const staleRepairSync = database.externalSyncs.get(session.sessionId);
+    const staleRepairManifest = JSON.parse(staleRepairSync.manifest_json);
+    staleRepairManifest.integrity.checkedAt = "2026-07-01T00:00:00.000Z";
+    staleRepairSync.manifest_json = JSON.stringify(staleRepairManifest);
+    database.throwAfterRepairAuthorizationConsume = true;
+    const mutationsBeforeConsumeCrash = uploadedNames.length +
+      recordingUploadRanges.length + artifactUploadRequests.length + createdFolders.length;
+    const consumeCrash = await request("/api/staff/google-drive/sync", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        confirmMissingRecordingAcrossDrive: true,
+      }),
+    }, env);
+    assert.equal(consumeCrash.status, 502);
+    const durableAuthorization = database.driveRecordingRepairAuthorizations.get(session.sessionId);
+    assert.ok(durableAuthorization?.consumed_at,
+      "successful preflight must durably consume the exact repair authorization");
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "completed",
+      "a crash immediately after consume leaves the immutable completed receipt in place");
+    assert.equal(database.driveUploadSteps.has(session.sessionId), false);
+    assert.equal(uploadedNames.length + recordingUploadRanges.length +
+      artifactUploadRequests.length + createdFolders.length,
+    mutationsBeforeConsumeCrash,
+    "consume-to-pending crash must perform zero Drive mutations");
+
+    // The exact consumed grant resumes completed→pending after a fresh strict
+    // preflight. A 503 from the first resumable INIT is outcome-unknown and must
+    // then stop automatically instead of replaying the POST.
+    injectRepairUploadInitiationFailure = true;
+    const mutationsBeforeUnconfirmedInit = uploadedNames.length + recordingUploadRanges.length +
+      artifactUploadRequests.length + createdFolders.length;
+    const unconfirmedInit = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.equal(unconfirmedInit.status, 502);
+    const heldRepair = database.externalSyncs.get(session.sessionId);
+    assert.equal(heldRepair.status, "failed");
+    assert.equal(heldRepair.error_code, "GOOGLE_DRIVE_RECORDING_REPAIR_INIT_UNCONFIRMED");
+    assert.ok(heldRepair.retry_blocked_at,
+      "an outcome-unknown repair INIT must require one explicit staff retry");
+    assert.equal(uploadedNames.length + recordingUploadRanges.length +
+      artifactUploadRequests.length + createdFolders.length,
+    mutationsBeforeUnconfirmedInit,
+    "an unconfirmed resumable INIT must not be treated as a stored Drive mutation");
+
+    const mutationsBeforeBlockedPoll = uploadedNames.length + recordingUploadRanges.length +
+      artifactUploadRequests.length + createdFolders.length;
+    const blockedCandidatePoll = await request("/api/interviews/archive", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    assert.equal(blockedCandidatePoll.status, 502);
+    assert.equal(uploadedNames.length + recordingUploadRanges.length +
+      artifactUploadRequests.length + createdFolders.length,
+    mutationsBeforeBlockedPoll,
+    "candidate/cron polling must never replay an outcome-unknown INIT");
+
+    // The retry endpoint consumes no new authority. If the UI or a stale tab
+    // sends the confirmation flag again, reject it before releasing the hold;
+    // otherwise the step API would see pending state and leave an unintended
+    // candidate/cron retry window after returning an error.
+    const heldAtBeforeDuplicateRetryConfirmation = heldRepair.retry_blocked_at;
+    const mutationsBeforeDuplicateRetryConfirmation = uploadedNames.length +
+      recordingUploadRanges.length + artifactUploadRequests.length + createdFolders.length;
+    const duplicateRetryConfirmation = await request("/api/staff/google-drive/retry", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        confirmMissingRecordingAcrossDrive: true,
+      }),
+    }, env);
+    assert.equal(duplicateRetryConfirmation.status, 409);
+    const stillHeldAfterDuplicateRetryConfirmation = database.externalSyncs.get(session.sessionId);
+    assert.equal(stillHeldAfterDuplicateRetryConfirmation.status, "failed");
+    assert.equal(
+      stillHeldAfterDuplicateRetryConfirmation.retry_blocked_at,
+      heldAtBeforeDuplicateRetryConfirmation,
+      "a duplicate confirmation must leave the durable manual hold untouched",
+    );
+    assert.equal(uploadedNames.length + recordingUploadRanges.length +
+      artifactUploadRequests.length + createdFolders.length,
+    mutationsBeforeDuplicateRetryConfirmation,
+    "a duplicate retry confirmation must perform zero Drive mutations");
+
+    // One authenticated staff retry releases the hold. The durable exact grant
+    // triggers the same Drive-wide/trash/5-artifact preflight before a new INIT.
+    const repairStarted = await request("/api/staff/google-drive/retry", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    }, env);
+    const repairStartedPayload = await repairStarted.json();
+    assert.equal(repairStarted.status, 200, JSON.stringify({
+      repairStartedPayload,
+      sync: database.externalSyncs.get(session.sessionId),
+    }));
+    assert.equal(repairStartedPayload.result?.status, "pending");
+    assert.equal(repairStartedPayload.result?.phase, "uploading");
+    assert.equal(recordingDataPutsThisApiCall, 0,
+      "the detection request persists the resumable upload before sending media");
+    const mutationsBeforeDuplicateAuthorization = uploadedNames.length +
+      recordingUploadRanges.length + artifactUploadRequests.length + createdFolders.length;
+    const duplicateAuthorization = await request("/api/staff/google-drive/sync", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        confirmMissingRecordingAcrossDrive: true,
+      }),
+    }, env);
+    assert.equal(duplicateAuthorization.status, 409);
+    assert.equal(uploadedNames.length + recordingUploadRanges.length +
+      artifactUploadRequests.length + createdFolders.length,
+    mutationsBeforeDuplicateAuthorization,
+    "a second or stale staff authorization must not open another Drive upload");
+    const missingRecordingAlert = database.operationalAlerts.get(session.sessionId);
+    assert.equal(missingRecordingAlert?.alert_type, "google_drive_archive_integrity");
+    assert.equal(missingRecordingAlert?.severity, "critical");
+    assert.equal(missingRecordingAlert?.status, "open");
+    assert.equal(missingRecordingAlert?.code, "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING");
+    assert.equal(missingRecordingAlert?.resolved_at, null);
+    const staffInbox = await request("/api/staff/interviews?poll=1", {
+      headers: {
+        Authorization: "Bearer staff-review-secret",
+        "X-Interview-Reviewer": encodeURIComponent("テスト採用担当"),
+      },
+    }, env);
+    const staffInboxPayload = await staffInbox.json();
+    assert.equal(staffInbox.status, 200, JSON.stringify(staffInboxPayload));
+    const staffTarget = staffInboxPayload.interviews.find((item) =>
+      item.sessionId === session.sessionId);
+    assert.equal(staffTarget?.driveAlertStatus, "open");
+    assert.equal(staffTarget?.driveAlertSeverity, "critical");
+    assert.equal(staffTarget?.driveAlertCode, "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING");
+    assert.equal(staffInboxPayload.archiveHealth.openAlerts, 1);
+    assert.deepEqual(staffInboxPayload.driveRecoverySessionIds, [session.sessionId],
+      "after one-time authorization, the running resumable step may be advanced safely");
+
+    let repairedPayload = { stored: false };
+    for (let call = 0; call < 22 && !repairedPayload.stored; call += 1) {
+      recordingDataPutsThisApiCall = 0;
+      const response = await request("/api/interviews/archive", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ sessionId: session.sessionId }),
+      }, env);
+      repairedPayload = await response.json();
+      assert.equal(response.status, 200, JSON.stringify({
+        repairedPayload,
+        sync: database.externalSyncs.get(session.sessionId),
+        step: database.driveUploadSteps.get(session.sessionId),
+        repairArtifactRequests: artifactUploadRequests.slice(repairArtifactRequestsBefore),
+        activeFiles: uploadedDriveFiles.map((file) => ({
+          id: file.id,
+          artifact: file.appProperties?.tokyoDogsArtifact,
+          version: file.version,
+          size: file.size,
+        })),
+      }));
+      assert.ok(recordingDataPutsThisApiCall <= 1);
+    }
+    assert.equal(repairedPayload.stored, true);
+    assert.equal(repairedPayload.recordingIncluded, true);
+    assert.equal(recordingUploadFinished, true);
+    const repairArtifactRequests = artifactUploadRequests.slice(repairArtifactRequestsBefore);
+    assert.deepEqual(repairArtifactRequests.map((call) => call.artifact), ["manifest"],
+      "recording-only repair may update the manifest but none of the four review artifacts or transcript");
+    assert.equal(repairArtifactRequests[0].method, "PATCH");
+    assert.deepEqual(uploadedNames.slice(repairUploadedNamesBefore), [
+      `${session.sessionId}_面接録画.webm`,
+      `${session.sessionId}_格納結果.json`,
+    ]);
+    assert.ok(recordingUploadRanges.length > repairRangesBefore);
+    assert.equal(uploadedDriveFiles.filter((file) =>
+      file.appProperties?.tokyoDogsArtifact === "recording").length, 1,
+    "replacement must converge to one active recording");
+    const immutableArtifactsAfterRepair = uploadedDriveFiles
+      .filter((file) => [
+        "transcript", "evaluation_json", "report_doc", "report_pdf",
+      ].includes(file.appProperties?.tokyoDogsArtifact))
+      .map((file) => ({
+        id: file.id,
+        artifact: file.appProperties.tokyoDogsArtifact,
+        version: file.version,
+        size: file.size,
+        body: file.body ? Buffer.from(file.body).toString("base64") : null,
+      }));
+    assert.deepEqual(immutableArtifactsAfterRepair, immutableArtifactsBeforeRepair,
+      "recording repair must preserve the IDs, versions, sizes, and bodies of all review artifacts");
+    const repairedReceipt = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    const activeRecording = uploadedDriveFiles.find((file) =>
+      file.appProperties?.tokyoDogsArtifact === "recording");
+    assert.ok(activeRecording);
+    assert.notEqual(activeRecording.id, deletedRecording.id);
+    assert.equal(repairedReceipt.files.recording.id, activeRecording.id);
+    assert.equal(repairedReceipt.integrity.artifacts.recording.fileId, activeRecording.id);
+    assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
+    assert.equal(repairedReceipt.recordingIncluded, true);
+    assert.equal(repairedReceipt.integrity.status, "verified");
+    assert.equal(Object.keys(repairedReceipt.integrity.artifacts).length, 6);
+    assert.equal(database.operationalAlerts.get(session.sessionId).status, "resolved");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -11903,7 +12414,7 @@ test("Drive archive rejects a partial realtime transcript after a candidate turn
   }
 });
 
-test("completed recorded-answer transcripts supersede an earlier realtime transcription failure", async () => {
+test("completed recorded-answer transcripts supersede an earlier realtime failure without bypassing Drive readback", async () => {
   const originalFetch = globalThis.fetch;
   const database = new FakeD1();
   const env = driveSyncEnv(database);
@@ -11947,11 +12458,17 @@ test("completed recorded-answer transcripts supersede an earlier realtime transc
       throw new Error("verified completed receipt must be an exact D1 readback");
     };
     const response = await requestAdminSync(session.sessionId, env);
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 503);
     const payload = await response.json();
-    assert.equal(payload.result.transcriptKind, "actual_transcript");
+    assert.equal(payload.error,
+      "Google Driveの保存内容を現在確認できません。確認できるまで完了扱いにしません。");
+    const preservedManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    assert.equal(preservedManifest.transcriptKind, "actual_transcript",
+      "the recorded-answer transcript remains the accepted durable source");
+    assert.equal(preservedManifest.integrity.status, "unknown",
+      "an unavailable Drive readback must not be acknowledged as stored");
     assert.equal(driveCalls, 1,
-      "a completed receipt is acknowledged only after one bounded integrity revalidation attempt");
+      "the source is accepted, but the completed receipt still needs one bounded Drive readback");
   } finally {
     globalThis.fetch = originalFetch;
   }
