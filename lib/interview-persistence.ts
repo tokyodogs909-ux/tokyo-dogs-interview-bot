@@ -6002,14 +6002,181 @@ async function reconcileNextRecordingRecoveryManualAttentionAlert(db: D1Database
       detail_json: string | null;
       created_at: string;
     }>();
-  if (!terminal) return false;
-  const detail = parseJson<Record<string, unknown>>(terminal.detail_json, {});
+  let reconciled = false;
+  if (terminal) {
+    const detail = parseJson<Record<string, unknown>>(terminal.detail_json, {});
+    await upsertRecordingRecoveryManualAttentionAlert(
+      db,
+      terminal.session_id,
+      detail.errorCode,
+      terminal.created_at,
+      terminal.event_type,
+    );
+    reconciled = true;
+  }
+
+  // Older deployments could persist the final missing-part attempt and mark the
+  // upload failed before writing the terminal audit event. Recover that exact
+  // durable state so it cannot remain invisible merely because the final write
+  // was interrupted. Active, recently expired, replaced, or evidence-complete
+  // sessions cannot qualify.
+  const now = Date.now();
+  const expiryGraceBefore = new Date(now - RECORDING_RECOVERY_EXPIRY_GRACE_MS).toISOString();
+  const staleBefore = new Date(now - 60 * 1_000).toISOString();
+  const stranded = await db.prepare(`SELECT s.id AS session_id, s.updated_at,
+      latest.detail_json, latest.created_at,
+      (SELECT COUNT(*) FROM interview_audit_events missing
+        WHERE missing.session_id = s.id
+          AND missing.event_type = '${RECORDING_RECOVERY_MISSING_EVENT}'
+          AND missing.actor_type = 'system') AS missing_attempt_count
+    FROM interview_sessions s
+    JOIN interview_audit_events latest ON latest.rowid = (
+      SELECT candidate.rowid FROM interview_audit_events candidate
+      WHERE candidate.session_id = s.id
+        AND candidate.event_type = '${RECORDING_RECOVERY_MISSING_EVENT}'
+        AND candidate.actor_type = 'system'
+      ORDER BY candidate.created_at DESC, candidate.rowid DESC
+      LIMIT 1
+    )
+    WHERE s.recording_status = 'failed'
+      AND s.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+      AND s.completed_at IS NULL
+      AND s.expires_at <= ?
+      AND s.updated_at <= ?
+      AND (SELECT COUNT(*) FROM interview_audit_events missing
+        WHERE missing.session_id = s.id
+          AND missing.event_type = '${RECORDING_RECOVERY_MISSING_EVENT}'
+          AND missing.actor_type = 'system') >= ?
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = s.id AND artifact.kind = 'recording'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = s.id
+          AND terminal.event_type IN (
+            '${RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}',
+            '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_recording_alerts alert WHERE alert.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_session_replacements replacement
+        WHERE replacement.source_session_id = s.id
+      )
+      AND (
+        EXISTS (
+          SELECT 1 FROM interview_transcript_drafts draft
+          WHERE draft.session_id = s.id
+            AND draft.mode = 'voice'
+            AND draft.sealed_at IS NOT NULL
+            AND draft.turn_count BETWEEN 1 AND 300
+            AND json_valid(draft.transcript_json)
+            AND EXISTS (
+              SELECT 1 FROM json_each(draft.transcript_json) turn
+              WHERE json_extract(turn.value, '$.speaker') = 'candidate'
+                AND length(trim(COALESCE(json_extract(turn.value, '$.text'), ''))) > 0
+            )
+        )
+        OR EXISTS (
+          SELECT 1 FROM recorded_interview_completions completion
+          WHERE completion.session_id = s.id
+        )
+      )
+    ORDER BY latest.created_at ASC, s.id ASC
+    LIMIT 1`)
+    .bind(expiryGraceBefore, staleBefore, RECORDING_RECOVERY_MISSING_ATTEMPT_LIMIT)
+    .first<{
+      session_id: string;
+      updated_at: string;
+      detail_json: string | null;
+      created_at: string;
+      missing_attempt_count: number;
+    }>();
+  if (!stranded) return reconciled;
+
+  const attemptCount = Math.max(
+    RECORDING_RECOVERY_MISSING_ATTEMPT_LIMIT,
+    Math.trunc(Number(stranded.missing_attempt_count) || 0),
+  );
+  const errorCode = "INTERVIEW_RECORDING_PART_MISSING";
+  const observedAt = new Date().toISOString();
+  const terminalWrite = await db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json, created_at
+    ) SELECT ?, s.id, '${RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}', 'system', ?, ?
+    FROM interview_sessions s
+    WHERE s.id = ?
+      AND s.updated_at = ?
+      AND s.recording_status = 'failed'
+      AND s.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+      AND s.completed_at IS NULL
+      AND s.expires_at <= ?
+      AND s.updated_at <= ?
+      AND (SELECT COUNT(*) FROM interview_audit_events missing
+        WHERE missing.session_id = s.id
+          AND missing.event_type = '${RECORDING_RECOVERY_MISSING_EVENT}'
+          AND missing.actor_type = 'system') >= ?
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_artifacts artifact
+        WHERE artifact.session_id = s.id AND artifact.kind = 'recording'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events terminal
+        WHERE terminal.session_id = s.id
+          AND terminal.event_type IN (
+            '${RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}',
+            '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_recording_alerts alert WHERE alert.session_id = s.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_session_replacements replacement
+        WHERE replacement.source_session_id = s.id
+      )
+      AND (
+        EXISTS (
+          SELECT 1 FROM interview_transcript_drafts draft
+          WHERE draft.session_id = s.id
+            AND draft.mode = 'voice'
+            AND draft.sealed_at IS NOT NULL
+            AND draft.turn_count BETWEEN 1 AND 300
+            AND json_valid(draft.transcript_json)
+            AND EXISTS (
+              SELECT 1 FROM json_each(draft.transcript_json) turn
+              WHERE json_extract(turn.value, '$.speaker') = 'candidate'
+                AND length(trim(COALESCE(json_extract(turn.value, '$.text'), ''))) > 0
+            )
+        )
+        OR EXISTS (
+          SELECT 1 FROM recorded_interview_completions completion
+          WHERE completion.session_id = s.id
+        )
+      )`)
+    .bind(
+      crypto.randomUUID(),
+      JSON.stringify({ attemptCount, errorCode, backfilled: true }),
+      observedAt,
+      stranded.session_id,
+      stranded.updated_at,
+      expiryGraceBefore,
+      staleBefore,
+      RECORDING_RECOVERY_MISSING_ATTEMPT_LIMIT,
+    ).run();
+  if (Number((terminalWrite as { meta?: { changes?: number } }).meta?.changes ?? 0) !== 1) {
+    return reconciled;
+  }
   await upsertRecordingRecoveryManualAttentionAlert(
     db,
-    terminal.session_id,
-    detail.errorCode,
-    terminal.created_at,
-    terminal.event_type,
+    stranded.session_id,
+    errorCode,
+    observedAt,
+    RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT,
   );
   return true;
 }
@@ -6018,9 +6185,10 @@ export async function recoverNextSealedResumableInterviewRecording() {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
-  // Each tick backfills at most one historical terminal incident and never
-  // touches R2 or Drive. Repeated ticks converge without incrementing the same
-  // alert, while keeping the recovery selector bounded.
+  // Each tick backfills at most one historical terminal incident and one
+  // stranded legacy incident, and never touches R2 or Drive. Repeated ticks
+  // converge without incrementing the same alert while keeping both selectors
+  // bounded.
   await reconcileNextRecordingRecoveryManualAttentionAlert(db);
   const staleBefore = new Date(Date.now() - 60 * 1_000).toISOString();
   // Keep the global selector aligned with the authenticated staff planner: a

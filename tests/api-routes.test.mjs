@@ -1446,7 +1446,7 @@ class FakeD1Statement {
       }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
-      this.sql.includes("'recording_recovery_part_missing'")
+      this.sql.includes("VALUES (?, ?, 'recording_recovery_part_missing'")
     ) {
       const [, sessionId, detailJson, createdAt] = this.values;
       this.database.auditEvents.push({
@@ -1456,6 +1456,58 @@ class FakeD1Statement {
         session_id: sessionId,
       });
       changes = 1;
+    } else if (
+      this.sql.startsWith("INSERT INTO interview_audit_events") &&
+      this.sql.includes("'recording_recovery_manual_attention'") &&
+      this.sql.includes("FROM interview_sessions s")
+    ) {
+      const [id, detailJson, createdAt, sessionId, expectedUpdatedAt,
+        expiryGraceBefore, staleBefore, minimumAttempts] = this.values;
+      const session = this.database.sessions.get(sessionId);
+      const missing = this.database.auditEvents.filter((event) =>
+        event.session_id === sessionId &&
+        event.event_type === "recording_recovery_part_missing" &&
+        event.actor_type === "system");
+      const hasTerminal = this.database.auditEvents.some((event) =>
+        event.session_id === sessionId && [
+          "recording_recovery_manual_attention",
+          "legacy_recording_recovery_manual_attention",
+          "interrupted_recording_recovery_manual_attention",
+        ].includes(event.event_type));
+      const hasRecording = this.database.artifacts.some((artifact) => artifact[1] === sessionId);
+      const draft = this.database.transcriptDrafts.get(sessionId);
+      let hasSealedCandidateDraft = false;
+      if (draft?.mode === "voice" && draft.sealed_at && draft.turn_count >= 1 &&
+        draft.turn_count <= 300) {
+        try {
+          const turns = JSON.parse(draft.transcript_json);
+          hasSealedCandidateDraft = Array.isArray(turns) && turns.some((turn) =>
+            turn?.speaker === "candidate" && typeof turn?.text === "string" && turn.text.trim());
+        } catch {
+          hasSealedCandidateDraft = false;
+        }
+      }
+      const hasCompletion = this.database.recordedCompletions.has(sessionId);
+      if (
+        session && session.updated_at === expectedUpdatedAt &&
+        session.recording_status === "failed" &&
+        ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+        session.completed_at == null && session.expires_at <= expiryGraceBefore &&
+        session.updated_at <= staleBefore && missing.length >= minimumAttempts &&
+        !hasRecording && !hasTerminal && !this.database.recordingAlerts.has(sessionId) &&
+        !this.database.sessionReplacements.has(sessionId) &&
+        (hasSealedCandidateDraft || hasCompletion)
+      ) {
+        this.database.auditEvents.push({
+          id,
+          session_id: sessionId,
+          event_type: "recording_recovery_manual_attention",
+          actor_type: "system",
+          detail_json: detailJson,
+          created_at: createdAt,
+        });
+        changes = 1;
+      }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("'recording_recovery_manual_attention'")
@@ -1766,6 +1818,62 @@ class FakeD1Statement {
     if (this.sql.startsWith("SELECT alert_type, severity, status, code") &&
       this.sql.includes("FROM interview_recording_alerts")) {
       return this.database.recordingAlerts.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT s.id AS session_id,") &&
+      this.sql.includes("AS missing_attempt_count") &&
+      this.sql.includes("recording_recovery_part_missing")) {
+      const [expiryGraceBefore, staleBefore, minimumAttempts] = this.values;
+      const candidates = [];
+      for (const session of this.database.sessions.values()) {
+        const missing = this.database.auditEvents
+          .filter((event) => event.session_id === session.id &&
+            event.event_type === "recording_recovery_part_missing" &&
+            event.actor_type === "system")
+          .sort((left, right) => right.created_at.localeCompare(left.created_at));
+        const latest = missing[0];
+        const alert = this.database.recordingAlerts.get(session.id);
+        const hasTerminal = this.database.auditEvents.some((event) =>
+          event.session_id === session.id &&
+          [
+            "recording_recovery_manual_attention",
+            "legacy_recording_recovery_manual_attention",
+            "interrupted_recording_recovery_manual_attention",
+          ].includes(event.event_type));
+        const hasRecording = this.database.artifacts.some((artifact) => artifact[1] === session.id);
+        const draft = this.database.transcriptDrafts.get(session.id);
+        let hasSealedCandidateDraft = false;
+        if (draft?.mode === "voice" && draft.sealed_at && draft.turn_count >= 1 &&
+          draft.turn_count <= 300) {
+          try {
+            const turns = JSON.parse(draft.transcript_json);
+            hasSealedCandidateDraft = Array.isArray(turns) && turns.some((turn) =>
+              turn?.speaker === "candidate" && typeof turn?.text === "string" && turn.text.trim());
+          } catch {
+            hasSealedCandidateDraft = false;
+          }
+        }
+        const hasCompletion = this.database.recordedCompletions.has(session.id);
+        if (
+          session.recording_status === "failed" &&
+          ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+          session.completed_at == null && session.expires_at <= expiryGraceBefore &&
+          session.updated_at <= staleBefore && missing.length >= minimumAttempts &&
+          !hasRecording && !hasTerminal && !alert &&
+          !this.database.sessionReplacements.has(session.id) &&
+          (hasSealedCandidateDraft || hasCompletion)
+        ) {
+          candidates.push({
+            session_id: session.id,
+            updated_at: session.updated_at,
+            detail_json: latest.detail_json ?? null,
+            created_at: latest.created_at,
+            missing_attempt_count: missing.length,
+          });
+        }
+      }
+      candidates.sort((left, right) => left.created_at.localeCompare(right.created_at) ||
+        left.session_id.localeCompare(right.session_id));
+      return candidates[0] ?? null;
     }
     if (this.sql.startsWith("SELECT terminal.session_id, terminal.event_type") &&
       this.sql.includes("recording_recovery_manual_attention")) {
@@ -9358,6 +9466,141 @@ test("scheduled recovery backfills one historical terminal recording alert idemp
   assert.equal(database.recordingAlerts.get(session.sessionId)?.status, "open");
   assert.equal(database.recordingAlerts.get(session.sessionId)?.occurrence_count, 2,
     "only a genuinely newer terminal incident may reopen and increment the alert");
+});
+
+test("scheduled recovery surfaces a stranded failed upload after twelve durable missing-part attempts", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, INTERVIEW_STAFF_TOKEN: "staff-review-secret" };
+  const session = await createTestInterviewSession(env);
+  const stored = database.sessions.get(session.sessionId);
+  stored.status = "in_progress";
+  stored.recording_status = "failed";
+  stored.expires_at = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
+  stored.updated_at = new Date(Date.now() - 30 * 60 * 1_000).toISOString();
+  seedExactSealedTranscriptDraft(database, session.sessionId, JSON.stringify([{
+    id: "stranded-answer",
+    speaker: "candidate",
+    text: "回答は保存済みですが録画部品が不足しています。",
+    createdAt: new Date(Date.now() - 60 * 60 * 1_000).toISOString(),
+  }]));
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId && event.event_type === "voice_transcript_sealed"), false,
+    "legacy recovered drafts must not need a voice_transcript_sealed event");
+  for (let attempt = 1; attempt <= 12; attempt += 1) {
+    database.auditEvents.push({
+      id: crypto.randomUUID(),
+      session_id: session.sessionId,
+      event_type: "recording_recovery_part_missing",
+      actor_type: "system",
+      detail_json: JSON.stringify({
+        attemptCount: attempt,
+        errorCode: "INTERVIEW_RECORDING_PART_MISSING",
+      }),
+      created_at: new Date(Date.now() - (13 - attempt) * 60_000).toISOString(),
+    });
+  }
+
+  await Promise.all([scheduleInterviewRecovery(env), scheduleInterviewRecovery(env)]);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === session.sessionId &&
+    event.event_type === "recording_recovery_manual_attention").length, 1,
+    "the missing terminal write must be reconstructed exactly once");
+  const alert = database.recordingAlerts.get(session.sessionId);
+  assert.equal(alert?.status, "open");
+  assert.equal(alert?.severity, "critical");
+  assert.equal(alert?.code, "INTERVIEW_RECORDING_PART_MISSING");
+  assert.equal(alert?.occurrence_count, 1);
+  assert.equal(stored.status, "in_progress");
+  assert.equal(stored.recording_status, "failed");
+  assert.equal(database.artifacts.some((artifact) => artifact[1] === session.sessionId), false);
+
+  await scheduleInterviewRecovery(env);
+  assert.equal(database.auditEvents.filter((event) =>
+    event.session_id === session.sessionId &&
+    event.event_type === "recording_recovery_manual_attention").length, 1);
+  assert.equal(database.recordingAlerts.get(session.sessionId)?.occurrence_count, 1,
+    "replaying the scheduler must not duplicate or increment the same incident");
+});
+
+test("stranded recording alert backfill requires every durable safety gate", async (t) => {
+  const cases = [
+    ["eleven attempts", ({ database, session }) => {
+      database.auditEvents.splice(database.auditEvents.findLastIndex((event) =>
+        event.session_id === session.sessionId &&
+        event.event_type === "recording_recovery_part_missing"), 1);
+    }],
+    ["candidate grace still active", ({ stored }) => {
+      stored.expires_at = new Date(Date.now() - 10 * 60 * 1_000).toISOString();
+    }],
+    ["upload still active", ({ stored }) => {
+      stored.recording_status = "uploading";
+    }],
+    ["recent session heartbeat", ({ stored }) => {
+      stored.updated_at = new Date().toISOString();
+    }],
+    ["canonical recording already exists", ({ database, session }) => {
+      database.artifacts.push([
+        crypto.randomUUID(), session.sessionId, "recording.manifest.json", "video/webm",
+        1_024, "etag", "2027-09-01",
+      ]);
+    }],
+    ["continuity replacement already exists", ({ database, session }) => {
+      database.sessionReplacements.set(session.sessionId, {
+        source_session_id: session.sessionId,
+        replacement_session_id: "TD-REPLACEMENT-FIXTURE",
+        replacement_mode: "text",
+        reason: "device_continuity",
+        created_at: new Date().toISOString(),
+      });
+    }],
+    ["draft is not sealed", ({ database, session }) => {
+      database.transcriptDrafts.get(session.sessionId).sealed_at = null;
+    }],
+    ["missing observations are not system generated", ({ database, session }) => {
+      for (const event of database.auditEvents) {
+        if (event.session_id === session.sessionId &&
+          event.event_type === "recording_recovery_part_missing") event.actor_type = "candidate";
+      }
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      const database = new FakeD1();
+      const env = { ...workerEnv, DB: database, INTERVIEW_STAFF_TOKEN: "staff-review-secret" };
+      const session = await createTestInterviewSession(env);
+      const stored = database.sessions.get(session.sessionId);
+      stored.status = "in_progress";
+      stored.recording_status = "failed";
+      stored.expires_at = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
+      stored.updated_at = new Date(Date.now() - 30 * 60 * 1_000).toISOString();
+      seedExactSealedTranscriptDraft(database, session.sessionId, JSON.stringify([{
+        id: "stranded-gate-answer",
+        speaker: "candidate",
+        text: "録画保存の安全条件を確認します。",
+        createdAt: new Date(Date.now() - 60 * 60 * 1_000).toISOString(),
+      }]));
+      for (let attempt = 1; attempt <= 12; attempt += 1) {
+        database.auditEvents.push({
+          id: crypto.randomUUID(),
+          session_id: session.sessionId,
+          event_type: "recording_recovery_part_missing",
+          actor_type: "system",
+          detail_json: JSON.stringify({ attemptCount: attempt }),
+          created_at: new Date(Date.now() - (13 - attempt) * 60_000).toISOString(),
+        });
+      }
+      mutate({ database, session, stored });
+
+      await scheduleInterviewRecovery(env);
+      assert.equal(database.auditEvents.some((event) =>
+        event.session_id === session.sessionId &&
+        event.event_type === "recording_recovery_manual_attention"), false);
+      assert.equal(database.recordingAlerts.has(session.sessionId), false);
+      assert.equal(database.externalSyncs.has(session.sessionId), false,
+        "alert reconciliation must not touch Drive");
+    });
+  }
 });
 
 test("an accepted recording part heartbeats D1 so active mobile upload is not reclaimed", async () => {
