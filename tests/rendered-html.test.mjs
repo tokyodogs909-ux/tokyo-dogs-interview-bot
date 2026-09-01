@@ -213,14 +213,18 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(recordingUploadSource, /upload\/start/);
   assert.match(recordingUploadSource, /upload\/complete/);
   assert.match(source, /RECORDER_FINALIZE_TIMEOUT/);
-  assert.match(source, /recordingFinalizeTimedOut[\s\S]*120_000/);
-  const recordingUploadIndex = source.indexOf("await uploadRecording(recordingBlob);");
-  const finalizationIndex = source.indexOf("await storeInterviewFinalization();", recordingUploadIndex);
+  assert.match(source, /const recordingResult = await Promise\.race[\s\S]*120_000/);
+  const completionSource = source.slice(
+    source.indexOf("async function completeInterview(reason: string)"),
+    source.indexOf("function handleRealtimeEvent(event: RealtimeEvent)"),
+  );
+  const recordingReceiptIndex = completionSource.indexOf("const recordingResult = await Promise.race");
+  const finalizationIndex = completionSource.indexOf("await ensureFinalArchiveStored(activeMode);", recordingReceiptIndex);
   assert.ok(
-    recordingUploadIndex >= 0 && finalizationIndex > recordingUploadIndex,
+    recordingReceiptIndex >= 0 && finalizationIndex > recordingReceiptIndex,
     "recording storage must finish before fallback completion can start the Drive archive",
   );
-  assert.match(source, /await syncInterviewArchive\(\);/);
+  assert.match(source, /await syncInterviewArchive\(activeMode\);/);
   assert.match(archiveRouteSource, /await stepInterviewToGoogleDrive\(sessionId\)/);
   assert.match(archiveRouteSource, /committedOffset: pendingStep\.committedOffset/);
   assert.match(driveSyncSource, /Advances a candidate archive by at most one Drive recording chunk/);
@@ -361,7 +365,7 @@ test("candidate receipt stays fail-closed until the server verifies the final Dr
   assert.doesNotMatch(source, /録画を継続できませんでした。面接は受け付け/);
 
   const archiveSync = source.slice(
-    source.indexOf("async function syncInterviewArchive(attempt = 0)"),
+    source.indexOf("async function syncInterviewArchive(activeMode"),
     source.indexOf("async function uploadRecording(blob: Blob)"),
   );
   assert.match(archiveSync, /catch \(error\) \{\s*setArchiveSyncState\("error"\);\s*throw error;/);
@@ -379,40 +383,42 @@ test("candidate receipt stays fail-closed until the server verifies the final Dr
   );
   assert.equal(
     [...retryRecording.matchAll(/setRecordingUploadState\("error"\)/g)].length,
-    1,
-    "only the recording-upload catch may return the recording to error",
+    0,
+    "transcript, evaluation, and Drive retry failures must not relabel the recording",
   );
-  assert.ok(
-    retryRecording.indexOf('setRecordingUploadState("error")') < retryRecording.indexOf("await storeInterviewFinalization()"),
-    "evaluation or Drive failures must happen after the only recording-error assignment",
+  const recordingFinalize = source.slice(
+    source.indexOf("function ensureRecordingFinalized()"),
+    source.indexOf("async function storeInterviewFinalization(activeMode"),
+  );
+  assert.equal(
+    [...recordingFinalize.matchAll(/setRecordingUploadState\("error"\)/g)].length,
+    1,
+    "only the shared recording-finalize failure may return the recording to error",
   );
 
   const completion = source.slice(
     source.indexOf("async function completeInterview(reason: string)"),
     source.indexOf("function handleRealtimeEvent(event: RealtimeEvent)"),
   );
-  assert.match(completion, /let recordingStored = mode === "text";/);
-  assert.match(completion, /completionPhase === "recording" && !recordingStored/);
+  assert.match(completion, /const recordingFinalization = activeMode === "text" \? null : ensureRecordingFinalized\(\);/);
+  assert.match(completion, /const recordingResult = await Promise\.race/);
   assert.doesNotMatch(completion, /recordingUploadState !== "stored"/);
-  assert.match(completion, /録画データを端末で生成できなかったため、面接記録の保存は完了していません/);
+  assert.match(completion, /録画の送信を完了できませんでした。下のボタンから再試行してください/);
   assert.ok(
-    completion.indexOf("await sealRecordedFallbackCompletion();") >= 0 &&
-      completion.indexOf("await sealRecordedFallbackCompletion();") < completion.indexOf("await uploadRecording(recordingBlob);"),
-    "the exact fallback answer count must be durably sealed before recording upload and staff recovery",
+    completion.indexOf("const recordingFinalization") >= 0 &&
+      completion.indexOf("const recordingFinalization") < completion.indexOf("await sealRecordedFallbackCompletion();"),
+    "recording finalization must start before a network-bound fallback seal",
   );
   assert.ok(
-    completion.indexOf('await sealDurableTranscriptDraft("voice");') >= 0 &&
-      completion.indexOf('await sealDurableTranscriptDraft("voice");') < completion.indexOf("await uploadRecording(recordingBlob);"),
-    "the exact voice draft must be durable before the recording upload",
+    completion.indexOf("const recordingResult = await Promise.race") >= 0 &&
+      completion.indexOf("const recordingResult = await Promise.race") < completion.indexOf("await ensureFinalArchiveStored(activeMode);"),
+    "the shared recording receipt must settle before evaluation",
   );
-  assert.ok(
-    completion.indexOf("await uploadRecording(recordingBlob);") < completion.indexOf("await storeInterviewFinalization();"),
-    "the durable recording must precede canonical voice sealing and evaluation",
-  );
+  assert.doesNotMatch(completion, /uploadRecording\(recordingBlob\)/);
   assert.match(source, /\/api\/interviews\/recorded\/seal/);
   const voiceSeal = source.slice(
     source.indexOf("async function sealVoiceTranscriptCompletion()"),
-    source.indexOf("async function syncInterviewArchive(attempt = 0)"),
+    source.indexOf("async function syncInterviewArchive(activeMode"),
   );
   assert.match(voiceSeal, /if \(voiceTranscriptCompletionBlocker\(\)\)/);
   assert.match(voiceSeal, /turn\.speaker === "candidate" && turn\.text\.trim\(\)\.length > 0/);
@@ -428,10 +434,12 @@ test("candidate receipt stays fail-closed until the server verifies the final Dr
     source.indexOf("async function retryInterviewFinalization()"),
   );
   assert.ok(
-    retryRecordingWithSeal.indexOf('mode === "voice"') >= 0 &&
-      retryRecordingWithSeal.indexOf('await sealDurableTranscriptDraft("voice");') <
-        retryRecordingWithSeal.indexOf("await uploadRecording(blob);"),
-    "recording retries must preserve the exact draft before media upload",
+    retryRecordingWithSeal.indexOf('activeMode === "voice"') >= 0 &&
+      retryRecordingWithSeal.indexOf("const recordingResult = ensureRecordingFinalized().then") <
+        retryRecordingWithSeal.indexOf('await sealDurableTranscriptDraft("voice");') &&
+      retryRecordingWithSeal.indexOf('await recordingResult === "failed"') <
+        retryRecordingWithSeal.indexOf("await ensureFinalArchiveStored(activeMode, true);"),
+    "recording retries must reuse one finalize promise and await it before evaluation",
   );
 
   // Recorded fallback is receipted only after answer-audio transcription and
@@ -478,7 +486,7 @@ test("capped or errored MediaRecorder output cannot be uploaded or receipted as 
 
   const upload = source.slice(
     source.indexOf("async function uploadRecording(blob: Blob)"),
-    source.indexOf("async function storeInterviewFinalization()"),
+    source.indexOf("async function storeInterviewFinalization(activeMode"),
   );
   assert.match(upload, /if \(!recordingCompleteRef\.current\) \{[\s\S]*throw new Error/);
   assert.ok(
@@ -496,14 +504,20 @@ test("capped or errored MediaRecorder output cannot be uploaded or receipted as 
     source.indexOf("async function completeInterview(reason: string)"),
     source.indexOf("function handleRealtimeEvent(event: RealtimeEvent)"),
   );
-  assert.match(completion, /const recordingComplete = mode === "text" \|\| \(!recordingFinalizeTimedOut && recordingCompleteRef\.current\);/);
-  assert.match(completion, /if \(mode !== "text" && \(!recordingBlob \|\| !recordingComplete\)\) \{/);
+  const finalize = source.slice(
+    source.indexOf("function ensureRecordingFinalized()"),
+    source.indexOf("async function storeInterviewFinalization(activeMode"),
+  );
+  assert.match(finalize, /if \(!blob \|\| !recordingCompleteRef\.current\) \{/);
+  assert.match(finalize, /throw new Error\("INTERVIEW_RECORDING_INCOMPLETE"\)/);
+  assert.match(completion, /const recordingFinalization = activeMode === "text" \? null : ensureRecordingFinalized\(\);/);
+  assert.match(completion, /recordingResult === "failed"/);
 
   const archive = source.slice(
-    source.indexOf("async function syncInterviewArchive(attempt = 0)"),
+    source.indexOf("async function syncInterviewArchive(activeMode"),
     source.indexOf("async function uploadRecording(blob: Blob)"),
   );
-  assert.match(archive, /if \(mode !== "text" && !recordingCompleteRef\.current\) \{/);
+  assert.match(archive, /if \(activeMode !== "text" && !recordingCompleteRef\.current\) \{/);
   assert.match(
     source,
     /recordingUploadState === "error" && recordingBlobRef\.current && recordingCompleteRef\.current && <div[^>]*><strong>録画の送信を再開できます/,
@@ -524,12 +538,12 @@ test("a failed realtime answer transcription requires one explicit repair before
   assert.match(failedEvent, /integrity\.transcriptionFailed[\s\S]*TRANSCRIPTION_ID_MISSING/);
 
   const finalization = source.slice(
-    source.indexOf("async function storeInterviewFinalization()"),
-    source.indexOf("function setArchiveCompletionMessage()"),
+    source.indexOf("async function storeInterviewFinalization(activeMode"),
+    source.indexOf("function setArchiveCompletionMessage(activeMode"),
   );
   assert.match(
     finalization,
-    /if \(mode === "voice" && voiceTranscriptCompletionBlocker\(\)\) \{[\s\S]*throw new Error/,
+    /if \(activeMode === "voice" && voiceTranscriptCompletionBlocker\(\)\) \{[\s\S]*throw new Error/,
   );
   assert.ok(
     [...source.matchAll(/resetRealtimeTranscriptIntegrity\(\);/g)].length >= 3,

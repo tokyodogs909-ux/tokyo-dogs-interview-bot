@@ -553,3 +553,103 @@ test("recording upload bounds both a hung request and a stalled response body", 
     assert.equal(attempts, 1);
   }
 });
+
+test("online retry and finalization share one pump and never double-account a full part", async () => {
+  const uploadId = "live-recording-upload-singleflight-0001";
+  let releasePart;
+  const partGate = new Promise((resolve) => { releasePart = resolve; });
+  let partCalls = 0;
+  let sealCalls = 0;
+  let completeCalls = 0;
+  const uploader = createLiveRecordingUploader({
+    sessionId: "TD-LIVE-RETRY-FINALIZE-RACE",
+    accessToken: "candidate-token",
+    uploadId,
+    contentType: "video/webm",
+    fetcher: async (url, init) => {
+      if (url.endsWith("/start")) return json({
+        stored: false,
+        uploadVersion: 3,
+        uploadId,
+        contentType: "video/webm",
+        partSize: RECORDING_UPLOAD_PART_BYTES,
+        sealed: false,
+        uploadedParts: [],
+        uploadedPartReceipts: [],
+      });
+      if (url.endsWith("/part")) {
+        partCalls += 1;
+        await partGate;
+        return json({ stored: true, index: Number(init.headers["X-Recording-Part-Index"]) });
+      }
+      if (url.endsWith("/seal")) {
+        sealCalls += 1;
+        return json({ sealed: true });
+      }
+      if (url.endsWith("/complete")) {
+        completeCalls += 1;
+        return json({ stored: true });
+      }
+      throw new Error(`unexpected ${url}`);
+    },
+    sleep: async () => undefined,
+  });
+  uploader.append(new Blob([new Uint8Array(RECORDING_UPLOAD_PART_BYTES).fill(12)]));
+  await waitFor(() => partCalls === 1, "the background pump should own the pending full part");
+  const retry = uploader.retry();
+  const finalize = uploader.finalize("both");
+  releasePart();
+  await Promise.all([retry, finalize]);
+  const snapshot = uploader.snapshot();
+  assert.equal(partCalls, 1);
+  assert.equal(sealCalls, 1);
+  assert.equal(completeCalls, 1);
+  assert.equal(snapshot.durableBytes, snapshot.totalBytes);
+  assert.equal(snapshot.completed, true);
+});
+
+test("concurrent finalization callers share one seal and one complete receipt", async () => {
+  const uploadId = "live-recording-upload-singleflight-0002";
+  let sealCalls = 0;
+  let completeCalls = 0;
+  const uploader = createLiveRecordingUploader({
+    sessionId: "TD-LIVE-DOUBLE-FINALIZE",
+    accessToken: "candidate-token",
+    uploadId,
+    contentType: "video/webm",
+    fetcher: async (url, init) => {
+      if (url.endsWith("/start")) return json({
+        stored: false,
+        uploadVersion: 3,
+        uploadId,
+        contentType: "video/webm",
+        partSize: RECORDING_UPLOAD_PART_BYTES,
+        sealed: false,
+        uploadedParts: [],
+        uploadedPartReceipts: [],
+      });
+      if (url.endsWith("/part")) {
+        return json({ stored: true, index: Number(init.headers["X-Recording-Part-Index"]) });
+      }
+      if (url.endsWith("/seal")) {
+        sealCalls += 1;
+        return json({ sealed: true });
+      }
+      if (url.endsWith("/complete")) {
+        completeCalls += 1;
+        return json({ stored: true });
+      }
+      throw new Error(`unexpected ${url}`);
+    },
+    sleep: async () => undefined,
+  });
+  uploader.append(new Blob([new Uint8Array(321).fill(13)]));
+  const [left, right] = await Promise.all([
+    uploader.finalize("both"),
+    uploader.finalize("both"),
+  ]);
+  assert.equal(left.stored, true);
+  assert.equal(right.stored, true);
+  assert.equal(sealCalls, 1);
+  assert.equal(completeCalls, 1);
+});

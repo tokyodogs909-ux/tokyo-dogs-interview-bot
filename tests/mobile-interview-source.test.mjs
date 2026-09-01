@@ -28,23 +28,27 @@ test("camera setup is hard-gated by measured microphone energy and explicit spea
   assert.match(source, /speakerVerified: speakerTestState === "passed"/);
 });
 
-test("backgrounding and local media changes stay sticky until explicit reacquisition", () => {
+test("backgrounding and local media changes permanently stop that recording generation", () => {
   const interruption = functionBody("function markLocalMediaInterrupted(", "function bindLocalMicrophoneTrack(");
   assert.match(interruption, /stageRef\.current !== "interview"/);
   assert.match(interruption, /recordingLocalContinuityValidRef\.current = false/);
-  assert.match(interruption, /stopRealtime\(\{ keepLocalStream: true, keepRecorder: true \}\)/);
+  assert.match(interruption, /stopRealtime\(\)/);
+  assert.match(interruption, /setStage\("setup"\)/);
+  assert.doesNotMatch(interruption, /keepRecorder: true/);
   assert.match(source, /markLocalMediaInterruptedActionRef\.current\("page_hidden"\)/);
-  assert.match(source, /reduceLocalMediaHealth\(localMediaHealthRef\.current,[\s\S]*explicit_recovery_verified/);
-  assert.match(source, /resumeAfterLocalMediaRecovery/);
+  assert.match(source, /switchInterruptedInterviewToTextContinuity/);
+  assert.doesNotMatch(source, /explicit_recovery_verified/);
+  assert.doesNotMatch(source, /resumeAfterLocalMediaRecovery|reacquireLocalMedia/);
 });
 
-test("recovery never claims a newly acquired camera was added to an active recorder", () => {
-  const recovery = functionBody("async function reacquireLocalMedia()", "async function resumeAfterLocalMediaRecovery()");
-  assert.match(recovery, /const recorderCamera = previousStream\?\.getVideoTracks\(\)\[0\]/);
-  assert.match(recovery, /nextCamera\.stop\(\)/);
-  assert.match(recovery, /new MediaStream\(\[recorderCamera, nextMicrophone\]\)/);
-  assert.doesNotMatch(recovery, /new MediaStream\(\[nextCamera,/);
-  assert.match(recovery, /previousStream\?\.getAudioTracks\(\)\.forEach\(\(track\) => track\.stop\(\)\)/);
+test("interrupted media is replaced by one server-backed text session, never a second recorder", () => {
+  const recovery = functionBody("async function switchInterruptedInterviewToTextContinuity()", "function stopAudioPrime()");
+  assert.match(recovery, /fetch\("\/api\/interviews\/resume"/);
+  assert.match(recovery, /data\.snapshot\.action !== "resume_text"/);
+  assert.match(recovery, /recordingGenerationRef\.current \+= 1/);
+  assert.match(recovery, /recordingFinalizePromiseRef\.current = null/);
+  assert.match(recovery, /await openTextContinuity/);
+  assert.doesNotMatch(recovery, /getUserMedia|startRecording|connectPreparedInterview/);
 
   const recordingStart = functionBody("async function startRecording(", "async function connectPreparedInterview()");
   assert.match(recordingStart, /!recordingLocalContinuityValidRef\.current/);
@@ -70,8 +74,8 @@ test("durable recording and transcript receipts precede final completion", () =>
     voiceSeal.indexOf("await sealDurableTranscriptDraft(\"voice\")") <
       voiceSeal.indexOf("/api/interviews/voice/transcript/seal"),
   );
-  const finalization = functionBody("async function storeInterviewFinalization()", "function setArchiveCompletionMessage()");
-  assert.match(finalization, /if \(mode === "voice"\) await sealVoiceTranscriptCompletion\(\)/);
+  const finalization = functionBody("async function storeInterviewFinalization(activeMode", "function setArchiveCompletionMessage(activeMode");
+  assert.match(finalization, /if \(activeMode === "voice"\) await sealVoiceTranscriptCompletion\(\)/);
   assert.ok(
     finalization.indexOf("await sealDurableTranscriptDraft(\"text\")") <
       finalization.indexOf("await requestEvaluation()"),
@@ -83,15 +87,23 @@ test("durable recording and transcript receipts precede final completion", () =>
     "function handleRealtimeEvent(event: RealtimeEvent)",
   );
   assert.ok(
-    completion.indexOf('await sealDurableTranscriptDraft("voice")') <
-      completion.indexOf("await uploadRecording(recordingBlob)"),
-    "the exact voice draft must be durable before recording finalization",
+    completion.indexOf("const recordingFinalization") <
+      completion.indexOf('await sealDurableTranscriptDraft("voice")'),
+    "recording finalization must start before a network-bound transcript seal",
   );
   assert.ok(
-    completion.indexOf("await uploadRecording(recordingBlob)") <
-      completion.indexOf("await storeInterviewFinalization()"),
+    completion.indexOf("const recordingResult = await Promise.race") <
+      completion.indexOf("await ensureFinalArchiveStored(activeMode)"),
     "the recording receipt must precede the canonical voice seal and evaluation",
   );
+  assert.doesNotMatch(completion, /uploadRecording\(recordingBlob\)/);
+  const recordingFinalize = functionBody("function ensureRecordingFinalized()", "async function storeInterviewFinalization(activeMode");
+  assert.match(recordingFinalize, /recordingFinalizePromiseRef\.current/);
+  assert.match(recordingFinalize, /await uploadRecording\(blob\)/);
+  const retry = functionBody("async function retryRecordingUpload()", "async function retryInterviewFinalization()");
+  assert.match(retry, /const recordingResult = ensureRecordingFinalized\(\)\.then/);
+  assert.match(retry, /transcriptSealFailed = true/);
+  assert.doesNotMatch(retry, /setRecordingUploadState\("error"\)[\s\S]*transcriptSealFailed/);
 });
 
 test("candidate stop, safety escalation, and unknown reasons are technical holds outside receipt flow", () => {
@@ -174,7 +186,7 @@ test("voice completion consumes strict pending item and response lifecycle state
     "async function completeInterview(reason: string)",
     "function handleRealtimeEvent(event: RealtimeEvent)",
   );
-  assert.match(completion, /mode === "voice" && voiceTranscriptCompletionBlocker\(\)/);
+  assert.match(completion, /activeMode === "voice" && voiceTranscriptCompletionBlocker\(\)/);
   assert.ok(
     completion.indexOf("voiceTranscriptCompletionBlocker()") < completion.indexOf("endingRef.current = true"),
     "pending voice events must block before recorder seal/evaluation begins",

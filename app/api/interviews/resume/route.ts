@@ -8,6 +8,7 @@ import {
   getInterviewContinuitySnapshot,
   replaceInterruptedInterviewWithText,
 } from "@/lib/interview-persistence";
+import { readBoundedJsonBody } from "@/lib/http-body";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
 function continuityCookie(request: Request) {
@@ -64,7 +65,26 @@ export async function POST(request: Request) {
     if (!credentials) return unavailableResponse();
     const authorized = await authorizeInterviewToken(credentials.sessionId, credentials.accessToken);
     if (!authorized?.session) return unavailableResponse();
-    const snapshot = await replaceInterruptedInterviewWithText(credentials.sessionId);
+    const bodyResult = request.body === null
+      ? { ok: true as const, value: {} }
+      : await readBoundedJsonBody<{
+          expectedDraftSha256?: unknown;
+          expectedDraftTurnCount?: unknown;
+        }>(request, { maxBytes: 1_000, allowEmpty: true });
+    if (!bodyResult.ok) {
+      return noStoreJson({
+        error: bodyResult.status === 413
+          ? "途中保存の確認情報が長すぎます。"
+          : "途中保存の確認情報を読み取れませんでした。",
+      }, { status: bodyResult.status });
+    }
+    const body = bodyResult.value;
+    const snapshot = await replaceInterruptedInterviewWithText(credentials.sessionId, {
+      sha256: body?.expectedDraftSha256 === null || typeof body?.expectedDraftSha256 === "string"
+        ? body.expectedDraftSha256
+        : null,
+      turnCount: Number(body?.expectedDraftTurnCount),
+    });
     if (!snapshot) {
       return noStoreJson({ error: "この面接は文字入力へ切り替えられません。" }, { status: 409 });
     }

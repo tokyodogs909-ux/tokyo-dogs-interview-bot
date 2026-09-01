@@ -74,6 +74,8 @@ type InterviewContinuitySnapshot = {
   mode: "voice" | "text" | "recorded-fallback";
   action: "resume_text" | "replace_with_text" | "processing" | "completed" | "held";
   transcript: TranscriptTurn[];
+  draftSha256: string | null;
+  draftTurnCount: number;
 };
 type InterviewContinuity = {
   accessToken: string;
@@ -355,6 +357,12 @@ export default function Home() {
   const recordingBlobRef = useRef<Blob | null>(null);
   const recordingLiveUploaderRef = useRef<ReturnType<typeof createLiveRecordingUploader> | null>(null);
   const recordingPromiseRef = useRef<Promise<Blob | null> | null>(null);
+  // One recorder generation owns exactly one finalization request. Completion,
+  // an online event and a manual retry must observe this same promise instead
+  // of racing duplicate seals/uploads.
+  const recordingFinalizePromiseRef = useRef<Promise<void> | null>(null);
+  const finalArchivePromiseRef = useRef<Promise<void> | null>(null);
+  const manualFinalizationPromiseRef = useRef<Promise<void> | null>(null);
   const recordingResolveRef = useRef<((blob: Blob | null) => void) | null>(null);
   const recordedAnswerRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedAnswerChunksRef = useRef<Blob[]>([]);
@@ -385,10 +393,13 @@ export default function Home() {
   } | null>(null);
   const accessTokenRef = useRef("");
   const sessionIdRef = useRef("TD-PENDING");
+  const employmentRef = useRef<(typeof EMPLOYMENT_OPTIONS)[number]>("正社員");
+  const locationRef = useRef("");
   const transcriptRef = useRef<TranscriptTurn[]>([]);
   // UI partials are intentionally separate from this append-only sequence.
   // Only completed Realtime items enter the durable draft, in completion order.
   const completedTranscriptRef = useRef<TranscriptTurn[]>([]);
+  const completedTranscriptVersionRef = useRef(0);
   const transcriptDraftWriterRef = useRef<ReturnType<typeof createTranscriptDraftWriter> | null>(null);
   const recordedInterviewSessionRef = useRef<string | null>(null);
   const assistantPartialsRef = useRef(new Map<string, string>());
@@ -425,7 +436,7 @@ export default function Home() {
   const microphoneCheckPassedRef = useRef(false);
   const microphoneVerificationRef = useRef(initialMicrophoneVerification());
   const localMediaHealthRef = useRef(initialLocalMediaHealth());
-  const localMediaRecoveryAttemptedRef = useRef(false);
+  const localMediaTextContinuityPendingRef = useRef(false);
   const localTrackHandlersRef = useRef(new Map<MediaStreamTrack, {
     mute: () => void;
     unmute: () => void;
@@ -520,7 +531,9 @@ export default function Home() {
       const online = navigator.onLine;
       setNetworkAvailable(online);
       if (!online) return;
-      void recordingLiveUploaderRef.current?.retry().catch(() => undefined);
+      if (!recordingFinalizePromiseRef.current) {
+        void recordingLiveUploaderRef.current?.retry().catch(() => undefined);
+      }
       const completed = completedTranscriptRef.current;
       if (completed.length > 0) enqueueCompletedTranscriptSnapshot(completed);
     };
@@ -536,6 +549,14 @@ export default function Home() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  useEffect(() => {
+    employmentRef.current = employment;
+  }, [employment]);
+
+  useEffect(() => {
+    locationRef.current = location;
+  }, [location]);
 
   useEffect(() => {
     stageRef.current = stage;
@@ -754,14 +775,6 @@ export default function Home() {
             microphoneCheckPassedRef.current = true;
             setMicrophoneCheckPassed(true);
           }
-          if (localMediaRecoveryAttemptedRef.current && localMediaHealthRef.current.blocked) {
-            localMediaHealthRef.current = reduceLocalMediaHealth(localMediaHealthRef.current, {
-              type: "explicit_recovery_verified",
-            });
-            localMediaRecoveryAttemptedRef.current = false;
-            setLocalMediaRecoveryRequired(false);
-            setAudioNotice("マイクの再取得と実音量を確認しました。準備が整ったら、明示的に再接続してください。");
-          }
         }
         else if (audioTrack.enabled && !audioTrack.muted) setCandidateAudioState("ready");
         meter.animationFrame = window.requestAnimationFrame(update);
@@ -822,21 +835,19 @@ export default function Home() {
     setSetupPhase("error");
     setConnectionState("error");
     setNetworkAudioState("error");
-    setErrorMessage("TD-CONN-MIC: マイク接続の変更を検知したため、質問を停止しました。「マイクを再取得」を押して、声の入力をもう一度確認してください。");
-    setAudioNotice("マイクが変化したため、自動で別の機器へ切り替えず、面接を停止しています。");
+    setErrorMessage("TD-CONN-MEDIA: カメラまたはマイクの中断を検知したため、録画式の面接を停止しました。保存済みの回答から文字入力へ切り替えて続けてください。");
+    setAudioNotice("録画の完全性を守るため、同じ録画・音声回線には再接続しません。");
     reportCandidateEvent("recording_unavailable", code);
     invalidateRecordingRemoteCoverage(code);
-    if (recorderRef.current && recorderRef.current.state !== "inactive") {
-      // The browser does not prove continuous camera/microphone capture across
-      // a mute, device swap, app background, or track end. Recovery may let the
-      // candidate continue, but the interrupted recording cannot receive the
-      // same complete/archive receipt as uninterrupted media.
-      recordingLocalContinuityValidRef.current = false;
-      recordingCompleteRef.current = false;
-    }
+    // Once an OS/browser interruption is observed, no later track reacquisition
+    // can prove a continuous WebM/MP4 stream. Keep the already received R2 parts
+    // as technical evidence, but never reconnect this interview to the same
+    // recorder or allow it to receive a complete-recording receipt.
+    recordingLocalContinuityValidRef.current = false;
+    recordingCompleteRef.current = false;
     if (modeRef.current === "recorded-fallback") abortActiveRecordedAnswerForMediaRecovery();
     if (stageRef.current === "interview") {
-      stopRealtime({ keepLocalStream: true, keepRecorder: true });
+      stopRealtime();
       setStage("setup");
     }
   }
@@ -848,7 +859,7 @@ export default function Home() {
       unmute: () => {
         if (localMediaHealthRef.current.blocked) {
           setCandidateAudioState("error");
-          setAudioNotice("マイクが再開したように見えても、自動では面接を続けません。「マイクを再取得」を押してください。");
+          setAudioNotice("端末の音声が戻っても、同じ録画・音声回線には再接続しません。文字入力へ切り替えて続けてください。");
         } else {
           setCandidateAudioState("ready");
         }
@@ -861,102 +872,109 @@ export default function Home() {
     track.addEventListener("ended", handlers.ended);
   }
 
-  async function reacquireLocalMedia() {
-    if (sessionStarting || !localMediaRecoveryRequired) return;
+  async function switchInterruptedInterviewToTextContinuity() {
+    if (
+      sessionStarting ||
+      localMediaTextContinuityPendingRef.current ||
+      !localMediaRecoveryRequired ||
+      !networkAvailable
+    ) return;
+    localMediaTextContinuityPendingRef.current = true;
     setSessionStarting(true);
     setErrorMessage("");
-    setAudioNotice("カメラとマイクの再取得を確認しています。許可画面が出た場合は「許可」を選んでください。");
-    let acquiredStream: MediaStream | null = null;
-    let nextStream: MediaStream | null = null;
+    setAudioNotice("保存済みの質問・回答を確認し、文字入力へ安全に切り替えています。");
     try {
-      acquiredStream = await navigator.mediaDevices.getUserMedia({
-        audio: AUDIO_CONSTRAINTS,
-        video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 540 } },
+      // A previous POST may already have committed the replacement cookie even
+      // when the first text-draft write later failed. Always inspect first so a
+      // retry opens that exact replacement instead of trying to replace it
+      // again.
+      const inspected = await fetch("/api/interviews/resume", {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
       });
-      const nextMicrophone = acquiredStream.getAudioTracks()[0];
-      const nextCamera = acquiredStream.getVideoTracks()[0];
-      if (!nextMicrophone || !nextCamera) throw new Error("TD-CONN-MIC: カメラまたはマイクを再取得できませんでした。");
-
-      const mix = recordingAudioMixRef.current;
-      const previousStream = streamRef.current;
-      const activeRecorder = recorderRef.current?.state === "recording";
-      if (activeRecorder) {
-        if (!mix || mix.context.state === "closed") {
-          throw new Error("TD-CONN-MIC: 録画を壊さずにマイクを更新できません。採用担当者へ受付番号をお知らせください。");
-        }
-        const recorderCamera = previousStream?.getVideoTracks()[0];
-        if (!recorderCamera || recorderCamera.readyState !== "live" || recorderCamera.muted) {
-          throw new Error("TD-CONN-CAMERA: 録画中のカメラを安全に継続できません。採用担当者へ受付番号をお知らせください。");
-        }
-        const replacementSource = mix.context.createMediaStreamSource(new MediaStream([nextMicrophone]));
-        replacementSource.connect(mix.destination);
-        try {
-          mix.localSource.disconnect();
-        } catch {
-          // The old source may already be disconnected after an OS interruption.
-        }
-        mix.localSource = replacementSource;
-        // MediaRecorder cannot safely swap encoded video tracks mid-container.
-        // Keep the exact original recorder-owned camera track for the preview;
-        // never imply that the newly acquired camera was added to the recording.
-        nextCamera.stop();
-        nextStream = new MediaStream([recorderCamera, nextMicrophone]);
-      } else {
-        nextStream = acquiredStream;
+      const inspectedData = await inspected.json().catch(() => null) as {
+        available?: boolean;
+        accessToken?: string;
+        snapshot?: InterviewContinuitySnapshot;
+        error?: string;
+      } | null;
+      if (!inspected.ok || inspectedData?.available !== true || !inspectedData.snapshot ||
+        typeof inspectedData.accessToken !== "string") {
+        throw new Error(inspectedData?.error || "保存済みの面接状態を確認できませんでした。");
       }
 
-      previousStream?.getAudioTracks().forEach(unbindLocalMicrophoneTrack);
-      streamRef.current = nextStream;
-      setStream(nextStream);
-      bindLocalMicrophoneTrack(nextMicrophone);
-      microphoneCheckPassedRef.current = false;
-      microphoneVerificationRef.current = initialMicrophoneVerification();
-      setMicrophoneCheckPassed(false);
-      localMediaRecoveryAttemptedRef.current = true;
-      setCandidateAudioState("checking");
-      setSetupPhase("devices-ready");
-      await startMicrophoneMeter(nextStream);
-      if (activeRecorder) previousStream?.getAudioTracks().forEach((track) => track.stop());
-      else previousStream?.getTracks().forEach((track) => track.stop());
-      setAudioNotice("マイクに向かって話し、入力メーターが動いた後に「オンライン一次面接へ再接続」を押してください。");
+      let next: InterviewContinuity = {
+        accessToken: inspectedData.accessToken,
+        snapshot: inspectedData.snapshot,
+      };
+      if (next.snapshot.action === "replace_with_text") {
+        // Let already-queued Realtime callbacks settle, then flush the exact
+        // append-only snapshot. The server binds the replacement transaction to
+        // this SHA/count and rejects a concurrent late append or seal.
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 150));
+        let receipt: { sha256?: string; turnCount?: number } | null = null;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const version = completedTranscriptVersionRef.current;
+          const sourceTurns = [...completedTranscriptRef.current];
+          if (sourceTurns.length > 0) {
+            const writer = transcriptDraftWriterRef.current;
+            if (!writer) throw new Error("回答記録の途中保存情報を確認できませんでした。");
+            receipt = await writer.flush(sourceTurns) as { sha256?: string; turnCount?: number };
+          } else {
+            receipt = { sha256: undefined, turnCount: 0 };
+          }
+          await Promise.resolve();
+          if (version === completedTranscriptVersionRef.current) break;
+          receipt = null;
+        }
+        if (!receipt || receipt.turnCount !== completedTranscriptRef.current.length ||
+          (receipt.turnCount > 0 && !/^[a-f0-9]{64}$/.test(receipt.sha256 ?? ""))) {
+          throw new Error("最新の回答記録の保存確認が完了しませんでした。文字入力への切り替えをもう一度お試しください。");
+        }
+        const response = await fetch("/api/interviews/resume", {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            expectedDraftSha256: receipt.turnCount > 0 ? receipt.sha256 : null,
+            expectedDraftTurnCount: receipt.turnCount,
+          }),
+        });
+        const data = await response.json().catch(() => null) as {
+          resumed?: boolean;
+          accessToken?: string;
+          snapshot?: InterviewContinuitySnapshot;
+          error?: string;
+        } | null;
+        if (!response.ok || data?.resumed !== true || typeof data.accessToken !== "string" ||
+          !data.snapshot || data.snapshot.action !== "resume_text") {
+          throw new Error(data?.error || "保存済みの面接を文字入力へ切り替えられませんでした。");
+        }
+        next = { accessToken: data.accessToken, snapshot: data.snapshot };
+      }
+      if (next.snapshot.action !== "resume_text") {
+        throw new Error("この面接は現在文字入力へ切り替えられません。採用担当者へ受付番号をお伝えください。");
+      }
+
+      // Invalidate every late callback owned by the interrupted recorder before
+      // the replacement session becomes the active candidate record.
+      recordingGenerationRef.current += 1;
+      recordingPromiseRef.current = null;
+      recordingFinalizePromiseRef.current = null;
+      recordingResolveRef.current = null;
+      recordingBlobRef.current = null;
+      recordingLiveUploaderRef.current = null;
+      recordingCompleteRef.current = false;
+      await openTextContinuity(next);
+      setLocalMediaRecoveryRequired(false);
     } catch (error) {
-      acquiredStream?.getTracks().forEach((track) => track.stop());
-      if (recorderRef.current?.state === "recording") {
-        recordingFinalStopRequestedRef.current = false;
-        recordingCompleteRef.current = false;
-        try {
-          recorderRef.current.stop();
-        } catch {
-          recordingResolveRef.current?.(null);
-          recordingResolveRef.current = null;
-        }
-      }
-      localMediaRecoveryAttemptedRef.current = false;
-      setCandidateAudioState("error");
-      setSetupPhase("error");
-      setErrorMessage(deviceErrorMessage(error));
+      setErrorMessage(error instanceof Error
+        ? error.message
+        : "保存済みの面接を文字入力へ切り替えられませんでした。");
+      setAudioNotice("同じ録画・音声回線には戻さず、文字入力への切り替えだけを再試行できます。");
     } finally {
+      localMediaTextContinuityPendingRef.current = false;
       setSessionStarting(false);
     }
-  }
-
-  async function resumeAfterLocalMediaRecovery() {
-    if (!cameraReadiness.ready || localMediaHealthRef.current.blocked) {
-      setErrorMessage(`TD-CONN-CHECK: ${cameraReadiness.message}`);
-      return;
-    }
-    setErrorMessage("");
-    if (modeRef.current === "recorded-fallback") {
-      recordedFallbackActiveRef.current = true;
-      setSetupPhase("devices-ready");
-      setConnectionState("ready");
-      setNetworkAudioState("idle");
-      setStage("interview");
-      setAudioNotice("マイクの再取得後、同じ質問の回答を最初から録音します。");
-      armRecordedAnswerButton();
-      return;
-    }
-    await connectPreparedInterview();
   }
 
   function stopAudioPrime() {
@@ -1707,6 +1725,7 @@ export default function Home() {
     }
     const next = [...current, uiTurn];
     completedTranscriptRef.current = next;
+    completedTranscriptVersionRef.current += 1;
     if (options.enqueue !== false) enqueueCompletedTranscriptSnapshot(next);
     return next;
   }
@@ -1974,6 +1993,7 @@ export default function Home() {
     if (!options.resume) {
       chunksRef.current = [];
       recordingLiveUploaderRef.current = null;
+      recordingFinalizePromiseRef.current = null;
       recordingBytesRef.current = 0;
       recordingSizeCappedRef.current = false;
       recordingCompleteRef.current = false;
@@ -2879,6 +2899,7 @@ export default function Home() {
       setErrorMessage(INTERVIEW_ACCESS_MESSAGES[access]);
       return;
     }
+    locationRef.current = preferredLocation;
     setLocation(preferredLocation);
     setStage("setup");
     setSetupPhase("requesting");
@@ -2892,7 +2913,7 @@ export default function Home() {
     microphoneVerificationRef.current = initialMicrophoneVerification();
     setMicrophoneCheckPassed(false);
     localMediaHealthRef.current = initialLocalMediaHealth();
-    localMediaRecoveryAttemptedRef.current = false;
+    localMediaTextContinuityPendingRef.current = false;
     setLocalMediaRecoveryRequired(false);
     setRecordingCaptureState("idle");
     updateRecordingAudioCoverage(null);
@@ -3007,11 +3028,13 @@ export default function Home() {
       };
       modeRef.current = "text";
       setMode("text");
+      locationRef.current = preferredLocation;
       setLocation(preferredLocation);
       startInterviewClock();
       transcriptRef.current = [firstTurn];
       setTranscript([firstTurn]);
       completedTranscriptRef.current = [firstTurn];
+      completedTranscriptVersionRef.current = 1;
       initializeTranscriptDraftWriter(
         { sessionId: data.sessionId, accessToken: data.accessToken },
         "text",
@@ -3031,6 +3054,8 @@ export default function Home() {
       setArchiveSyncState("idle");
       setCompletionSavePending(false);
       interviewFinalizationStoredRef.current = false;
+      finalArchivePromiseRef.current = null;
+      manualFinalizationPromiseRef.current = null;
       voiceTranscriptSealedRef.current = false;
       setStage("interview");
     } catch (error) {
@@ -3067,6 +3092,8 @@ export default function Home() {
     sessionIdRef.current = snapshot.sessionId;
     setSessionId(snapshot.sessionId);
     setCandidateName(snapshot.candidateName);
+    employmentRef.current = snapshot.employment as (typeof EMPLOYMENT_OPTIONS)[number];
+    locationRef.current = snapshot.location;
     setEmployment(snapshot.employment as (typeof EMPLOYMENT_OPTIONS)[number]);
     setLocation(snapshot.location);
     setConsent(true);
@@ -3079,13 +3106,24 @@ export default function Home() {
     transcriptRef.current = resumedTurns;
     setTranscript(resumedTurns);
     completedTranscriptRef.current = resumedTurns;
+    completedTranscriptVersionRef.current = resumedTurns.length;
     initializeTranscriptDraftWriter(
       { sessionId: snapshot.sessionId, accessToken },
       "text",
     );
-    await transcriptDraftWriterRef.current!.enqueue(resumedTurns);
+    let initialDraftPending = false;
+    try {
+      await transcriptDraftWriterRef.current!.enqueue(resumedTurns);
+    } catch {
+      // The replacement transaction already copied the exact source draft.
+      // Keep the candidate in the text interview; the next append and final
+      // seal retry this same prefix through the new session.
+      initialDraftPending = true;
+    }
     setTextDraft("");
-    setProcessingWarning("途中保存済みの回答から再開しました。参加方法の変更は選考上の不利益に扱いません。");
+    setProcessingWarning(initialDraftPending
+      ? "回答は引き継ぎ済みです。文字入力の途中保存を再確認しているため、この画面は閉じずに続けてください。"
+      : "途中保存済みの回答から再開しました。参加方法の変更は選考上の不利益に扱いません。");
     setErrorMessage("");
     setConnectionState("ready");
     setConnectionStep("ready");
@@ -3093,6 +3131,8 @@ export default function Home() {
     setArchiveSyncState("idle");
     setCompletionSavePending(false);
     interviewFinalizationStoredRef.current = false;
+    finalArchivePromiseRef.current = null;
+    manualFinalizationPromiseRef.current = null;
     voiceTranscriptSealedRef.current = false;
     setContinuity(null);
     setStage("interview");
@@ -3110,7 +3150,13 @@ export default function Home() {
       if (continuity.snapshot.action === "replace_with_text") {
         const response = await fetch("/api/interviews/resume", {
           method: "POST",
-          headers: { Accept: "application/json" },
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            expectedDraftSha256: continuity.snapshot.draftTurnCount > 0
+              ? continuity.snapshot.draftSha256
+              : null,
+            expectedDraftTurnCount: continuity.snapshot.draftTurnCount,
+          }),
         });
         const data = await response.json().catch(() => null) as {
           resumed?: boolean;
@@ -3248,9 +3294,9 @@ export default function Home() {
         Authorization: `Bearer ${accessTokenRef.current}`,
       },
       body: JSON.stringify({
-        sessionId,
-        employment,
-        location: normalizePreferredLocation(location),
+        sessionId: sessionIdRef.current,
+        employment: employmentRef.current,
+        location: normalizePreferredLocation(locationRef.current),
         transcript,
       }),
     });
@@ -3398,7 +3444,7 @@ export default function Home() {
         Authorization: `Bearer ${accessTokenRef.current}`,
       },
       body: JSON.stringify({
-        sessionId,
+        sessionId: sessionIdRef.current,
         questionCount,
       }),
     });
@@ -3421,7 +3467,7 @@ export default function Home() {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessTokenRef.current}`,
       },
-      body: JSON.stringify({ sessionId, expectedAnswerCount }),
+      body: JSON.stringify({ sessionId: sessionIdRef.current, expectedAnswerCount }),
     });
     const data = (await response.json().catch(() => null)) as { sealed?: boolean; error?: string } | null;
     if (!response.ok || data?.sealed !== true) {
@@ -3450,7 +3496,7 @@ export default function Home() {
         Authorization: `Bearer ${accessTokenRef.current}`,
       },
       body: JSON.stringify({
-        sessionId,
+        sessionId: sessionIdRef.current,
         transcript,
         transcriptionComplete: true,
       }),
@@ -3462,8 +3508,8 @@ export default function Home() {
     voiceTranscriptSealedRef.current = true;
   }
 
-  async function syncInterviewArchive(attempt = 0): Promise<void> {
-    if (mode !== "text" && !recordingCompleteRef.current) {
+  async function syncInterviewArchive(activeMode = modeRef.current, attempt = 0): Promise<void> {
+    if (activeMode !== "text" && !recordingCompleteRef.current) {
       setArchiveSyncState("error");
       throw new Error("完全な録画を確認できないため、社内Drive格納を完了できません。");
     }
@@ -3479,7 +3525,7 @@ export default function Home() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${accessTokenRef.current}`,
         },
-        body: JSON.stringify({ sessionId }),
+        body: JSON.stringify({ sessionId: sessionIdRef.current }),
       });
       const data = (await response.json().catch(() => null)) as {
         stored?: boolean;
@@ -3493,9 +3539,9 @@ export default function Home() {
       if (response.ok && data?.pending === true) {
         const retryAfterMs = Math.max(100, Math.min(5_000, Number(data.retryAfterMs) || 250));
         await new Promise((resolve) => window.setTimeout(resolve, retryAfterMs));
-        return await syncInterviewArchive(attempt + 1);
+        return await syncInterviewArchive(activeMode, attempt + 1);
       }
-      const needsRecording = mode !== "text";
+      const needsRecording = activeMode !== "text";
       if (
         !response.ok ||
         !data?.stored ||
@@ -3534,7 +3580,7 @@ export default function Home() {
     setRecordingUploadProgress(0);
     await uploadRecordingResumably({
       blob,
-      sessionId,
+      sessionId: sessionIdRef.current,
       accessToken: accessTokenRef.current,
       audioCoverage,
       onProgress: setRecordingUploadProgress,
@@ -3542,93 +3588,165 @@ export default function Home() {
     setRecordingUploadState("stored");
   }
 
-  async function storeInterviewFinalization() {
+  function ensureRecordingFinalized() {
+    const existing = recordingFinalizePromiseRef.current;
+    if (existing) return existing;
+    const generation = recordingGenerationRef.current;
+    const tracked: Promise<void> = (async () => {
+      const blob = await (
+        recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current)
+      );
+      if (recordingGenerationRef.current !== generation || modeRef.current === "text") {
+        throw new Error("INTERVIEW_RECORDING_GENERATION_CHANGED");
+      }
+      if (!blob || !recordingCompleteRef.current) {
+        throw new Error("INTERVIEW_RECORDING_INCOMPLETE");
+      }
+      if (recordingHasBothAudioRef.current !== true) {
+        void reportCandidateEvent("recording_unavailable", "REMOTE_AUDIO_UNVERIFIED");
+      }
+      await uploadRecording(blob);
+    })().catch((error) => {
+      if (recordingFinalizePromiseRef.current === tracked) {
+        recordingFinalizePromiseRef.current = null;
+      }
+      if (recordingGenerationRef.current === generation && modeRef.current !== "text") {
+        setRecordingUploadState("error");
+        const code = error instanceof Error && error.message === "INTERVIEW_RECORDING_INCOMPLETE"
+          ? "NO_RECORDING_AT_COMPLETION"
+          : "UPLOAD_FAILED";
+        void reportCandidateEvent("recording_unavailable", code);
+      }
+      throw error;
+    });
+    recordingFinalizePromiseRef.current = tracked;
+    void tracked.catch(() => undefined);
+    return tracked;
+  }
+
+  async function storeInterviewFinalization(activeMode = modeRef.current) {
     if (interviewFinalizationStoredRef.current) return;
-    if (mode === "voice" && voiceTranscriptCompletionBlocker()) {
+    if (activeMode === "voice" && voiceTranscriptCompletionBlocker()) {
       throw new Error("回答音声の文字起こしに未完了の箇所があるため、面接記録の保存は完了していません。");
     }
     if (!finalizationTranscript().some((turn) => turn.speaker === "candidate" && turn.text.trim().length > 0)) {
       throw new Error("評価に必要な回答記録がありません。オンライン一次面接を最初からお試しください。");
     }
-    if (mode === "voice") await sealVoiceTranscriptCompletion();
-    if (mode === "recorded-fallback") {
+    if (activeMode === "voice") await sealVoiceTranscriptCompletion();
+    if (activeMode === "recorded-fallback") {
       await completeRecordedFallback(retryRecordedAnswersOnFinalizationRef.current);
     } else {
-      if (mode === "text") await sealDurableTranscriptDraft("text");
+      if (activeMode === "text") await sealDurableTranscriptDraft("text");
       await requestEvaluation();
     }
     interviewFinalizationStoredRef.current = true;
   }
 
-  function setArchiveCompletionMessage() {
+  function setArchiveCompletionMessage(activeMode = modeRef.current) {
     setProcessingWarning(
-      mode === "recorded-fallback"
+      activeMode === "recorded-fallback"
         ? "回答音声の自動文字起こしを根拠に評価補助を作成しました。採用担当者が録画と文字起こしを照合して最終判断し、録画・音声の品質は不利益に使用しません。"
         : "",
     );
   }
 
+  function ensureFinalArchiveStored(activeMode: InterviewMode, retryRecordedAnswers = false) {
+    const existing = finalArchivePromiseRef.current;
+    if (existing) return existing;
+    const tracked = (async () => {
+      retryRecordedAnswersOnFinalizationRef.current = retryRecordedAnswers;
+      await storeInterviewFinalization(activeMode);
+      await syncInterviewArchive(activeMode);
+      setArchiveCompletionMessage(activeMode);
+      setCompletionSavePending(false);
+    })().finally(() => {
+      retryRecordedAnswersOnFinalizationRef.current = false;
+      if (finalArchivePromiseRef.current === tracked) finalArchivePromiseRef.current = null;
+    });
+    finalArchivePromiseRef.current = tracked;
+    void tracked.catch(() => undefined);
+    return tracked;
+  }
+
+  function runManualFinalizationSingleflight(task: () => Promise<void>) {
+    const existing = manualFinalizationPromiseRef.current;
+    if (existing) return existing;
+    const tracked = task().finally(() => {
+      if (manualFinalizationPromiseRef.current === tracked) {
+        manualFinalizationPromiseRef.current = null;
+      }
+    });
+    manualFinalizationPromiseRef.current = tracked;
+    void tracked.catch(() => undefined);
+    return tracked;
+  }
+
   async function retryRecordingUpload() {
     if (completionHoldRef.current !== "none") return;
-    const blob = recordingBlobRef.current;
-    if (!blob || recordingUploadState === "uploading") return;
+    if (recordingUploadState === "uploading") return;
     if (!recordingCompleteRef.current) {
       setProcessingWarning("録画が途中で終了したため、この録画を完了データとして送信できません。採用担当者へ受付番号をお知らせください。");
       setStage("review");
       return;
     }
-    setStage("evaluating");
-    try {
-      if (mode === "voice") await sealDurableTranscriptDraft("voice");
-      if (mode === "recorded-fallback") await sealRecordedFallbackCompletion(true);
-      await uploadRecording(blob);
-    } catch {
-      setRecordingUploadState("error");
-      setProcessingWarning("録画の送信を完了できませんでした。下のボタンから再試行してください。");
-      reportCandidateEvent("recording_unavailable", "UPLOAD_FAILED");
-      setStage("review");
-      return;
-    }
-    try {
-      retryRecordedAnswersOnFinalizationRef.current = true;
-      await storeInterviewFinalization();
-      await syncInterviewArchive();
-      setArchiveCompletionMessage();
-      setCompletionSavePending(false);
-    } catch {
-      // The recording is already durable at this point. An evaluation or Drive
-      // failure must not falsely return the recording itself to the error state.
-      setProcessingWarning("面接記録の最終保存を完了できませんでした。下のボタンから再試行してください。");
-    } finally {
-      retryRecordedAnswersOnFinalizationRef.current = false;
-      setStage("review");
-    }
+    const activeMode = modeRef.current;
+    await runManualFinalizationSingleflight(async () => {
+      setStage("evaluating");
+      const recordingResult = ensureRecordingFinalized().then(
+        () => "stored" as const,
+        () => "failed" as const,
+      );
+      let transcriptSealFailed = false;
+      try {
+        if (activeMode === "voice") await sealDurableTranscriptDraft("voice");
+        if (activeMode === "recorded-fallback") await sealRecordedFallbackCompletion(true);
+      } catch {
+        transcriptSealFailed = true;
+      }
+      if (await recordingResult === "failed") {
+        setProcessingWarning("録画の送信を完了できませんでした。下のボタンから再試行してください。");
+        setStage("review");
+        return;
+      }
+      if (transcriptSealFailed) {
+        setProcessingWarning("録画の一次保存は完了しましたが、回答記録の保全を完了できませんでした。下のボタンから最終保存を再試行してください。");
+        setStage("review");
+        return;
+      }
+      try {
+        await ensureFinalArchiveStored(activeMode, true);
+      } catch {
+        // The recording is already durable at this point. An evaluation or
+        // Drive failure must not relabel the recording itself as failed.
+        setProcessingWarning("面接記録の最終保存を完了できませんでした。下のボタンから再試行してください。");
+      } finally {
+        setStage("review");
+      }
+    });
   }
 
   async function retryInterviewFinalization() {
     if (completionHoldRef.current !== "none") return;
     if (archiveSyncState === "syncing") return;
-    if (mode !== "text" && !recordingCompleteRef.current) {
+    const activeMode = modeRef.current;
+    if (activeMode !== "text" && !recordingCompleteRef.current) {
       setArchiveSyncState("error");
       setProcessingWarning("完全な録画を確認できないため、面接記録の最終保存は完了していません。採用担当者へ受付番号をお知らせください。");
       setStage("review");
       return;
     }
-    setStage("evaluating");
-    try {
-      if (mode === "voice") await sealVoiceTranscriptCompletion();
-      if (mode === "recorded-fallback") await sealRecordedFallbackCompletion(true);
-      retryRecordedAnswersOnFinalizationRef.current = true;
-      await storeInterviewFinalization();
-      await syncInterviewArchive();
-      setArchiveCompletionMessage();
-      setCompletionSavePending(false);
-    } catch {
-      setProcessingWarning("面接記録の最終保存を完了できませんでした。下のボタンから再試行してください。");
-    } finally {
-      retryRecordedAnswersOnFinalizationRef.current = false;
-      setStage("review");
-    }
+    await runManualFinalizationSingleflight(async () => {
+      setStage("evaluating");
+      try {
+        if (activeMode === "voice") await sealVoiceTranscriptCompletion();
+        if (activeMode === "recorded-fallback") await sealRecordedFallbackCompletion(true);
+        await ensureFinalArchiveStored(activeMode, true);
+      } catch {
+        setProcessingWarning("面接記録の最終保存を完了できませんでした。下のボタンから再試行してください。");
+      } finally {
+        setStage("review");
+      }
+    });
   }
 
   function runPendingCompletion() {
@@ -3764,6 +3882,7 @@ export default function Home() {
   }
 
   async function completeInterview(reason: string) {
+    const activeMode = modeRef.current;
     if (reason === "candidate_requested_stop") {
       // A model/tool/internal call can never prove a visible candidate gesture.
       // Only stopInterviewFromCandidateButton() may create the durable hold.
@@ -3778,7 +3897,7 @@ export default function Home() {
       return;
     }
     if (endingRef.current || completionHoldRef.current !== "none") return;
-    if (mode === "internal-test") {
+    if (activeMode === "internal-test") {
       upsertTurn({
         id: `internal-test-complete-${Date.now()}`,
         speaker: "interviewer",
@@ -3798,7 +3917,7 @@ export default function Home() {
       });
       return;
     }
-    if (mode === "voice" && voiceTranscriptCompletionBlocker()) {
+    if (activeMode === "voice" && voiceTranscriptCompletionBlocker()) {
       await enterInterviewHold("transcript_incomplete", {
         type: "transcription_failed",
         code: "TRANSCRIPTION_FAILED",
@@ -3808,14 +3927,14 @@ export default function Home() {
     if (pendingCompletionTimerRef.current) window.clearTimeout(pendingCompletionTimerRef.current);
     pendingCompletionTimerRef.current = null;
     pendingCompletionReasonRef.current = null;
-    if (mode === "voice") verifyRecordingRemoteCoverageAtCompletion();
+    if (activeMode === "voice") verifyRecordingRemoteCoverageAtCompletion();
     endingRef.current = true;
     // From this point until the verified Drive receipt, leaving the page can
     // abandon bytes or finalization requests that no server has received yet.
     setCompletionSavePending(true);
     setStage("evaluating");
     setConnectionState("idle");
-    if (mode === "recorded-fallback" && recordedAnswerRecorderRef.current) {
+    if (activeMode === "recorded-fallback" && recordedAnswerRecorderRef.current) {
       const answerNumber = recordedQuestionIndex + 1;
       finishRecordedAnswerCapture(answerNumber);
       upsertTurn({
@@ -3826,89 +3945,81 @@ export default function Home() {
       });
     }
     stopRealtime();
-    // Persist the small append-only transcript draft before waiting for the
-    // mobile browser to finish its media container. The canonical voice seal
-    // comes only after the recording receipt below: if this request boundary is
-    // interrupted, scheduled recovery can promote the exact sealed draft while
-    // never evaluating an interview whose recording is still incomplete.
-    if (mode === "recorded-fallback") {
+    // Start recorder finalization before any network-bound transcript request.
+    // On iOS, delaying this until after a seal request can let the page suspend
+    // before MediaRecorder.onstop releases its final part. The shared promise is
+    // reused by every retry, so a slow finalizer can never create a second
+    // recording upload.
+    const recordingFinalization = activeMode === "text" ? null : ensureRecordingFinalized();
+    if (recordingFinalization) void recordingFinalization.catch(() => undefined);
+
+    // The transcript seal and recording receipt are independent durability
+    // boundaries. A temporary transcript failure must not relabel a recording
+    // upload as failed or abandon its final part.
+    let transcriptSealFailed = false;
+    if (activeMode === "recorded-fallback") {
       try {
         await sealRecordedFallbackCompletion();
       } catch {
-        setRecordingUploadState("error");
-        setProcessingWarning("回答数の完了情報を保存できませんでした。下のボタンから再試行してください。");
-        setStage("review");
-        endingRef.current = false;
-        return;
+        transcriptSealFailed = true;
       }
-    } else if (mode === "voice") {
+    } else if (activeMode === "voice") {
       try {
         await sealDurableTranscriptDraft("voice");
       } catch {
-        setRecordingUploadState("error");
-        setProcessingWarning("回答の文字起こしを保全できませんでした。下のボタンから再試行してください。");
+        transcriptSealFailed = true;
+      }
+    }
+
+    if (recordingFinalization) {
+      let timeoutId: number | null = null;
+      const recordingResult = await Promise.race([
+        recordingFinalization.then(
+          () => "stored" as const,
+          () => "failed" as const,
+        ),
+        new Promise<"timed_out">((resolve) => {
+          timeoutId = window.setTimeout(() => resolve("timed_out"), 120_000);
+        }),
+      ]);
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      if (recordingResult === "timed_out") {
+        void reportCandidateEvent("recording_unavailable", "RECORDER_FINALIZE_TIMEOUT");
+        setProcessingWarning("録画の最終部分を引き続き保存しています。この画面を閉じずにお待ちください。完了後、最終保存を再開できます。");
+        setStage("review");
+        endingRef.current = false;
+        void recordingFinalization.then(() => {
+          setProcessingWarning(transcriptSealFailed
+            ? "録画の一次保存は完了しましたが、回答記録の保全を完了できませんでした。下のボタンから最終保存を再試行してください。"
+            : "録画の一次保存が完了しました。下のボタンから社内Driveへの最終保存を再開してください。");
+        }).catch(() => {
+          setProcessingWarning("録画の送信を完了できませんでした。下のボタンから再試行してください。");
+        });
+        return;
+      }
+      if (recordingResult === "failed") {
+        setProcessingWarning("録画の送信を完了できませんでした。下のボタンから再試行してください。");
         setStage("review");
         endingRef.current = false;
         return;
       }
     }
-    // A browser media finalizer must never leave the candidate on an endless
-    // spinner. Two minutes is deliberately far above normal WebM/MP4 stop time.
-    // On timeout, accepted parts and the completion seal remain available to
-    // server recovery; the candidate sees a hold, never a false success.
-    let recordingFinalizeTimedOut = false;
-    const recordingPromise = recordingPromiseRef.current ?? Promise.resolve(recordingBlobRef.current);
-    const recordingBlob = mode === "text" ? null : await Promise.race([
-      recordingPromise,
-      new Promise<null>((resolve) => window.setTimeout(() => {
-        recordingFinalizeTimedOut = true;
-        resolve(null);
-      }, 120_000)),
-    ]);
-    const recordingComplete = mode === "text" || (!recordingFinalizeTimedOut && recordingCompleteRef.current);
-    if (recordingFinalizeTimedOut) {
-      void reportCandidateEvent("recording_unavailable", "RECORDER_FINALIZE_TIMEOUT");
-    }
-    if (mode !== "text" && (!recordingBlob || !recordingComplete)) reportCandidateEvent("recording_unavailable", "NO_RECORDING_AT_COMPLETION");
-    if (mode !== "text" && recordingBlob && recordingComplete && recordingHasBothAudioRef.current !== true) {
-      reportCandidateEvent("recording_unavailable", "REMOTE_AUDIO_UNVERIFIED");
-    }
-    if (mode !== "text" && (!recordingBlob || !recordingComplete)) {
-      setRecordingUploadState("error");
-      setProcessingWarning("完全な録画データを端末で生成できなかったため、面接記録の保存は完了していません。採用担当者へ受付番号をお知らせください。");
+
+    if (transcriptSealFailed) {
+      setArchiveSyncState("error");
+      setProcessingWarning("録画の一次保存は完了しましたが、回答記録の保全を完了できませんでした。下のボタンから最終保存を再試行してください。");
       setStage("review");
       endingRef.current = false;
       return;
     }
     // Do not let evaluation completion start the Drive archive before the
-    // recording artifact is durable. Both operations were awaited eventually,
-    // but running them concurrently allowed a permanent video-less archive.
-    let completionPhase: "recording" | "evaluation" | "archive" = "recording";
-    let recordingStored = mode === "text";
+    // recording artifact is durable. ensureRecordingFinalized above is the one
+    // recording boundary; evaluation and Drive never race ahead of it.
     try {
-      if (mode !== "text" && recordingBlob) {
-        await uploadRecording(recordingBlob);
-        recordingStored = true;
-      }
-      completionPhase = "evaluation";
-      await storeInterviewFinalization();
-      completionPhase = "archive";
-      await syncInterviewArchive();
-      setArchiveCompletionMessage();
-      setCompletionSavePending(false);
+      await ensureFinalArchiveStored(activeMode);
       setStage("review");
     } catch (error) {
-      if (completionPhase === "recording" && !recordingStored && mode !== "text") {
-        setRecordingUploadState("error");
-        reportCandidateEvent("recording_unavailable", "UPLOAD_FAILED");
-      }
-      setProcessingWarning(
-        completionPhase === "recording"
-          ? "録画の送信を完了できませんでした。下のボタンから再試行してください。"
-          : completionPhase === "evaluation"
-            ? "回答記録の整理を完了できませんでした。下のボタンから再試行してください。"
-            : "社内Driveへの最終格納を完了できませんでした。下のボタンから再試行してください。",
-      );
+      setProcessingWarning("面接記録の整理または社内Driveへの最終格納を完了できませんでした。下のボタンから再試行してください。");
       setStage("review");
       void error;
     } finally {
@@ -4180,10 +4291,13 @@ export default function Home() {
       setArchiveSyncState("idle");
       setCompletionSavePending(false);
       interviewFinalizationStoredRef.current = false;
+      finalArchivePromiseRef.current = null;
+      manualFinalizationPromiseRef.current = null;
       voiceTranscriptSealedRef.current = false;
       transcriptRef.current = [];
       setTranscript([]);
       completedTranscriptRef.current = [];
+      completedTranscriptVersionRef.current = 0;
       recordedInterviewSessionRef.current = activeSessionId;
     }
     assistantPartialsRef.current.clear();
@@ -4496,6 +4610,7 @@ export default function Home() {
     transcriptRef.current = [];
     setTranscript([]);
     completedTranscriptRef.current = [];
+    completedTranscriptVersionRef.current = 0;
     transcriptDraftWriterRef.current = null;
     processedCompletionCallsRef.current.clear();
     attemptedCandidateEventsRef.current.clear();
@@ -4507,6 +4622,9 @@ export default function Home() {
     setErrorMessage("");
     recordingBlobRef.current = null;
     recordingLiveUploaderRef.current = null;
+    recordingFinalizePromiseRef.current = null;
+    finalArchivePromiseRef.current = null;
+    manualFinalizationPromiseRef.current = null;
     recordingPromiseRef.current = null;
     recordingResolveRef.current = null;
     recordingBytesRef.current = 0;
@@ -4532,7 +4650,7 @@ export default function Home() {
     microphoneVerificationRef.current = initialMicrophoneVerification();
     setMicrophoneCheckPassed(false);
     localMediaHealthRef.current = initialLocalMediaHealth();
-    localMediaRecoveryAttemptedRef.current = false;
+    localMediaTextContinuityPendingRef.current = false;
     setLocalMediaRecoveryRequired(false);
     setCandidateAudioState("idle");
     setRemoteAudioState("idle");
@@ -4554,6 +4672,7 @@ export default function Home() {
     transcriptRef.current = [];
     setTranscript([]);
     completedTranscriptRef.current = [];
+    completedTranscriptVersionRef.current = 0;
     transcriptDraftWriterRef.current = null;
     processedCompletionCallsRef.current.clear();
     attemptedCandidateEventsRef.current.clear();
@@ -4574,6 +4693,9 @@ export default function Home() {
     recordingGenerationRef.current += 1;
     recordingBlobRef.current = null;
     recordingLiveUploaderRef.current = null;
+    recordingFinalizePromiseRef.current = null;
+    finalArchivePromiseRef.current = null;
+    manualFinalizationPromiseRef.current = null;
     recordingPromiseRef.current = null;
     recordingResolveRef.current = null;
     setTextDraft("");
@@ -4591,7 +4713,7 @@ export default function Home() {
     microphoneVerificationRef.current = initialMicrophoneVerification();
     setMicrophoneCheckPassed(false);
     localMediaHealthRef.current = initialLocalMediaHealth();
-    localMediaRecoveryAttemptedRef.current = false;
+    localMediaTextContinuityPendingRef.current = false;
     setLocalMediaRecoveryRequired(false);
     setCandidateAudioState("idle");
     setRemoteAudioState("idle");
@@ -4888,9 +5010,9 @@ export default function Home() {
             {errorMessage && <div className="inline-error" role="alert">{errorMessage}</div>}
             {localMediaRecoveryRequired && (
               <div className="recorded-fallback-card" role="alert" aria-live="assertive">
-                <strong>マイク接続が変化したため、面接を停止しました</strong>
-                <span>自動で別のマイクへ切り替えたり、質問を進めたりしません。下のボタンを押してマイクを再取得し、声でメーターが動くことを確認してください。</span>
-                <button type="button" disabled={sessionStarting} onClick={() => void reacquireLocalMedia()}>{sessionStarting ? "マイクを再取得中…" : "マイクを再取得"}</button>
+                <strong>カメラまたはマイクの中断を検知しました</strong>
+                <span>録画の欠損を防ぐため、同じ音声回線への再接続は行いません。保存済みの質問・回答を引き継ぎ、文字入力で面接を続けられます。</span>
+                <button type="button" disabled={sessionStarting || !networkAvailable} onClick={() => void switchInterruptedInterviewToTextContinuity()}>{sessionStarting ? "安全に切り替え中…" : "文字入力へ切り替えて続ける"}</button>
               </div>
             )}
             {setupPhase === "error" && !localMediaRecoveryRequired && accessTokenRef.current && (
@@ -4906,9 +5028,11 @@ export default function Home() {
               {screenShareSupported && <button type="button" onClick={() => void enableScreenCapture()}>{screenCaptureState === "ready" ? "画面共有を追加済み" : "画面共有を追加（任意）"}</button>}
             </div>
             {!cameraReadiness.ready && !localMediaRecoveryRequired && <div className="inline-error" role="status" aria-live="polite">{cameraReadiness.message}</div>}
-            <button className="primary-action setup-connect-button" disabled={!stream || sessionStarting || !cameraReadiness.ready} onClick={() => void (localMediaHealthRef.current.revision > 0 ? resumeAfterLocalMediaRecovery() : setupPhase === "error" ? startRecordedFallback() : connectPreparedInterview())}>
-              {sessionStarting ? "オンライン一次面接へ接続中…" : setupPhase === "error" ? "録画式のオンライン一次面接へ進む" : localMediaHealthRef.current.revision > 0 ? "オンライン一次面接へ再接続" : "オンライン一次面接へ接続"} <span>→</span>
-            </button>
+            {!localMediaRecoveryRequired && (
+              <button className="primary-action setup-connect-button" disabled={!stream || sessionStarting || !cameraReadiness.ready} onClick={() => void (setupPhase === "error" ? startRecordedFallback() : connectPreparedInterview())}>
+                {sessionStarting ? "オンライン一次面接へ接続中…" : setupPhase === "error" ? "録画式のオンライン一次面接へ進む" : "オンライン一次面接へ接続"} <span>→</span>
+              </button>
+            )}
             <p className="setup-footnote">カメラ映像と音声の確認後に録画を開始します。画面共有はPCのみ任意で追加できます。</p>
           </div>
         </section>

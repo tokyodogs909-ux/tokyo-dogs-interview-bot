@@ -194,15 +194,23 @@ class FakeD1Statement {
     let changes = 0;
     if (this.sql.startsWith("INSERT INTO interview_sessions") &&
       this.sql.includes("FROM interview_sessions source")) {
-      const [replacementId, createdAt, updatedAt, sourceId] = this.values;
+      const [replacementId, createdAt, updatedAt, sourceId,
+        emptyDraftCount, expectedDraftCount, expectedDraftSha, exactDraftCount] = this.values;
       const source = this.database.sessions.get(sourceId);
+      const sourceDraft = this.database.transcriptDrafts.get(sourceId);
+      const draftFenceMatches = Number(expectedDraftCount) === 0
+        ? Number(emptyDraftCount) === 0 && !sourceDraft
+        : Number(expectedDraftCount) >= 1 && Number(expectedDraftCount) <= 300 &&
+          sourceDraft?.mode === "voice" && sourceDraft.sealed_at === null &&
+          sourceDraft.transcript_sha256 === expectedDraftSha &&
+          sourceDraft.turn_count === Number(exactDraftCount);
       const textStarted = this.database.auditEvents.some((event) =>
         event.session_id === sourceId && event.event_type === "reasonable_accommodation_text_selected");
       const held = hasCompletionHold(this.database, sourceId);
       if (source && ["created", "in_progress"].includes(source.status) &&
         source.completed_at == null &&
         ["not_started", "uploading", "failed", "not_applicable"].includes(source.recording_status) &&
-        !textStarted && !held && !this.database.sessionReplacements.has(sourceId)) {
+        !textStarted && !held && !this.database.sessionReplacements.has(sourceId) && draftFenceMatches) {
         this.database.sessions.set(replacementId, {
           ...source,
           id: replacementId,
@@ -218,14 +226,39 @@ class FakeD1Statement {
         changes = 1;
       }
     } else if (this.sql.startsWith("INSERT INTO interview_session_replacements")) {
-      const [sourceId, replacementId, replacementMode, reason, createdAt] = this.values;
-      if (this.database.sessions.has(replacementId) && !this.database.sessionReplacements.has(sourceId)) {
+      const [sourceId, replacementId, createdAt, checkedReplacementId, checkedSourceId] = this.values;
+      if (replacementId === checkedReplacementId && sourceId === checkedSourceId &&
+        this.database.sessions.has(replacementId) && !this.database.sessionReplacements.has(sourceId)) {
         this.database.sessionReplacements.set(sourceId, {
           source_session_id: sourceId,
           replacement_session_id: replacementId,
-          replacement_mode: replacementMode,
-          reason,
+          replacement_mode: "text",
+          reason: "device_continuity",
           created_at: createdAt,
+        });
+        changes = 1;
+      }
+    } else if (this.sql.startsWith("INSERT INTO interview_transcript_drafts") &&
+      this.sql.includes("FROM interview_transcript_drafts source")) {
+      const [replacementId, createdAt, updatedAt, sourceId,
+        expectedDraftSha, expectedDraftCount, checkedSourceId, checkedReplacementId] = this.values;
+      const sourceDraft = this.database.transcriptDrafts.get(sourceId);
+      const replacement = this.database.sessionReplacements.get(checkedSourceId);
+      if (sourceDraft?.sealed_at == null && sourceDraft.turn_count >= 1 &&
+        sourceDraft.turn_count <= 300 && checkedSourceId === sourceId &&
+        sourceDraft.transcript_sha256 === expectedDraftSha &&
+        sourceDraft.turn_count === Number(expectedDraftCount) &&
+        replacement?.replacement_session_id === checkedReplacementId &&
+        checkedReplacementId === replacementId &&
+        !this.database.transcriptDrafts.has(replacementId) &&
+        !this.database.skipContinuityDraftCopy) {
+        this.database.transcriptDrafts.set(replacementId, {
+          ...sourceDraft,
+          session_id: replacementId,
+          mode: "text",
+          sealed_at: null,
+          created_at: createdAt,
+          updated_at: updatedAt,
         });
         changes = 1;
       }
@@ -707,6 +740,28 @@ class FakeD1Statement {
         changes = 1;
       }
     } else if (
+      this.sql.startsWith("INSERT INTO interview_recording_alerts") &&
+      this.sql.includes("'recording_recovery_manual_attention'")
+    ) {
+      const [sessionId, code, firstSeenAt, lastSeenAt, createdAt, updatedAt] = this.values;
+      const existing = this.database.recordingAlerts.get(sessionId);
+      if (!existing || lastSeenAt > existing.last_seen_at) {
+        this.database.recordingAlerts.set(sessionId, {
+          session_id: sessionId,
+          alert_type: "recording_recovery_manual_attention",
+          severity: "critical",
+          status: "open",
+          code,
+          first_seen_at: existing?.first_seen_at ?? firstSeenAt,
+          last_seen_at: lastSeenAt,
+          occurrence_count: existing ? existing.occurrence_count + 1 : 1,
+          resolved_at: null,
+          created_at: existing?.created_at ?? createdAt,
+          updated_at: updatedAt,
+        });
+        changes = 1;
+      }
+    } else if (
       this.sql.startsWith("INSERT INTO interview_operational_alerts") &&
       this.sql.includes("'google_drive_archive_integrity'")
     ) {
@@ -1107,7 +1162,11 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("INSERT INTO interview_transcript_drafts")) {
       const [sessionId, mode, transcriptJson, transcriptSha256, turnCount,
         createdAt, updatedAt] = this.values;
-      if (!this.database.transcriptDrafts.has(sessionId)) {
+      const session = this.database.sessions.get(sessionId);
+      const activeFenceRequired = this.sql.includes("interview_session_replacements");
+      const active = session && ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+        !this.database.sessionReplacements.has(sessionId);
+      if (!this.database.transcriptDrafts.has(sessionId) && (!activeFenceRequired || active)) {
         this.database.transcriptDrafts.set(sessionId, {
           session_id: sessionId,
           mode,
@@ -1124,10 +1183,14 @@ class FakeD1Statement {
       const [transcriptJson, transcriptSha256, turnCount, updatedAt,
         sessionId, mode, previousSha256] = this.values;
       const draft = this.database.transcriptDrafts.get(sessionId);
+      const session = this.database.sessions.get(sessionId);
+      const activeFenceRequired = this.sql.includes("interview_session_replacements");
+      const active = session && ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+        !this.database.sessionReplacements.has(sessionId);
       if (
         draft?.mode === mode &&
         draft.transcript_sha256 === previousSha256 &&
-        draft.sealed_at === null
+        draft.sealed_at === null && (!activeFenceRequired || active)
       ) {
         Object.assign(draft, {
           transcript_json: transcriptJson,
@@ -1140,11 +1203,15 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE interview_transcript_drafts SET sealed_at")) {
       const [sealedAt, updatedAt, sessionId, mode, transcriptSha256, transcriptJson] = this.values;
       const draft = this.database.transcriptDrafts.get(sessionId);
+      const session = this.database.sessions.get(sessionId);
+      const activeFenceRequired = this.sql.includes("interview_session_replacements");
+      const active = session && ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+        !this.database.sessionReplacements.has(sessionId);
       if (
         draft?.mode === mode &&
         draft.transcript_sha256 === transcriptSha256 &&
         draft.transcript_json === transcriptJson &&
-        draft.sealed_at === null
+        draft.sealed_at === null && (!activeFenceRequired || active)
       ) {
         Object.assign(draft, { sealed_at: sealedAt, updated_at: updatedAt });
         changes = 1;
@@ -1696,6 +1763,33 @@ class FakeD1Statement {
     if (this.sql.startsWith("SELECT replacement_session_id FROM interview_session_replacements")) {
       return this.database.sessionReplacements.get(this.values[0]) ?? null;
     }
+    if (this.sql.startsWith("SELECT alert_type, severity, status, code") &&
+      this.sql.includes("FROM interview_recording_alerts")) {
+      return this.database.recordingAlerts.get(this.values[0]) ?? null;
+    }
+    if (this.sql.startsWith("SELECT terminal.session_id, terminal.event_type") &&
+      this.sql.includes("recording_recovery_manual_attention")) {
+      const terminalTypes = new Set([
+        "recording_recovery_manual_attention",
+        "legacy_recording_recovery_manual_attention",
+        "interrupted_recording_recovery_manual_attention",
+      ]);
+      const terminal = this.database.auditEvents
+        .filter((event) => {
+          if (!terminalTypes.has(event.event_type)) return false;
+          const alert = this.database.recordingAlerts.get(event.session_id);
+          return !alert || (alert.status === "resolved" && alert.resolved_at &&
+            event.created_at > alert.resolved_at);
+        })
+        .sort((left, right) => left.created_at.localeCompare(right.created_at) ||
+          left.session_id.localeCompare(right.session_id))[0];
+      return terminal ? {
+        session_id: terminal.session_id,
+        event_type: terminal.event_type,
+        detail_json: terminal.detail_json ?? null,
+        created_at: terminal.created_at,
+      } : null;
+    }
     if (this.sql.startsWith("SELECT s.id, s.candidate_name, s.employment") &&
       this.sql.includes("draft.mode AS draft_mode")) {
       const session = this.database.sessions.get(this.values[0]);
@@ -1712,6 +1806,8 @@ class FakeD1Statement {
         created_at: session.created_at,
         draft_mode: draft?.mode ?? null,
         draft_json: draft?.transcript_json ?? null,
+        draft_sha256: draft?.transcript_sha256 ?? null,
+        draft_turn_count: draft?.turn_count ?? null,
         draft_sealed_at: draft?.sealed_at ?? null,
         text_started: this.database.auditEvents.some((event) =>
           event.session_id === session.id && event.event_type === "reasonable_accommodation_text_selected") ? 1 : 0,
@@ -1720,6 +1816,12 @@ class FakeD1Statement {
         completion_hold: hasCompletionHold(this.database, session.id) ? 1 : 0,
         technical_hold: this.database.auditEvents.some((event) =>
           event.session_id === session.id && isRealtimeTranscriptionGapEvent(event)) ? 1 : 0,
+        recording_manual_attention: this.database.auditEvents.some((event) =>
+          event.session_id === session.id && [
+            "recording_recovery_manual_attention",
+            "legacy_recording_recovery_manual_attention",
+            "interrupted_recording_recovery_manual_attention",
+          ].includes(event.event_type)) ? 1 : 0,
       };
     }
     if (this.sql.startsWith("SELECT s.id, s.status, s.recording_status") &&
@@ -2429,7 +2531,10 @@ class FakeD1Statement {
           .slice(0, limit)
           .map((session) => {
             const sync = this.database.externalSyncs.get(session.id);
-            const alert = this.database.operationalAlerts.get(session.id);
+            const recordingAlert = this.database.recordingAlerts.get(session.id);
+            const alert = recordingAlert?.status === "open"
+              ? recordingAlert
+              : this.database.operationalAlerts.get(session.id);
             return {
               id: session.id,
               candidate_name: session.candidate_name,
@@ -2525,6 +2630,7 @@ class FakeD1 {
     this.publicEntries = [];
     this.externalSyncs = new Map();
     this.operationalAlerts = new Map();
+    this.recordingAlerts = new Map();
     this.driveUploadSteps = new Map();
     this.driveRecordingRepairAuthorizations = new Map();
     this.driveHierarchyNodes = new Map();
@@ -2538,6 +2644,7 @@ class FakeD1 {
     this.beforeExternalSyncComplete = null;
     this.beforeDriveUploadStepDelete = null;
     this.throwAfterRepairAuthorizationConsume = false;
+    this.skipContinuityDraftCopy = false;
   }
 
   prepare(sql) {
@@ -3166,12 +3273,20 @@ for (const mode of ["missing-state", "no-full-parts", "part-gap", "digest-mismat
     assert.equal(database.auditEvents.filter((event) =>
       event.session_id === fixture.session.id &&
       event.event_type === "interrupted_recording_recovery_manual_attention").length, 1);
+    const firstAlert = database.recordingAlerts.get(fixture.session.id);
+    assert.equal(firstAlert?.alert_type, "recording_recovery_manual_attention");
+    assert.equal(firstAlert?.severity, "critical");
+    assert.equal(firstAlert?.status, "open");
+    assert.equal(firstAlert?.occurrence_count, 1);
+    assert.match(firstAlert?.code ?? "", /^[A-Z0-9_]+$/);
     const writesAfterAttention = recordings.putCount;
     await scheduleInterviewRecovery(env);
     assert.equal(recordings.putCount, writesAfterAttention);
     assert.equal(database.auditEvents.filter((event) =>
       event.session_id === fixture.session.id &&
       event.event_type === "interrupted_recording_recovery_manual_attention").length, 1);
+    assert.equal(database.recordingAlerts.get(fixture.session.id)?.occurrence_count, 1,
+      "a replay must not inflate the same terminal alert");
   });
 }
 
@@ -3247,6 +3362,11 @@ test("missing legacy v1 parts create one manual-attention marker and never mutat
   assert.equal(database.auditEvents.filter((event) =>
     event.session_id === fixture.session.id &&
     event.event_type === "legacy_recording_recovery_manual_attention").length, 1);
+  const alert = database.recordingAlerts.get(fixture.session.id);
+  assert.equal(alert?.alert_type, "recording_recovery_manual_attention");
+  assert.equal(alert?.severity, "critical");
+  assert.equal(alert?.status, "open");
+  assert.equal(alert?.occurrence_count, 1);
 });
 
 test("legacy v1 recovery rejects an existing conflicting manifest and preserves every D1 output field", async () => {
@@ -6283,6 +6403,29 @@ test("candidate continuity cookie resumes text and replaces interrupted media ex
   const source = database.sessions.get(createdPayload.sessionId);
   source.status = "in_progress";
   source.recording_status = "uploading";
+  const sourceTurns = [{
+    id: "voice-question-1",
+    speaker: "interviewer",
+    text: "これまでの経験を教えてください。",
+    createdAt: new Date().toISOString(),
+  }, {
+    id: "voice-answer-1",
+    speaker: "candidate",
+    text: "接客の仕事をしてきました。",
+    createdAt: new Date().toISOString(),
+  }];
+  const sourceTranscriptJson = JSON.stringify(sourceTurns);
+  const sourceTranscriptSha256 = sha256Hex(sourceTranscriptJson);
+  database.transcriptDrafts.set(createdPayload.sessionId, {
+    session_id: createdPayload.sessionId,
+    mode: "voice",
+    transcript_json: sourceTranscriptJson,
+    transcript_sha256: sourceTranscriptSha256,
+    turn_count: sourceTurns.length,
+    sealed_at: null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
 
   const inspected = await request("/api/interviews/resume", {
     headers: { Cookie: cookie },
@@ -6298,11 +6441,19 @@ test("candidate continuity cookie resumes text and replaces interrupted media ex
   const [replaced, concurrentReplay] = await Promise.all([
     request("/api/interviews/resume", {
       method: "POST",
-      headers: { Cookie: cookie },
+      headers: { Cookie: cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expectedDraftSha256: sourceTranscriptSha256,
+        expectedDraftTurnCount: sourceTurns.length,
+      }),
     }, env),
     request("/api/interviews/resume", {
       method: "POST",
-      headers: { Cookie: cookie },
+      headers: { Cookie: cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expectedDraftSha256: sourceTranscriptSha256,
+        expectedDraftTurnCount: sourceTurns.length,
+      }),
     }, env),
   ]);
   assert.equal(replaced.status, 200, await replaced.clone().text());
@@ -6316,6 +6467,13 @@ test("candidate continuity cookie resumes text and replaces interrupted media ex
   assert.notEqual(replacedPayload.snapshot.sessionId, createdPayload.sessionId);
   assert.equal(replacedPayload.snapshot.mode, "text");
   assert.equal(replacedPayload.snapshot.action, "resume_text");
+  assert.equal(
+    database.transcriptDrafts.get(replacedPayload.snapshot.sessionId)?.transcript_json,
+    JSON.stringify(sourceTurns),
+    "the source draft must be copied atomically to the replacement",
+  );
+  assert.deepEqual(replacedPayload.snapshot.transcript, sourceTurns,
+    "the replacement must continue from the exact server-side draft");
   assert.equal(database.sessions.get(createdPayload.sessionId).status, "interrupted");
   assert.equal(database.sessions.get(replacedPayload.snapshot.sessionId).recording_status, "not_applicable");
   assert.equal(
@@ -6338,6 +6496,36 @@ test("candidate continuity cookie resumes text and replaces interrupted media ex
   }, env);
   assert.equal(followed.status, 200);
   assert.equal((await followed.json()).snapshot.sessionId, replacedPayload.snapshot.sessionId);
+
+  const staleSourceDraft = await request("/api/interviews/transcript/draft", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${createdPayload.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      sessionId: createdPayload.sessionId,
+      mode: "voice",
+      transcript: [...sourceTurns, {
+        id: "stale-old-tab-answer",
+        speaker: "candidate",
+        text: "古い画面から追加された回答です。",
+        createdAt: new Date().toISOString(),
+      }],
+    }),
+  }, env);
+  assert.equal(staleSourceDraft.status, 409,
+    "an old media tab must not append after the immutable text cutover");
+  assert.equal(database.transcriptDrafts.get(createdPayload.sessionId)?.transcript_json,
+    sourceTranscriptJson);
+
+  database.transcriptDrafts.get(replacedPayload.snapshot.sessionId).transcript_sha256 = "0".repeat(64);
+  const corruptedReplay = await request("/api/interviews/resume", {
+    method: "POST",
+    headers: { Cookie: cookie },
+  }, env);
+  assert.equal(corruptedReplay.status, 409,
+    "a mapped replacement is reusable only after source/replacement digest readback matches");
 
   const absent = await request("/api/interviews/resume", undefined, env);
   assert.equal(absent.status, 200);
@@ -6380,6 +6568,42 @@ test("candidate continuity never labels a known transcription gap as indefinitel
   const inspectedPayload = await inspected.json();
   assert.equal(inspectedPayload.snapshot.action, "held");
   assert.notEqual(inspectedPayload.snapshot.action, "processing");
+});
+
+test("candidate continuity holds a recording with terminal manual attention", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const created = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "録画 保留",
+      employment: "正社員",
+      location: "越谷店",
+      consent: true,
+      interviewMode: "camera",
+    }),
+  }, env);
+  assert.equal(created.status, 201);
+  const payload = await created.json();
+  const cookie = created.headers.get("set-cookie").split(";", 1)[0];
+  const session = database.sessions.get(payload.sessionId);
+  session.status = "in_progress";
+  session.recording_status = "stored";
+  database.auditEvents.push({
+    id: crypto.randomUUID(),
+    session_id: payload.sessionId,
+    event_type: "recording_recovery_manual_attention",
+    actor_type: "system",
+    detail_json: JSON.stringify({ errorCode: "INTERVIEW_RECORDING_PART_MISSING" }),
+    created_at: new Date().toISOString(),
+  });
+
+  const inspected = await request("/api/interviews/resume", {
+    headers: { Cookie: cookie },
+  }, env);
+  assert.equal(inspected.status, 200);
+  assert.equal((await inspected.json()).snapshot.action, "held");
 });
 
 test("interview session stores the candidate name and protects the recording with a scoped bearer token", async () => {
@@ -9014,6 +9238,19 @@ test("missing recording parts terminalize once after candidate expiry and never 
   assert.equal(database.auditEvents.filter((event) =>
     event.session_id === session.sessionId &&
     event.event_type === "recording_recovery_manual_attention").length, 1);
+  const firstAlert = database.recordingAlerts.get(session.sessionId);
+  assert.equal(firstAlert?.alert_type, "recording_recovery_manual_attention");
+  assert.equal(firstAlert?.severity, "critical");
+  assert.equal(firstAlert?.status, "open");
+  assert.equal(firstAlert?.occurrence_count, 1);
+  assert.equal(stored.status, "in_progress",
+    "a missing recording part must never complete the interview");
+  assert.equal(database.artifacts.filter((artifact) => artifact[1] === session.sessionId).length, 0,
+    "a partial upload must not create a canonical recording artifact");
+  assert.equal(database.externalSyncs.has(session.sessionId), false,
+    "Drive sync must remain blocked without a canonical recording artifact");
+  assert.equal(recordings.objects.has(`interviews/${session.sessionId}/recording.manifest.json`), false,
+    "R2 must not publish a complete-recording manifest when a required part is absent");
 
   stored.updated_at = new Date(0).toISOString();
   const secondResponse = await recover();
@@ -9027,6 +9264,8 @@ test("missing recording parts terminalize once after candidate expiry and never 
   assert.equal(database.auditEvents.filter((event) =>
     event.session_id === session.sessionId &&
     event.event_type === "recording_recovery_manual_attention").length, 1);
+  assert.equal(database.recordingAlerts.get(session.sessionId)?.occurrence_count, 1,
+    "the same terminal incident must not increment on another recovery request");
 
   const logs = [];
   const originalInfo = console.info;
@@ -9038,6 +9277,87 @@ test("missing recording parts terminalize once after candidate expiry and never 
   }
   assert.equal(logs.at(-1)[1].states.recording, "idle",
     "the next unattended tick must converge instead of repeating attention");
+});
+
+test("scheduled recovery backfills one historical terminal recording alert idempotently", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, INTERVIEW_STAFF_TOKEN: "staff-review-secret" };
+  const session = await createTestInterviewSession(env);
+  const createdAt = new Date(Date.now() - 60_000).toISOString();
+  database.operationalAlerts.set(session.sessionId, {
+    session_id: session.sessionId,
+    alert_type: "google_drive_save_failure",
+    severity: "warning",
+    status: "open",
+    code: "GOOGLE_DRIVE_API_404",
+    first_seen_at: createdAt,
+    last_seen_at: createdAt,
+    occurrence_count: 1,
+    resolved_at: null,
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+  database.auditEvents.push({
+    id: crypto.randomUUID(),
+    session_id: session.sessionId,
+    event_type: "interrupted_recording_recovery_manual_attention",
+    actor_type: "system",
+    detail_json: JSON.stringify({ errorCode: "INTERVIEW_RECORDING_PART_MISSING" }),
+    created_at: createdAt,
+  });
+
+  await scheduleInterviewRecovery(env);
+  const first = database.recordingAlerts.get(session.sessionId);
+  assert.equal(first?.alert_type, "recording_recovery_manual_attention");
+  assert.equal(first?.severity, "critical");
+  assert.equal(first?.status, "open");
+  assert.equal(first?.code, "INTERVIEW_RECORDING_PART_MISSING");
+  assert.equal(first?.occurrence_count, 1);
+  assert.equal(database.operationalAlerts.get(session.sessionId)?.code, "GOOGLE_DRIVE_API_404",
+    "a recording incident must never overwrite the independent Drive incident");
+
+  const staffInbox = await request("/api/staff/interviews", {
+    headers: {
+      Authorization: "Bearer staff-review-secret",
+      "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+    },
+  }, env);
+  const staffPayload = await staffInbox.json();
+  assert.equal(staffInbox.status, 200, JSON.stringify(staffPayload));
+  const staffTarget = staffPayload.interviews.find((item) => item.sessionId === session.sessionId);
+  assert.equal(staffTarget?.driveAlertStatus, "open");
+  assert.equal(staffTarget?.driveAlertSeverity, "critical");
+  assert.equal(staffTarget?.driveAlertCode, "INTERVIEW_RECORDING_PART_MISSING");
+  assert.equal(staffPayload.archiveHealth.openAlerts, 1,
+    "an in-progress recording failure must be counted even without a completed Drive archive");
+
+  await scheduleInterviewRecovery(env);
+  assert.equal(database.recordingAlerts.get(session.sessionId)?.occurrence_count, 1);
+
+  const resolvedAt = new Date(Date.parse(createdAt) + 30_000).toISOString();
+  Object.assign(database.recordingAlerts.get(session.sessionId), {
+    status: "resolved",
+    resolved_at: resolvedAt,
+    updated_at: resolvedAt,
+  });
+  await scheduleInterviewRecovery(env);
+  assert.equal(database.recordingAlerts.get(session.sessionId)?.status, "resolved",
+    "an older terminal event must not reopen a resolved incident");
+  assert.equal(database.recordingAlerts.get(session.sessionId)?.occurrence_count, 1);
+
+  const newerAt = new Date(Date.parse(resolvedAt) + 30_000).toISOString();
+  database.auditEvents.push({
+    id: crypto.randomUUID(),
+    session_id: session.sessionId,
+    event_type: "recording_recovery_manual_attention",
+    actor_type: "system",
+    detail_json: JSON.stringify({ errorCode: "INTERVIEW_RECORDING_PART_MISSING" }),
+    created_at: newerAt,
+  });
+  await scheduleInterviewRecovery(env);
+  assert.equal(database.recordingAlerts.get(session.sessionId)?.status, "open");
+  assert.equal(database.recordingAlerts.get(session.sessionId)?.occurrence_count, 2,
+    "only a genuinely newer terminal incident may reopen and increment the alert");
 });
 
 test("an accepted recording part heartbeats D1 so active mobile upload is not reclaimed", async () => {

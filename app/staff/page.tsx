@@ -480,7 +480,7 @@ export default function StaffReviewPage() {
             !knownOpenDriveAlertsRef.current.has(item.sessionId));
           openDriveAlerts.forEach((item) => knownOpenDriveAlertsRef.current.add(item.sessionId));
           if (newlyOpenedAlerts.length > 0) {
-            setCompletionNotice(`保存要確認：${newlyOpenedAlerts.length}件のDrive自動再試行を停止しました。候補者記録を確認してください。`);
+            setCompletionNotice(`保存要確認：${newlyOpenedAlerts.length}件の面接記録を自動復旧できないため、人手確認へ移しました。`);
             showBrowserStorageFailureNotification(newlyOpenedAlerts);
           }
         }

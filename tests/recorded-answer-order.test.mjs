@@ -135,15 +135,21 @@ test("recorded fallback source keeps registration, STT completion, and retry bod
     source.indexOf("function handleRealtimeEvent(event: RealtimeEvent)"),
   );
   assert.ok(
-    completion.indexOf("await sealRecordedFallbackCompletion();") <
-      completion.indexOf("await uploadRecording(recordingBlob);"),
-    "registration-gated sealing must precede the full recording upload",
+    completion.indexOf("const recordingFinalization") <
+      completion.indexOf("await sealRecordedFallbackCompletion();"),
+    "mobile recording finalization must start before a network-bound answer seal",
   );
   assert.ok(
-    completion.indexOf("await uploadRecording(recordingBlob);") <
-      completion.indexOf("await storeInterviewFinalization();"),
-    "STT-dependent finalization must happen after the full recording is durable",
+    completion.indexOf("const recordingResult = await Promise.race") <
+      completion.indexOf("await ensureFinalArchiveStored(activeMode);"),
+    "STT-dependent finalization must happen only after the shared recording receipt settles",
   );
+  assert.doesNotMatch(completion, /uploadRecording\(recordingBlob\)/);
+  const recordingFinalization = source.slice(
+    source.indexOf("function ensureRecordingFinalized()"),
+    source.indexOf("async function storeInterviewFinalization(activeMode"),
+  );
+  assert.match(recordingFinalization, /await uploadRecording\(blob\)/);
 
   const fallbackCompletion = source.slice(
     source.indexOf("async function completeRecordedFallback("),

@@ -571,6 +571,23 @@ async function ensureSchema(db: D1Database) {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS interview_operational_alerts_status_idx ON interview_operational_alerts (status, severity, last_seen_at)"),
+    // Recording continuity failures are independent from Drive archive
+    // failures. The legacy operational table owns one row per interview, so
+    // storing both there would let either incident hide the other.
+    db.prepare(`CREATE TABLE IF NOT EXISTS interview_recording_alerts (
+      session_id TEXT PRIMARY KEY NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+      alert_type TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      status TEXT DEFAULT 'open' NOT NULL,
+      code TEXT NOT NULL,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      occurrence_count INTEGER DEFAULT 1 NOT NULL,
+      resolved_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS interview_recording_alerts_status_idx ON interview_recording_alerts (status, severity, last_seen_at)"),
     db.prepare(`CREATE TABLE IF NOT EXISTS interview_drive_upload_steps (
       session_id TEXT PRIMARY KEY NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
       started_at TEXT NOT NULL,
@@ -1021,6 +1038,8 @@ export type InterviewContinuitySnapshot = {
   mode: "voice" | "text" | "recorded-fallback";
   action: "resume_text" | "replace_with_text" | "processing" | "completed" | "held";
   transcript: TranscriptTurn[];
+  draftSha256: string | null;
+  draftTurnCount: number;
 };
 
 type InterviewContinuityRow = {
@@ -1034,11 +1053,27 @@ type InterviewContinuityRow = {
   created_at: string;
   draft_mode: string | null;
   draft_json: string | null;
+  draft_sha256: string | null;
+  draft_turn_count: number | null;
   draft_sealed_at: string | null;
   text_started: number;
   recorded_fallback_started: number;
   completion_hold: number;
   technical_hold: number;
+  recording_manual_attention: number;
+};
+
+type InterviewTranscriptDraftRow = {
+  mode: string;
+  transcript_json: string;
+  transcript_sha256: string;
+  turn_count: number;
+  sealed_at: string | null;
+};
+
+export type InterviewContinuityDraftFence = {
+  sha256: string | null;
+  turnCount: number;
 };
 
 function candidateContinuityTranscript(value: string | null): TranscriptTurn[] {
@@ -1059,6 +1094,89 @@ function candidateContinuityTranscript(value: string | null): TranscriptTurn[] {
   return turns;
 }
 
+function normalizedContinuityDraftFence(
+  value: InterviewContinuityDraftFence,
+): InterviewContinuityDraftFence {
+  const turnCount = Math.trunc(Number(value?.turnCount));
+  const sha = value?.sha256;
+  if (turnCount === 0 && sha === null) return { sha256: null, turnCount: 0 };
+  if (turnCount < 1 || turnCount > 300 || typeof sha !== "string" || !/^[a-f0-9]{64}$/.test(sha)) {
+    throw new Error("INTERVIEW_CONTINUITY_READBACK_MISMATCH");
+  }
+  return { sha256: sha, turnCount };
+}
+
+async function continuitySourceDraft(db: D1Database, sessionId: string) {
+  return await db.prepare(`SELECT mode, transcript_json, transcript_sha256,
+      turn_count, sealed_at
+    FROM interview_transcript_drafts WHERE session_id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<InterviewTranscriptDraftRow>();
+}
+
+async function assertContinuitySourceDraft(
+  db: D1Database,
+  sessionId: string,
+  fence: InterviewContinuityDraftFence,
+) {
+  const draft = await continuitySourceDraft(db, sessionId);
+  if (fence.turnCount === 0) {
+    if (draft) throw new Error("INTERVIEW_CONTINUITY_READBACK_MISMATCH");
+    return;
+  }
+  const transcript = candidateContinuityTranscript(draft?.transcript_json ?? null);
+  if (
+    !draft || draft.mode !== "voice" || draft.sealed_at !== null ||
+    draft.transcript_sha256 !== fence.sha256 || draft.turn_count !== fence.turnCount ||
+    transcript.length !== fence.turnCount ||
+    await sha256(draft.transcript_json) !== fence.sha256
+  ) throw new Error("INTERVIEW_CONTINUITY_READBACK_MISMATCH");
+}
+
+async function assertContinuityReplacementDraft(
+  db: D1Database,
+  replacementSessionId: string,
+  fence: InterviewContinuityDraftFence,
+) {
+  const draft = await continuitySourceDraft(db, replacementSessionId);
+  if (fence.turnCount === 0) {
+    if (draft) throw new Error("INTERVIEW_CONTINUITY_READBACK_MISMATCH");
+    return;
+  }
+  const transcript = candidateContinuityTranscript(draft?.transcript_json ?? null);
+  if (
+    !draft || draft.mode !== "text" || draft.sealed_at !== null ||
+    draft.transcript_sha256 !== fence.sha256 || draft.turn_count !== fence.turnCount ||
+    transcript.length !== fence.turnCount ||
+    await sha256(draft.transcript_json) !== fence.sha256
+  ) throw new Error("INTERVIEW_CONTINUITY_READBACK_MISMATCH");
+}
+
+async function assertContinuityReplacementMatchesSource(
+  db: D1Database,
+  sourceSessionId: string,
+  replacementSessionId: string,
+) {
+  const [source, replacement] = await Promise.all([
+    continuitySourceDraft(db, sourceSessionId),
+    continuitySourceDraft(db, replacementSessionId),
+  ]);
+  if (!source && !replacement) return;
+  const sourceTranscript = candidateContinuityTranscript(source?.transcript_json ?? null);
+  const replacementTranscript = candidateContinuityTranscript(replacement?.transcript_json ?? null);
+  if (
+    !source || !replacement || source.mode !== "voice" || replacement.mode !== "text" ||
+    source.sealed_at !== null || replacement.sealed_at !== null ||
+    source.transcript_json !== replacement.transcript_json ||
+    source.transcript_sha256 !== replacement.transcript_sha256 ||
+    source.turn_count !== replacement.turn_count ||
+    sourceTranscript.length !== source.turn_count ||
+    replacementTranscript.length !== replacement.turn_count ||
+    await sha256(source.transcript_json) !== source.transcript_sha256 ||
+    await sha256(replacement.transcript_json) !== replacement.transcript_sha256
+  ) throw new Error("INTERVIEW_CONTINUITY_READBACK_MISMATCH");
+}
+
 async function continuitySnapshotForSession(
   db: D1Database,
   sessionId: string,
@@ -1066,6 +1184,7 @@ async function continuitySnapshotForSession(
   const row = await db.prepare(`SELECT s.id, s.candidate_name, s.employment,
       s.preferred_location, s.status, s.recording_status, s.expires_at, s.created_at,
       draft.mode AS draft_mode, draft.transcript_json AS draft_json,
+      draft.transcript_sha256 AS draft_sha256, draft.turn_count AS draft_turn_count,
       draft.sealed_at AS draft_sealed_at,
       EXISTS (SELECT 1 FROM interview_audit_events mode
         WHERE mode.session_id = s.id
@@ -1084,6 +1203,13 @@ async function continuitySnapshotForSession(
             THEN json_extract(hold.detail_json, '$.code') ELSE NULL END IN (
               'TRANSCRIPTION_FAILED', 'TRANSCRIPTION_EMPTY', 'TRANSCRIPTION_ID_MISSING'
             )) AS technical_hold
+      , EXISTS (SELECT 1 FROM interview_audit_events recording_hold
+        WHERE recording_hold.session_id = s.id
+          AND recording_hold.event_type IN (
+            '${RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}',
+            '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}',
+            '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+          )) AS recording_manual_attention
     FROM interview_sessions s
     LEFT JOIN interview_transcript_drafts draft ON draft.session_id = s.id
     WHERE s.id = ? LIMIT 1`)
@@ -1098,6 +1224,7 @@ async function continuitySnapshotForSession(
   else if (
     Number(row.completion_hold) === 1 ||
     Number(row.technical_hold) === 1 ||
+    Number(row.recording_manual_attention) === 1 ||
     row.status === "interrupted"
   ) action = "held";
   else if (
@@ -1125,6 +1252,8 @@ async function continuitySnapshotForSession(
     mode,
     action,
     transcript: mode === "text" ? candidateContinuityTranscript(row.draft_json) : [],
+    draftSha256: typeof row.draft_sha256 === "string" ? row.draft_sha256 : null,
+    draftTurnCount: Math.max(0, Math.trunc(Number(row.draft_turn_count) || 0)),
   };
 }
 
@@ -1145,7 +1274,10 @@ export async function getInterviewContinuitySnapshot(sessionId: string) {
  * stream. Freeze that source as technical evidence and atomically create one
  * text-only replacement that reuses the already-authenticated token hash.
  */
-export async function replaceInterruptedInterviewWithText(sourceSessionId: string) {
+export async function replaceInterruptedInterviewWithText(
+  sourceSessionId: string,
+  expectedDraft: InterviewContinuityDraftFence,
+) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
@@ -1153,7 +1285,25 @@ export async function replaceInterruptedInterviewWithText(sourceSessionId: strin
     FROM interview_session_replacements WHERE source_session_id = ? LIMIT 1`)
     .bind(sourceSessionId)
     .first<{ replacement_session_id: string }>();
-  if (prior) return await continuitySnapshotForSession(db, prior.replacement_session_id);
+  if (prior) {
+    // A lost successful POST response must be replayable even by a pre-cutover
+    // client that did not send the new draft fence. The immutable mapping is
+    // still accepted only after the source and replacement drafts match byte
+    // for byte and both digests are recomputed.
+    await assertContinuityReplacementMatchesSource(
+      db,
+      sourceSessionId,
+      prior.replacement_session_id,
+    );
+    const replay = await continuitySnapshotForSession(db, prior.replacement_session_id);
+    if (!replay || replay.action !== "resume_text") {
+      throw new Error("INTERVIEW_CONTINUITY_READBACK_MISMATCH");
+    }
+    return replay;
+  }
+
+  const draftFence = normalizedContinuityDraftFence(expectedDraft);
+  await assertContinuitySourceDraft(db, sourceSessionId, draftFence);
 
   const replacementSessionId = publicSessionId();
   const now = new Date().toISOString();
@@ -1177,14 +1327,53 @@ export async function replaceInterruptedInterviewWithText(sourceSessionId: strin
             'candidate_requested_stop', 'safety_escalation', 'completion_reason_invalid'
           ))
         AND NOT EXISTS (SELECT 1 FROM interview_session_replacements replacement
-          WHERE replacement.source_session_id = source.id)`)
-      .bind(replacementSessionId, now, now, sourceSessionId),
+          WHERE replacement.source_session_id = source.id)
+        AND (
+          (? = 0 AND NOT EXISTS (
+            SELECT 1 FROM interview_transcript_drafts source_draft
+            WHERE source_draft.session_id = source.id
+          ))
+          OR (
+            ? BETWEEN 1 AND 300
+            AND EXISTS (
+              SELECT 1 FROM interview_transcript_drafts source_draft
+              WHERE source_draft.session_id = source.id
+                AND source_draft.mode = 'voice'
+                AND source_draft.sealed_at IS NULL
+                AND source_draft.transcript_sha256 = ?
+                AND source_draft.turn_count = ?
+            )
+          )
+        )`)
+      .bind(
+        replacementSessionId, now, now, sourceSessionId,
+        draftFence.turnCount, draftFence.turnCount, draftFence.sha256 ?? "", draftFence.turnCount,
+      ),
     db.prepare(`INSERT INTO interview_session_replacements (
         source_session_id, replacement_session_id, replacement_mode, reason, created_at
       ) SELECT ?, ?, 'text', 'device_continuity', ?
       WHERE EXISTS (SELECT 1 FROM interview_sessions WHERE id = ?)
         AND NOT EXISTS (SELECT 1 FROM interview_session_replacements WHERE source_session_id = ?)`)
       .bind(sourceSessionId, replacementSessionId, now, replacementSessionId, sourceSessionId),
+    db.prepare(`INSERT INTO interview_transcript_drafts (
+        session_id, mode, transcript_json, transcript_sha256, turn_count,
+        sealed_at, created_at, updated_at
+      ) SELECT ?, 'text', source.transcript_json, source.transcript_sha256,
+        source.turn_count, NULL, ?, ?
+      FROM interview_transcript_drafts source
+      WHERE source.session_id = ?
+        AND source.sealed_at IS NULL
+        AND source.turn_count BETWEEN 1 AND 300
+        AND json_valid(source.transcript_json)
+        AND source.transcript_sha256 = ?
+        AND source.turn_count = ?
+        AND EXISTS (SELECT 1 FROM interview_session_replacements replacement
+          WHERE replacement.source_session_id = ?
+            AND replacement.replacement_session_id = ?)
+      ON CONFLICT(session_id) DO NOTHING`)
+      .bind(replacementSessionId, now, now, sourceSessionId,
+        draftFence.sha256 ?? "", draftFence.turnCount,
+        sourceSessionId, replacementSessionId),
     db.prepare(`UPDATE interview_sessions SET status = 'interrupted', updated_at = ?
       WHERE id = ? AND status IN ('created', 'in_progress')
         AND EXISTS (SELECT 1 FROM interview_session_replacements replacement
@@ -1224,9 +1413,11 @@ export async function replaceInterruptedInterviewWithText(sourceSessionId: strin
       .bind(sourceSessionId)
       .first<{ replacement_session_id: string }>();
     if (!raced) throw new Error("INTERVIEW_CONTINUITY_NOT_REPLACEABLE");
+    await assertContinuityReplacementDraft(db, raced.replacement_session_id, draftFence);
     return await continuitySnapshotForSession(db, raced.replacement_session_id);
   }
 
+  await assertContinuityReplacementDraft(db, replacementSessionId, draftFence);
   const snapshot = await continuitySnapshotForSession(db, replacementSessionId);
   if (!snapshot || snapshot.action !== "resume_text") {
     throw new Error("INTERVIEW_CONTINUITY_READBACK_MISMATCH");
@@ -1235,14 +1426,6 @@ export async function replaceInterruptedInterviewWithText(sourceSessionId: strin
 }
 
 export type InterviewTranscriptDraftMode = "voice" | "text";
-
-type InterviewTranscriptDraftRow = {
-  mode: string;
-  transcript_json: string;
-  transcript_sha256: string;
-  turn_count: number;
-  sealed_at: string | null;
-};
 
 function serializeTranscriptDraft(transcript: TranscriptTurn[]) {
   if (transcript.length < 1 || transcript.length > 300) {
@@ -1353,7 +1536,16 @@ export async function saveInterviewTranscriptDraft(input: {
       }
       const updated = await db.prepare(`UPDATE interview_transcript_drafts SET
           transcript_json = ?, transcript_sha256 = ?, turn_count = ?, updated_at = ?
-        WHERE session_id = ? AND mode = ? AND transcript_sha256 = ? AND sealed_at IS NULL`)
+        WHERE session_id = ? AND mode = ? AND transcript_sha256 = ? AND sealed_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM interview_sessions active
+            WHERE active.id = interview_transcript_drafts.session_id
+              AND active.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM interview_session_replacements replacement
+            WHERE replacement.source_session_id = interview_transcript_drafts.session_id
+          )`)
         .bind(
           transcriptJson,
           transcriptSha256,
@@ -1381,7 +1573,16 @@ export async function saveInterviewTranscriptDraft(input: {
     const inserted = await db.prepare(`INSERT INTO interview_transcript_drafts (
         session_id, mode, transcript_json, transcript_sha256, turn_count,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ) SELECT ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions active
+        WHERE active.id = ?
+          AND active.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+      )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_session_replacements replacement
+          WHERE replacement.source_session_id = ?
+        )
       ON CONFLICT(session_id) DO NOTHING`)
       .bind(
         input.sessionId,
@@ -1391,6 +1592,8 @@ export async function saveInterviewTranscriptDraft(input: {
         input.transcript.length,
         now,
         now,
+        input.sessionId,
+        input.sessionId,
       )
       .run();
     if (Number(inserted.meta?.changes ?? 0) === 1) {
@@ -1441,7 +1644,16 @@ export async function sealInterviewTranscriptDraft(input: {
   const sealed = await db.prepare(`UPDATE interview_transcript_drafts SET
       sealed_at = ?, updated_at = ?
     WHERE session_id = ? AND mode = ? AND transcript_sha256 = ?
-      AND transcript_json = ? AND sealed_at IS NULL`)
+      AND transcript_json = ? AND sealed_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM interview_sessions active
+        WHERE active.id = interview_transcript_drafts.session_id
+          AND active.status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_session_replacements replacement
+        WHERE replacement.source_session_id = interview_transcript_drafts.session_id
+      )`)
     .bind(
       now,
       now,
@@ -4491,15 +4703,19 @@ export async function listInterviewSummaryPage(
     d.manifest_json AS drive_manifest_json, d.failure_count AS drive_failure_count,
     d.next_retry_at AS drive_next_retry_at, d.retry_blocked_at AS drive_retry_blocked_at,
     d.retry_block_reason AS drive_retry_block_reason,
-    alert.status AS drive_alert_status, alert.severity AS drive_alert_severity,
-    alert.code AS drive_alert_code, alert.last_seen_at AS drive_alert_last_seen_at
+    COALESCE(recording_alert.status, drive_alert.status) AS drive_alert_status,
+    COALESCE(recording_alert.severity, drive_alert.severity) AS drive_alert_severity,
+    COALESCE(recording_alert.code, drive_alert.code) AS drive_alert_code,
+    COALESCE(recording_alert.last_seen_at, drive_alert.last_seen_at) AS drive_alert_last_seen_at
     FROM interview_sessions AS s
     LEFT JOIN interview_external_syncs AS d
       ON d.session_id = s.id AND d.provider = 'google_drive'
-    LEFT JOIN interview_operational_alerts AS alert
-      ON alert.session_id = s.id AND alert.alert_type IN (
+    LEFT JOIN interview_operational_alerts AS drive_alert
+      ON drive_alert.session_id = s.id AND drive_alert.alert_type IN (
         'google_drive_save_failure', 'google_drive_archive_integrity'
-      )`;
+      )
+    LEFT JOIN interview_recording_alerts AS recording_alert
+      ON recording_alert.session_id = s.id AND recording_alert.status = 'open'`;
   const rows = options.cursor
     ? await db.prepare(`${select}
         WHERE s.created_at < ? OR (s.created_at = ? AND s.id < ?)
@@ -5700,10 +5916,112 @@ export async function recoverResumableInterviewRecording(sessionId: string) {
   return await completeResumableInterviewRecording(session, { unsealedAsMissing: true });
 }
 
+const RECORDING_RECOVERY_ALERT_TYPE = "recording_recovery_manual_attention";
+
+function recordingRecoveryAlertCode(value: unknown, eventType?: string) {
+  if (typeof value === "string" && /^[A-Z0-9_]{1,120}$/.test(value)) return value;
+  if (eventType === LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT) {
+    return "LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION";
+  }
+  if (eventType === INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT) {
+    return "INTERRUPTED_RECORDING_RECOVERY_MANUAL_ATTENTION";
+  }
+  return "INTERVIEW_RECORDING_RECOVERY_MANUAL_ATTENTION";
+}
+
+async function upsertRecordingRecoveryManualAttentionAlert(
+  db: D1Database,
+  sessionId: string,
+  errorCode: unknown,
+  observedAt: string,
+  eventType?: string,
+) {
+  const code = recordingRecoveryAlertCode(errorCode, eventType);
+  // A recording incident has its own row so a simultaneous Drive incident can
+  // neither hide it nor be overwritten by it. Replaying the same terminal
+  // event is idempotent; a genuinely newer incident reopens a resolved row.
+  await db.prepare(`INSERT INTO interview_recording_alerts (
+      session_id, alert_type, severity, status, code,
+      first_seen_at, last_seen_at, occurrence_count, resolved_at, created_at, updated_at
+    ) VALUES (?, '${RECORDING_RECOVERY_ALERT_TYPE}', 'critical', 'open', ?, ?, ?, 1, NULL, ?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET
+      severity = 'critical',
+      status = 'open',
+      code = excluded.code,
+      last_seen_at = excluded.last_seen_at,
+      occurrence_count = interview_recording_alerts.occurrence_count + 1,
+      resolved_at = NULL,
+      updated_at = excluded.updated_at
+    WHERE excluded.last_seen_at > interview_recording_alerts.last_seen_at`)
+    .bind(sessionId, code, observedAt, observedAt, observedAt, observedAt)
+    .run();
+  const readback = await db.prepare(`SELECT alert_type, severity, status, code,
+      last_seen_at, occurrence_count, resolved_at
+    FROM interview_recording_alerts WHERE session_id = ? LIMIT 1`)
+    .bind(sessionId)
+    .first<{
+      alert_type: string;
+      severity: string;
+      status: string;
+      code: string;
+      last_seen_at: string;
+      occurrence_count: number;
+      resolved_at: string | null;
+    }>();
+  if (
+    !readback || readback.alert_type !== RECORDING_RECOVERY_ALERT_TYPE ||
+    readback.severity !== "critical" || readback.status !== "open" ||
+    readback.code !== code || readback.last_seen_at < observedAt ||
+    Number(readback.occurrence_count) < 1 || readback.resolved_at !== null
+  ) throw new Error("INTERVIEW_RECORDING_ALERT_READBACK_MISMATCH");
+}
+
+async function reconcileNextRecordingRecoveryManualAttentionAlert(db: D1Database) {
+  const terminal = await db.prepare(`SELECT terminal.session_id, terminal.event_type,
+      terminal.detail_json, terminal.created_at
+    FROM interview_audit_events terminal
+    LEFT JOIN interview_recording_alerts alert ON alert.session_id = terminal.session_id
+    WHERE terminal.event_type IN (
+        '${RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}',
+        '${LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}',
+        '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}'
+      )
+      AND (
+        alert.session_id IS NULL
+        OR (
+          alert.status = 'resolved'
+          AND alert.resolved_at IS NOT NULL
+          AND terminal.created_at > alert.resolved_at
+        )
+      )
+    ORDER BY terminal.created_at ASC, terminal.session_id ASC
+    LIMIT 1`)
+    .first<{
+      session_id: string;
+      event_type: string;
+      detail_json: string | null;
+      created_at: string;
+    }>();
+  if (!terminal) return false;
+  const detail = parseJson<Record<string, unknown>>(terminal.detail_json, {});
+  await upsertRecordingRecoveryManualAttentionAlert(
+    db,
+    terminal.session_id,
+    detail.errorCode,
+    terminal.created_at,
+    terminal.event_type,
+  );
+  return true;
+}
+
 export async function recoverNextSealedResumableInterviewRecording() {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
+  // Each tick backfills at most one historical terminal incident and never
+  // touches R2 or Drive. Repeated ticks converge without incrementing the same
+  // alert, while keeping the recovery selector bounded.
+  await reconcileNextRecordingRecoveryManualAttentionAlert(db);
   const staleBefore = new Date(Date.now() - 60 * 1_000).toISOString();
   // Keep the global selector aligned with the authenticated staff planner: a
   // completed evaluation gets a five-minute grace period for the candidate's
@@ -5839,6 +6157,13 @@ export async function recoverNextSealedResumableInterviewRecording() {
               observedAtIso,
               target.id,
             ).run();
+          await upsertRecordingRecoveryManualAttentionAlert(
+            db,
+            target.id,
+            code,
+            observedAtIso,
+            RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT,
+          );
           firstDeferred ??= {
             state: "manual_attention",
             sessionId: target.id,
@@ -6127,7 +6452,17 @@ async function markLegacyV1RecordingManualAttention(input: {
     LIMIT 1`)
     .bind(attentionEventId, input.target.id)
     .first<{ present: number }>();
-  return Number(readback?.present ?? 0) === 1;
+  const stored = Number(readback?.present ?? 0) === 1;
+  if (stored) {
+    await upsertRecordingRecoveryManualAttentionAlert(
+      db,
+      input.target.id,
+      input.errorCode,
+      createdAt,
+      LEGACY_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT,
+    );
+  }
+  return stored;
 }
 
 async function createLegacyV1RecoveryManifest(input: {
@@ -6980,7 +7315,17 @@ async function markInterruptedV3ManualAttention(input: {
     WHERE id = ? AND session_id = ?
       AND event_type = '${INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT}' LIMIT 1`)
     .bind(eventId, input.target.id).first<{ present: number }>();
-  return Number(readback?.present ?? 0) === 1;
+  const stored = Number(readback?.present ?? 0) === 1;
+  if (stored) {
+    await upsertRecordingRecoveryManualAttentionAlert(
+      db,
+      input.target.id,
+      input.errorCode,
+      createdAt,
+      INTERRUPTED_V3_RECORDING_RECOVERY_MANUAL_ATTENTION_EVENT,
+    );
+  }
+  return stored;
 }
 
 async function finalizeInterruptedV3Recording(input: {
