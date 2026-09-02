@@ -1,6 +1,7 @@
 import {
   DRIVE_API_ENDPOINT,
   DRIVE_UPLOAD_ENDPOINT,
+  expectedGoogleDriveAccountEmail,
   fetchGoogleDriveAccessToken,
   missingGoogleDriveConfiguration,
   validateGoogleDriveRoot,
@@ -86,6 +87,7 @@ type DrivePermission = {
   type?: string;
   role?: string;
   allowFileDiscovery?: boolean;
+  emailAddress?: string;
 };
 
 type DriveFile = {
@@ -173,6 +175,14 @@ export type GoogleDriveArchiveIntegrity = {
     modifiedTime: string;
   };
   artifacts: Partial<Record<DriveArtifactKey, DriveArtifactIntegrityReceipt>>;
+};
+
+type GoogleDriveIntegrityObservation = {
+  integrity: GoogleDriveArchiveIntegrity;
+  metadataRebaselineEvidence: {
+    exactCanonicalChildSet: boolean;
+    permissionsFullyClassified: boolean;
+  };
 };
 
 export type GoogleDriveSyncResult = {
@@ -889,7 +899,7 @@ async function listFolderChildren(accessToken: string, parentId: string) {
     spaces: "drive",
     supportsAllDrives: "true",
     includeItemsFromAllDrives: "true",
-    fields: "nextPageToken,files(id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,version,modifiedTime,trashed,webViewLink,parents,appProperties,permissions(type,role,allowFileDiscovery))",
+    fields: "nextPageToken,files(id,name,mimeType,size,md5Checksum,sha1Checksum,sha256Checksum,version,modifiedTime,trashed,webViewLink,parents,appProperties,permissions(type,role,allowFileDiscovery,emailAddress))",
   });
   const result = await driveJson<DriveFilePage>(`${DRIVE_API_ENDPOINT}/files?${params}`, accessToken);
   if (result.nextPageToken) throw new Error("GOOGLE_DRIVE_ARCHIVE_FILE_READBACK_MISMATCH");
@@ -1109,6 +1119,21 @@ function sharingRiskFromPermissions(permissions: DrivePermission[] | undefined):
     return "anyone_reader";
   }
   return "restricted";
+}
+
+// Integrity re-baselining must not treat an omitted permission response, a
+// Workspace-domain grant, or a group grant as owner-only access. `anyone`
+// grants and any additional direct-user grant cannot be compared to the prior
+// ACL because the v1 receipt intentionally stores no principal identities.
+// The legacy path is therefore limited to the single configured account owner.
+function drivePermissionsFullyClassified(permissions: DrivePermission[] | undefined) {
+  if (!Array.isArray(permissions) || permissions.length !== 1) return false;
+  const permission = permissions[0];
+  return Boolean(
+    permission.type === "user" &&
+    permission.role === "owner" &&
+    permission.emailAddress?.trim().toLowerCase() === expectedGoogleDriveAccountEmail(),
+  );
 }
 
 function highestSharingRisk(risks: DriveSharingRisk[]) {
@@ -2314,6 +2339,13 @@ export function googleDriveIntegrityReceiptsMatch(
     stored.folder.version !== observed.folder.version ||
     stored.folder.modifiedTime !== observed.folder.modifiedTime
   ) return false;
+  return googleDriveArtifactIntegrityReceiptsMatch(stored, observed);
+}
+
+function googleDriveArtifactIntegrityReceiptsMatch(
+  stored: GoogleDriveArchiveIntegrity,
+  observed: GoogleDriveArchiveIntegrity,
+) {
   const storedKeys = Object.keys(stored.artifacts).sort();
   const observedKeys = Object.keys(observed.artifacts).sort();
   if (storedKeys.join("\0") !== observedKeys.join("\0")) return false;
@@ -2332,6 +2364,33 @@ export function googleDriveIntegrityReceiptsMatch(
       left.fingerprintSource === right.fingerprintSource,
     );
   });
+}
+
+/**
+ * Google can advance a folder's metadata version without changing any archived
+ * file bytes (for example after an owner-only metadata operation). Re-baseline
+ * that narrow case only when the folder contains exactly the canonical files,
+ * every immutable artifact receipt still matches, permission metadata contains
+ * only owner roles, and both access states are restricted. Unknown permissions, a
+ * parent move, an extra child, or any receipt change stays a critical drift.
+ */
+export function googleDriveFolderMetadataOnlyChangeCanBeRebased(
+  stored: GoogleDriveArchiveIntegrity,
+  observed: GoogleDriveArchiveIntegrity,
+  evidence: GoogleDriveIntegrityObservation["metadataRebaselineEvidence"],
+) {
+  return Boolean(
+    stored.folder.fileId === observed.folder.fileId &&
+    stored.folder.parentId === observed.folder.parentId &&
+    (
+      stored.folder.version !== observed.folder.version ||
+      stored.folder.modifiedTime !== observed.folder.modifiedTime
+    ) &&
+    evidence.exactCanonicalChildSet &&
+    evidence.permissionsFullyClassified &&
+    stored.sharingRisk === "restricted" && observed.sharingRisk === "restricted" &&
+    googleDriveArtifactIntegrityReceiptsMatch(stored, observed)
+  );
 }
 
 export function googleDriveRecordingReceiptCanBeReused(input: {
@@ -2378,19 +2437,19 @@ export function googleDriveIntegrityFailureStatus(error: unknown) {
  * Performs only bounded Drive reads. The caller owns cooldown/claim persistence
  * and must keep the original receipt when this snapshot differs or fails.
  */
-export async function readGoogleDriveArchiveIntegritySnapshot(input: {
+async function readGoogleDriveArchiveIntegrityObservation(input: {
   sessionId: string;
   folderId: string;
   files: Record<string, unknown>;
   recordingIncluded: boolean;
   previous?: GoogleDriveArchiveIntegrity;
   accessToken?: string;
-}) : Promise<GoogleDriveArchiveIntegrity> {
+}) : Promise<GoogleDriveIntegrityObservation> {
   if (!/^[A-Za-z0-9_-]{1,200}$/.test(input.folderId)) {
     throw new Error("GOOGLE_DRIVE_ARCHIVE_FOLDER_READBACK_MISMATCH");
   }
   const accessToken = input.accessToken ?? await fetchGoogleDriveAccessToken();
-  const fields = "id,name,mimeType,version,modifiedTime,trashed,parents,appProperties,permissions(type,role,allowFileDiscovery)";
+  const fields = "id,name,mimeType,version,modifiedTime,trashed,parents,appProperties,permissions(type,role,allowFileDiscovery,emailAddress)";
   const folder = await driveJson<DriveFile>(
     `${DRIVE_API_ENDPOINT}/files/${encodeURIComponent(input.folderId)}?supportsAllDrives=true&fields=${encodeURIComponent(fields)}`,
     accessToken,
@@ -2469,7 +2528,19 @@ export async function readGoogleDriveArchiveIntegritySnapshot(input: {
       file: canonicalFiles.get(artifactKey) as DriveFile,
     }),
   ] as const));
-  return {
+  const canonicalChildIds = new Set(
+    required.map((key) => canonicalFiles.get(key)?.id).filter(Boolean),
+  );
+  const exactCanonicalChildSet = Boolean(
+    canonicalChildIds.size === required.length &&
+    children.length === required.length &&
+    children.every((child) => canonicalChildIds.has(child.id)),
+  );
+  const permissionsFullyClassified = [
+    folder,
+    ...required.map((key) => canonicalFiles.get(key)),
+  ].every((file) => Boolean(file) && drivePermissionsFullyClassified(file?.permissions));
+  const integrity: GoogleDriveArchiveIntegrity = {
     schemaVersion: "2026-08-14-v1",
     status: "verified",
     checkedAt: new Date().toISOString(),
@@ -2494,6 +2565,24 @@ export async function readGoogleDriveArchiveIntegritySnapshot(input: {
     },
     artifacts: Object.fromEntries(artifactEntries),
   };
+  return {
+    integrity,
+    metadataRebaselineEvidence: {
+      exactCanonicalChildSet,
+      permissionsFullyClassified,
+    },
+  };
+}
+
+export async function readGoogleDriveArchiveIntegritySnapshot(input: {
+  sessionId: string;
+  folderId: string;
+  files: Record<string, unknown>;
+  recordingIncluded: boolean;
+  previous?: GoogleDriveArchiveIntegrity;
+  accessToken?: string;
+}) : Promise<GoogleDriveArchiveIntegrity> {
+  return (await readGoogleDriveArchiveIntegrityObservation(input)).integrity;
 }
 
 function storedGoogleDriveIntegrity(value: unknown): GoogleDriveArchiveIntegrity | undefined {
@@ -2523,16 +2612,32 @@ export async function revalidateCompletedGoogleDriveArchive(sessionId: string) {
   const previous = storedGoogleDriveIntegrity(claim.manifest.integrity);
   const recordingIncluded = claim.manifest.recordingIncluded === true;
   try {
-    const observed = await readGoogleDriveArchiveIntegritySnapshot({
+    const observation = await readGoogleDriveArchiveIntegrityObservation({
       sessionId,
       folderId: claim.folderId,
       files,
       recordingIncluded,
       previous,
     });
-    const matches = !previous || googleDriveIntegrityReceiptsMatch(previous, observed);
+    const observed = observation.integrity;
+    const exactMatch = !previous || googleDriveIntegrityReceiptsMatch(previous, observed);
+    const folderMetadataOnlyRebaseline = Boolean(
+      previous && !exactMatch &&
+      googleDriveFolderMetadataOnlyChangeCanBeRebased(
+        previous,
+        observed,
+        observation.metadataRebaselineEvidence,
+      )
+    );
+    const matches = exactMatch || folderMetadataOnlyRebaseline;
     const integrity = previous
-      ? {
+      ? folderMetadataOnlyRebaseline
+        ? {
+          ...observed,
+          status: "verified" as const,
+          errorCode: null,
+        }
+        : {
           ...previous,
           status: matches ? "verified" as const : "drift" as const,
           checkedAt: observed.checkedAt,

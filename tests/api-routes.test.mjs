@@ -12089,6 +12089,364 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
   }
 
   {
+    const metadataManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
+    const expectedOwnerPermission = {
+      type: "user", role: "owner", emailAddress: "tokyodogs909@gmail.com",
+    };
+    for (const file of files) file.permissions = [expectedOwnerPermission];
+    const recordingBody = Buffer.from("complete-recording-integrity-fixture");
+    bodies.recording = recordingBody;
+    const recordingFile = {
+      id: "recording-file",
+      name: "recording-file",
+      mimeType: "video/webm",
+      size: String(recordingBody.byteLength),
+      sha256Checksum: sha256Hex(recordingBody),
+      version: "90",
+      modifiedTime: "2026-08-14T01:05:00.000Z",
+      trashed: false,
+      parents: [folderId],
+      appProperties: { tokyoDogsArtifact: "recording", tokyoDogsProvider: "google_drive" },
+      permissions: [expectedOwnerPermission],
+    };
+    files.push(recordingFile);
+    metadataManifest.files.recording = { id: recordingFile.id };
+    metadataManifest.recordingIncluded = true;
+    metadataManifest.integrity.sharingRisk = "restricted";
+    metadataManifest.integrity.artifacts.recording = {
+      fileId: recordingFile.id,
+      mimeType: recordingFile.mimeType,
+      size: recordingBody.byteLength,
+      version: recordingFile.version,
+      modifiedTime: recordingFile.modifiedTime,
+      contentSha256: recordingFile.sha256Checksum,
+      fingerprintSource: "sha256Checksum",
+    };
+    const originalMetadataArtifacts = structuredClone(metadataManifest.integrity.artifacts);
+    metadataManifest.integrity = {
+      ...metadataManifest.integrity,
+      status: "drift",
+      checkedAt: "2020-01-01T00:00:00.000Z",
+      errorCode: "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT",
+    };
+    database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(metadataManifest);
+    database.operationalAlerts.set(session.sessionId, {
+      session_id: session.sessionId,
+      alert_type: "google_drive_archive_integrity",
+      severity: "critical",
+      status: "open",
+      code: "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT",
+      first_seen_at: "2026-08-20T00:00:00.000Z",
+      last_seen_at: "2026-08-21T00:00:00.000Z",
+      occurrence_count: 2,
+      resolved_at: null,
+      created_at: "2026-08-20T00:00:00.000Z",
+      updated_at: "2026-08-21T00:00:00.000Z",
+    });
+    let observedFolderVersion = "70";
+    let observedFolderModifiedTime = originalFolderModifiedTime;
+    let observedFolderPermissions = [expectedOwnerPermission];
+    const methods = [];
+    try {
+      globalThis.fetch = async (url, init = {}) => {
+        const href = String(url);
+        if (href.startsWith("https://www.googleapis.com/drive/v3/")) {
+          methods.push(init.method ?? "GET");
+        }
+        if (href === "https://oauth2.googleapis.com/token") {
+          return Response.json({ access_token: "drive-read-token" });
+        }
+        if (href.includes(`/files/${folderId}?`)) return Response.json({
+          id: folderId,
+          name: "candidate",
+          mimeType: "application/vnd.google-apps.folder",
+          version: observedFolderVersion,
+          modifiedTime: observedFolderModifiedTime,
+          trashed: false,
+          parents: [parentId],
+          appProperties: { tokyoDogsInterviewSession: session.sessionId },
+          permissions: observedFolderPermissions,
+        });
+        if (href.includes(`/files/${parentId}?`)) return Response.json({
+          id: parentId,
+          name: "08",
+          mimeType: "application/vnd.google-apps.folder",
+          version: "4",
+          modifiedTime: "2026-08-01T00:00:00.000Z",
+          trashed: false,
+          parents: ["year-folder-integrity"],
+          appProperties: { tokyoDogsInterviewMonth: "2026-08" },
+        });
+        if (href.includes("/files?") && href.includes(encodeURIComponent(folderId))) {
+          return Response.json({ files });
+        }
+        if (href.includes("/report-doc-file/export?")) {
+          return new Response(bodies.report_doc, {
+            headers: { "Content-Length": String(Buffer.byteLength(bodies.report_doc)) },
+          });
+        }
+        const media = files.find((file) => href.includes(`/files/${file.id}?alt=media`));
+        if (media) {
+          const body = bodies[media.appProperties.tokyoDogsArtifact];
+          return new Response(body, {
+            headers: { "Content-Length": String(Buffer.byteLength(body)) },
+          });
+        }
+        throw new Error(`unexpected fetch ${href}`);
+      };
+      const response = await request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+        headers: {
+          Authorization: "Bearer staff-review-secret",
+          "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+        },
+      }, env);
+      const payload = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(payload));
+      assert.equal(payload.review.driveSync.integrityStatus, "verified");
+      let rebased = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).integrity;
+      assert.equal(rebased.folder.version, observedFolderVersion);
+      assert.equal(rebased.folder.modifiedTime, observedFolderModifiedTime);
+      assert.deepEqual(rebased.artifacts, originalMetadataArtifacts,
+        "version-only folder re-baseline must preserve every immutable artifact receipt");
+      assert.equal(rebased.sharingRisk, "restricted");
+      assert.equal(rebased.artifacts.recording.fileId, recordingFile.id);
+      assert.equal(rebased.artifacts.recording.size, recordingBody.byteLength);
+      assert.equal(rebased.artifacts.recording.version, recordingFile.version);
+      assert.equal(rebased.artifacts.recording.modifiedTime, recordingFile.modifiedTime);
+      assert.equal(rebased.artifacts.recording.contentSha256, recordingFile.sha256Checksum);
+      assert.equal(rebased.artifacts.recording.fingerprintSource, "sha256Checksum");
+      assert.equal(database.operationalAlerts.get(session.sessionId).status, "resolved");
+
+      const timeOnlyManifest = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      );
+      timeOnlyManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+      database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(
+        timeOnlyManifest,
+      );
+      observedFolderModifiedTime = "2026-08-21T02:30:00.000Z";
+      const timeOnlyResponse = await request(
+        `/api/staff/interview?sessionId=${session.sessionId}`,
+        {
+          headers: {
+            Authorization: "Bearer staff-review-secret",
+            "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+          },
+        },
+        env,
+      );
+      const timeOnlyPayload = await timeOnlyResponse.json();
+      assert.equal(timeOnlyResponse.status, 200, JSON.stringify(timeOnlyPayload));
+      assert.equal(timeOnlyPayload.review.driveSync.integrityStatus, "verified");
+      rebased = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).integrity;
+      assert.equal(rebased.folder.version, observedFolderVersion);
+      assert.equal(rebased.folder.modifiedTime, observedFolderModifiedTime);
+      assert.deepEqual(rebased.artifacts, originalMetadataArtifacts,
+        "time-only folder re-baseline must preserve every immutable artifact receipt");
+
+      const extraChildManifest = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      );
+      extraChildManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+      database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(
+        extraChildManifest,
+      );
+      observedFolderVersion = "71";
+      observedFolderModifiedTime = "2026-08-21T02:45:00.000Z";
+      files.push({
+        id: "unexpected-child-file",
+        name: "unexpected-child-file",
+        mimeType: "text/plain",
+        size: "1",
+        version: "1",
+        modifiedTime: "2026-08-21T02:40:00.000Z",
+        trashed: false,
+        parents: [folderId],
+        appProperties: {},
+        permissions: [],
+      });
+      const extraChildResponse = await request(
+        `/api/staff/interview?sessionId=${session.sessionId}`,
+        {
+          headers: {
+            Authorization: "Bearer staff-review-secret",
+            "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+          },
+        },
+        env,
+      );
+      const extraChildPayload = await extraChildResponse.json();
+      assert.equal(extraChildResponse.status, 200, JSON.stringify(extraChildPayload));
+      assert.equal(extraChildPayload.review.driveSync.integrityStatus, "drift");
+      const extraChildDrift = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      ).integrity;
+      assert.equal(extraChildDrift.folder.version, "70",
+        "an unexpected active child must never be accepted into the baseline");
+      files.pop();
+
+      const broaderSharingManifest = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      );
+      broaderSharingManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+      database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(
+        broaderSharingManifest,
+      );
+      observedFolderVersion = "72";
+      observedFolderModifiedTime = "2026-08-21T03:00:00.000Z";
+      observedFolderPermissions = [{
+        type: "anyone", role: "reader", allowFileDiscovery: false,
+      }];
+      const broaderSharingResponse = await request(
+        `/api/staff/interview?sessionId=${session.sessionId}`,
+        {
+          headers: {
+            Authorization: "Bearer staff-review-secret",
+            "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+          },
+        },
+        env,
+      );
+      const broaderSharingPayload = await broaderSharingResponse.json();
+      assert.equal(broaderSharingResponse.status, 200, JSON.stringify(broaderSharingPayload));
+      assert.equal(broaderSharingPayload.review.driveSync.integrityStatus, "drift");
+      const sharingDrift = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      ).integrity;
+      assert.equal(sharingDrift.folder.version, "70",
+        "broader sharing must never be accepted as a metadata-only re-baseline");
+      assert.equal(sharingDrift.sharingRisk, "anyone_reader");
+      assert.equal(database.operationalAlerts.get(session.sessionId).status, "open");
+      assert.equal(database.operationalAlerts.get(session.sessionId).severity, "critical");
+
+      const domainPermissionManifest = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      );
+      domainPermissionManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+      database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(
+        domainPermissionManifest,
+      );
+      observedFolderVersion = "73";
+      observedFolderModifiedTime = "2026-08-21T03:15:00.000Z";
+      observedFolderPermissions = [{ type: "domain", role: "reader" }];
+      const domainPermissionResponse = await request(
+        `/api/staff/interview?sessionId=${session.sessionId}`,
+        {
+          headers: {
+            Authorization: "Bearer staff-review-secret",
+            "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+          },
+        },
+        env,
+      );
+      const domainPermissionPayload = await domainPermissionResponse.json();
+      assert.equal(domainPermissionResponse.status, 200, JSON.stringify(domainPermissionPayload));
+      assert.equal(domainPermissionPayload.review.driveSync.integrityStatus, "drift");
+      const domainPermissionDrift = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      ).integrity;
+      assert.equal(domainPermissionDrift.folder.version, "70",
+        "an unclassified domain grant must remain fail-closed");
+
+      const directWriterManifest = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      );
+      directWriterManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+      database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(
+        directWriterManifest,
+      );
+      observedFolderVersion = "74";
+      observedFolderModifiedTime = "2026-08-21T03:25:00.000Z";
+      observedFolderPermissions = [
+        expectedOwnerPermission,
+        { type: "user", role: "writer", emailAddress: "reviewer@example.invalid" },
+      ];
+      const directWriterResponse = await request(
+        `/api/staff/interview?sessionId=${session.sessionId}`,
+        {
+          headers: {
+            Authorization: "Bearer staff-review-secret",
+            "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+          },
+        },
+        env,
+      );
+      const directWriterPayload = await directWriterResponse.json();
+      assert.equal(directWriterResponse.status, 200, JSON.stringify(directWriterPayload));
+      assert.equal(directWriterPayload.review.driveSync.integrityStatus, "drift");
+      const directWriterDrift = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      ).integrity;
+      assert.equal(directWriterDrift.folder.version, "70",
+        "a newly observed direct user writer must remain fail-closed");
+
+      const replacedOwnerManifest = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      );
+      replacedOwnerManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+      database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(
+        replacedOwnerManifest,
+      );
+      observedFolderVersion = "75";
+      observedFolderModifiedTime = "2026-08-21T03:35:00.000Z";
+      observedFolderPermissions = [{
+        type: "user", role: "owner", emailAddress: "other-owner@example.invalid",
+      }];
+      const replacedOwnerResponse = await request(
+        `/api/staff/interview?sessionId=${session.sessionId}`,
+        {
+          headers: {
+            Authorization: "Bearer staff-review-secret",
+            "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+          },
+        },
+        env,
+      );
+      const replacedOwnerPayload = await replacedOwnerResponse.json();
+      assert.equal(replacedOwnerResponse.status, 200, JSON.stringify(replacedOwnerPayload));
+      assert.equal(replacedOwnerPayload.review.driveSync.integrityStatus, "drift");
+      const replacedOwnerDrift = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      ).integrity;
+      assert.equal(replacedOwnerDrift.folder.version, "70",
+        "an unexpected replacement owner must remain fail-closed");
+
+      const unknownPermissionManifest = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      );
+      unknownPermissionManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+      database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(
+        unknownPermissionManifest,
+      );
+      observedFolderVersion = "76";
+      observedFolderModifiedTime = "2026-08-21T03:50:00.000Z";
+      observedFolderPermissions = undefined;
+      const unknownPermissionResponse = await request(
+        `/api/staff/interview?sessionId=${session.sessionId}`,
+        {
+          headers: {
+            Authorization: "Bearer staff-review-secret",
+            "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+          },
+        },
+        env,
+      );
+      const unknownPermissionPayload = await unknownPermissionResponse.json();
+      assert.equal(unknownPermissionResponse.status, 200, JSON.stringify(unknownPermissionPayload));
+      assert.equal(unknownPermissionPayload.review.driveSync.integrityStatus, "drift");
+      const unknownPermissionDrift = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      ).integrity;
+      assert.equal(unknownPermissionDrift.folder.version, "70",
+        "an omitted permission readback must remain fail-closed");
+      assert.deepEqual(new Set(methods), new Set(["GET"]),
+        "folder metadata-only recovery must never write to Drive");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  {
     const duplicateManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
     duplicateManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
     database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(duplicateManifest);
