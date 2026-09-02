@@ -2656,16 +2656,23 @@ export async function revalidateCompletedGoogleDriveArchive(sessionId: string) {
     const status = googleDriveIntegrityFailureStatus(error);
     const checkedAt = new Date().toISOString();
     const sourceErrorCode = safeErrorCode(error);
-    const errorCode = status === "drift"
-      ? sourceErrorCode === DRIVE_RECORDING_MISSING_CODE || sourceErrorCode === DRIVE_RECORDING_MOVED_CODE
-        ? sourceErrorCode
-        : "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT"
-      : sourceErrorCode;
+    // A transient read failure is not evidence that a previously confirmed
+    // drift improved. Preserve its critical state and six-hour cadence while
+    // advancing checkedAt to prevent a tight retry loop.
+    const preserveKnownDrift = previous?.status === "drift" && status === "unknown";
+    const effectiveStatus = preserveKnownDrift ? "drift" as const : status;
+    const errorCode = preserveKnownDrift
+      ? previous?.errorCode ?? "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT"
+      : effectiveStatus === "drift"
+        ? sourceErrorCode === DRIVE_RECORDING_MISSING_CODE || sourceErrorCode === DRIVE_RECORDING_MOVED_CODE
+          ? sourceErrorCode
+          : "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT"
+        : sourceErrorCode;
     const integrity = previous
-      ? { ...previous, status, checkedAt, errorCode }
+      ? { ...previous, status: effectiveStatus, checkedAt, errorCode }
       : {
           schemaVersion: "2026-08-14-v1",
-          status,
+          status: effectiveStatus,
           checkedAt,
           errorCode,
           sharingRisk: "unknown",

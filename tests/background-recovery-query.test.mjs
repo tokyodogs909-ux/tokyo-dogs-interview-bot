@@ -5,7 +5,7 @@ import test from "node:test";
 
 function driveRecoveryQuery(source) {
   const match = source.match(
-    /const candidates = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(\n\s+integrityMaintenanceOnly,\n\s+failedBefore,\n\s+pendingBefore,\n\s+includeIntegrityRecheck,\n\s+integrityBefore,\n\s+driftBefore,\n\s+integrityMaintenanceOnly,\n\s+integrityBefore,\n\s+driftBefore,\n\s+\)/,
+    /const candidates = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(\n\s+integrityMaintenanceOnly,\n\s+failedBefore,\n\s+pendingBefore,\n\s+includeIntegrityRecheck,\n\s+integrityBefore,\n\s+driftBefore,\n\s+integrityMaintenanceOnly,\n\s+integrityBefore,\n\s+driftBefore,\n\s+integrityMaintenanceOnly,\n\s+\)/,
   );
   assert.ok(match, "the exact production Drive recovery query must remain discoverable");
   return match[1];
@@ -110,10 +110,75 @@ test("global Drive recovery skips more than 25 invalid rows without starving val
     0,
     "2026-08-11T00:00:00.000Z",
     "2026-08-11T18:00:00.000Z",
+    0,
   );
   assert.deepEqual(rows.map((row) => row.id), ["TD-VALID-0001", "TD-RECOVERED-01"]);
   assert.equal(rows.some((row) => row.id.startsWith("TD-BAD-")), false);
   assert.equal(rows.some((row) => row.id === "TD-GAP-000001"), false);
+  database.close();
+});
+
+test("maintenance-only Drive recovery prioritizes a six-hour critical drift over 25 older routine checks", async () => {
+  const source = await readFile(new URL("../lib/interview-persistence.ts", import.meta.url), "utf8");
+  const database = new DatabaseSync(":memory:");
+  database.exec(`
+    CREATE TABLE interview_sessions (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      recording_status TEXT NOT NULL,
+      transcript_json TEXT,
+      created_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE TABLE interview_audit_events (
+      session_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      detail_json TEXT
+    );
+    CREATE TABLE interview_external_syncs (
+      session_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      status TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      manifest_json TEXT,
+      next_retry_at TEXT,
+      retry_blocked_at TEXT
+    );
+  `);
+  const transcript = [{ id: "candidate-answer-1", speaker: "candidate", text: "actual answer" }];
+  const manifest = (status, checkedAt) => JSON.stringify({
+    transcriptAvailable: true,
+    transcriptKind: "actual_transcript",
+    recordingIncluded: true,
+    integrity: { status, checkedAt },
+  });
+  for (let index = 0; index < 26; index += 1) {
+    const id = `TD-ROUTINE-${String(index).padStart(4, "0")}`;
+    insertSession(database, id, transcript, "2026-06-01T00:00:00.000Z");
+    database.prepare(`INSERT INTO interview_external_syncs (
+      session_id, provider, status, updated_at, manifest_json, next_retry_at, retry_blocked_at
+    ) VALUES (?, 'google_drive', 'completed', '2026-06-01T00:00:00.000Z', ?, NULL, NULL)`)
+      .run(id, manifest("verified", "2026-08-01T00:00:00.000Z"));
+  }
+  insertSession(database, "TD-CRITICAL-DRIFT", transcript, "2026-08-01T00:00:00.000Z");
+  database.prepare(`INSERT INTO interview_external_syncs (
+    session_id, provider, status, updated_at, manifest_json, next_retry_at, retry_blocked_at
+  ) VALUES (?, 'google_drive', 'completed', '2026-08-01T00:00:00.000Z', ?, NULL, NULL)`)
+    .run("TD-CRITICAL-DRIFT", manifest("drift", "2026-08-11T17:00:00.000Z"));
+
+  const rows = database.prepare(driveRecoveryQuery(source)).all(
+    1,
+    "2026-08-12T00:00:00.000Z",
+    "2026-08-12T00:05:00.000Z",
+    1,
+    "2026-08-11T00:00:00.000Z",
+    "2026-08-11T18:00:00.000Z",
+    1,
+    "2026-08-11T00:00:00.000Z",
+    "2026-08-11T18:00:00.000Z",
+    1,
+  );
+  assert.equal(rows[0]?.id, "TD-CRITICAL-DRIFT");
   database.close();
 });
 

@@ -3077,6 +3077,9 @@ export async function findInterviewDriveRecoverySessions(options: {
         )
       )
     ORDER BY CASE
+        WHEN ? = 1
+          AND d.status = 'completed'
+          AND json_extract(d.manifest_json, '$.integrity.status') = 'drift' THEN -1
         WHEN d.status = 'running' THEN 0
         WHEN d.status = 'pending' THEN 1
         WHEN d.status = 'failed' THEN 2
@@ -3101,6 +3104,7 @@ export async function findInterviewDriveRecoverySessions(options: {
       integrityMaintenanceOnly,
       integrityBefore,
       driftBefore,
+      integrityMaintenanceOnly,
     )
     .all<{ id: string; transcript_json: string; candidate_transcription_failed: number }>();
 

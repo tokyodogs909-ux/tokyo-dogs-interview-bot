@@ -195,16 +195,26 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
     // Without this separate selector, a continuous queue of uploads could
     // indefinitely starve a six-hour drift recheck. The integrity claim and
     // its checkedAt cooldown still prevent duplicate or tight-loop reads.
-    const maintenanceSessionId = await findNextInterviewDriveRecoverySession({
-      includeIntegrityRecheck: true,
-      integrityMaintenanceOnly: true,
-    });
+    let maintenanceSessionId: string | null = null;
+    let maintenanceSelectionFailed = false;
+    try {
+      maintenanceSessionId = await findNextInterviewDriveRecoverySession({
+        includeIntegrityRecheck: true,
+        integrityMaintenanceOnly: true,
+      });
+    } catch {
+      // Maintenance discovery must never prevent already selected live
+      // archives from advancing. Surface attention while preserving them.
+      maintenanceSelectionFailed = true;
+    }
     const runMaintenance = Boolean(
       maintenanceSessionId && !sessionIds.includes(maintenanceSessionId),
     );
-    if (sessionIds.length === 0 && !runMaintenance) return "idle";
+    if (sessionIds.length === 0 && !runMaintenance) {
+      return maintenanceSelectionFailed ? "attention" : "idle";
+    }
     let advanced = false;
-    let attention = false;
+    let attention = maintenanceSelectionFailed;
     for (const sessionId of sessionIds) {
       try {
         const result = await stepInterviewToGoogleDrive(sessionId);

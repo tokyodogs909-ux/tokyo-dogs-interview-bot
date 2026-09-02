@@ -2556,7 +2556,11 @@ class FakeD1Statement {
         maintenanceOnlyConfirmation,
         maintenanceIntegrityBefore,
         maintenanceDriftBefore,
+        maintenancePriority,
       ] = this.values;
+      if (Number(integrityMaintenanceOnly) === 1 && this.database.failIntegrityMaintenanceQuery) {
+        throw new Error("TEST_INTEGRITY_MAINTENANCE_QUERY_FAILED");
+      }
       return {
         results: [...this.database.sessions.values()]
           .filter((session) => {
@@ -2625,6 +2629,15 @@ class FakeD1Statement {
           .sort((left, right) => {
             const leftSync = this.database.externalSyncs.get(left.id);
             const rightSync = this.database.externalSyncs.get(right.id);
+            if (Number(maintenancePriority) === 1) {
+              let leftManifest = {};
+              let rightManifest = {};
+              try { leftManifest = JSON.parse(leftSync?.manifest_json ?? "{}"); } catch {}
+              try { rightManifest = JSON.parse(rightSync?.manifest_json ?? "{}"); } catch {}
+              const driftOrder = Number(leftManifest.integrity?.status !== "drift") -
+                Number(rightManifest.integrity?.status !== "drift");
+              if (driftOrder !== 0) return driftOrder;
+            }
             const priority = (sync, session) => {
               if (sync?.status === "running") return 0;
               if (sync?.status === "pending") return 1;
@@ -11890,7 +11903,8 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
   process.env.INTERVIEW_STAFF_TOKEN = "staff-review-secret";
   const originalFetch = globalThis.fetch;
   const database = new FakeD1();
-  const env = driveSyncEnv(database);
+  const recordings = new FakeR2();
+  const env = { ...driveSyncEnv(database), RECORDINGS: recordings };
   const session = await seedCompletedInterview(env, database);
   const folderId = "candidate-folder-integrity";
   const parentId = "month-folder-integrity";
@@ -12607,6 +12621,67 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
   });
   assert.equal(database.externalSyncs.get(session.sessionId).status, "completed");
 
+  {
+    const knownDriftManifest = JSON.parse(
+      database.externalSyncs.get(session.sessionId).manifest_json,
+    );
+    const previousDriftErrorCode = knownDriftManifest.integrity.errorCode;
+    knownDriftManifest.integrity.status = "drift";
+    knownDriftManifest.integrity.checkedAt = "2020-01-01T00:00:00.000Z";
+    knownDriftManifest.integrity.errorCode = previousDriftErrorCode ??
+      "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT";
+    database.externalSyncs.get(session.sessionId).manifest_json = JSON.stringify(
+      knownDriftManifest,
+    );
+    const alert = database.operationalAlerts.get(session.sessionId);
+    Object.assign(alert, { status: "open", severity: "critical", resolved_at: null });
+    let transientFolderReads = 0;
+    const transientMethods = [];
+    try {
+      globalThis.fetch = async (url, init = {}) => {
+        const href = String(url);
+        if (href === "https://oauth2.googleapis.com/token") {
+          return Response.json({ access_token: "drive-read-token" });
+        }
+        if (href.startsWith("https://www.googleapis.com/drive/v3/")) {
+          transientMethods.push(String(init.method ?? "GET").toUpperCase());
+        }
+        if (href.includes(`/files/${folderId}?`)) {
+          transientFolderReads += 1;
+          return Response.json({ error: { code: 503 } }, { status: 503 });
+        }
+        throw new Error(`unexpected fetch ${href}`);
+      };
+      const staffRequest = () => request(`/api/staff/interview?sessionId=${session.sessionId}`, {
+        headers: {
+          Authorization: "Bearer staff-review-secret",
+          "X-Interview-Reviewer": encodeURIComponent("採用担当A"),
+        },
+      }, env);
+      const transient = await staffRequest();
+      const transientPayload = await transient.json();
+      assert.equal(transient.status, 200, JSON.stringify(transientPayload));
+      assert.equal(transientPayload.review.driveSync.integrityStatus, "drift");
+      const preservedDrift = JSON.parse(
+        database.externalSyncs.get(session.sessionId).manifest_json,
+      ).integrity;
+      assert.equal(preservedDrift.status, "drift");
+      assert.equal(preservedDrift.errorCode, knownDriftManifest.integrity.errorCode);
+      assert.notEqual(preservedDrift.checkedAt, "2020-01-01T00:00:00.000Z");
+      assert.equal(database.operationalAlerts.get(session.sessionId).status, "open");
+      assert.equal(database.operationalAlerts.get(session.sessionId).severity, "critical");
+      assert.equal(transientFolderReads, 1);
+      const immediate = await staffRequest();
+      assert.equal(immediate.status, 200, await immediate.clone().text());
+      assert.equal(transientFolderReads, 1,
+        "a transient read over known drift must retain the six-hour cooldown");
+      assert.deepEqual(new Set(transientMethods), new Set(["GET"]));
+      assert.equal(recordings.putCount, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
   const unknownManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
   unknownManifest.integrity = {
     ...unknownManifest.integrity,
@@ -12635,7 +12710,8 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
 test("background Drive recovery advances three pending interviews before bounded drift maintenance", async () => {
   const originalFetch = globalThis.fetch;
   const database = new FakeD1();
-  const env = driveSyncEnv(database);
+  const recordings = new FakeR2();
+  const env = { ...driveSyncEnv(database), RECORDINGS: recordings };
   const pending = await Promise.all([
     seedCompletedInterview(env, database, { candidateName: "復旧並行 一郎", location: "越谷店" }),
     seedCompletedInterview(env, database, { candidateName: "復旧並行 二郎", location: "所沢店" }),
@@ -12647,6 +12723,20 @@ test("background Drive recovery advances three pending interviews before bounded
   });
   const old = "2026-08-01T00:00:00.000Z";
   const recentDrift = new Date(Date.now() - 7 * 60 * 60 * 1_000).toISOString();
+  const routine = [];
+  const routineTemplate = database.sessions.get(stale.sessionId);
+  for (let index = 0; index < 26; index += 1) {
+    const sessionId = `TD-ROUTINE-${String(index).padStart(4, "0")}`;
+    database.sessions.set(sessionId, {
+      ...structuredClone(routineTemplate),
+      id: sessionId,
+      candidate_name: `定期監査 ${String(index).padStart(2, "0")}`,
+      created_at: "2026-06-01T00:00:00.000Z",
+      completed_at: "2026-06-01T00:00:00.000Z",
+      updated_at: "2026-06-01T00:00:00.000Z",
+    });
+    routine.push({ sessionId });
+  }
   for (const session of pending) {
     database.externalSyncs.set(session.sessionId, {
       provider: "google_drive",
@@ -12688,12 +12778,45 @@ test("background Drive recovery advances three pending interviews before bounded
     error_code: null,
     updated_at: old,
   });
+  for (const session of routine) {
+    database.externalSyncs.set(session.sessionId, {
+      provider: "google_drive",
+      status: "completed",
+      requested_at: "2026-06-01T00:00:00.000Z",
+      started_at: "2026-06-01T00:00:00.000Z",
+      completed_at: "2026-06-01T00:00:00.000Z",
+      folder_id: `routine-${session.sessionId}`,
+      folder_url: `https://drive.google.com/drive/folders/routine-${session.sessionId}`,
+      manifest_json: JSON.stringify({
+        files: {},
+        recordingIncluded: false,
+        transcriptAvailable: true,
+        transcriptKind: "actual_transcript",
+        reportPresentationVersion: "2026-08-23-v2",
+        integrity: {
+          schemaVersion: "2026-08-14-v1",
+          status: "verified",
+          checkedAt: old,
+          errorCode: null,
+          sharingRisk: "restricted",
+          folder: null,
+          artifacts: {},
+        },
+      }),
+      error_code: null,
+      updated_at: "2026-06-01T00:00:00.000Z",
+    });
+  }
   const tickLogs = [];
+  const driveRequests = [];
   const originalInfo = console.info;
   console.info = (...args) => tickLogs.push(args);
   try {
-    globalThis.fetch = async (url) => {
+    globalThis.fetch = async (url, init = {}) => {
       const href = String(url);
+      if (href.startsWith("https://www.googleapis.com/drive/")) {
+        driveRequests.push({ href, method: String(init.method ?? "GET").toUpperCase() });
+      }
       if (href === "https://oauth2.googleapis.com/token") {
         return Response.json({ access_token: "background-drive-token" });
       }
@@ -12725,9 +12848,73 @@ test("background Drive recovery advances three pending interviews before bounded
     assert.equal(staleManifest.integrity.status, "drift");
     assert.notEqual(staleManifest.integrity.checkedAt, recentDrift,
       "a critical drift receives a reserved read-only recheck despite three live archives");
+    assert.equal(driveRequests.every((request) => request.method === "GET"), true,
+      "the reserved maintenance slot and failed preflights must not write to Drive");
+    const staleFolderReads = driveRequests.filter((request) =>
+      request.href.includes("/drive/v3/files/stale-integrity-folder?")).length;
+    assert.equal(staleFolderReads, 1, "critical drift must be checked once despite 25 older routine rows");
+    assert.equal(recordings.putCount, 0, "integrity maintenance must never write to R2");
+
+    await scheduleInterviewRecovery(env);
+    assert.equal(driveRequests.filter((request) =>
+      request.href.includes("/drive/v3/files/stale-integrity-folder?")).length, staleFolderReads,
+    "the six-hour cooldown must suppress an immediate second read");
+    assert.equal(recordings.putCount, 0);
     assert.equal(tickLogs.at(-1)[1].states.drive, "attention");
   } finally {
     console.info = originalInfo;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a maintenance selector failure never prevents three live Drive archives from advancing", async () => {
+  const originalFetch = globalThis.fetch;
+  const database = new FakeD1();
+  const env = driveSyncEnv(database);
+  const sessions = await Promise.all([
+    seedCompletedInterview(env, database, { candidateName: "監査分離 一郎" }),
+    seedCompletedInterview(env, database, { candidateName: "監査分離 二郎" }),
+    seedCompletedInterview(env, database, { candidateName: "監査分離 三郎" }),
+  ]);
+  const old = "2026-08-01T00:00:00.000Z";
+  for (const session of sessions) {
+    database.externalSyncs.set(session.sessionId, {
+      provider: "google_drive",
+      status: "pending",
+      requested_at: old,
+      started_at: null,
+      completed_at: null,
+      folder_id: null,
+      folder_url: null,
+      manifest_json: null,
+      error_code: null,
+      updated_at: old,
+    });
+  }
+  database.failIntegrityMaintenanceQuery = true;
+  try {
+    globalThis.fetch = async (url) => {
+      const href = String(url);
+      if (href === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "background-drive-token" });
+      }
+      if (href.includes(`/drive/v3/files/${DRIVE_ROOT_FOLDER_ID}?`)) {
+        return Response.json({
+          id: DRIVE_ROOT_FOLDER_ID,
+          name: "unexpected root",
+          mimeType: "application/vnd.google-apps.folder",
+          trashed: false,
+          capabilities: { canAddChildren: true },
+        });
+      }
+      throw new Error(`unexpected fetch ${href}`);
+    };
+    await scheduleInterviewRecovery(env);
+    assert.equal(sessions.every((session) => {
+      const receipt = database.externalSyncs.get(session.sessionId);
+      return receipt.status === "failed" && receipt.updated_at !== old;
+    }), true, "maintenance discovery is isolated from all three live archive slots");
+  } finally {
     globalThis.fetch = originalFetch;
   }
 });
