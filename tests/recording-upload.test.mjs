@@ -3,10 +3,15 @@ import test from "node:test";
 
 import {
   RECORDING_UPLOAD_PART_BYTES,
+  RECORDING_PART_REQUEST_TIMEOUT_MS,
   createLiveRecordingUploader,
   recordingPartSha256,
   uploadRecordingResumably,
 } from "../lib/recording-upload.js";
+
+test("mobile media parts allow a weak uplink without lengthening control-request timeouts", () => {
+  assert.equal(RECORDING_PART_REQUEST_TIMEOUT_MS, 180_000);
+});
 
 class VirtualBlob {
   constructor(size, type = "video/mp4") {

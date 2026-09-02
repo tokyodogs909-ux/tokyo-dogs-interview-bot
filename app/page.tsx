@@ -658,17 +658,37 @@ export default function Home() {
 
   useEffect(() => {
     if (stage !== "interview" || (mode !== "voice" && mode !== "recorded-fallback")) return;
-    const markLocalHidden = () => {
-      if (document.visibilityState === "hidden") {
-        markLocalMediaInterruptedActionRef.current("page_hidden");
+    const flushRecordingBeforeSuspension = () => {
+      const recorder = recorderRef.current;
+      if (recorder?.state !== "recording") return;
+      try {
+        recorder.requestData();
+      } catch {
+        // A concurrent recorder stop will deliver its own final data event.
       }
     };
-    const markLocalPageHidden = () => markLocalMediaInterruptedActionRef.current("page_hidden");
-    document.addEventListener("visibilitychange", markLocalHidden);
-    window.addEventListener("pagehide", markLocalPageHidden);
+    const flushLocalHidden = () => {
+      if (document.visibilityState === "hidden") {
+        flushRecordingBeforeSuspension();
+      }
+    };
+    const resumePendingRecordingUpload = () => {
+      if (document.visibilityState !== "visible") return;
+      const uploader = recordingLiveUploaderRef.current;
+      if (!uploader || uploader.snapshot().completed) return;
+      void uploader.retry().catch(() => undefined);
+    };
+    document.addEventListener("visibilitychange", flushLocalHidden);
+    document.addEventListener("visibilitychange", resumePendingRecordingUpload);
+    window.addEventListener("pagehide", flushRecordingBeforeSuspension);
+    window.addEventListener("pageshow", resumePendingRecordingUpload);
+    window.addEventListener("online", resumePendingRecordingUpload);
     return () => {
-      document.removeEventListener("visibilitychange", markLocalHidden);
-      window.removeEventListener("pagehide", markLocalPageHidden);
+      document.removeEventListener("visibilitychange", flushLocalHidden);
+      document.removeEventListener("visibilitychange", resumePendingRecordingUpload);
+      window.removeEventListener("pagehide", flushRecordingBeforeSuspension);
+      window.removeEventListener("pageshow", resumePendingRecordingUpload);
+      window.removeEventListener("online", resumePendingRecordingUpload);
     };
   }, [mode, stage]);
 
@@ -3284,6 +3304,40 @@ export default function Home() {
     displayStreamRef.current = null;
   }
 
+  async function stopRealtimeForFinalCompletion() {
+    const activeRecorder = recorderRef.current;
+    if (activeRecorder && activeRecorder.state !== "inactive") {
+      // Finalize MediaRecorder while its source tracks are still live. Some
+      // mobile browsers emit onstop as soon as a source track ends; stopping
+      // camera/microphone first can therefore discard the last dataavailable
+      // chunk and leave an otherwise completed interview unrecoverable.
+      recordingFinalStopRequestedRef.current = true;
+      try {
+        activeRecorder.requestData();
+      } catch {
+        // The recorder may already be transitioning to its stopped state.
+      }
+      try {
+        activeRecorder.stop();
+      } catch {
+        recordingFinalStopRequestedRef.current = false;
+        recordingCompleteRef.current = false;
+        recordingResolveRef.current?.(null);
+        recordingResolveRef.current = null;
+      }
+      const recorderCompletion = recordingPromiseRef.current;
+      if (recorderCompletion) {
+        await Promise.race([
+          recorderCompletion.catch(() => null),
+          new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 10_000)),
+        ]);
+      }
+    }
+    // onstop/dataavailable has now had the first opportunity to release the
+    // final chunk. Network and source tracks may be closed without racing it.
+    stopRealtime({ keepRecorder: true });
+  }
+
   async function requestEvaluation() {
     setProcessingWarning("");
     const transcript = finalizationTranscript();
@@ -3944,7 +3998,7 @@ export default function Home() {
         createdAt: new Date().toISOString(),
       });
     }
-    stopRealtime();
+    await stopRealtimeForFinalCompletion();
     // Start recorder finalization before any network-bound transcript request.
     // On iOS, delaying this until after a seal request can let the page suspend
     // before MediaRecorder.onstop releases its final part. The shared promise is
@@ -4474,7 +4528,8 @@ export default function Home() {
         });
       }
     } catch (error) {
-      stopRealtime({ keepLocalStream: true });
+      const preserveExistingRecorder = !isNewInterviewSession && recorderRef.current?.state === "recording";
+      stopRealtime({ keepLocalStream: true, keepRecorder: preserveExistingRecorder });
       if (streamRef.current) void startMicrophoneMeter(streamRef.current);
       setStage("setup");
       setSetupPhase("error");

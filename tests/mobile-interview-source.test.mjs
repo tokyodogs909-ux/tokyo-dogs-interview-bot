@@ -28,14 +28,17 @@ test("camera setup is hard-gated by measured microphone energy and explicit spea
   assert.match(source, /speakerVerified: speakerTestState === "passed"/);
 });
 
-test("backgrounding and local media changes permanently stop that recording generation", () => {
+test("real local media changes stop recording while backgrounding flushes and resumes the same upload", () => {
   const interruption = functionBody("function markLocalMediaInterrupted(", "function bindLocalMicrophoneTrack(");
   assert.match(interruption, /stageRef\.current !== "interview"/);
   assert.match(interruption, /recordingLocalContinuityValidRef\.current = false/);
   assert.match(interruption, /stopRealtime\(\)/);
   assert.match(interruption, /setStage\("setup"\)/);
   assert.doesNotMatch(interruption, /keepRecorder: true/);
-  assert.match(source, /markLocalMediaInterruptedActionRef\.current\("page_hidden"\)/);
+  assert.doesNotMatch(source, /markLocalMediaInterruptedActionRef\.current\("page_hidden"\)/);
+  assert.match(source, /flushRecordingBeforeSuspension/);
+  assert.match(source, /recorder\.requestData\(\)/);
+  assert.match(source, /uploader\.retry\(\)/);
   assert.match(source, /switchInterruptedInterviewToTextContinuity/);
   assert.doesNotMatch(source, /explicit_recovery_verified/);
   assert.doesNotMatch(source, /resumeAfterLocalMediaRecovery|reacquireLocalMedia/);

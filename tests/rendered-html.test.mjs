@@ -267,7 +267,7 @@ test("voice interview implements bidirectional audio health and recovery guards"
   assert.match(driveSyncSource, /応募者端末で生成された文字起こし/);
   assert.match(source, /stage === "setup"/);
   assert.match(source, /startMicrophoneMeter/);
-  assert.match(source, /stopRealtime\(\{ keepLocalStream: true \}\)/);
+  assert.match(source, /stopRealtime\(\{ keepLocalStream: true, keepRecorder: preserveExistingRecorder \}\)/);
   assert.doesNotMatch(source, /fetch\("\/api\/health"/);
   assert.match(source, /録画式のオンライン一次面接へ進む/);
   assert.match(source, /startRecordedFallback\(\{ continueCurrentAttempt: true \}\)/);
@@ -482,7 +482,16 @@ test("capped or errored MediaRecorder output cannot be uploaded or receipted as 
       stopHandler.indexOf("recordingCompleteRef.current = true;"),
     "a partial Blob must resolve as null before the clean-stop path can mark a recording complete",
   );
-  assert.match(source, /recordingFinalStopRequestedRef\.current = endingRef\.current;\s*activeRecorder\.stop\(\);/);
+  const finalStop = source.slice(
+    source.indexOf("async function stopRealtimeForFinalCompletion()"),
+    source.indexOf("async function requestEvaluation()"),
+  );
+  assert.ok(
+    finalStop.indexOf("recordingFinalStopRequestedRef.current = true") <
+      finalStop.indexOf("activeRecorder.stop()") &&
+      finalStop.indexOf("activeRecorder.stop()") < finalStop.indexOf("stopRealtime({ keepRecorder: true })"),
+    "normal completion must stop and await MediaRecorder before source tracks are closed",
+  );
 
   const upload = source.slice(
     source.indexOf("async function uploadRecording(blob: Blob)"),

@@ -38,8 +38,8 @@ test("camera mode requires live tracks, measured microphone energy, and an expli
   assert.equal(cameraInterviewReadiness({ ...base, embeddedBrowser: true }).code, "EMBEDDED_BROWSER");
 });
 
-test("mute, end, devicechange, and backgrounding remain sticky until explicit verified recovery", () => {
-  for (const type of ["track_muted", "track_ended", "device_changed", "page_hidden"]) {
+test("real media interruptions stay sticky while visibility-only backgrounding does not invent a track failure", () => {
+  for (const type of ["track_muted", "track_ended", "device_changed"]) {
     const blocked = reduceLocalMediaHealth(initialLocalMediaHealth(), { type });
     assert.equal(blocked.blocked, true);
     assert.equal(reduceLocalMediaHealth(blocked, { type: "track_unmuted" }), blocked);
@@ -48,6 +48,8 @@ test("mute, end, devicechange, and backgrounding remain sticky until explicit ve
     assert.equal(recovered.blocked, false);
     assert.equal(recovered.revision, blocked.revision + 1);
   }
+  const healthy = initialLocalMediaHealth();
+  assert.equal(reduceLocalMediaHealth(healthy, { type: "page_hidden" }), healthy);
 });
 
 test("microphone verification needs five consecutive live energy samples and resets on silence", () => {
