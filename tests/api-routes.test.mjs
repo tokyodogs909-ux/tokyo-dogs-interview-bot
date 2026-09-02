@@ -2546,7 +2546,17 @@ class FakeD1Statement {
       };
     }
     if (this.sql.startsWith("SELECT s.id, s.transcript_json, EXISTS")) {
-      const [failedBefore, pendingBefore, includeIntegrityRecheck, integrityBefore] = this.values;
+      const [
+        integrityMaintenanceOnly,
+        failedBefore,
+        pendingBefore,
+        includeIntegrityRecheck,
+        integrityBefore,
+        driftBefore,
+        maintenanceOnlyConfirmation,
+        maintenanceIntegrityBefore,
+        maintenanceDriftBefore,
+      ] = this.values;
       return {
         results: [...this.database.sessions.values()]
           .filter((session) => {
@@ -2566,6 +2576,22 @@ class FakeD1Statement {
             if (transcript.some((turn) => turn?.speaker === "candidate" &&
               String(turn.id ?? "").startsWith("recorded-fallback-answer-"))) return false;
             const sync = this.database.externalSyncs.get(session.id);
+            if (Number(integrityMaintenanceOnly) === 1) {
+              if (Number(maintenanceOnlyConfirmation) !== 1 || !sync || sync.retry_blocked_at ||
+                sync.status !== "completed") return false;
+              let manifest;
+              try {
+                manifest = JSON.parse(sync.manifest_json ?? "{}");
+              } catch {
+                return false;
+              }
+              if (manifest.transcriptAvailable !== true || manifest.transcriptKind !== "actual_transcript") return false;
+              if (session.recording_status === "stored" && manifest.recordingIncluded !== true) return false;
+              return typeof manifest.integrity?.checkedAt !== "string" ||
+                manifest.integrity.checkedAt <= maintenanceIntegrityBefore ||
+                (manifest.integrity?.status === "drift" &&
+                  manifest.integrity.checkedAt <= maintenanceDriftBefore);
+            }
             if (!sync) return true;
             if (sync.retry_blocked_at) return false;
             if (sync.status === "running") return true;
@@ -2591,7 +2617,9 @@ class FakeD1Statement {
                 manifest.integrity?.errorCode === "GOOGLE_DRIVE_ARCHIVE_RECORDING_MISSING") ||
               (Number(includeIntegrityRecheck) === 1 && (
                 typeof manifest.integrity?.checkedAt !== "string" ||
-                manifest.integrity.checkedAt <= integrityBefore
+                manifest.integrity.checkedAt <= integrityBefore ||
+                (manifest.integrity?.status === "drift" &&
+                  manifest.integrity.checkedAt <= driftBefore)
               ));
           })
           .sort((left, right) => {
@@ -12604,7 +12632,7 @@ test("staff Drive integrity readback is single-owner, cooldown bounded, and repo
   });
 });
 
-test("background Drive recovery advances three pending interviews before stale integrity maintenance", async () => {
+test("background Drive recovery advances three pending interviews before bounded drift maintenance", async () => {
   const originalFetch = globalThis.fetch;
   const database = new FakeD1();
   const env = driveSyncEnv(database);
@@ -12618,6 +12646,7 @@ test("background Drive recovery advances three pending interviews before stale i
     location: "春日部店",
   });
   const old = "2026-08-01T00:00:00.000Z";
+  const recentDrift = new Date(Date.now() - 7 * 60 * 60 * 1_000).toISOString();
   for (const session of pending) {
     database.externalSyncs.set(session.sessionId, {
       provider: "google_drive",
@@ -12648,9 +12677,9 @@ test("background Drive recovery advances three pending interviews before stale i
       reportPresentationVersion: "2026-08-23-v2",
       integrity: {
         schemaVersion: "2026-08-14-v1",
-        status: "verified",
-        checkedAt: old,
-        errorCode: null,
+        status: "drift",
+        checkedAt: recentDrift,
+        errorCode: "GOOGLE_DRIVE_ARCHIVE_INTEGRITY_DRIFT",
         sharingRisk: "unknown",
         folder: null,
         artifacts: {},
@@ -12691,10 +12720,11 @@ test("background Drive recovery advances three pending interviews before stale i
       "one archive failure must not prevent the other two bounded attempts");
     assert.equal(database.externalSyncs.get(stale.sessionId).status, "completed");
 
-    await scheduleInterviewRecovery(env);
     const staleManifest = JSON.parse(database.externalSyncs.get(stale.sessionId).manifest_json);
     assert.equal(database.externalSyncs.get(stale.sessionId).status, "completed");
     assert.equal(staleManifest.integrity.status, "drift");
+    assert.notEqual(staleManifest.integrity.checkedAt, recentDrift,
+      "a critical drift receives a reserved read-only recheck despite three live archives");
     assert.equal(tickLogs.at(-1)[1].states.drive, "attention");
   } finally {
     console.info = originalInfo;

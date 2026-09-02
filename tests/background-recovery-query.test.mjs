@@ -5,7 +5,7 @@ import test from "node:test";
 
 function driveRecoveryQuery(source) {
   const match = source.match(
-    /const candidates = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(failedBefore, pendingBefore, includeIntegrityRecheck, integrityBefore\)/,
+    /const candidates = await db\.prepare\(`([\s\S]*?)`\)\n\s+\.bind\(\n\s+integrityMaintenanceOnly,\n\s+failedBefore,\n\s+pendingBefore,\n\s+includeIntegrityRecheck,\n\s+integrityBefore,\n\s+driftBefore,\n\s+integrityMaintenanceOnly,\n\s+integrityBefore,\n\s+driftBefore,\n\s+\)/,
   );
   assert.ok(match, "the exact production Drive recovery query must remain discoverable");
   return match[1];
@@ -101,10 +101,15 @@ test("global Drive recovery skips more than 25 invalid rows without starving val
   );
 
   const rows = database.prepare(driveRecoveryQuery(source)).all(
+    0,
     "2026-08-12T00:00:00.000Z",
     "2026-08-12T00:05:00.000Z",
     1,
     "2026-08-11T00:00:00.000Z",
+    "2026-08-11T18:00:00.000Z",
+    0,
+    "2026-08-11T00:00:00.000Z",
+    "2026-08-11T18:00:00.000Z",
   );
   assert.deepEqual(rows.map((row) => row.id), ["TD-VALID-0001", "TD-RECOVERED-01"]);
   assert.equal(rows.some((row) => row.id.startsWith("TD-BAD-")), false);

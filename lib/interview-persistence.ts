@@ -2939,6 +2939,7 @@ export async function finishExternalSyncIntegrityCheck(input: {
 const BACKGROUND_DRIVE_FAILED_RETRY_MS = 10 * 60 * 1_000;
 const BACKGROUND_DRIVE_PENDING_RETRY_MS = 5 * 60 * 1_000;
 const BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS = 24 * 60 * 60 * 1_000;
+const BACKGROUND_DRIVE_DRIFT_RECHECK_MS = 6 * 60 * 60 * 1_000;
 
 /**
  * Finds one archive that can be advanced by a server-side scheduled event.
@@ -2951,6 +2952,7 @@ const BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS = 24 * 60 * 60 * 1_000;
  */
 export async function findInterviewDriveRecoverySessions(options: {
   includeIntegrityRecheck?: boolean;
+  integrityMaintenanceOnly?: boolean;
   limit?: number;
 } = {}) {
   const db = database();
@@ -2960,7 +2962,9 @@ export async function findInterviewDriveRecoverySessions(options: {
   const failedBefore = new Date(now - BACKGROUND_DRIVE_FAILED_RETRY_MS).toISOString();
   const pendingBefore = new Date(now - BACKGROUND_DRIVE_PENDING_RETRY_MS).toISOString();
   const integrityBefore = new Date(now - BACKGROUND_DRIVE_INTEGRITY_RECHECK_MS).toISOString();
-  const includeIntegrityRecheck = options.includeIntegrityRecheck === false ? 0 : 1;
+  const driftBefore = new Date(now - BACKGROUND_DRIVE_DRIFT_RECHECK_MS).toISOString();
+  const integrityMaintenanceOnly = options.integrityMaintenanceOnly === true ? 1 : 0;
+  const includeIntegrityRecheck = integrityMaintenanceOnly === 1 || options.includeIntegrityRecheck !== false ? 1 : 0;
   const safeLimit = Math.max(1, Math.min(3, Math.trunc(options.limit ?? 1)));
   const candidates = await db.prepare(`SELECT
       s.id, s.transcript_json,
@@ -3035,8 +3039,9 @@ export async function findInterviewDriveRecoverySessions(options: {
         )
       )
       AND (
-        d.session_id IS NULL
-        OR (d.retry_blocked_at IS NULL AND (
+        (? = 0 AND (
+          d.session_id IS NULL
+          OR (d.retry_blocked_at IS NULL AND (
           d.status = 'running'
           OR (d.status = 'failed' AND d.updated_at <= ?
             AND (d.next_retry_at IS NULL OR datetime(d.next_retry_at) <= datetime('now')))
@@ -3050,9 +3055,26 @@ export async function findInterviewDriveRecoverySessions(options: {
           OR (? = 1 AND (
             json_extract(d.manifest_json, '$.integrity.checkedAt') IS NULL
             OR json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?
+            OR (json_extract(d.manifest_json, '$.integrity.status') = 'drift'
+              AND json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?)
+          ))
           ))
           ))
         ))
+        OR (? = 1
+          AND d.retry_blocked_at IS NULL
+          AND d.status = 'completed'
+          AND COALESCE(json_extract(d.manifest_json, '$.transcriptAvailable'), 0) = 1
+          AND COALESCE(json_extract(d.manifest_json, '$.transcriptKind'), '') = 'actual_transcript'
+          AND (s.recording_status != 'stored'
+            OR COALESCE(json_extract(d.manifest_json, '$.recordingIncluded'), 0) = 1)
+          AND (
+            json_extract(d.manifest_json, '$.integrity.checkedAt') IS NULL
+            OR json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?
+            OR (json_extract(d.manifest_json, '$.integrity.status') = 'drift'
+              AND json_extract(d.manifest_json, '$.integrity.checkedAt') <= ?)
+          )
+        )
       )
     ORDER BY CASE
         WHEN d.status = 'running' THEN 0
@@ -3069,7 +3091,17 @@ export async function findInterviewDriveRecoverySessions(options: {
       COALESCE(d.updated_at, s.completed_at, s.created_at) ASC,
       s.id ASC
     LIMIT 25`)
-    .bind(failedBefore, pendingBefore, includeIntegrityRecheck, integrityBefore)
+    .bind(
+      integrityMaintenanceOnly,
+      failedBefore,
+      pendingBefore,
+      includeIntegrityRecheck,
+      integrityBefore,
+      driftBefore,
+      integrityMaintenanceOnly,
+      integrityBefore,
+      driftBefore,
+    )
     .all<{ id: string; transcript_json: string; candidate_transcription_failed: number }>();
 
   const selected: string[] = [];
@@ -3103,6 +3135,7 @@ export async function findInterviewDriveRecoverySessions(options: {
 
 export async function findNextInterviewDriveRecoverySession(options: {
   includeIntegrityRecheck?: boolean;
+  integrityMaintenanceOnly?: boolean;
 } = {}) {
   return (await findInterviewDriveRecoverySessions({ ...options, limit: 1 }))[0] ?? null;
 }

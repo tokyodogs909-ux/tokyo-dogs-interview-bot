@@ -14,7 +14,10 @@ import {
   findRecordedInterviewReadyForCompletion,
   recoverNextRecordedAnswerTranscription,
 } from "@/lib/recorded-transcription";
-import { stepInterviewToGoogleDrive } from "@/lib/google-drive-sync";
+import {
+  revalidateCompletedGoogleDriveArchive,
+  stepInterviewToGoogleDrive,
+} from "@/lib/google-drive-sync";
 import { authorizeBearerSecret, bearerToken, serverSecretReadiness } from "@/lib/server-secret-auth";
 
 type InterviewBackgroundRecoveryBindings = {
@@ -188,13 +191,18 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
       [...normalSessionIds, ...technicalSessionIds, ...reportRefreshSessionIds]
         .filter((value): value is string => typeof value === "string"),
     )];
-    if (sessionIds.length === 0) {
-      const maintenanceSessionId = await findNextInterviewDriveRecoverySession({
-        includeIntegrityRecheck: true,
-      });
-      if (!maintenanceSessionId) return "idle";
-      sessionIds.push(maintenanceSessionId);
-    }
+    // Reserve one GET-only maintenance slot even when live archives are busy.
+    // Without this separate selector, a continuous queue of uploads could
+    // indefinitely starve a six-hour drift recheck. The integrity claim and
+    // its checkedAt cooldown still prevent duplicate or tight-loop reads.
+    const maintenanceSessionId = await findNextInterviewDriveRecoverySession({
+      includeIntegrityRecheck: true,
+      integrityMaintenanceOnly: true,
+    });
+    const runMaintenance = Boolean(
+      maintenanceSessionId && !sessionIds.includes(maintenanceSessionId),
+    );
+    if (sessionIds.length === 0 && !runMaintenance) return "idle";
     let advanced = false;
     let attention = false;
     for (const sessionId of sessionIds) {
@@ -212,6 +220,21 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
         attention = true;
       }
     }
+    if (runMaintenance && maintenanceSessionId) {
+      try {
+        const integrity = await revalidateCompletedGoogleDriveArchive(maintenanceSessionId);
+        if (!integrity) {
+          // Another worker owns the same short integrity claim; do not retry or
+          // reinterpret an unknown result in this tick.
+        } else if (integrity.status === "verified") {
+          advanced = true;
+        } else {
+          attention = true;
+        }
+      } catch {
+        attention = true;
+      }
+    }
     if (attention) return "attention";
     return advanced ? "advanced" : "waiting";
   } catch {
@@ -221,8 +244,9 @@ async function recoverDriveArchive(): Promise<RecoveryStageState> {
 
 /**
  * Advances a bounded amount of global work per scheduled event. At most one
- * paid answer transcription and at most five Drive chunks (each <=4 MiB) are
- * attempted. Up to three live archives occupy one slot each; at most two report-only
+ * paid answer transcription, at most five Drive chunks (each <=4 MiB), and one
+ * GET-only integrity recheck are attempted. Up to three live archives occupy one
+ * slot each; at most two report-only
  * presentation refreshes reuse the canonical recording without uploading it;
  * technical evidence uses the remaining slots. Every
  * mutable stage retains its existing D1 compare-and-set/lease fence, so an
