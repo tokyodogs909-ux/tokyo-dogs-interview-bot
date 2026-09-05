@@ -1,5 +1,6 @@
 import {
   authorizeInterviewRequest,
+  interviewSessionAllowsCameraMedia,
   sealInterviewTranscriptDraft,
   type InterviewTranscriptDraftMode,
 } from "@/lib/interview-persistence";
@@ -44,6 +45,9 @@ export async function POST(request: Request) {
         { error: "オンライン一次面接の有効期限または認証を確認してください。" },
         { status: 401 },
       );
+    }
+    if (mode === "voice" && !await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreJson({ error: "この面接方式では音声記録を確定できません。" }, { status: 409 });
     }
     const receipt = await sealInterviewTranscriptDraft({ sessionId, mode, transcript });
     return noStoreJson({ sealed: true, ...receipt });

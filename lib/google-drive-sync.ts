@@ -370,6 +370,31 @@ function scoreLabel(score: number | null) {
   return score === null ? "未確認" : `${score}/5`;
 }
 
+function interviewRecordingDisposition(source: ArchiveSource) {
+  if (source.recordingStatus === "not_applicable") {
+    return {
+      interviewMode: "text",
+      recordingExpected: false,
+      recordingDisposition: "not_recorded_by_design",
+      label: "文字入力方式（録画なし・正常）",
+    } as const;
+  }
+  if (source.recordingStatus === "stored" && source.recording) {
+    return {
+      interviewMode: "camera",
+      recordingExpected: true,
+      recordingDisposition: "stored",
+      label: "カメラ・音声方式（録画保存済み）",
+    } as const;
+  }
+  return {
+    interviewMode: "camera",
+    recordingExpected: true,
+    recordingDisposition: "not_stored",
+    label: `カメラ・音声方式（録画状態: ${source.recordingStatus}）`,
+  } as const;
+}
+
 function buildReportHtml(source: ArchiveSource) {
   const technicalEvidence = isTechnicalEvidenceArchiveSource(source);
   const technicalReason = technicalEvidenceArchiveReason(source);
@@ -378,6 +403,7 @@ function buildReportHtml(source: ArchiveSource) {
   const questionAnswers = buildInterviewQuestionAnswers(archiveTranscript(source));
   const valueHighlights = buildCandidateValueHighlights(evaluation);
   const outline = buildCandidateReviewOutline(evaluation);
+  const recordingDisposition = interviewRecordingDisposition(source);
   const questionAnswerHtml = questionAnswers.length
     ? questionAnswers.map((item) => `<section class="qa">
       <h3>Q${item.number}. ${escapeHtml(item.question)}</h3>
@@ -417,7 +443,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Yu Gothic",san
 <tr><th>雇用形態</th><td>${escapeHtml(source.employment)}</td></tr>
 <tr><th>入職希望対象店舗</th><td>${escapeHtml(source.preferredLocation)}</td></tr>
 <tr><th>${technicalEvidence ? "技術保留日時" : "面接完了日時"}</th><td>${escapeHtml(japaneseDate(technicalEvidence ? source.updatedAt : source.completedAt))}</td></tr>
-<tr><th>録画状態</th><td>${escapeHtml(source.recordingStatus)}</td></tr>
+<tr><th>参加方法・録画状態</th><td>${escapeHtml(recordingDisposition.label)}</td></tr>
 </table>
 <p class="notice">${technicalEvidence
   ? technicalReason === "recording_missing"
@@ -457,6 +483,7 @@ ${humanReviews}
 function buildResultJson(source: ArchiveSource) {
   const transcriptKind = archiveTranscriptKind(source);
   const questionAnswers = buildInterviewQuestionAnswers(archiveTranscript(source));
+  const recordingDisposition = interviewRecordingDisposition(source);
   return JSON.stringify({
     schemaVersion: "2026-08-23-v2",
     reportPresentationVersion: INTERVIEW_REPORT_PRESENTATION_VERSION,
@@ -468,6 +495,9 @@ function buildResultJson(source: ArchiveSource) {
       preferredLocation: source.preferredLocation,
       status: source.status,
       recordingStatus: source.recordingStatus,
+      interviewMode: recordingDisposition.interviewMode,
+      recordingExpected: recordingDisposition.recordingExpected,
+      recordingDisposition: recordingDisposition.recordingDisposition,
       consentVersion: source.consentVersion,
       consentedAt: source.consentedAt,
       retentionPolicy: source.retentionPolicy,
@@ -2859,6 +2889,8 @@ async function prepareDriveArchive(
   await reportProgress();
   const transcriptFileName = transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND
     ? `${filePrefix}_技術保留_受領済み文字起こし_人手確認必須.txt`
+    : source.recordingStatus === "not_applicable"
+    ? `${filePrefix}_文字入力面接_録画なし_正常.txt`
     : transcriptAvailable
     ? `${filePrefix}_文字起こし.txt`
     : `${filePrefix}_録画式面接_質問記録_文字起こし未実施.txt`;
@@ -3016,6 +3048,9 @@ async function finalizeDriveArchive(
     rootFolderId: prepared.rootFolderId,
     folderId: prepared.candidateFolder.id,
     recordingIncluded: Boolean(source.recording),
+    interviewMode: interviewRecordingDisposition(source).interviewMode,
+    recordingExpected: interviewRecordingDisposition(source).recordingExpected,
+    recordingDisposition: interviewRecordingDisposition(source).recordingDisposition,
     transcriptAvailable: prepared.transcriptAvailable,
     transcriptKind: prepared.transcriptKind,
     technicalHold: prepared.transcriptKind === TECHNICAL_EVIDENCE_TRANSCRIPT_KIND,

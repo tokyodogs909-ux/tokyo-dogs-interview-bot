@@ -16,6 +16,7 @@ import {
 import { readBoundedTextBody } from "@/lib/http-body";
 import {
   authorizeInterviewRequest,
+  interviewSessionAllowsCameraMedia,
   markInterviewStarted,
   reserveInterviewRealtimeConnection,
 } from "@/lib/interview-persistence";
@@ -55,6 +56,9 @@ export async function POST(request: Request) {
       return noStoreText("TD-CONN-SDP: 音声通話の準備情報を確認できません。", 400);
     }
     const sdp = body.value;
+    if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreText("TD-CONN-MODE: この面接方式ではカメラ・マイクを使用できません。", 409);
+    }
     if (!await reserveInterviewRealtimeConnection(sessionId)) {
       return noStoreText("TD-CONN-LIMIT: 音声回線への再接続回数が上限に達しました。採用担当者へご連絡ください。", 429);
     }

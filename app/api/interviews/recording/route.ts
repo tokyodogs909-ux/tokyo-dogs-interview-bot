@@ -3,6 +3,7 @@ import {
   claimInterviewRecordingUpload,
   failInterviewRecordingUpload,
   hasRecordingStorage,
+  interviewSessionAllowsCameraMedia,
   saveInterviewRecording,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
@@ -25,6 +26,9 @@ export async function POST(request: Request) {
     }
     if (!["in_progress", "evaluation_pending", "evaluation_processing", "completed"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接は録画を受け付ける状態ではありません。" }, { status: 409 });
+    }
+    if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreJson({ error: "この面接方式では録画を保存できません。" }, { status: 409 });
     }
     if (!hasRecordingStorage()) {
       return noStoreJson({ error: "録画の保存領域を準備できませんでした。" }, { status: 503 });

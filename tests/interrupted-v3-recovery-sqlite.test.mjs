@@ -140,6 +140,111 @@ function scheduled(workerEnv) {
   return promise;
 }
 
+function request(path, init, workerEnv) {
+  return worker.fetch(new Request(`http://localhost${path}`, init), workerEnv, {
+    waitUntil() {},
+    passThroughOnException() {},
+  });
+}
+
+test("real SQLite blocks camera-to-text downgrade and completion without a recording artifact", async () => {
+  const db = new SqliteD1();
+  const env = {
+    ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) },
+    DB: db,
+    RECORDINGS: new MemoryR2(),
+  };
+  try {
+    await scheduled(env);
+    const created = await request("/api/interviews/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        candidateName: "SQLite 録画テスト",
+        employment: "正社員",
+        location: "越谷店",
+        consent: true,
+        interviewMode: "camera",
+      }),
+    }, env);
+    assert.equal(created.status, 201, await created.clone().text());
+    const session = await created.json();
+
+    const textStart = await request("/api/interviews/text/start", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "X-Interview-Session": session.sessionId,
+      },
+    }, env);
+    assert.equal(textStart.status, 409, await textStart.clone().text());
+    assert.deepEqual({ ...db.sqlite.prepare(
+      "SELECT status, recording_status FROM interview_sessions WHERE id = ?",
+    ).get(session.sessionId) }, { status: "created", recording_status: "not_started" });
+
+    const transcript = [{
+      id: "candidate-sqlite-no-recording",
+      speaker: "candidate",
+      text: "録画前に完了してはいけない回答です。",
+      createdAt: new Date().toISOString(),
+    }];
+    const transcriptJson = JSON.stringify(transcript);
+    const now = new Date().toISOString();
+    db.sqlite.prepare("UPDATE interview_sessions SET status = 'in_progress' WHERE id = ?")
+      .run(session.sessionId);
+    db.sqlite.prepare(`INSERT INTO interview_transcript_drafts (
+      session_id, mode, transcript_json, transcript_sha256, turn_count,
+      sealed_at, created_at, updated_at
+    ) VALUES (?, 'voice', ?, ?, 1, ?, ?, ?)`)
+      .run(
+        session.sessionId,
+        transcriptJson,
+        sha256Hex(new TextEncoder().encode(transcriptJson)),
+        now,
+        now,
+        now,
+      );
+
+    let upstreamCalls = 0;
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async () => {
+        upstreamCalls += 1;
+        throw new Error("recording evidence fence must run before OpenAI");
+      };
+      const evaluation = await request("/api/evaluate", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sessionId: session.sessionId,
+          employment: "正社員",
+          location: "越谷店",
+          transcript,
+        }),
+      }, env);
+      assert.equal(evaluation.status, 409, await evaluation.clone().text());
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.equal(upstreamCalls, 0);
+    assert.deepEqual({ ...db.sqlite.prepare(
+      "SELECT status, recording_status, completed_at FROM interview_sessions WHERE id = ?",
+    ).get(session.sessionId) }, {
+      status: "in_progress",
+      recording_status: "not_started",
+      completed_at: null,
+    });
+    assert.equal(db.sqlite.prepare(
+      "SELECT COUNT(*) AS count FROM interview_evaluation_claims WHERE session_id = ?",
+    ).get(session.sessionId).count, 0);
+  } finally {
+    db.close();
+  }
+});
+
 test("real SQLite executes interrupted v3 claim and final fences atomically", async () => {
   const db = new SqliteD1();
   const recordings = new MemoryR2();

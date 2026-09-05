@@ -1,5 +1,6 @@
 import {
   authorizeInterviewRequest,
+  interviewSessionAllowsCameraMedia,
   sealVoiceInterviewTranscript,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
@@ -39,6 +40,9 @@ export async function POST(request: Request) {
         { error: "オンライン一次面接の有効期限または認証を確認してください。" },
         { status: 401 },
       );
+    }
+    if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreJson({ error: "この面接方式では音声記録を確定できません。" }, { status: 409 });
     }
     if (
       Number(authorized.session.candidate_requested_stop ?? 0) === 1 ||

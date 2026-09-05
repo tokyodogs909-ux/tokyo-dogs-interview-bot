@@ -56,7 +56,7 @@ test("server-renders the TOKYO DOGS online first interview portal", async () => 
   assert.match(html, /自動処理だけで合否を決定しません/);
   assert.match(html, /参加方法や技術不具合は不利益に扱わず/);
   assert.match(html, /文字入力/);
-  assert.match(html, /カメラ・マイク不要/);
+  assert.match(html, /カメラ・マイクを使用しません/);
   assert.match(html, /接続確認（選考対象外）/);
   assert.match(html, /interviewer-mogi\.jpg/);
   assert.doesNotMatch(html, /interviewer-dog\.svg/);

@@ -1,6 +1,7 @@
 import {
   authorizeInterviewRequest,
   completeResumableInterviewRecording,
+  interviewSessionAllowsCameraMedia,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
 
@@ -17,6 +18,9 @@ export async function POST(request: Request) {
     const authorized = await authorizeInterviewRequest(request, sessionId);
     if (!authorized?.session) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
+    }
+    if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreJson({ error: "この面接方式では録画を確定できません。" }, { status: 409 });
     }
     if (authorized.session.recording_status === "stored") return noStoreJson({ stored: true, alreadyStored: true });
     const uploadId = request.headers.get("X-Recording-Upload-Id")?.trim();

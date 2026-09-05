@@ -1,5 +1,6 @@
 import {
   authorizeInterviewRequest,
+  interviewSessionAllowsCameraMedia,
   interviewSessionHasCompletionHold,
 } from "@/lib/interview-persistence";
 import { sealRecordedInterviewCompletion } from "@/lib/recorded-transcription";
@@ -22,6 +23,9 @@ export async function POST(request: Request) {
     const authorized = await authorizeInterviewRequest(request, sessionId);
     if (!authorized?.session) {
       return noStoreJson({ error: "オンライン一次面接の有効期限または認証を確認してください。" }, { status: 401 });
+    }
+    if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreJson({ error: "この面接方式では録画式面接を完了できません。" }, { status: 409 });
     }
     if (interviewSessionHasCompletionHold(authorized.session)) {
       return noStoreJson({ error: "このオンライン一次面接は技術確認中のため完了準備できません。" }, { status: 409 });

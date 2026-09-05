@@ -152,7 +152,7 @@ const recordingStatusLabels: Record<string, string> = {
   uploading: "録画保存中",
   stored: "録画保存済み",
   failed: "録画要確認",
-  not_applicable: "文字入力（録画なし）",
+  not_applicable: "文字入力で完了（録画なし・正常）",
 };
 
 function formatInterviewDate(value: string) {
@@ -193,7 +193,7 @@ function driveArchiveLabel(item: InterviewListItem) {
   if (item.driveTranscriptAvailable !== true || item.driveTranscriptKind !== "actual_transcript") {
     return "保存未完了（文字起こし未格納）";
   }
-  if (item.recordingStatus === "not_applicable") return "Drive格納済み";
+  if (item.recordingStatus === "not_applicable") return "文字入力記録を格納済み（動画なし・正常）";
   return item.recordingStatus === "stored" && item.driveRecordingIncluded === true
     ? "動画含め格納済み"
     : "保存未完了（録画未格納）";
@@ -735,7 +735,7 @@ export default function StaffReviewPage() {
         <ol>
           <li><strong>1. 共通URLを案内</strong><span>上の「候補者用URLをコピー」を押し、候補者へ送ります。</span></li>
           <li><strong>2. 面接完了後に一覧を確認</strong><span>担当者表示名（自己申告）と共通アクセスキーを入力し、「候補者一覧を表示」を押します。</span></li>
-          <li><strong>3. 保存完了を確認</strong><span>通常面接は「面接完了・録画保存済み・Drive格納済み」、文字入力方式は「面接完了・Drive格納済み」を確認します。</span></li>
+          <li><strong>3. 保存完了を確認</strong><span>カメラ・音声方式は「面接完了・録画保存済み・動画含め格納済み」、文字入力方式は「文字入力で完了・動画なし・正常」を確認します。</span></li>
         </ol>
         <p className="staff-operation-alert"><strong>「要確認」がある場合</strong> 候補者を不利に評価せず、記録を開いて技術フラグを確認してください。Driveまたはレポートだけが未完了の場合は「Drive・レポートを更新」を押します。</p>
       </section>

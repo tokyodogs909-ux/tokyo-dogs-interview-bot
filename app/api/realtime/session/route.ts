@@ -20,6 +20,7 @@ import {
 import { readBoundedJsonBody } from "@/lib/http-body";
 import {
   authorizeInterviewRequest,
+  interviewSessionAllowsCameraMedia,
   markInterviewStarted,
   reserveInterviewRealtimeConnection,
 } from "@/lib/interview-persistence";
@@ -67,6 +68,9 @@ export async function POST(request: Request) {
         authorized.session.preferred_location !== location)
     ) {
       return noStoreJson({ error: "応募条件とオンライン一次面接の接続情報が一致しません。" }, { status: 409 });
+    }
+    if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreJson({ error: "この面接方式ではカメラ・マイクを使用できません。" }, { status: 409 });
     }
     if (!await reserveInterviewRealtimeConnection(sessionId)) {
       return noStoreJson({

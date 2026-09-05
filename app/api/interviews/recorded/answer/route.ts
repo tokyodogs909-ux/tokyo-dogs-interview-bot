@@ -1,5 +1,6 @@
 import {
   authorizeInterviewRequest,
+  interviewSessionAllowsCameraMedia,
   interviewSessionHasCompletionHold,
 } from "@/lib/interview-persistence";
 import {
@@ -29,6 +30,9 @@ export async function POST(request: Request) {
     }
     if (!["in_progress", "evaluation_pending"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接は回答を受け付ける状態ではありません。" }, { status: 409 });
+    }
+    if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreJson({ error: "この面接方式では回答音声を保存できません。" }, { status: 409 });
     }
 
     const declaredBytesHeader = request.headers.get("X-Recorded-Answer-Bytes");

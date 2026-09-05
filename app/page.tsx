@@ -4978,7 +4978,7 @@ export default function Home() {
             <span className="field-label" id="interview-format-label">参加方法</span>
             <div className="interview-format-control" role="group" aria-labelledby="interview-format-label">
               <button type="button" className={interviewFormat === "camera" ? "active" : ""} aria-pressed={interviewFormat === "camera"} onClick={() => { setInterviewFormat("camera"); setConsent(false); }}><strong>カメラ・音声</strong><span>茂木と自然な音声で進行</span></button>
-              <button type="button" className={interviewFormat === "text" ? "active" : ""} aria-pressed={interviewFormat === "text"} onClick={() => { setInterviewFormat("text"); setConsent(false); }}><strong>文字入力</strong><span>カメラ・マイク不要</span></button>
+              <button type="button" className={interviewFormat === "text" ? "active" : ""} aria-pressed={interviewFormat === "text"} onClick={() => { setInterviewFormat("text"); setConsent(false); }}><strong>文字入力（録画なし）</strong><span>カメラ・マイクを使用しません</span></button>
             </div>
             {interviewFormat === "text" && <p className="accommodation-note">配慮が必要な理由の入力は不要です。質問内容と採用担当者による確認方法は共通で、入力方法の違いを不利益に扱いません。</p>}
             <label className={`consent-line ${consent ? "checked" : ""}`} htmlFor="selection-consent">

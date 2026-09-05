@@ -2096,9 +2096,43 @@ export async function authorizeReviewerRequest(request: Request) {
   return await secureServerSecretMatch(token, expected) ? reviewer : null;
 }
 
+/**
+ * Media endpoints must not infer consent from client-side screen state. This
+ * server-side readback is shared by every public camera/audio entrypoint so a
+ * text-consented session (including a continuity replacement) can never mint a
+ * realtime call or upload media.
+ */
+export async function interviewSessionAllowsCameraMedia(sessionId: string) {
+  const db = database();
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  await ensureSchema(db);
+  const allowed = await db.prepare(`SELECT 1 AS allowed
+    FROM interview_sessions session
+    WHERE session.id = ?
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events consent
+        WHERE consent.session_id = session.id
+          AND consent.event_type = 'consent_recorded'
+          AND json_valid(consent.detail_json)
+          AND json_extract(consent.detail_json, '$.interviewMode') = 'camera'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events text_mode
+        WHERE text_mode.session_id = session.id
+          AND text_mode.event_type = 'reasonable_accommodation_text_selected'
+      )
+    LIMIT 1`)
+    .bind(sessionId)
+    .first<{ allowed: number }>();
+  return Number(allowed?.allowed ?? 0) === 1;
+}
+
 export async function markInterviewStarted(sessionId: string) {
   const db = database();
-  if (!db) return;
+  if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
+  if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+    throw new Error("INTERVIEW_CAMERA_CONSENT_REQUIRED");
+  }
   const now = new Date().toISOString();
   await db.batch([
     db.prepare("UPDATE interview_sessions SET status = 'in_progress', updated_at = ? WHERE id = ? AND status IN ('created', 'in_progress')")
@@ -2112,6 +2146,9 @@ export async function markRecordedFallbackStarted(sessionId: string) {
   const db = database();
   if (!db) throw new Error("INTERVIEW_DATABASE_UNAVAILABLE");
   await ensureSchema(db);
+  if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+    throw new Error("INTERVIEW_CAMERA_CONSENT_REQUIRED");
+  }
   const now = new Date().toISOString();
   await db.batch([
     db.prepare(`UPDATE interview_sessions SET status = 'in_progress', updated_at = ?
@@ -2175,10 +2212,49 @@ export async function markTextInterviewStarted(sessionId: string) {
   const result = await db.batch([
     db.prepare(`UPDATE interview_sessions SET
       status = 'in_progress', recording_status = 'not_applicable', updated_at = ?
-      WHERE id = ? AND status IN ('created', 'in_progress')`)
+      WHERE id = ? AND status IN ('created', 'in_progress')
+        AND recording_status IN ('not_started', 'not_applicable')
+        AND EXISTS (
+          SELECT 1 FROM interview_audit_events consent
+          WHERE consent.session_id = interview_sessions.id
+            AND consent.event_type = 'consent_recorded'
+            AND json_valid(consent.detail_json)
+            AND json_extract(consent.detail_json, '$.interviewMode') = 'text'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM interview_audit_events started
+          WHERE started.session_id = interview_sessions.id
+            AND started.event_type IN ('interview_started', 'recorded_fallback_started')
+        )`)
       .bind(now, sessionId),
-    db.prepare("INSERT INTO interview_audit_events (id, session_id, event_type, actor_type, detail_json) VALUES (?, ?, 'reasonable_accommodation_text_selected', 'candidate', ?)")
-      .bind(crypto.randomUUID(), sessionId, JSON.stringify({ selectionImpact: "none" })),
+    db.prepare(`INSERT INTO interview_audit_events (
+      id, session_id, event_type, actor_type, detail_json
+    ) SELECT ?, ?, 'reasonable_accommodation_text_selected', 'candidate', ?
+      WHERE EXISTS (
+        SELECT 1 FROM interview_sessions session
+        WHERE session.id = ?
+          AND session.status = 'in_progress'
+          AND session.recording_status = 'not_applicable'
+          AND EXISTS (
+            SELECT 1 FROM interview_audit_events consent
+            WHERE consent.session_id = session.id
+              AND consent.event_type = 'consent_recorded'
+              AND json_valid(consent.detail_json)
+              AND json_extract(consent.detail_json, '$.interviewMode') = 'text'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events selected
+        WHERE selected.session_id = ?
+          AND selected.event_type = 'reasonable_accommodation_text_selected'
+      )`)
+      .bind(
+        crypto.randomUUID(),
+        sessionId,
+        JSON.stringify({ selectionImpact: "none", recordingExpected: false }),
+        sessionId,
+        sessionId,
+      ),
   ]);
   return Number((result[0] as { meta?: { changes?: number } }).meta?.changes ?? 0) === 1;
 }
@@ -2211,6 +2287,46 @@ export async function reserveInterviewRealtimeConnection(sessionId: string) {
 }
 
 const EVALUATION_CLAIM_STALE_AFTER_MS = 10 * 60 * 1_000;
+
+/**
+ * Final completion is permitted only after the expected durable evidence is
+ * present. Camera and recorded-fallback interviews require a non-empty R2
+ * recording artifact. Text interviews require the explicit text-mode audit
+ * trail and draft, and must never have entered recorded fallback. Keeping this
+ * predicate inside the atomic claim and completion UPDATEs closes the race in
+ * which a client could otherwise finish while a recording was still missing.
+ */
+function interviewEvidenceReadyFence(sessionAlias: string) {
+  return `AND (
+    (
+      ${sessionAlias}.recording_status = 'stored'
+      AND EXISTS (
+        SELECT 1 FROM interview_artifacts recording
+        WHERE recording.session_id = ${sessionAlias}.id
+          AND recording.kind = 'recording'
+          AND recording.byte_size > 0
+      )
+    )
+    OR (
+      ${sessionAlias}.recording_status = 'not_applicable'
+      AND EXISTS (
+        SELECT 1 FROM interview_audit_events text_mode
+        WHERE text_mode.session_id = ${sessionAlias}.id
+          AND text_mode.event_type = 'reasonable_accommodation_text_selected'
+      )
+      AND EXISTS (
+        SELECT 1 FROM interview_transcript_drafts text_draft
+        WHERE text_draft.session_id = ${sessionAlias}.id
+          AND text_draft.mode = 'text'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM interview_audit_events recorded_mode
+        WHERE recorded_mode.session_id = ${sessionAlias}.id
+          AND recorded_mode.event_type = 'recorded_fallback_started'
+      )
+    )
+  )`;
+}
 
 /**
  * Returns one durable, stale or released evaluation for the staff recovery loop.
@@ -2265,6 +2381,7 @@ export async function findNextStaleInterviewEvaluation() {
             WHERE seal.session_id = s.id AND seal.event_type = 'voice_transcript_sealed')
         )
       )
+      ${interviewEvidenceReadyFence("s")}
       AND NOT EXISTS (
         SELECT 1 FROM interview_audit_events stopped
         WHERE stopped.session_id = s.id
@@ -2424,6 +2541,7 @@ export async function claimInterviewEvaluation(input: {
     FROM interview_sessions s
     LEFT JOIN interview_evaluation_claims current ON current.session_id = s.id
     WHERE s.id = ?
+      ${interviewEvidenceReadyFence("s")}
       AND NOT EXISTS (
         SELECT 1 FROM interview_audit_events stopped
         WHERE stopped.session_id = s.id
@@ -2451,6 +2569,7 @@ export async function claimInterviewEvaluation(input: {
     status = 'evaluation_processing', transcript_json = ?, updated_at = ?
     WHERE id = ?
       AND status IN ('in_progress', 'evaluation_pending', 'evaluation_processing')
+      ${interviewEvidenceReadyFence("interview_sessions")}
       AND EXISTS (SELECT 1 FROM interview_evaluation_claims
         WHERE session_id = ? AND claim_id = ?)
       AND NOT EXISTS (
@@ -2544,6 +2663,7 @@ export async function saveInterviewEvaluation(input: {
       status = 'completed', transcript_json = ?, evaluation_json = ?, summary = ?,
       completed_at = ?, updated_at = ? WHERE id = ?
       AND status = 'evaluation_processing'
+      ${interviewEvidenceReadyFence("interview_sessions")}
       AND EXISTS (SELECT 1 FROM interview_evaluation_claims
         WHERE session_id = ? AND claim_id = ?)
       AND NOT EXISTS (

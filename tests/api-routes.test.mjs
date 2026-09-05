@@ -76,6 +76,22 @@ function hasCompletionHold(database, sessionId) {
     ].includes(event.event_type));
 }
 
+function evaluationEvidenceReady(database, session) {
+  if (!session) return false;
+  if (session.recording_status === "stored") {
+    return database.artifacts.some((artifact) =>
+      artifact[1] === session.id && Number(artifact[4]) > 0);
+  }
+  if (session.recording_status !== "not_applicable") return false;
+  const textSelected = database.auditEvents.some((event) =>
+    event.session_id === session.id &&
+    event.event_type === "reasonable_accommodation_text_selected");
+  const recordedFallbackStarted = database.auditEvents.some((event) =>
+    event.session_id === session.id && event.event_type === "recorded_fallback_started");
+  const draft = database.transcriptDrafts.get(session.id);
+  return textSelected && !recordedFallbackStarted && draft?.mode === "text";
+}
+
 function isRealtimeTranscriptionGapEvent(event) {
   return event.event_type === "transcription_failed" && [
     "TRANSCRIPTION_FAILED", "TRANSCRIPTION_EMPTY", "TRANSCRIPTION_ID_MISSING",
@@ -1238,8 +1254,18 @@ class FakeD1Statement {
     } else if (this.sql.startsWith("UPDATE interview_sessions SET status = 'in_progress'")) {
       const [updatedAt, id] = this.values;
       const session = this.database.sessions.get(id);
+      const textModeFence = this.sql.includes("$.interviewMode') = 'text'");
+      const consentedToText = hasLegacyAudit(this.database, id, "consent_recorded",
+        (detail) => detail.interviewMode === "text");
+      const mediaAlreadyStarted = this.database.auditEvents.some((event) =>
+        event.session_id === id && ["interview_started", "recorded_fallback_started"]
+          .includes(event.event_type));
       if (session && ["created", "in_progress"].includes(session.status) &&
-        (!this.sql.includes("completion_reason_invalid") || !hasCompletionHold(this.database, id))) {
+        (!this.sql.includes("completion_reason_invalid") || !hasCompletionHold(this.database, id)) &&
+        (!textModeFence || (
+          ["not_started", "not_applicable"].includes(session.recording_status) &&
+          consentedToText && !mediaAlreadyStarted
+        ))) {
         session.status = "in_progress";
         if (this.sql.includes("recording_status = 'not_applicable'")) {
           session.recording_status = "not_applicable";
@@ -1257,7 +1283,9 @@ class FakeD1Statement {
           (current?.started_at && current.started_at <= staleBefore) ||
           (!current && session.updated_at <= staleBefore)
         ))
-      ) && !this.database.auditEvents.some((event) =>
+      ) && (!this.sql.includes("interview_artifacts recording") ||
+        evaluationEvidenceReady(this.database, session)) &&
+      !this.database.auditEvents.some((event) =>
         event.session_id === sessionId && [
           "candidate_requested_stop", "safety_escalation", "completion_reason_invalid",
         ].includes(event.event_type)) && !this.database.auditEvents.some((event) => {
@@ -1311,6 +1339,8 @@ class FakeD1Statement {
       });
       if (session && claim?.claim_id === claimId &&
         ["in_progress", "evaluation_pending", "evaluation_processing"].includes(session.status) &&
+        (!this.sql.includes("interview_artifacts recording") ||
+          evaluationEvidenceReady(this.database, session)) &&
         !candidateStopped && (!realtimeGap || !this.sql.includes("TRANSCRIPTION_EMPTY")) &&
         (!voiceSealed || session.transcript_json === sealedTranscriptJson)) {
         Object.assign(session, {
@@ -1359,6 +1389,8 @@ class FakeD1Statement {
         }
       });
       if (session?.status === "evaluation_processing" && claim?.claim_id === claimId &&
+        (!this.sql.includes("interview_artifacts recording") ||
+          evaluationEvidenceReady(this.database, session)) &&
         !candidateStopped && (!realtimeGap || !this.sql.includes("TRANSCRIPTION_EMPTY")) &&
         (!voiceSealed || session.transcript_json === sealedTranscriptJson)) {
         Object.assign(session, {
@@ -1603,14 +1635,25 @@ class FakeD1Statement {
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("'reasonable_accommodation_text_selected'")
     ) {
-      const [, sessionId, detailJson] = this.values;
-      this.database.auditEvents.push({
-        event_type: "reasonable_accommodation_text_selected",
-        detail_json: detailJson,
-        created_at: new Date().toISOString(),
-        session_id: sessionId,
-      });
-      changes = 1;
+      const [, sessionId, detailJson, checkedSessionId, duplicateSessionId] = this.values;
+      const session = this.database.sessions.get(checkedSessionId ?? sessionId);
+      const consentedToText = hasLegacyAudit(this.database, checkedSessionId ?? sessionId,
+        "consent_recorded", (detail) => detail.interviewMode === "text");
+      const alreadySelected = this.database.auditEvents.some((event) =>
+        event.session_id === (duplicateSessionId ?? sessionId) &&
+        event.event_type === "reasonable_accommodation_text_selected");
+      if (!this.sql.includes("SELECT") || (
+        session?.status === "in_progress" && session.recording_status === "not_applicable" &&
+        consentedToText && !alreadySelected
+      )) {
+        this.database.auditEvents.push({
+          event_type: "reasonable_accommodation_text_selected",
+          detail_json: detailJson,
+          created_at: new Date().toISOString(),
+          session_id: sessionId,
+        });
+        changes = 1;
+      }
     } else if (
       this.sql.startsWith("INSERT INTO interview_audit_events") &&
       this.sql.includes("'transcription_failed', 'system'")
@@ -1760,6 +1803,17 @@ class FakeD1Statement {
   }
 
   async first() {
+    if (this.sql.startsWith("SELECT 1 AS allowed") &&
+      this.sql.includes("$.interviewMode') = 'camera'")) {
+      const sessionId = this.values[0];
+      const cameraConsent = hasLegacyAudit(this.database, sessionId, "consent_recorded",
+        (detail) => detail.interviewMode === "camera");
+      const textSelected = hasLegacyAudit(this.database, sessionId,
+        "reasonable_accommodation_text_selected");
+      return this.database.sessions.has(sessionId) && cameraConsent && !textSelected
+        ? { allowed: 1 }
+        : null;
+    }
     if (this.sql.startsWith("SELECT manifest_json, completed_at FROM interview_external_syncs")) {
       const sync = this.database.externalSyncs.get(this.values[0]);
       if (!sync || sync.status !== "completed" || !sync.completed_at) return null;
@@ -2191,6 +2245,8 @@ class FakeD1Statement {
                   event.session_id === session.id && event.event_type === "voice_transcript_sealed"))) ||
             typeof session.transcript_json !== "string"
           ) return false;
+          if (this.sql.includes("interview_artifacts recording") &&
+            !evaluationEvidenceReady(this.database, session)) return false;
           try {
             const transcript = JSON.parse(session.transcript_json);
             if (!Array.isArray(transcript)) return false;
@@ -3107,6 +3163,7 @@ async function createTestInterviewSession(
       employment,
       location,
       consent: true,
+      ...(options.interviewMode ? { interviewMode: options.interviewMode } : {}),
     }),
   }, env);
   assert.equal(response.status, 201);
@@ -3174,6 +3231,23 @@ async function storeSealedTranscriptDraft(env, session, mode, transcript) {
 async function storeAndSealVoiceTranscript(env, session, transcript) {
   await storeSealedTranscriptDraft(env, session, "voice", transcript);
   return await sealVoiceTranscript(env, session, transcript);
+}
+
+function seedStoredRecording(database, sessionId, byteSize = 1_024) {
+  const session = database.sessions.get(sessionId);
+  assert.ok(session, "recording fixture requires an existing session");
+  session.recording_status = "stored";
+  if (!database.artifacts.some((artifact) => artifact[1] === sessionId)) {
+    database.artifacts.push([
+      `recording-${sessionId}`,
+      sessionId,
+      `interviews/${sessionId}/recording.webm`,
+      "video/webm",
+      byteSize,
+      "recording-etag",
+      session.retention_until,
+    ]);
+  }
 }
 
 function seedExactSealedTranscriptDraft(database, sessionId, transcriptJson, mode = "voice") {
@@ -5326,7 +5400,7 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     assert.equal(legacyDuplicateFile.appProperties.tokyoDogsArtifact, "legacy_duplicate_transcript");
     assert.equal(legacyDuplicateFile.appProperties.tokyoDogsLegacyArtifact, "transcript");
     const completedManifest = JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json);
-    assert.equal(completedManifest.reportPresentationVersion, "2026-08-23-v2");
+    assert.equal(completedManifest.reportPresentationVersion, "2026-09-05-v3");
     assert.equal(completedManifest.files.transcript.id, canonicalTranscript.id,
       "the current-run canonical file must remain the durable receipt");
     const reportDocument = uploadedDriveFiles.find((file) =>
@@ -5378,7 +5452,7 @@ test("candidate archive fails closed before writes for a mismatched transcript d
     assert.equal(presentationRefreshArtifacts.every((call) => call.method === "PATCH"), true,
       "a report-only refresh must reuse every canonical Drive file ID");
     assert.equal(JSON.parse(database.externalSyncs.get(session.sessionId).manifest_json).reportPresentationVersion,
-      "2026-08-23-v2");
+      "2026-09-05-v3");
 
     const driveCallsBeforeIdempotentRead = uploadedNames.length + recordingUploadRanges.length + createdFolders.length;
     const replay = await request("/api/interviews/archive", {
@@ -6225,7 +6299,7 @@ test("required invite mode fails closed when the signing secret is not configure
   const response = await request("/api/interviews/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true, interviewMode: "camera" }),
   }, {
     ...workerEnv,
     DB: database,
@@ -6525,6 +6599,107 @@ test("text interview starts without camera or recording and is visible as a tech
   assert.equal(database.auditEvents.some((event) =>
     event.session_id === session.sessionId &&
     event.event_type === "reasonable_accommodation_text_selected"), true);
+});
+
+test("a camera-consented session cannot be downgraded to no-recording text mode", async () => {
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database };
+  const created = await request("/api/interviews/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      candidateName: "録画方式 テスト",
+      employment: "正社員",
+      location: "希望店舗は相談",
+      consent: true,
+      interviewMode: "camera",
+    }),
+  }, env);
+  assert.equal(created.status, 201);
+  const session = await created.json();
+
+  const start = await request("/api/interviews/text/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  assert.equal(start.status, 409, await start.clone().text());
+  assert.equal(database.sessions.get(session.sessionId).status, "created");
+  assert.equal(database.sessions.get(session.sessionId).recording_status, "not_started");
+  assert.equal(database.auditEvents.some((event) =>
+    event.session_id === session.sessionId &&
+    event.event_type === "reasonable_accommodation_text_selected"), false);
+});
+
+test("a text-consented session cannot open any camera, audio, or recorded interview path", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const recordings = new FakeR2();
+  const env = { ...workerEnv, DB: database, RECORDINGS: recordings };
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", {
+    interviewMode: "text",
+  });
+  const started = await request("/api/interviews/text/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  assert.equal(started.status, 200);
+
+  let upstreamCalls = 0;
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      upstreamCalls += 1;
+      return Response.json({ value: "must-not-be-issued" });
+    };
+    const realtime = await request("/api/realtime/session", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${session.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+      }),
+    }, env);
+    assert.equal(realtime.status, 409);
+    assert.equal(upstreamCalls, 0, "text consent must be rejected before any paid media call");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const recorded = await request("/api/interviews/recorded/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "X-Interview-Session": session.sessionId,
+    },
+  }, env);
+  assert.equal(recorded.status, 409);
+
+  const upload = await request("/api/interviews/recording/upload/start", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      sessionId: session.sessionId,
+      uploadVersion: 3,
+      uploadId: "textmodeuploadid123456",
+      contentType: "video/webm",
+      partSize: 4 * 1024 * 1024,
+    }),
+  }, env);
+  assert.equal(upload.status, 409);
+  assert.equal(recordings.putCount, 0);
 });
 
 test("candidate continuity cookie resumes text and replaces interrupted media exactly once", async () => {
@@ -6999,7 +7174,7 @@ test("recording upload survives one transient D1 failure after the R2 object is 
   const sessionResponse = await request("/api/interviews/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true, interviewMode: "camera" }),
   }, env);
   const session = await sessionResponse.json();
   database.sessions.get(session.sessionId).status = "in_progress";
@@ -7221,7 +7396,7 @@ test("resumable recording upload resumes 14 parts without opening stored body st
 test("voice transcript seal is authenticated, fail-closed, and exactly idempotent without completing the interview", async () => {
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database };
-  const session = await createTestInterviewSession(env);
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "camera" });
   const stored = database.sessions.get(session.sessionId);
   // Realtime call coverage separately proves that only a successful upstream
   // voice connection moves a production session into this state.
@@ -7298,7 +7473,7 @@ test("voice transcript seal is authenticated, fail-closed, and exactly idempoten
 test("recorded fallback mode cannot forge the normal voice transcript recovery fence", async () => {
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database };
-  const session = await createTestInterviewSession(env);
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "camera" });
   const started = await request("/api/interviews/recorded/start", {
     method: "POST",
     headers: {
@@ -7346,7 +7521,7 @@ test("candidate technical incidents are audited and cross-origin mutations are r
   }, env);
   assert.equal(spoofed.status, 403);
 
-  const session = await createTestInterviewSession(env);
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "camera" });
   const incident = await request("/api/interviews/event", {
     method: "POST",
     headers: {
@@ -7569,7 +7744,7 @@ test("recorded contingency requires all 15 actual answer transcriptions before c
   assert.equal(start.status, 200);
   assert.deepEqual(await start.json(), { started: true });
   assert.equal(database.sessions.get(session.sessionId).status, "in_progress");
-  database.sessions.get(session.sessionId).recording_status = "stored";
+  seedStoredRecording(database, session.sessionId);
 
   const unsealed = await request("/api/interviews/recorded/complete", {
     method: "POST",
@@ -7701,7 +7876,7 @@ test("recorded contingency can complete a stopped interview with only its answer
     },
   }, env);
   await sealRecordedCompletion(env, session, 3);
-  database.sessions.get(session.sessionId).recording_status = "stored";
+  seedStoredRecording(database, session.sessionId);
   for (let answerIndex = 1; answerIndex <= 3; answerIndex += 1) {
     const bytes = new TextEncoder().encode(`partial-answer-${answerIndex}`);
     const response = await request("/api/interviews/recorded/answer", {
@@ -7762,7 +7937,7 @@ test("a prior technical hold blocks every recorded mutation and completion route
         return Response.json({ text: "must-not-run" });
       } },
     };
-    const session = await createTestInterviewSession(env);
+    const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "text" });
     const event = await request("/api/interviews/event", {
       method: "POST",
       headers: {
@@ -7856,7 +8031,7 @@ test("recorded recovery skips held oldest transcription and completion rows", as
     const item = ordered[index];
     const stored = database.sessions.get(item.sessionId);
     stored.status = "in_progress";
-    stored.recording_status = "stored";
+    seedStoredRecording(database, item.sessionId);
     stored.updated_at = times[index];
     database.recordedCompletions.set(item.sessionId, {
       session_id: item.sessionId,
@@ -8578,9 +8753,8 @@ test("staff polling completes a durable pending transcription after the candidat
     body: bytes,
   }, env);
   assert.equal(initial.status, 202);
-  const storedSession = database.sessions.get(session.sessionId);
   await sealRecordedCompletion(env, session, 1);
-  storedSession.recording_status = "stored";
+  seedStoredRecording(database, session.sessionId);
   const pending = database.recordedAnswers.get(`${session.sessionId}:1`);
   pending.next_retry_at = new Date(0).toISOString();
 
@@ -8619,6 +8793,7 @@ test("staff polling completes one stale durable evaluation as human review witho
   };
   const session = await createTestInterviewSession(env);
   const stored = database.sessions.get(session.sessionId);
+  seedStoredRecording(database, session.sessionId);
   stored.status = "evaluation_processing";
   stored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
   database.evaluationClaims.set(session.sessionId, {
@@ -8661,7 +8836,8 @@ test("staff polling completes a stale released evaluation_pending transcript aft
     RECORDINGS: new FakeR2(),
     INTERVIEW_STAFF_TOKEN: "staff-review-secret",
   };
-  const session = await createTestInterviewSession(env);
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "text" });
+  await startTextTestInterview(env, session);
   const stored = database.sessions.get(session.sessionId);
   stored.status = "evaluation_pending";
   stored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
@@ -8765,6 +8941,8 @@ test("an oldest transcript with a known gap cannot starve the next valid stale e
   const valid = await createTestInterviewSession(env);
   const invalidStored = database.sessions.get(invalid.sessionId);
   const validStored = database.sessions.get(valid.sessionId);
+  seedStoredRecording(database, invalid.sessionId);
+  seedStoredRecording(database, valid.sessionId);
   invalidStored.status = "evaluation_pending";
   invalidStored.updated_at = new Date(Date.now() - 20 * 60 * 1_000).toISOString();
   invalidStored.transcript_json = JSON.stringify([{
@@ -8816,6 +8994,7 @@ test("recorded-answer transcripts supersede an earlier realtime gap during evalu
   };
   const session = await createTestInterviewSession(env);
   const stored = database.sessions.get(session.sessionId);
+  seedStoredRecording(database, session.sessionId);
   stored.status = "evaluation_pending";
   stored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
   stored.transcript_json = JSON.stringify([
@@ -8867,7 +9046,7 @@ test("staff polling completes a sealed voice transcript once its recording is st
   const session = await createTestInterviewSession(env);
   const stored = database.sessions.get(session.sessionId);
   stored.status = "in_progress";
-  stored.recording_status = "stored";
+  seedStoredRecording(database, session.sessionId);
   stored.transcript_json = JSON.stringify([
     { id: "voice-answer-sealed", speaker: "candidate", text: "音声面接で確定済みの回答です。", createdAt: new Date().toISOString() },
   ]);
@@ -9031,6 +9210,7 @@ test("concurrent staff polls complete a stale evaluation only once", async () =>
   };
   const session = await createTestInterviewSession(env);
   const stored = database.sessions.get(session.sessionId);
+  seedStoredRecording(database, session.sessionId);
   stored.status = "evaluation_processing";
   stored.updated_at = new Date(Date.now() - 11 * 60 * 1_000).toISOString();
   database.evaluationClaims.set(session.sessionId, {
@@ -10903,7 +11083,7 @@ test("same-origin realtime call authorizes the exact new interview session and p
   const sessionResponse = await request("/api/interviews/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true, interviewMode: "camera" }),
   }, env);
   const session = await sessionResponse.json();
   const originalFetch = globalThis.fetch;
@@ -11068,6 +11248,7 @@ test("three voice transcripts and evidence-bound evaluations remain isolated und
   for (const session of sessions) database.sessions.get(session.sessionId).status = "in_progress";
   await Promise.all(sessions.map((session, index) =>
     storeAndSealVoiceTranscript(env, session, transcripts[index])));
+  for (const session of sessions) seedStoredRecording(database, session.sessionId);
 
   const originalFetch = globalThis.fetch;
   let evaluationCalls = 0;
@@ -11135,6 +11316,46 @@ test("three voice transcripts and evidence-bound evaluations remain isolated und
   }
 });
 
+test("camera interview cannot evaluate or complete before a durable recording exists", async () => {
+  process.env.OPENAI_API_KEY = "test-key-never-returned";
+  const database = new FakeD1();
+  const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "camera" });
+  database.sessions.get(session.sessionId).status = "in_progress";
+  const sealed = await storeAndSealVoiceTranscript(env, session, candidateTurns);
+  assert.equal(sealed.status, 200, await sealed.clone().text());
+
+  let upstreamCalls = 0;
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      upstreamCalls += 1;
+      throw new Error("recording fence must reject before the paid model call");
+    };
+    const response = await request("/api/evaluate", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${session.accessToken}`,
+      },
+      body: JSON.stringify({
+        sessionId: session.sessionId,
+        employment: "正社員",
+        location: "越谷店",
+        transcript: candidateTurns,
+      }),
+    }, env);
+    assert.equal(response.status, 409, await response.clone().text());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(upstreamCalls, 0);
+  const stored = database.sessions.get(session.sessionId);
+  assert.equal(stored.status, "in_progress");
+  assert.equal(stored.completed_at, undefined);
+  assert.equal(database.evaluationClaims.has(session.sessionId), false);
+});
+
 async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
   const database = new FakeD1();
   const recordings = new FakeR2();
@@ -11142,7 +11363,7 @@ async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
   const sessionResponse = await request("/api/interviews/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true, interviewMode: "text" }),
   }, env);
   const session = await sessionResponse.json();
   await startTextTestInterview(env, session);
@@ -11190,7 +11411,7 @@ async function runEvaluationApi(invalidEvidence, transform = (value) => value) {
 test("a pre-draft text tab cannot promote its in-memory transcript after cutover", async () => {
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
-  const session = await createTestInterviewSession(env);
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "text" });
   await startTextTestInterview(env, session);
   let upstreamCalls = 0;
   const originalFetch = globalThis.fetch;
@@ -11284,7 +11505,7 @@ test("candidate evaluation endpoint stores a verified result without disclosing 
 test("candidate evaluation rejects an interviewer-only transcript before any OpenAI call", async () => {
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
-  const session = await createTestInterviewSession(env);
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "text" });
   await startTextTestInterview(env, session);
   let upstreamCalls = 0;
   const originalFetch = globalThis.fetch;
@@ -11321,7 +11542,7 @@ test("candidate-requested stop cannot seal, evaluate, complete, or create a Driv
   process.env.OPENAI_API_KEY = "test-key-never-returned";
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
-  const session = await createTestInterviewSession(env);
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "text" });
   await startTextTestInterview(env, session);
   const unprovenStop = await request("/api/interviews/event", {
     method: "POST",
@@ -11439,7 +11660,7 @@ test("safety escalation and invalid completion reasons cannot evaluate or comple
   ]) {
     const database = new FakeD1();
     const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
-    const session = await createTestInterviewSession(env);
+    const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "text" });
     await startTextTestInterview(env, session);
     await storeSealedTranscriptDraft(env, session, "text", candidateTurns);
     const held = await request("/api/interviews/event", {
@@ -11644,7 +11865,7 @@ test("concurrent evaluation submissions for the same session never both report s
   const sessionResponse = await request("/api/interviews/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true }),
+    body: JSON.stringify({ candidateName: "テスト 応募者", employment: "正社員", location: "越谷店", consent: true, interviewMode: "text" }),
   }, env);
   const session = await sessionResponse.json();
   await startTextTestInterview(env, session);
@@ -11688,7 +11909,7 @@ test("an unavailable evaluation service persists a human-review fallback without
   process.env.OPENAI_API_KEY = "test-key-never-returned";
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
-  const session = await createTestInterviewSession(env);
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "text" });
   await startTextTestInterview(env, session);
   await storeSealedTranscriptDraft(env, session, "text", candidateTurns);
   const originalFetch = globalThis.fetch;
@@ -11743,7 +11964,7 @@ test("a malformed evaluation response is stored as a human-review fallback", asy
   process.env.OPENAI_API_KEY = "test-key-never-returned";
   const database = new FakeD1();
   const env = { ...workerEnv, DB: database, RECORDINGS: new FakeR2() };
-  const session = await createTestInterviewSession(env);
+  const session = await createTestInterviewSession(env, "正社員", "越谷店", { interviewMode: "text" });
   await startTextTestInterview(env, session);
   await storeSealedTranscriptDraft(env, session, "text", candidateTurns);
   const originalFetch = globalThis.fetch;
@@ -13820,7 +14041,7 @@ test("a Google Drive worker that loses its claim stops before duplicating candid
     assert.equal(response.status, 502);
     assert.deepEqual(
       uploadedNames,
-      [`${session.sessionId}_文字起こし.txt`],
+      [`${session.sessionId}_文字入力面接_録画なし_正常.txt`],
       "the worker must stop at its next progress check instead of re-uploading every artifact",
     );
     const sync = database.externalSyncs.get(session.sessionId);

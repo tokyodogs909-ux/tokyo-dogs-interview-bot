@@ -1,5 +1,6 @@
 import {
   authorizeInterviewRequest,
+  interviewSessionAllowsCameraMedia,
   sealProvisionalInterviewRecording,
 } from "@/lib/interview-persistence";
 import { hasTrustedRequestOrigin, noStoreJson } from "@/lib/openai-server";
@@ -29,6 +30,9 @@ export async function POST(request: Request) {
     }
     if (!["in_progress", "evaluation_pending", "evaluation_processing", "completed"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接は録画を受け付ける状態ではありません。" }, { status: 409 });
+    }
+    if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreJson({ error: "この面接方式では録画を確定できません。" }, { status: 409 });
     }
     const uploadId = payload.uploadId?.trim() ?? "";
     const audioCoverage = payload.audioCoverage ?? "";

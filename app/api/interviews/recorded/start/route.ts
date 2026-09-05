@@ -1,5 +1,6 @@
 import {
   authorizeInterviewRequest,
+  interviewSessionAllowsCameraMedia,
   interviewSessionHasCompletionHold,
   markRecordedFallbackStarted,
 } from "@/lib/interview-persistence";
@@ -23,6 +24,9 @@ export async function POST(request: Request) {
     }
     if (!["created", "in_progress"].includes(authorized.session.status)) {
       return noStoreJson({ error: "このオンライン一次面接は開始できません。" }, { status: 409 });
+    }
+    if (!await interviewSessionAllowsCameraMedia(sessionId)) {
+      return noStoreJson({ error: "この面接方式では録画式面接を開始できません。" }, { status: 409 });
     }
     await markRecordedFallbackStarted(sessionId);
     return noStoreJson({ started: true });
